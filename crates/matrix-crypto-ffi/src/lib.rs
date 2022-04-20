@@ -152,6 +152,7 @@ pub fn migrate(
     mut data: MigrationData,
     path: &str,
     passphrase: Option<String>,
+    progress_listener: Box<dyn ProgressListener>,
 ) -> Result<(), anyhow::Error> {
     use matrix_sdk_crypto::{
         olm::PrivateCrossSigningIdentity,
@@ -166,8 +167,24 @@ pub fn migrate(
     };
     use zeroize::Zeroize;
 
+    // The total steps here include all the sessions/inbound group sessions and
+    // additionally some static number of steps:
+    //     * opening the store
+    //     * the Account
+    //     * the cross signing keys
+    //     * the tracked users
+    //     * the final save operation
+    let total_steps = 5 + data.sessions.len() + data.inbound_group_sessions.len();
+    let mut processed_steps = 0;
+    let listener = |progress: usize, total: usize| {
+        progress_listener.on_progress(progress as i32, total as i32)
+    };
+
     let store = SledStore::open_with_passphrase(path, passphrase.as_deref())?;
     let runtime = Runtime::new()?;
+
+    processed_steps += 1;
+    listener(processed_steps, total_steps);
 
     let user_id: Arc<UserId> = parse_user_id(&data.account.user_id)?.into();
     let device_id: Box<DeviceId> = data.account.device_id.into();
@@ -175,9 +192,7 @@ pub fn migrate(
 
     let account = Account::from_libolm_pickle(&data.account.pickle, &data.pickle_key)?;
     let pickle = account.pickle();
-
     let identity_keys = Arc::new(account.identity_keys());
-
     let pickled_account = matrix_sdk_crypto::olm::PickledAccount {
         user_id: parse_user_id(&data.account.user_id)?,
         device_id: device_id.as_ref().to_owned(),
@@ -185,8 +200,10 @@ pub fn migrate(
         shared: data.account.shared,
         uploaded_signed_key_count: data.account.uploaded_signed_key_count as u64,
     };
-
     let account = matrix_sdk_crypto::olm::ReadOnlyAccount::from_pickle(pickled_account)?;
+
+    processed_steps += 1;
+    listener(processed_steps, total_steps);
 
     let mut sessions = Vec::new();
 
@@ -213,6 +230,8 @@ pub fn migrate(
         );
 
         sessions.push(session);
+        processed_steps += 1;
+        listener(processed_steps, total_steps);
     }
 
     let mut inbound_group_sessions = Vec::new();
@@ -239,6 +258,8 @@ pub fn migrate(
         let session = matrix_sdk_crypto::olm::InboundGroupSession::from_pickle(pickle)?;
 
         inbound_group_sessions.push(session);
+        processed_steps += 1;
+        listener(processed_steps, total_steps);
     }
 
     let recovery_key =
@@ -255,6 +276,9 @@ pub fn migrate(
     data.cross_signing.self_signing_key.zeroize();
     data.cross_signing.user_signing_key.zeroize();
 
+    processed_steps += 1;
+    listener(processed_steps, total_steps);
+
     let tracked_users = data
         .tracked_users
         .into_iter()
@@ -266,6 +290,9 @@ pub fn migrate(
 
     runtime.block_on(store.save_tracked_users(tracked_users.as_slice()))?;
 
+    processed_steps += 1;
+    listener(processed_steps, total_steps);
+
     let changes = RustChanges {
         account: Some(account),
         private_identity: Some(cross_signing),
@@ -275,8 +302,12 @@ pub fn migrate(
         backup_version: data.backup_version,
         ..Default::default()
     };
+    runtime.block_on(store.save_changes(changes))?;
 
-    Ok(runtime.block_on(store.save_changes(changes))?)
+    processed_steps += 1;
+    listener(processed_steps, total_steps);
+
+    Ok(())
 }
 
 /// Callback that will be passed over the FFI to report progress
@@ -289,6 +320,12 @@ pub trait ProgressListener {
     ///
     /// * `total` - The total number of items that will be handled
     fn on_progress(&self, progress: i32, total: i32);
+}
+
+impl<T: Fn(i32, i32)> ProgressListener for T {
+    fn on_progress(&self, progress: i32, total: i32) {
+        self(progress, total)
+    }
 }
 
 /// An event that was successfully decrypted.
@@ -502,7 +539,7 @@ mod test {
         let path =
             dir.path().to_str().expect("Creating a string from the tempdir path should not fail");
 
-        migrate(migration_data, path, None)?;
+        migrate(migration_data, path, None, Box::new(|_, _| {}))?;
 
         let machine = OlmMachine::new("@ganfra146:matrix.org", "DEWRCMENGS", path)?;
 
