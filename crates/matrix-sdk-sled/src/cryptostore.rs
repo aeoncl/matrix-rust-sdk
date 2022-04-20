@@ -657,7 +657,7 @@ impl SledStore {
         tracked_users: &[(&UserId, bool)],
     ) -> Result<(), CryptoStoreError> {
         let users: Vec<TrackedUser> = tracked_users
-            .into_iter()
+            .iter()
             .map(|(u, d)| TrackedUser { user_id: (*u).into(), dirty: *d })
             .collect();
 
