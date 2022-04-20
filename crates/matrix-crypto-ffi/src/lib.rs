@@ -566,9 +566,9 @@ mod test {
         assert_eq!(room_keys.len(), 2);
 
         let cross_signing_status = machine.cross_signing_status();
-        assert_eq!(cross_signing_status.has_master, true);
-        assert_eq!(cross_signing_status.has_user_signing, true);
-        assert_eq!(cross_signing_status.has_self_signing, true);
+        assert!(cross_signing_status.has_master);
+        assert!(cross_signing_status.has_user_signing);
+        assert!(cross_signing_status.has_self_signing);
 
         let backup_keys = machine.get_backup_keys()?;
         assert!(backup_keys.is_some());
