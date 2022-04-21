@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::anyhow;
 use dashmap::DashSet;
+use matrix_sdk_base::ruma::OwnedUserId;
 use matrix_sdk_common::{
     async_trait,
     locks::Mutex,
@@ -158,7 +159,7 @@ pub struct AccountInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TrackedUser {
-    user_id: Box<UserId>,
+    user_id: OwnedUserId,
     dirty: bool,
 }
 
@@ -173,8 +174,8 @@ pub struct SledStore {
     inner: Db,
 
     session_cache: SessionStore,
-    tracked_users_cache: Arc<DashSet<Box<UserId>>>,
-    users_for_key_query_cache: Arc<DashSet<Box<UserId>>>,
+    tracked_users_cache: Arc<DashSet<OwnedUserId>>,
+    users_for_key_query_cache: Arc<DashSet<OwnedUserId>>,
 
     account: Tree,
     private_identity: Tree,
@@ -829,11 +830,11 @@ impl CryptoStore for SledStore {
         !self.users_for_key_query_cache.is_empty()
     }
 
-    fn users_for_key_query(&self) -> HashSet<Box<UserId>> {
+    fn users_for_key_query(&self) -> HashSet<OwnedUserId> {
         self.users_for_key_query_cache.iter().map(|u| u.clone()).collect()
     }
 
-    fn tracked_users(&self) -> HashSet<Box<UserId>> {
+    fn tracked_users(&self) -> HashSet<OwnedUserId> {
         self.tracked_users_cache.to_owned().iter().map(|u| u.clone()).collect()
     }
 
@@ -876,7 +877,7 @@ impl CryptoStore for SledStore {
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<Box<DeviceId>, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
         let key = self.encode_key(DEVICE_TABLE_NAME, user_id);
         self.devices
             .scan_prefix(key)

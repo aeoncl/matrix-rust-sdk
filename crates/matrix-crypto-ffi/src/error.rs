@@ -33,7 +33,7 @@ pub enum SignatureError {
     #[error(transparent)]
     CryptoStore(#[from] InnerStoreError),
     #[error("Unknown device {0} {1}")]
-    UnknownDevice(Box<UserId>, String),
+    UnknownDevice(OwnedUserId, String),
     #[error("Unknown user identity {0}")]
     UnknownUserIdentity(String),
 }

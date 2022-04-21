@@ -538,7 +538,7 @@ impl Joined {
         event_type: &str,
         txn_id: Option<&TransactionId>,
     ) -> Result<send_message_event::v3::Response> {
-        let txn_id: Box<TransactionId> = txn_id.map_or_else(TransactionId::new, ToOwned::to_owned);
+        let txn_id: OwnedTransactionId = txn_id.map_or_else(TransactionId::new, ToOwned::to_owned);
 
         #[cfg(not(feature = "encryption"))]
         let content = {
@@ -902,7 +902,7 @@ impl Joined {
         &self,
         event_id: &EventId,
         reason: Option<&str>,
-        txn_id: Option<Box<TransactionId>>,
+        txn_id: Option<OwnedTransactionId>,
     ) -> HttpResult<redact_event::v3::Response> {
         let txn_id = txn_id.unwrap_or_else(TransactionId::new);
         let request =
