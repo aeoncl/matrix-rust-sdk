@@ -1027,8 +1027,7 @@ mod tests {
             ReadOnlyDevice::from_account(&ReadOnlyAccount::new(&user_id, alice2_device_id())).await;
 
         let store: Arc<dyn CryptoStore> = Arc::new(MemoryStore::new());
-        let identity =
-            Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id().to_owned())));
+        let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
         let verification = VerificationMachine::new(account, identity.clone(), store.clone());
 
         let store = Store::new(user_id.clone(), identity, store, verification);
