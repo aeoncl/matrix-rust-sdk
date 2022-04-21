@@ -1004,8 +1004,7 @@ mod tests {
         let user_id = Arc::from(bob_id());
         let account = ReadOnlyAccount::new(&user_id, alice_device_id());
         let store: Arc<dyn CryptoStore> = Arc::new(MemoryStore::new());
-        let identity =
-            Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(bob_id().to_owned())));
+        let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())));
         let verification = VerificationMachine::new(account, identity.clone(), store.clone());
         let store = Store::new(user_id.to_owned(), identity, store, verification);
         let session_cache = GroupSessionCache::new(store.clone());

@@ -339,7 +339,7 @@ impl PrivateCrossSigningIdentity {
     }
 
     /// Create a new empty identity.
-    pub(crate) fn empty(user_id: Box<UserId>) -> Self {
+    pub(crate) fn empty(user_id: &UserId) -> Self {
         Self {
             user_id: user_id.into(),
             shared: Arc::new(AtomicBool::new(false)),

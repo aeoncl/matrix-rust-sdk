@@ -98,7 +98,7 @@ impl OlmMachine {
             )?);
 
         Ok(OlmMachine {
-            inner: runtime.block_on(InnerMachine::with_store(user_id, device_id, store))?,
+            inner: runtime.block_on(InnerMachine::with_store(&user_id, device_id, store))?,
             runtime,
         })
     }
