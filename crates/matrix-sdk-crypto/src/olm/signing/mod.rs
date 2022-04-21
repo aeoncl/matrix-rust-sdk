@@ -272,7 +272,7 @@ impl PrivateCrossSigningIdentity {
     /// The private parts should be unexpanded Ed25519 keys encoded as a base64
     /// string.
     ///
-    /// *Note*: This method won't check if the public keys match to the public
+    /// *Note*: This method won't check if the public keys match the public
     /// keys present on the server.
     pub async fn import_secrets_unchecked(
         &self,
