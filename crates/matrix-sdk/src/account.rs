@@ -32,7 +32,7 @@ use ruma::{
     assign,
     events::room::MediaSource,
     thirdparty::Medium,
-    ClientSecret, MxcUri, SessionId, UInt, presence::PresenceState,
+    ClientSecret, MxcUri, OwnedMxcUri, SessionId, UInt, presence::PresenceState
 };
 
 use crate::{config::RequestConfig, Client, Error, Result};
@@ -133,7 +133,7 @@ impl Account {
     /// }
     /// # Result::<_, matrix_sdk::Error>::Ok(()) });
     /// ```
-    pub async fn get_avatar_url(&self) -> Result<Option<Box<MxcUri>>> {
+    pub async fn get_avatar_url(&self) -> Result<Option<OwnedMxcUri>> {
         let user_id = self.client.user_id().await.ok_or(Error::AuthenticationRequired)?;
         let request = get_avatar_url::v3::Request::new(&user_id);
 
@@ -221,7 +221,7 @@ impl Account {
         &self,
         content_type: &Mime,
         reader: &mut R,
-    ) -> Result<Box<MxcUri>> {
+    ) -> Result<OwnedMxcUri> {
         let upload_response = self.client.upload(content_type, reader).await?;
         self.set_avatar_url(Some(&upload_response.content_uri)).await?;
         Ok(upload_response.content_uri)
