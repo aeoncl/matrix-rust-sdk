@@ -27,12 +27,12 @@ use ruma::{
         profile::{
             get_avatar_url, get_display_name, get_profile, set_avatar_url, set_display_name,
         },
-        uiaa::AuthData,
+        uiaa::AuthData, presence::{get_presence, set_presence},
     },
     assign,
     events::room::MediaSource,
     thirdparty::Medium,
-    ClientSecret, MxcUri, SessionId, UInt,
+    ClientSecret, MxcUri, SessionId, UInt, presence::PresenceState,
 };
 
 use crate::{config::RequestConfig, Client, Error, Result};
@@ -95,6 +95,22 @@ impl Account {
     pub async fn set_display_name(&self, name: Option<&str>) -> Result<()> {
         let user_id = self.client.user_id().await.ok_or(Error::AuthenticationRequired)?;
         let request = set_display_name::v3::Request::new(&user_id, name);
+        self.client.send(request, None).await?;
+        Ok(())
+    }
+
+    pub async fn get_presence(&self) -> Result<get_presence::v3::Response> {
+        let user_id = self.client.user_id().await.ok_or(Error::AuthenticationRequired)?;
+        let request = get_presence::v3::Request::new(&user_id);
+        let response = self.client.send(request, None).await?;
+        Ok(response)
+    }
+
+    pub async fn set_presence(&self, presence_state: PresenceState, status_msg: Option<&str>) -> Result<()> {
+        let user_id = self.client.user_id().await.ok_or(Error::AuthenticationRequired)?;
+        let request = assign!(set_presence::v3::Request::new(&user_id, presence_state), {
+            status_msg: status_msg
+        });
         self.client.send(request, None).await?;
         Ok(())
     }
