@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use ruma::api::client::sync::sync_events;
+use ruma::{api::client::sync::sync_events, presence::PresenceState};
 
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -25,6 +25,7 @@ pub struct SyncSettings<'a> {
     pub(crate) timeout: Option<Duration>,
     pub(crate) token: Option<String>,
     pub(crate) full_state: bool,
+    pub(crate) set_presence: PresenceState
 }
 
 impl<'a> Default for SyncSettings<'a> {
@@ -37,7 +38,7 @@ impl<'a> SyncSettings<'a> {
     /// Create new default sync settings.
     #[must_use]
     pub fn new() -> Self {
-        Self { filter: None, timeout: Some(DEFAULT_SYNC_TIMEOUT), token: None, full_state: false }
+        Self { filter: None, timeout: Some(DEFAULT_SYNC_TIMEOUT), token: None, full_state: false, set_presence: PresenceState::Online }
     }
 
     /// Set the sync token.
@@ -88,4 +89,15 @@ impl<'a> SyncSettings<'a> {
         self.full_state = full_state;
         self
     }
+
+    /// Sets the presence upon calling Sync.
+    ///
+    /// # Arguments
+    /// * `set_presence` - An enum representing the availlable presence states.
+    #[must_use]
+    pub fn set_presence(mut self, set_presence: PresenceState) -> Self {
+        self.set_presence = set_presence;
+        self
+    }
+
 }

@@ -1713,7 +1713,7 @@ impl Client {
             filter: sync_settings.filter.as_ref(),
             since: sync_settings.token.as_deref(),
             full_state: sync_settings.full_state,
-            set_presence: &PresenceState::Online,
+            set_presence: &sync_settings.set_presence,
             timeout: sync_settings.timeout,
         });
 
