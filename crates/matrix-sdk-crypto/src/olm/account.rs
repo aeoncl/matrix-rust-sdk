@@ -23,7 +23,7 @@ use std::{
     },
 };
 
-use matrix_sdk_common::{locks::Mutex, util::seconds_since_unix_epoch};
+use matrix_sdk_common::locks::Mutex;
 use ruma::{
     api::client::keys::{
         upload_keys,
@@ -37,7 +37,7 @@ use ruma::{
     },
     serde::{CanonicalJsonValue, Raw},
     DeviceId, DeviceKeyAlgorithm, DeviceKeyId, EventEncryptionAlgorithm, OwnedDeviceId,
-    OwnedDeviceKeyId, OwnedUserId, RoomId, UInt, UserId,
+    OwnedDeviceKeyId, OwnedUserId, RoomId, SecondsSinceUnixEpoch, UInt, UserId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue as RawJsonValue, Value};
@@ -90,8 +90,13 @@ impl SessionType {
     }
 }
 
+/// A struct witnessing a successful decryption of an Olm-encrypted to-device
+/// event.
+///
+/// Contains the decrypted event plaintext along with some associated metadata,
+/// such as the identity (Curve25519) key of the to-device event sender.
 #[derive(Debug, Clone)]
-pub struct OlmDecryptionInfo {
+pub(crate) struct OlmDecryptionInfo {
     pub sender: OwnedUserId,
     pub session: SessionType,
     pub message_hash: OlmMessageHash,
@@ -213,7 +218,7 @@ impl Account {
         }
     }
 
-    pub async fn decrypt_to_device_event(
+    pub(crate) async fn decrypt_to_device_event(
         &self,
         event: &ToDeviceRoomEncryptedEvent,
     ) -> OlmResult<OlmDecryptionInfo> {
@@ -922,7 +927,7 @@ impl ReadOnlyAccount {
     ) -> Session {
         let session = self.inner.lock().await.create_outbound_session(identity_key, one_time_key);
 
-        let now = seconds_since_unix_epoch();
+        let now = SecondsSinceUnixEpoch::now();
         let session_id = session.session_id();
 
         Session {
@@ -1005,7 +1010,7 @@ impl ReadOnlyAccount {
     /// session failed.
     ///
     /// # Arguments
-    /// * `their_identity_key` - The other account's identitiy/curve25519 key.
+    /// * `their_identity_key` - The other account's identity/curve25519 key.
     ///
     /// * `message` - A pre-key Olm message that was sent to us by the other
     /// account.
@@ -1018,7 +1023,7 @@ impl ReadOnlyAccount {
         let result =
             self.inner.lock().await.create_inbound_session(&their_identity_key, message)?;
 
-        let now = seconds_since_unix_epoch();
+        let now = SecondsSinceUnixEpoch::now();
         let session_id = result.session.session_id();
 
         let session = Session {

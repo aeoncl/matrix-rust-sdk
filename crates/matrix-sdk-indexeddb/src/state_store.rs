@@ -15,33 +15,33 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::anyhow;
+use async_trait::async_trait;
 use futures_util::stream;
 use indexed_db_futures::prelude::*;
 use matrix_sdk_base::{
-    async_trait,
     deserialized_responses::SyncRoomEvent,
     media::{MediaRequest, UniqueKey},
-    ruma::{
-        events::{
-            presence::PresenceEvent,
-            receipt::Receipt,
-            room::{
-                member::{MembershipState, OriginalSyncRoomMemberEvent, RoomMemberEventContent},
-                redaction::SyncRoomRedactionEvent,
-            },
-            AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncMessageLikeEvent,
-            AnySyncRoomEvent, AnySyncStateEvent, GlobalAccountDataEventType,
-            RoomAccountDataEventType, StateEventType,
-        },
-        receipt::ReceiptType,
-        serde::Raw,
-        signatures::{redact_in_place, CanonicalJsonObject},
-        EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
-    },
     store::{BoxStream, Result as StoreResult, StateChanges, StateStore, StoreError},
     RoomInfo,
 };
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
+use ruma::{
+    events::{
+        presence::PresenceEvent,
+        receipt::Receipt,
+        room::{
+            member::{MembershipState, OriginalSyncRoomMemberEvent, RoomMemberEventContent},
+            redaction::SyncRoomRedactionEvent,
+        },
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncMessageLikeEvent,
+        AnySyncRoomEvent, AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType,
+        StateEventType,
+    },
+    receipt::ReceiptType,
+    serde::Raw,
+    signatures::{redact_in_place, CanonicalJsonObject},
+    EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use wasm_bindgen::JsValue;
@@ -1349,6 +1349,8 @@ mod encrypted_tests {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+    use std::sync::Arc;
+
     use matrix_sdk_base::statestore_integration_tests;
     use uuid::Uuid;
 
@@ -1356,9 +1358,9 @@ mod encrypted_tests {
 
     async fn get_store() -> Result<IndexeddbStore> {
         let db_name =
-            format!("test-state-encrypted-{}", Uuid::new_v4().to_hyphenated().to_string());
+            format!("test-state-encrypted-{}", Uuid::new_v4().as_hyphenated().to_string());
         let key = StoreCipher::new()?;
-        Ok(IndexeddbStore::open_helper(db_name, Some(key)).await?)
+        Ok(IndexeddbStore::open_helper(db_name, Some(Arc::new(key))).await?)
     }
 
     statestore_integration_tests! { integration }

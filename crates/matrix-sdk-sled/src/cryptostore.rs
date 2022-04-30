@@ -20,15 +20,9 @@ use std::{
 };
 
 use anyhow::anyhow;
+use async_trait::async_trait;
 use dashmap::DashSet;
-use matrix_sdk_common::{
-    async_trait,
-    locks::Mutex,
-    ruma::{
-        events::room_key_request::RequestedKeyInfo, DeviceId, OwnedDeviceId, OwnedUserId, RoomId,
-        TransactionId, UserId,
-    },
-};
+use matrix_sdk_common::locks::Mutex;
 use matrix_sdk_crypto::{
     olm::{
         IdentityKeys, InboundGroupSession, OutboundGroupSession, PickledInboundGroupSession,
@@ -41,6 +35,10 @@ use matrix_sdk_crypto::{
     GossipRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
 };
 use matrix_sdk_store_encryption::StoreCipher;
+use ruma::{
+    events::room_key_request::RequestedKeyInfo, DeviceId, OwnedDeviceId, OwnedUserId, RoomId,
+    TransactionId, UserId,
+};
 use serde::{Deserialize, Serialize};
 pub use sled::Error;
 use sled::{
@@ -1040,15 +1038,13 @@ impl CryptoStore for SledStore {
 
 #[cfg(test)]
 mod tests {
-    use lazy_static::lazy_static;
     use matrix_sdk_crypto::cryptostore_integration_tests;
+    use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
 
     use super::SledStore;
-    lazy_static! {
-        /// This is an example for using doc comment attributes
-        static ref TMP_DIR: TempDir = tempdir().unwrap();
-    }
+
+    static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
     async fn get_store(name: String, passphrase: Option<&str>) -> SledStore {
         let tmpdir_path = TMP_DIR.path().join(name);
