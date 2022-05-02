@@ -41,7 +41,7 @@ use ruma::{
     api::{
         client::{
             account::{register, whoami},
-            device::{delete_devices, get_devices},
+            device::{delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
                 get_capabilities::{self, Capabilities},
@@ -61,7 +61,6 @@ use ruma::{
     },
     assign,
     events::room::MediaSource,
-    presence::PresenceState,
     MxcUri, OwnedDeviceId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomOrAliasId,
     ServerName, UInt,
 };
@@ -1598,6 +1597,14 @@ impl Client {
     ) -> HttpResult<delete_devices::v3::Response> {
         let mut request = delete_devices::v3::Request::new(devices);
         request.auth = auth_data;
+
+        self.send(request, None).await
+    }
+
+
+    pub async fn update_device(&self, device: &OwnedDeviceId, display_name: String) -> HttpResult<update_device::v3::Response> {
+        let mut request = update_device::v3::Request::new(device);
+        request.display_name = Some(display_name);
 
         self.send(request, None).await
     }
