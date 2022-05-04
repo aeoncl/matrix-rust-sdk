@@ -35,7 +35,7 @@ pub mod integration_tests;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use matrix_sdk_common::{locks::RwLock, AsyncTraitDeps};
-#[cfg(feature = "encryption")]
+#[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::store::CryptoStore;
 use ruma::{
     api::client::push::get_notifications::v3::Notification,
@@ -491,7 +491,6 @@ pub struct StateChanges {
 
     /// A mapping of `RoomId` to a map of event type string to a state key and
     /// `AnySyncStateEvent`.
-    #[allow(clippy::type_complexity)]
     pub state:
         BTreeMap<OwnedRoomId, BTreeMap<StateEventType, BTreeMap<String, Raw<AnySyncStateEvent>>>>,
     /// A mapping of `RoomId` to a map of event type string to `AnyBasicEvent`.
@@ -504,7 +503,6 @@ pub struct StateChanges {
 
     /// A mapping of `RoomId` to a map of event type to a map of state key to
     /// `AnyStrippedStateEvent`.
-    #[allow(clippy::type_complexity)]
     pub stripped_state: BTreeMap<
         OwnedRoomId,
         BTreeMap<StateEventType, BTreeMap<String, Raw<AnyStrippedStateEvent>>>,
@@ -565,7 +563,7 @@ impl StateChanges {
     ) {
         self.room_account_data
             .entry(room_id.to_owned())
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .insert(event.event_type(), raw_event);
     }
 
@@ -574,10 +572,7 @@ impl StateChanges {
     pub fn add_stripped_member(&mut self, room_id: &RoomId, event: StrippedRoomMemberEvent) {
         let user_id = event.state_key.clone();
 
-        self.stripped_members
-            .entry(room_id.to_owned())
-            .or_insert_with(BTreeMap::new)
-            .insert(user_id, event);
+        self.stripped_members.entry(room_id.to_owned()).or_default().insert(user_id, event);
     }
 
     /// Update the `StateChanges` struct with the given room with a new
@@ -590,16 +585,16 @@ impl StateChanges {
     ) {
         self.state
             .entry(room_id.to_owned())
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .entry(event.event_type())
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .insert(event.state_key().to_owned(), raw_event);
     }
 
     /// Update the `StateChanges` struct with the given room with a new
     /// `Notification`.
     pub fn add_notification(&mut self, room_id: &RoomId, notification: Notification) {
-        self.notifications.entry(room_id.to_owned()).or_insert_with(Vec::new).push(notification);
+        self.notifications.entry(room_id.to_owned()).or_default().push(notification);
     }
 
     /// Update the `StateChanges` struct with the given room with a new
@@ -627,7 +622,7 @@ impl StateChanges {
 /// ```
 #[derive(Default)]
 pub struct StoreConfig {
-    #[cfg(feature = "encryption")]
+    #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store: Option<Box<dyn CryptoStore>>,
     pub(crate) state_store: Option<Box<dyn StateStore>>,
 }
@@ -649,7 +644,7 @@ impl StoreConfig {
     /// Set a custom implementation of a `CryptoStore`.
     ///
     /// The crypto store must be opened before being set.
-    #[cfg(feature = "encryption")]
+    #[cfg(feature = "e2e-encryption")]
     pub fn crypto_store(mut self, store: Box<dyn CryptoStore>) -> Self {
         self.crypto_store = Some(store);
         self
