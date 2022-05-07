@@ -1335,7 +1335,7 @@ impl Client {
     }
 
     pub async fn get_or_create_dm_room(&mut self, user_id: OwnedUserId) -> Result<Option<room::Joined>>  {
-        let mut direct_event:  GlobalAccountDataEvent<DirectEventContent>;
+        let direct_event:  GlobalAccountDataEvent<DirectEventContent>;
         if let Some(directs) = self.store().get_account_data_event(GlobalAccountDataEventType::Direct).await? {
             direct_event = directs.deserialize_as()?;
         } else {
