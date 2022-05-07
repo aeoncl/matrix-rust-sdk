@@ -26,7 +26,7 @@ use anymap2::any::CloneAnySendSync;
 use dashmap::DashMap;
 use futures_core::stream::Stream;
 use matrix_sdk_base::{
-    deserialized_responses::SyncResponse,
+    deserialized_responses::{SyncResponse, JoinedRoom},
     media::{MediaEventContent, MediaFormat, MediaRequest, MediaThumbnailSize},
     BaseClient, Session, Store,
 };
@@ -60,9 +60,9 @@ use ruma::{
         MatrixVersion, OutgoingRequest, SendAccessToken,
     },
     assign,
-    events::room::MediaSource,
+    events::{room::{MediaSource, member::MembershipState}, GlobalAccountDataEventType, direct::{DirectEvent, DirectEventContent}, GlobalAccountDataEvent},
     MxcUri, OwnedDeviceId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, RoomOrAliasId,
-    ServerName, UInt,
+    ServerName, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
 use tracing::{error, info, instrument, warn};
@@ -1332,6 +1332,38 @@ impl Client {
     ) -> HttpResult<create_room::v3::Response> {
         let request = room.into();
         self.send(request, None).await
+    }
+
+    pub async fn get_or_create_dm_room(&mut self, user_id: OwnedUserId) -> Result<Option<room::Joined>>  {
+        let mut direct_event:  GlobalAccountDataEvent<DirectEventContent>;
+        if let Some(directs) = self.store().get_account_data_event(GlobalAccountDataEventType::Direct).await? {
+            direct_event = directs.deserialize_as()?;
+        } else {
+            direct_event = self.account().get_directs().await?;
+        }
+
+        let content = direct_event.content.0;
+        for current in content {
+            if current.0 == user_id {
+                let dm_rooms = current.1;
+                for dm_room in dm_rooms {
+                    //For each dm room for a direct user
+                        if let Some(joined_room) = self.get_joined_room(&dm_room) {
+                            let joined_members_count = joined_room.joined_members().await?.len();
+                            //If we are still in the room
+                            if let Some(member_event) = self.store().get_member_event(&dm_room, &user_id).await.unwrap() {
+                                if member_event.content.membership == MembershipState::Invite || member_event.content.membership == MembershipState::Join && joined_members_count >= 1 && joined_members_count <= 2 {
+                                    //if user still invited or present in the room AND the room contains between one and two users
+                                    return Ok(Some(joined_room));
+                                }
+
+                            }
+                        }
+                    
+                }
+            }
+        }
+        return Ok(self.create_dm_room(user_id).await?);
     }
 
     /// Search the homeserver's directory for public rooms with a filter.

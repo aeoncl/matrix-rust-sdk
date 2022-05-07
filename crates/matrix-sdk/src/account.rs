@@ -27,10 +27,10 @@ use ruma::{
         profile::{
             get_avatar_url, get_display_name, get_profile, set_avatar_url, set_display_name,
         },
-        uiaa::AuthData, presence::{get_presence, set_presence},
+        uiaa::AuthData, presence::{get_presence, set_presence}, config::get_global_account_data,
     },
     assign,
-    events::room::MediaSource,
+    events::{room::MediaSource, GlobalAccountDataEvent, direct::DirectEventContent},
     thirdparty::Medium,
     ClientSecret, MxcUri, OwnedMxcUri, SessionId, UInt, presence::PresenceState
 };
@@ -113,6 +113,14 @@ impl Account {
         });
         self.client.send(request, None).await?;
         Ok(())
+    }
+
+    pub async fn get_directs(&self) -> Result<GlobalAccountDataEvent<DirectEventContent>> {
+        let user_id = self.client.user_id().await.ok_or(Error::AuthenticationRequired)?;
+        let request = get_global_account_data::v3::Request::new(&user_id, "m.direct");
+        let response = self.client.send(request, None).await?;
+        let out : GlobalAccountDataEvent<DirectEventContent> = response.account_data.deserialize_as()?;
+        return Ok(out);
     }
 
     /// Get the MXC URI of the account's avatar, if set.
