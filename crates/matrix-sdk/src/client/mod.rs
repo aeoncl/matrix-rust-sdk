@@ -1356,7 +1356,7 @@ impl Client {
                             let joined_members_count = joined_room.joined_members().await?.len();
                             //If we are still in the room
                             if let Some(member_event) = self.store().get_member_event(&dm_room, &user_id).await.unwrap() {
-                                if member_event.content.membership == MembershipState::Invite || member_event.content.membership == MembershipState::Join && joined_members_count >= 1 && joined_members_count <= 2 {
+                                if member_event.membership() == &MembershipState::Invite || member_event.membership() == &MembershipState::Join && joined_members_count >= 1 && joined_members_count <= 2 {
                                     //if user still invited or present in the room AND the room contains between one and two users
                                     return Ok(Some(joined_room));
                                 }
