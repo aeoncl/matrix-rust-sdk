@@ -16,34 +16,37 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+#[cfg(feature = "experimental-timeline")]
 use futures_util::stream;
 use indexed_db_futures::prelude::*;
 use matrix_sdk_base::{
-    deserialized_responses::SyncRoomEvent,
+    deserialized_responses::MemberEvent,
     media::{MediaRequest, UniqueKey},
-    store::{BoxStream, Result as StoreResult, StateChanges, StateStore, StoreError},
-    RoomInfo,
+    store::{Result as StoreResult, StateChanges, StateStore, StoreError},
+    MinimalStateEvent, RoomInfo,
 };
+#[cfg(feature = "experimental-timeline")]
+use matrix_sdk_base::{deserialized_responses::SyncRoomEvent, store::BoxStream};
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
 use ruma::{
     events::{
         presence::PresenceEvent,
         receipt::Receipt,
-        room::{
-            member::{MembershipState, OriginalSyncRoomMemberEvent, RoomMemberEventContent},
-            redaction::SyncRoomRedactionEvent,
-        },
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncMessageLikeEvent,
-        AnySyncRoomEvent, AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType,
-        StateEventType,
+        room::member::{MembershipState, RoomMemberEventContent},
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent,
+        GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     receipt::ReceiptType,
     serde::Raw,
+    EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, UserId,
+};
+#[cfg(feature = "experimental-timeline")]
+use ruma::{
+    events::{room::redaction::SyncRoomRedactionEvent, AnySyncMessageLikeEvent, AnySyncRoomEvent},
     signatures::{redact_in_place, CanonicalJsonObject},
-    EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
+    RoomVersionId,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
 use wasm_bindgen::JsValue;
 use web_sys::IdbKeyRange;
 
@@ -92,7 +95,7 @@ impl From<SerializationError> for StoreError {
                     expected, found
                 )),
             },
-            _ => StoreError::Backend(anyhow!(e)),
+            _ => StoreError::backend(e),
         }
     }
 }
@@ -118,12 +121,17 @@ mod KEYS {
     pub const STRIPPED_ROOM_INFOS: &str = "stripped_room_infos";
     pub const STRIPPED_MEMBERS: &str = "stripped_members";
     pub const STRIPPED_ROOM_STATE: &str = "stripped_room_state";
+    pub const STRIPPED_JOINED_USER_IDS: &str = "stripped_joined_user_ids";
+    pub const STRIPPED_INVITED_USER_IDS: &str = "stripped_invited_user_ids";
 
     pub const ROOM_USER_RECEIPTS: &str = "room_user_receipts";
     pub const ROOM_EVENT_RECEIPTS: &str = "room_event_receipts";
 
+    #[cfg(feature = "experimental-timeline")]
     pub const ROOM_TIMELINE: &str = "room_timeline";
+    #[cfg(feature = "experimental-timeline")]
     pub const ROOM_TIMELINE_METADATA: &str = "room_timeline_metadata";
+    #[cfg(feature = "experimental-timeline")]
     pub const ROOM_EVENT_ID_TO_POSITION: &str = "room_event_id_to_position";
 
     pub const MEDIA: &str = "media";
@@ -178,13 +186,18 @@ impl IndexeddbStore {
                 db.create_object_store(KEYS::STRIPPED_ROOM_INFOS)?;
                 db.create_object_store(KEYS::STRIPPED_MEMBERS)?;
                 db.create_object_store(KEYS::STRIPPED_ROOM_STATE)?;
+                db.create_object_store(KEYS::STRIPPED_JOINED_USER_IDS)?;
+                db.create_object_store(KEYS::STRIPPED_INVITED_USER_IDS)?;
 
                 db.create_object_store(KEYS::ROOM_USER_RECEIPTS)?;
                 db.create_object_store(KEYS::ROOM_EVENT_RECEIPTS)?;
 
-                db.create_object_store(KEYS::ROOM_TIMELINE)?;
-                db.create_object_store(KEYS::ROOM_TIMELINE_METADATA)?;
-                db.create_object_store(KEYS::ROOM_EVENT_ID_TO_POSITION)?;
+                #[cfg(feature = "experimental-timeline")]
+                {
+                    db.create_object_store(KEYS::ROOM_TIMELINE)?;
+                    db.create_object_store(KEYS::ROOM_TIMELINE_METADATA)?;
+                    db.create_object_store(KEYS::ROOM_EVENT_ID_TO_POSITION)?;
+                }
 
                 db.create_object_store(KEYS::MEDIA)?;
 
@@ -294,9 +307,10 @@ impl IndexeddbStore {
             Some(ref cipher) => key.encode_to_range_secure(table_name, cipher),
             None => key.encode_to_range(),
         }
-        .map_err(|e| SerializationError::StoreError(StoreError::Backend(anyhow!(e))))
+        .map_err(|e| SerializationError::StoreError(StoreError::Backend(anyhow!(e).into())))
     }
 
+    #[cfg(feature = "experimental-timeline")]
     fn encode_key_with_counter<T>(&self, table_name: &str, key: &T, i: usize) -> JsValue
     where
         T: SafeEncode,
@@ -354,10 +368,12 @@ impl IndexeddbStore {
             (!changes.profiles.is_empty(), KEYS::PROFILES),
             (!changes.state.is_empty(), KEYS::ROOM_STATE),
             (!changes.room_account_data.is_empty(), KEYS::ROOM_ACCOUNT_DATA),
+            #[cfg(feature = "experimental-timeline")]
             (!changes.room_infos.is_empty() || !changes.timeline.is_empty(), KEYS::ROOM_INFOS),
+            #[cfg(not(feature = "experimental-timeline"))]
+            (!changes.room_infos.is_empty(), KEYS::ROOM_INFOS),
             (!changes.receipts.is_empty(), KEYS::ROOM_EVENT_RECEIPTS),
             (!changes.stripped_state.is_empty(), KEYS::STRIPPED_ROOM_STATE),
-            (!changes.stripped_members.is_empty(), KEYS::STRIPPED_MEMBERS),
             (!changes.stripped_room_infos.is_empty(), KEYS::STRIPPED_ROOM_INFOS),
         ]
         .iter()
@@ -373,10 +389,19 @@ impl IndexeddbStore {
             ])
         }
 
+        if !changes.stripped_members.is_empty() {
+            stores.extend([
+                KEYS::STRIPPED_MEMBERS,
+                KEYS::STRIPPED_INVITED_USER_IDS,
+                KEYS::STRIPPED_JOINED_USER_IDS,
+            ])
+        }
+
         if !changes.receipts.is_empty() {
             stores.extend([KEYS::ROOM_EVENT_RECEIPTS, KEYS::ROOM_USER_RECEIPTS])
         }
 
+        #[cfg(feature = "experimental-timeline")]
         if !changes.timeline.is_empty() {
             stores.extend([
                 KEYS::ROOM_TIMELINE,
@@ -473,10 +498,38 @@ impl IndexeddbStore {
 
         if !changes.stripped_members.is_empty() {
             let store = tx.object_store(KEYS::STRIPPED_MEMBERS)?;
+            let joined = tx.object_store(KEYS::STRIPPED_JOINED_USER_IDS)?;
+            let invited = tx.object_store(KEYS::STRIPPED_INVITED_USER_IDS)?;
             for (room, events) in &changes.stripped_members {
                 for event in events.values() {
-                    let key = self.encode_key(KEYS::STRIPPED_MEMBERS, (room, &event.state_key));
-                    store.put_key_val(&key, &self.serialize_event(&event)?)?;
+                    let key = (room, &event.state_key);
+
+                    match event.content.membership {
+                        MembershipState::Join => {
+                            joined.put_key_val_owned(
+                                &self.encode_key(KEYS::STRIPPED_JOINED_USER_IDS, key),
+                                &self.serialize_event(&event.state_key)?,
+                            )?;
+                            invited
+                                .delete(&self.encode_key(KEYS::STRIPPED_INVITED_USER_IDS, key))?;
+                        }
+                        MembershipState::Invite => {
+                            invited.put_key_val_owned(
+                                &self.encode_key(KEYS::STRIPPED_INVITED_USER_IDS, key),
+                                &self.serialize_event(&event.state_key)?,
+                            )?;
+                            joined.delete(&self.encode_key(KEYS::STRIPPED_JOINED_USER_IDS, key))?;
+                        }
+                        _ => {
+                            joined.delete(&self.encode_key(KEYS::STRIPPED_JOINED_USER_IDS, key))?;
+                            invited
+                                .delete(&self.encode_key(KEYS::STRIPPED_INVITED_USER_IDS, key))?;
+                        }
+                    }
+                    store.put_key_val(
+                        &self.encode_key(KEYS::STRIPPED_MEMBERS, key),
+                        &self.serialize_event(&event)?,
+                    )?;
                 }
             }
         }
@@ -495,29 +548,29 @@ impl IndexeddbStore {
         }
 
         if !changes.members.is_empty() {
+            let profiles_store = tx.object_store(KEYS::PROFILES)?;
+            let joined = tx.object_store(KEYS::JOINED_USER_IDS)?;
+            let invited = tx.object_store(KEYS::INVITED_USER_IDS)?;
+            let members = tx.object_store(KEYS::MEMBERS)?;
+
             for (room, events) in &changes.members {
                 let profile_changes = changes.profiles.get(room);
 
-                let profiles_store = tx.object_store(KEYS::PROFILES)?;
-                let joined = tx.object_store(KEYS::JOINED_USER_IDS)?;
-                let invited = tx.object_store(KEYS::INVITED_USER_IDS)?;
-                let members = tx.object_store(KEYS::MEMBERS)?;
-
                 for event in events.values() {
-                    let key = (room, &event.state_key);
+                    let key = (room, event.state_key());
 
-                    match event.content.membership {
+                    match event.membership() {
                         MembershipState::Join => {
                             joined.put_key_val_owned(
                                 &self.encode_key(KEYS::JOINED_USER_IDS, key),
-                                &self.serialize_event(&event.state_key)?,
+                                &self.serialize_event(event.state_key())?,
                             )?;
                             invited.delete(&self.encode_key(KEYS::INVITED_USER_IDS, key))?;
                         }
                         MembershipState::Invite => {
                             invited.put_key_val_owned(
                                 &self.encode_key(KEYS::INVITED_USER_IDS, key),
-                                &self.serialize_event(&event.state_key)?,
+                                &self.serialize_event(event.state_key())?,
                             )?;
                             joined.delete(&self.encode_key(KEYS::JOINED_USER_IDS, key))?;
                         }
@@ -532,7 +585,7 @@ impl IndexeddbStore {
                         &self.serialize_event(&event)?,
                     )?;
 
-                    if let Some(profile) = profile_changes.and_then(|p| p.get(&event.state_key)) {
+                    if let Some(profile) = profile_changes.and_then(|p| p.get(event.state_key())) {
                         profiles_store.put_key_val_owned(
                             &self.encode_key(KEYS::PROFILES, key),
                             &self.serialize_event(&profile)?,
@@ -583,6 +636,7 @@ impl IndexeddbStore {
             }
         }
 
+        #[cfg(feature = "experimental-timeline")]
         if !changes.timeline.is_empty() {
             let timeline_store = tx.object_store(KEYS::ROOM_TIMELINE)?;
             let timeline_metadata_store = tx.object_store(KEYS::ROOM_TIMELINE_METADATA)?;
@@ -591,12 +645,15 @@ impl IndexeddbStore {
 
             for (room_id, timeline) in &changes.timeline {
                 if timeline.sync {
-                    info!("Save new timeline batch from sync response for {}", room_id);
+                    tracing::info!("Save new timeline batch from sync response for {}", room_id);
                 } else {
-                    info!("Save new timeline batch from messages response for {}", room_id);
+                    tracing::info!(
+                        "Save new timeline batch from messages response for {}",
+                        room_id
+                    );
                 }
                 let metadata: Option<TimelineMetadata> = if timeline.limited {
-                    info!(
+                    tracing::info!(
                         "Delete stored timeline for {} because the sync response was limited",
                         room_id
                     );
@@ -625,7 +682,7 @@ impl IndexeddbStore {
                             // This should only happen when a developer adds a wrong timeline
                             // batch to the `StateChanges` or the server returns a wrong response
                             // to our request.
-                            warn!("Drop unexpected timeline batch for {}", room_id);
+                            tracing::warn!("Drop unexpected timeline batch for {}", room_id);
                             return Ok(());
                         }
 
@@ -649,7 +706,7 @@ impl IndexeddbStore {
                         }
 
                         if delete_timeline {
-                            info!(
+                            tracing::info!(
                                 "Delete stored timeline for {} because of duplicated events",
                                 room_id
                             );
@@ -698,7 +755,7 @@ impl IndexeddbStore {
                         .transpose()?
                         .and_then(|info| info.room_version().cloned())
                         .unwrap_or_else(|| {
-                            warn!(
+                            tracing::warn!(
                                 "Unable to find the room version for {}, assume version 9",
                                 room_id
                             );
@@ -831,7 +888,7 @@ impl IndexeddbStore {
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> Result<Option<RoomMemberEventContent>> {
+    ) -> Result<Option<MinimalStateEvent<RoomMemberEventContent>>> {
         self.inner
             .transaction_on_one_with_mode(KEYS::PROFILES, IdbTransactionMode::Readonly)?
             .object_store(KEYS::PROFILES)?
@@ -845,14 +902,30 @@ impl IndexeddbStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> Result<Option<OriginalSyncRoomMemberEvent>> {
-        self.inner
+    ) -> Result<Option<MemberEvent>> {
+        if let Some(e) = self
+            .inner
             .transaction_on_one_with_mode(KEYS::MEMBERS, IdbTransactionMode::Readonly)?
             .object_store(KEYS::MEMBERS)?
             .get(&self.encode_key(KEYS::MEMBERS, (room_id, state_key)))?
             .await?
             .map(|f| self.deserialize_event(f))
-            .transpose()
+            .transpose()?
+        {
+            Ok(Some(MemberEvent::Sync(e)))
+        } else if let Some(e) = self
+            .inner
+            .transaction_on_one_with_mode(KEYS::STRIPPED_MEMBERS, IdbTransactionMode::Readonly)?
+            .object_store(KEYS::STRIPPED_MEMBERS)?
+            .get(&self.encode_key(KEYS::STRIPPED_MEMBERS, (room_id, state_key)))?
+            .await?
+            .map(|f| self.deserialize_event(f))
+            .transpose()?
+        {
+            Ok(Some(MemberEvent::Stripped(e)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn get_user_ids_stream(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
@@ -881,6 +954,51 @@ impl IndexeddbStore {
             .inner
             .transaction_on_one_with_mode(KEYS::JOINED_USER_IDS, IdbTransactionMode::Readonly)?
             .object_store(KEYS::JOINED_USER_IDS)?
+            .get_all_with_key(&range)?
+            .await?
+            .iter()
+            .filter_map(|f| self.deserialize_event::<OwnedUserId>(f).ok())
+            .collect::<Vec<_>>())
+    }
+
+    pub async fn get_stripped_user_ids_stream(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
+        Ok([
+            self.get_stripped_invited_user_ids(room_id).await?,
+            self.get_stripped_joined_user_ids(room_id).await?,
+        ]
+        .concat())
+    }
+
+    pub async fn get_stripped_invited_user_ids(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<OwnedUserId>> {
+        let range = self.encode_to_range(KEYS::STRIPPED_INVITED_USER_IDS, room_id)?;
+        let entries = self
+            .inner
+            .transaction_on_one_with_mode(
+                KEYS::STRIPPED_INVITED_USER_IDS,
+                IdbTransactionMode::Readonly,
+            )?
+            .object_store(KEYS::STRIPPED_INVITED_USER_IDS)?
+            .get_all_with_key(&range)?
+            .await?
+            .iter()
+            .filter_map(|f| self.deserialize_event::<OwnedUserId>(f).ok())
+            .collect::<Vec<_>>();
+
+        Ok(entries)
+    }
+
+    pub async fn get_stripped_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
+        let range = self.encode_to_range(KEYS::STRIPPED_JOINED_USER_IDS, room_id)?;
+        Ok(self
+            .inner
+            .transaction_on_one_with_mode(
+                KEYS::STRIPPED_JOINED_USER_IDS,
+                IdbTransactionMode::Readonly,
+            )?
+            .object_store(KEYS::STRIPPED_JOINED_USER_IDS)?
             .get_all_with_key(&range)?
             .await?
             .iter()
@@ -1092,8 +1210,11 @@ impl IndexeddbStore {
             KEYS::ROOM_USER_RECEIPTS,
             KEYS::STRIPPED_ROOM_STATE,
             KEYS::STRIPPED_MEMBERS,
+            #[cfg(feature = "experimental-timeline")]
             KEYS::ROOM_TIMELINE,
+            #[cfg(feature = "experimental-timeline")]
             KEYS::ROOM_TIMELINE_METADATA,
+            #[cfg(feature = "experimental-timeline")]
             KEYS::ROOM_EVENT_ID_TO_POSITION,
         ];
 
@@ -1122,6 +1243,7 @@ impl IndexeddbStore {
         tx.await.into_result().map_err::<SerializationError, _>(|e| e.into())
     }
 
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline(
         &self,
         room_id: &RoomId,
@@ -1141,7 +1263,7 @@ impl IndexeddbStore {
         {
             Some(tl) => tl,
             _ => {
-                info!("No timeline for {} was previously stored", room_id);
+                tracing::info!("No timeline for {} was previously stored", room_id);
                 return Ok(None);
             }
         };
@@ -1157,7 +1279,11 @@ impl IndexeddbStore {
 
         let stream = Box::pin(stream::iter(timeline.into_iter()));
 
-        info!("Found previously stored timeline for {}, with end token {:?}", room_id, end_token);
+        tracing::info!(
+            "Found previously stored timeline for {}, with end token {:?}",
+            room_id,
+            end_token
+        );
 
         Ok(Some((stream, end_token)))
     }
@@ -1209,7 +1335,7 @@ impl StateStore for IndexeddbStore {
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> StoreResult<Option<RoomMemberEventContent>> {
+    ) -> StoreResult<Option<MinimalStateEvent<RoomMemberEventContent>>> {
         self.get_profile(room_id, user_id).await.map_err(|e| e.into())
     }
 
@@ -1217,20 +1343,32 @@ impl StateStore for IndexeddbStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> StoreResult<Option<OriginalSyncRoomMemberEvent>> {
+    ) -> StoreResult<Option<MemberEvent>> {
         self.get_member_event(room_id, state_key).await.map_err(|e| e.into())
     }
 
     async fn get_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        self.get_user_ids_stream(room_id).await.map_err(|e| e.into())
+        let ids: Vec<OwnedUserId> = self.get_user_ids_stream(room_id).await?;
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        self.get_stripped_user_ids_stream(room_id).await.map_err(|e| e.into())
     }
 
     async fn get_invited_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        self.get_invited_user_ids(room_id).await.map_err(|e| e.into())
+        let ids: Vec<OwnedUserId> = self.get_invited_user_ids(room_id).await?;
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        self.get_stripped_invited_user_ids(room_id).await.map_err(|e| e.into())
     }
 
     async fn get_joined_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        self.get_joined_user_ids(room_id).await.map_err(|e| e.into())
+        let ids: Vec<OwnedUserId> = self.get_joined_user_ids(room_id).await?;
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        self.get_stripped_joined_user_ids(room_id).await.map_err(|e| e.into())
     }
 
     async fn get_room_infos(&self) -> StoreResult<Vec<RoomInfo>> {
@@ -1312,6 +1450,7 @@ impl StateStore for IndexeddbStore {
         self.remove_room(room_id).await.map_err(|e| e.into())
     }
 
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline(
         &self,
         room_id: &RoomId,
@@ -1321,6 +1460,7 @@ impl StateStore for IndexeddbStore {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "experimental-timeline")]
 struct TimelineMetadata {
     pub start: String,
     pub start_position: usize,

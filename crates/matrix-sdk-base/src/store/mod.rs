@@ -42,9 +42,7 @@ use ruma::{
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptEventContent},
-        room::member::{
-            OriginalSyncRoomMemberEvent, RoomMemberEventContent, StrippedRoomMemberEvent,
-        },
+        room::member::{StrippedRoomMemberEvent, SyncRoomMemberEvent},
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
@@ -56,11 +54,13 @@ use ruma::{
 /// BoxStream of owned Types
 pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
 
+#[cfg(feature = "experimental-timeline")]
+use crate::deserialized_responses::{SyncRoomEvent, TimelineSlice};
 use crate::{
-    deserialized_responses::{SyncRoomEvent, TimelineSlice},
+    deserialized_responses::MemberEvent,
     media::MediaRequest,
     rooms::{RoomInfo, RoomType},
-    Room, Session,
+    MinimalRoomMemberEvent, Room, Session,
 };
 
 pub(crate) mod ambiguity_map;
@@ -71,9 +71,9 @@ pub use self::memory_store::MemoryStore;
 /// State store specific error type.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error(transparent)]
     /// An error happened in the underlying database backend.
-    Backend(#[from] anyhow::Error),
+    #[error(transparent)]
+    Backend(Box<dyn std::error::Error + Send + Sync>),
     /// An error happened while serializing or deserializing some data.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -94,12 +94,33 @@ pub enum StoreError {
     /// The store failed to encode or decode some data.
     #[error("Error encoding or decoding data from the store: {0}")]
     Codec(String),
+
+    /// The database format has changed in a backwards incompatible way.
+    #[error(
+        "The database format changed in an incompatible way, current \
+        version: {0}, latest version: {1}"
+    )]
+    UnsupportedDatabaseVersion(usize, usize),
     /// Redacting an event in the store has failed.
     ///
     /// This should never happen.
     #[error("Redaction failed: {0}")]
     Redaction(#[source] ruma::signatures::Error),
 }
+
+impl StoreError {
+    /// Create a new [`Backend`][Self::Backend] error.
+    ///
+    /// Shorthand for `StoreError::Backend(Box::new(error))`.
+    #[inline]
+    pub fn backend<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::Backend(Box::new(error))
+    }
+}
+
 /// A `StateStore` specific result type.
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
@@ -176,9 +197,9 @@ pub trait StateStore: AsyncTraitDeps {
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> Result<Option<RoomMemberEventContent>>;
+    ) -> Result<Option<MinimalRoomMemberEvent>>;
 
-    /// Get a raw `MemberEvent` for the given state key in the given room id.
+    /// Get the `MemberEvent` for the given state key in the given room id.
     ///
     /// # Arguments
     ///
@@ -189,17 +210,18 @@ pub trait StateStore: AsyncTraitDeps {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> Result<Option<OriginalSyncRoomMemberEvent>>;
+    ) -> Result<Option<MemberEvent>>;
 
-    /// Get all the user ids of members for a given room.
+    /// Get all the user ids of members for a given room, for stripped and
+    /// regular rooms alike.
     async fn get_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>>;
 
     /// Get all the user ids of members that are in the invited state for a
-    /// given room.
+    /// given room, for stripped and regular rooms alike.
     async fn get_invited_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>>;
 
     /// Get all the user ids of members that are in the joined state for a
-    /// given room.
+    /// given room, for stripped and regular rooms alike.
     async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>>;
 
     /// Get all the pure `RoomInfo`s the store knows about.
@@ -344,6 +366,7 @@ pub trait StateStore: AsyncTraitDeps {
     ///
     /// Returns a stream of events and a token that can be used to request
     /// previous events.
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline(
         &self,
         room_id: &RoomId,
@@ -482,12 +505,11 @@ pub struct StateChanges {
     /// A mapping of `UserId` to `PresenceEvent`.
     pub presence: BTreeMap<OwnedUserId, Raw<PresenceEvent>>,
 
+    /// A mapping of `RoomId` to a map of users and their `SyncRoomMemberEvent`.
+    pub members: BTreeMap<OwnedRoomId, BTreeMap<OwnedUserId, SyncRoomMemberEvent>>,
     /// A mapping of `RoomId` to a map of users and their
-    /// `OriginalRoomMemberEvent`.
-    pub members: BTreeMap<OwnedRoomId, BTreeMap<OwnedUserId, OriginalSyncRoomMemberEvent>>,
-    /// A mapping of `RoomId` to a map of users and their
-    /// `RoomMemberEventContent`.
-    pub profiles: BTreeMap<OwnedRoomId, BTreeMap<OwnedUserId, RoomMemberEventContent>>,
+    /// `MinimalRoomMemberEvent`.
+    pub profiles: BTreeMap<OwnedRoomId, BTreeMap<OwnedUserId, MinimalRoomMemberEvent>>,
 
     /// A mapping of `RoomId` to a map of event type string to a state key and
     /// `AnySyncStateEvent`.
@@ -520,6 +542,7 @@ pub struct StateChanges {
     /// A map of `RoomId` to a vector of `Notification`s
     pub notifications: BTreeMap<OwnedRoomId, Vec<Notification>>,
     /// A mapping of `RoomId` to a `TimelineSlice`
+    #[cfg(feature = "experimental-timeline")]
     pub timeline: BTreeMap<OwnedRoomId, TimelineSlice>,
 }
 
@@ -605,6 +628,7 @@ impl StateChanges {
 
     /// Update the `StateChanges` struct with the given room with a new
     /// `TimelineSlice`.
+    #[cfg(feature = "experimental-timeline")]
     pub fn add_timeline(&mut self, room_id: &RoomId, timeline: TimelineSlice) {
         self.timeline.insert(room_id.to_owned(), timeline);
     }

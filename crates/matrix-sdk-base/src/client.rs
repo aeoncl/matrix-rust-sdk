@@ -22,12 +22,14 @@ use std::{
 #[cfg(feature = "e2e-encryption")]
 use std::{ops::Deref, result::Result as StdResult};
 
+#[cfg(feature = "experimental-timeline")]
+use matrix_sdk_common::deserialized_responses::TimelineSlice;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::locks::Mutex;
 use matrix_sdk_common::{
     deserialized_responses::{
         AmbiguityChanges, JoinedRoom, LeftRoom, MembersResponse, Rooms, SyncResponse,
-        SyncRoomEvent, Timeline, TimelineSlice,
+        SyncRoomEvent, Timeline,
     },
     instant::Instant,
     locks::RwLock,
@@ -42,7 +44,10 @@ use matrix_sdk_crypto::{
 use ruma::{
     api::client::keys::claim_keys::v3::Request as KeysClaimRequest,
     events::{
-        room::{encrypted::RoomEncryptedEventContent, history_visibility::HistoryVisibility},
+        room::{
+            encrypted::RoomEncryptedEventContent, history_visibility::HistoryVisibility,
+            redaction::SyncRoomRedactionEvent,
+        },
         AnySyncMessageLikeEvent, MessageLikeEventContent, SyncMessageLikeEvent,
     },
     DeviceId, OwnedTransactionId, TransactionId,
@@ -51,16 +56,16 @@ use ruma::{
     api::client::{self as api, push::get_notifications::v3::Notification},
     events::{
         push_rules::PushRulesEvent,
-        room::member::{MembershipState, OriginalSyncRoomMemberEvent, RoomMemberEvent},
+        room::member::{MembershipState, SyncRoomMemberEvent},
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncEphemeralRoomEvent, AnySyncRoomEvent, AnySyncStateEvent, GlobalAccountDataEventType,
-        StateEventType, SyncStateEvent,
+        StateEventType,
     },
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
     MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UInt, UserId,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 #[cfg(feature = "e2e-encryption")]
 use crate::error::Error;
@@ -276,15 +281,15 @@ impl BaseClient {
                     #[allow(clippy::single_match)]
                     match &e {
                         AnySyncRoomEvent::State(s) => match s {
-                            AnySyncStateEvent::RoomMember(SyncStateEvent::Original(member)) => {
+                            AnySyncStateEvent::RoomMember(member) => {
                                 ambiguity_cache.handle_event(changes, room_id, member).await?;
 
-                                match member.content.membership {
+                                match member.membership() {
                                     MembershipState::Join | MembershipState::Invite => {
-                                        user_ids.insert(member.state_key.clone());
+                                        user_ids.insert(member.state_key().to_owned());
                                     }
                                     _ => {
-                                        user_ids.remove(&member.state_key);
+                                        user_ids.remove(member.state_key());
                                     }
                                 }
 
@@ -292,19 +297,19 @@ impl BaseClient {
                                 // of profiles that the member set themselves to avoid
                                 // having confusing profile changes when a member gets
                                 // kicked/banned.
-                                if member.state_key == member.sender {
+                                if member.state_key() == member.sender() {
                                     changes
                                         .profiles
                                         .entry(room_id.to_owned())
                                         .or_default()
-                                        .insert(member.sender.clone(), member.content.clone());
+                                        .insert(member.sender().to_owned(), member.into());
                                 }
 
                                 changes
                                     .members
                                     .entry(room_id.to_owned())
                                     .or_default()
-                                    .insert(member.state_key.clone(), member.to_owned());
+                                    .insert(member.state_key().to_owned(), member.clone());
                             }
                             _ => {
                                 room_info.handle_state_event(s);
@@ -312,6 +317,21 @@ impl BaseClient {
                                 changes.add_state_event(room_id, s.clone(), raw_event);
                             }
                         },
+
+                        #[cfg(feature = "e2e-encryption")]
+                        AnySyncRoomEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
+                            // Redacted redactions don't have the `redacts` key, so we can't know
+                            // what they were meant to redact. A future room version might move the
+                            // redacts key, replace the current redaction event altogether, or have
+                            // the redacts key survive redaction.
+                            SyncRoomRedactionEvent::Original(r),
+                        )) => {
+                            room_info.handle_redaction(r);
+                            // FIXME: Find the event in self.store (needs
+                            // something like a get_event_by_id), redact it and
+                            // put it back via StateChanges. See
+                            // https://github.com/matrix-org/matrix-rust-sdk/issues/607
+                        }
 
                         #[cfg(feature = "e2e-encryption")]
                         AnySyncRoomEvent::MessageLike(e) => match e {
@@ -341,6 +361,7 @@ impl BaseClient {
                             }
                             _ => (),
                         },
+
                         #[cfg(not(feature = "e2e-encryption"))]
                         _ => (),
                     }
@@ -449,12 +470,12 @@ impl BaseClient {
 
             room_info.handle_state_event(&event);
 
-            if let AnySyncStateEvent::RoomMember(SyncStateEvent::Original(member)) = event {
+            if let AnySyncStateEvent::RoomMember(member) = event {
                 ambiguity_cache.handle_event(changes, &room_id, &member).await?;
 
-                match member.content.membership {
+                match member.membership() {
                     MembershipState::Join | MembershipState::Invite => {
-                        user_ids.insert(member.state_key.clone());
+                        user_ids.insert(member.state_key().to_owned());
                     }
                     _ => (),
                 }
@@ -463,11 +484,11 @@ impl BaseClient {
                 // of profiles that the member set themselves to avoid
                 // having confusing profile changes when a member gets
                 // kicked/banned.
-                if member.state_key == member.sender {
-                    profiles.insert(member.sender.clone(), member.content.clone());
+                if member.state_key() == member.sender() {
+                    profiles.insert(member.sender().to_owned(), (&member).into());
                 }
 
-                members.insert(member.state_key.clone(), member);
+                members.insert(member.state_key().to_owned(), member);
             } else {
                 state_events
                     .entry(event.event_type())
@@ -665,6 +686,7 @@ impl BaseClient {
             let notification_count = new_info.unread_notifications.into();
             room_info.update_notification_count(notification_count);
 
+            #[cfg(feature = "experimental-timeline")]
             let timeline_slice = TimelineSlice::new(
                 timeline.events.clone(),
                 next_batch.clone(),
@@ -673,6 +695,7 @@ impl BaseClient {
                 true,
             );
 
+            #[cfg(feature = "experimental-timeline")]
             changes.add_timeline(&room_id, timeline_slice);
 
             new_rooms.join.insert(
@@ -795,6 +818,7 @@ impl BaseClient {
             }
         }
 
+        #[cfg(feature = "experimental-timeline")]
         for (room_id, timeline_slice) in &changes.timeline {
             if let Some(room) = self.store.get_room(room_id) {
                 room.add_timeline_slice(timeline_slice).await;
@@ -807,6 +831,7 @@ impl BaseClient {
     /// You should pass only slices requested from the store to this function.
     ///
     /// * `timeline` - The `TimelineSlice`
+    #[cfg(feature = "experimental-timeline")]
     pub async fn receive_messages(&self, room_id: &RoomId, timeline: TimelineSlice) -> Result<()> {
         let mut changes = StateChanges::default();
 
@@ -834,12 +859,12 @@ impl BaseClient {
         let members: Vec<_> = response
             .chunk
             .iter()
-            .filter_map(|e| e.deserialize().ok())
-            .filter_map(|ev| match ev {
-                RoomMemberEvent::Original(ev) => Some(ev),
-                // FIXME: don't filter these out
-                // https://github.com/matrix-org/matrix-rust-sdk/issues/607
-                RoomMemberEvent::Redacted(_) => None,
+            .filter_map(|event| match event.deserialize() {
+                Ok(ev) => Some(ev),
+                Err(e) => {
+                    debug!(?event, "Failed to deserialize m.room.member event: {}", e);
+                    None
+                }
             })
             .collect();
 
@@ -855,32 +880,32 @@ impl BaseClient {
             let mut user_ids = BTreeSet::new();
 
             for member in &members {
-                let member: OriginalSyncRoomMemberEvent = member.clone().into();
+                let member: SyncRoomMemberEvent = member.clone().into();
 
-                if self.store.get_member_event(room_id, &member.state_key).await?.is_none() {
+                if self.store.get_member_event(room_id, member.state_key()).await?.is_none() {
                     #[cfg(feature = "e2e-encryption")]
-                    match member.content.membership {
+                    match member.membership() {
                         MembershipState::Join | MembershipState::Invite => {
-                            user_ids.insert(member.state_key.clone());
+                            user_ids.insert(member.state_key().to_owned());
                         }
                         _ => (),
                     }
 
                     ambiguity_cache.handle_event(&changes, room_id, &member).await?;
 
-                    if member.state_key == member.sender {
+                    if member.state_key() == member.sender() {
                         changes
                             .profiles
                             .entry(room_id.to_owned())
                             .or_default()
-                            .insert(member.sender.clone(), member.content.clone());
+                            .insert(member.sender().to_owned(), (&member).into());
                     }
 
                     changes
                         .members
                         .entry(room_id.to_owned())
                         .or_default()
-                        .insert(member.state_key.clone(), member);
+                        .insert(member.state_key().to_owned(), member);
                 }
             }
 
@@ -1213,7 +1238,10 @@ impl BaseClient {
         let user_display_name = if let Some(member) =
             changes.members.get(room_id).and_then(|members| members.get(user_id))
         {
-            member.content.displayname.clone().unwrap_or_else(|| user_id.localpart().to_owned())
+            member
+                .as_original()
+                .and_then(|ev| ev.content.displayname.clone())
+                .unwrap_or_else(|| user_id.localpart().to_owned())
         } else if let Some(member) = room.get_member(user_id).await? {
             member.name().to_owned()
         } else {
@@ -1266,8 +1294,10 @@ impl BaseClient {
         if let Some(member) =
             changes.members.get(&**room_id).and_then(|members| members.get(user_id))
         {
-            push_rules.user_display_name =
-                member.content.displayname.clone().unwrap_or_else(|| user_id.localpart().to_owned())
+            push_rules.user_display_name = member
+                .as_original()
+                .and_then(|ev| ev.content.displayname.clone())
+                .unwrap_or_else(|| user_id.localpart().to_owned())
         }
 
         if let Some(AnySyncStateEvent::RoomPowerLevels(event)) = changes
@@ -1294,12 +1324,15 @@ impl Default for BaseClient {
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk_test::{async_test, EventBuilder};
-    use ruma::{room_id, user_id};
+    use matrix_sdk_test::{async_test, response_from_file, EventBuilder};
+    use ruma::{
+        api::{client as api, IncomingResponse},
+        room_id, user_id,
+    };
     use serde_json::json;
 
     use super::BaseClient;
-    use crate::{RoomType, Session};
+    use crate::{DisplayName, RoomType, Session};
 
     #[async_test]
     async fn invite_after_leaving() {
@@ -1355,5 +1388,101 @@ mod tests {
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().room_type(), RoomType::Invited);
+    }
+
+    #[async_test]
+    async fn invite_displayname_integration_test() {
+        let user_id = user_id!("@alice:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = BaseClient::new();
+        client
+            .restore_login(Session {
+                access_token: "token".to_owned(),
+                user_id: user_id.to_owned(),
+                device_id: "FOOBAR".into(),
+            })
+            .await
+            .unwrap();
+
+        let response = api::sync::sync_events::v3::Response::try_from_http_response(response_from_file(&json!({
+            "next_batch": "asdkl;fjasdkl;fj;asdkl;f",
+            "device_one_time_keys_count": {
+                "signed_curve25519": 50u64
+            },
+            "device_unused_fallback_key_types": [
+                "signed_curve25519"
+            ],
+            "rooms": {
+                "invite": {
+                    "!ithpyNKDtmhneaTQja:example.org": {
+                        "invite_state": {
+                            "events": [
+                                {
+                                    "content": {
+                                        "creator": "@test:example.org",
+                                        "room_version": "9"
+                                    },
+                                    "sender": "@test:example.org",
+                                    "state_key": "",
+                                    "type": "m.room.create"
+                                },
+                                {
+                                    "content": {
+                                        "join_rule": "invite"
+                                    },
+                                    "sender": "@test:example.org",
+                                    "state_key": "",
+                                    "type": "m.room.join_rules"
+                                },
+                                {
+                                    "content": {
+                                        "algorithm": "m.megolm.v1.aes-sha2"
+                                    },
+                                    "sender": "@test:example.org",
+                                    "state_key": "",
+                                    "type": "m.room.encryption"
+                                },
+                                {
+                                    "content": {
+                                        "avatar_url": "mxc://example.org/dcBBDwuWEUrjfrOchvkirUST",
+                                        "displayname": "Kyra",
+                                        "membership": "join"
+                                    },
+                                    "sender": "@test:example.org",
+                                    "state_key": "@test:example.org",
+                                    "type": "m.room.member"
+                                },
+                                {
+                                    "content": {
+                                        "avatar_url": "mxc://example.org/ABFEXSDrESxovWwEnCYdNcHT",
+                                        "displayname": "alice",
+                                        "is_direct": true,
+                                        "membership": "invite"
+                                    },
+                                    "origin_server_ts": 1650878657984u64,
+                                    "sender": "@test:example.org",
+                                    "state_key": "@alice:example.org",
+                                    "type": "m.room.member",
+                                    "unsigned": {
+                                        "age": 14u64
+                                    },
+                                    "event_id": "$fLDqltg9Puj-kWItLSFVHPGN4YkgpYQf2qImPzdmgrE"
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }))).expect("static json doesn't fail to parse");
+
+        client.receive_sync_response(response).await.unwrap();
+
+        let room = client.get_room(room_id).expect("Room not found");
+        assert_eq!(room.room_type(), RoomType::Invited);
+        assert_eq!(
+            room.display_name().await.expect("fetching display name failed"),
+            DisplayName::Calculated("Kyra".to_owned())
+        );
     }
 }

@@ -10,11 +10,11 @@ default = ["state-store"]
 state-store = ["matrix-sdk-base"]
 crypto-store = [
     "matrix-sdk-crypto",
-    "matrix-sdk-base?/e2e-encryption",
+    "matrix-sdk-base/e2e-encryption",
 ]
+experimental-timeline = ["matrix-sdk-base/experimental-timeline"]
 
 [dependencies]
-anyhow = "1.0.57"
 async-stream = "0.3.3"
 async-trait = "0.1.53"
 dashmap = "5.2.0"

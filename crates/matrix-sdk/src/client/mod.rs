@@ -23,6 +23,8 @@ use std::{
 };
 
 use anymap2::any::CloneAnySendSync;
+#[cfg(target_arch = "wasm32")]
+pub use async_once_cell::OnceCell;
 use dashmap::DashMap;
 use futures_core::stream::Stream;
 use matrix_sdk_base::{
@@ -65,6 +67,8 @@ use ruma::{
     ServerName, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
+#[cfg(not(target_arch = "wasm32"))]
+pub use tokio::sync::OnceCell;
 use tracing::{error, info, instrument, warn};
 use url::Url;
 
@@ -128,7 +132,7 @@ pub(crate) struct ClientInner {
     /// User session data.
     pub(crate) base_client: BaseClient,
     /// The Matrix versions the server supports (well-known ones only)
-    server_versions: Mutex<Arc<[MatrixVersion]>>,
+    server_versions: OnceCell<Arc<[MatrixVersion]>>,
     /// Locks making sure we only have one group session sharing request in
     /// flight per room.
     #[cfg(feature = "e2e-encryption")]
@@ -1517,28 +1521,35 @@ impl Client {
         self.inner.http_client.send(request, config, self.server_versions().await?).await
     }
 
-    async fn server_versions(&self) -> HttpResult<Arc<[MatrixVersion]>> {
-        let mut server_versions = self.inner.server_versions.lock().await;
+    async fn request_server_versions(&self) -> HttpResult<Arc<[MatrixVersion]>> {
+        let server_versions: Arc<[MatrixVersion]> = self
+            .inner
+            .http_client
+            .send(
+                get_supported_versions::Request::new(),
+                None,
+                [MatrixVersion::V1_0].into_iter().collect(),
+            )
+            .await?
+            .known_versions()
+            .into_iter()
+            .collect();
 
         if server_versions.is_empty() {
-            // Not initialized before
-            *server_versions = self
-                .inner
-                .http_client
-                .send(
-                    get_supported_versions::Request::new(),
-                    None,
-                    [MatrixVersion::V1_0].into_iter().collect(),
-                )
-                .await?
-                .known_versions()
-                .collect();
-
-            if server_versions.is_empty() {
-                // No known versions, fall back to v1.0 (r0 paths)
-                *server_versions = vec![MatrixVersion::V1_0].into();
-            }
+            Ok(vec![MatrixVersion::V1_0].into())
+        } else {
+            Ok(server_versions)
         }
+    }
+
+    async fn server_versions(&self) -> HttpResult<Arc<[MatrixVersion]>> {
+        #[cfg(target_arch = "wasm32")]
+        let server_versions =
+            self.inner.server_versions.get_or_try_init(self.request_server_versions()).await?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let server_versions =
+            self.inner.server_versions.get_or_try_init(|| self.request_server_versions()).await?;
 
         Ok(server_versions.clone())
     }
@@ -2288,7 +2299,11 @@ pub(crate) mod tests {
 
     use std::{collections::BTreeMap, convert::TryInto, io::Cursor, str::FromStr, time::Duration};
 
-    use matrix_sdk_base::media::{MediaFormat, MediaRequest, MediaThumbnailSize};
+    use matrix_sdk_base::{
+        media::{MediaFormat, MediaRequest, MediaThumbnailSize},
+        DisplayName,
+    };
+    #[cfg(feature = "experimental-timeline")]
     use matrix_sdk_common::deserialized_responses::SyncRoomEvent;
     use matrix_sdk_test::{test_json, EventBuilder, EventsJson};
     use mockito::{mock, Matcher};
@@ -3404,7 +3419,10 @@ pub(crate) mod tests {
         let _response = client.sync_once(sync_settings).await.unwrap();
         let room = client.get_joined_room(room_id!("!SVkFJHzfwvuaIEawgC:localhost")).unwrap();
 
-        assert_eq!("example2", room.display_name().await.unwrap());
+        assert_eq!(
+            DisplayName::Calculated("example2".to_owned()),
+            room.display_name().await.unwrap()
+        );
     }
 
     #[async_test]
@@ -3482,7 +3500,7 @@ pub(crate) mod tests {
         assert_eq!(client.rooms().len(), 1);
         let room = client.get_joined_room(room_id!("!SVkFJHzfwvuaIEawgC:localhost")).unwrap();
 
-        assert_eq!("tutorial".to_owned(), room.display_name().await.unwrap());
+        assert_eq!(DisplayName::Aliased("tutorial".to_owned()), room.display_name().await.unwrap());
 
         let _m = mock("GET", Matcher::Regex(r"^/_matrix/client/r0/sync\?.*$".to_owned()))
             .with_status(200)
@@ -3496,7 +3514,10 @@ pub(crate) mod tests {
         assert_eq!(client.rooms().len(), 1);
         let invited_room = client.get_invited_room(room_id!("!696r7674:example.com")).unwrap();
 
-        assert_eq!("My Room Name".to_owned(), invited_room.display_name().await.unwrap());
+        assert_eq!(
+            DisplayName::Named("My Room Name".to_owned()),
+            invited_room.display_name().await.unwrap()
+        );
     }
 
     #[async_test]
@@ -3814,6 +3835,7 @@ pub(crate) mod tests {
     // inconsistent manners, isn't activated.
     //#[async_test]
     #[allow(dead_code)]
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline_with_remove() {
         let client = logged_in_client().await;
         let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
@@ -3937,7 +3959,9 @@ pub(crate) mod tests {
         mocked_messages.assert();
         mocked_messages_2.assert();
     }
+
     #[async_test]
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline() {
         let client = logged_in_client().await;
         let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));

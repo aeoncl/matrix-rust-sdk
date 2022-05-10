@@ -8,9 +8,15 @@ use ruma::{
             State, ToDevice, UnreadNotificationsCount as RumaUnreadNotificationsCount,
         },
     },
-    events::{room::member::OriginalRoomMemberEvent, AnyRoomEvent, AnySyncRoomEvent},
+    events::{
+        room::member::{
+            MembershipState, RoomMemberEvent, RoomMemberEventContent, StrippedRoomMemberEvent,
+            SyncRoomMemberEvent,
+        },
+        AnyRoomEvent, AnySyncRoomEvent,
+    },
     serde::Raw,
-    DeviceKeyAlgorithm, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId,
+    DeviceKeyAlgorithm, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -290,13 +296,47 @@ impl TimelineSlice {
     }
 }
 
+/// Wrapper around both MemberEvent-Types
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum MemberEvent {
+    Sync(SyncRoomMemberEvent),
+    Stripped(StrippedRoomMemberEvent),
+}
+
+impl MemberEvent {
+    /// The inner Content of the wrapped Event
+    pub fn original_content(&self) -> Option<&RoomMemberEventContent> {
+        match self {
+            MemberEvent::Sync(e) => e.as_original().map(|e| &e.content),
+            MemberEvent::Stripped(e) => Some(&e.content),
+        }
+    }
+
+    /// The membership state of the user
+    pub fn membership(&self) -> &MembershipState {
+        match self {
+            MemberEvent::Sync(e) => e.membership(),
+            MemberEvent::Stripped(e) => &e.content.membership,
+        }
+    }
+
+    /// The user id associated to this member event
+    pub fn user_id(&self) -> &UserId {
+        match self {
+            MemberEvent::Sync(e) => e.state_key(),
+            MemberEvent::Stripped(e) => &e.state_key,
+        }
+    }
+}
+
 /// A deserialized response for the rooms members API call.
 ///
 /// [GET /_matrix/client/r0/rooms/{roomId}/members](https://matrix.org/docs/spec/client_server/r0.6.0#get-matrix-client-r0-rooms-roomid-members)
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MembersResponse {
     /// The list of members events.
-    pub chunk: Vec<OriginalRoomMemberEvent>,
+    pub chunk: Vec<RoomMemberEvent>,
     /// Collection of ambiguity changes that room member events trigger.
     pub ambiguity_changes: AmbiguityChanges,
 }

@@ -19,34 +19,37 @@ use std::{
     time::Instant,
 };
 
-use anyhow::anyhow;
+#[cfg(feature = "experimental-timeline")]
 use async_stream::stream;
 use async_trait::async_trait;
 use futures_core::stream::Stream;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use matrix_sdk_base::{
-    deserialized_responses::SyncRoomEvent,
+    deserialized_responses::MemberEvent,
     media::{MediaRequest, UniqueKey},
-    store::{BoxStream, Result as StoreResult, StateChanges, StateStore, StoreError},
-    RoomInfo,
+    store::{Result as StoreResult, StateChanges, StateStore, StoreError},
+    MinimalStateEvent, RoomInfo,
 };
+#[cfg(feature = "experimental-timeline")]
+use matrix_sdk_base::{deserialized_responses::SyncRoomEvent, store::BoxStream};
 use matrix_sdk_store_encryption::{Error as KeyEncryptionError, StoreCipher};
 use ruma::{
     events::{
         presence::PresenceEvent,
         receipt::Receipt,
-        room::{
-            member::{MembershipState, OriginalSyncRoomMemberEvent, RoomMemberEventContent},
-            redaction::SyncRoomRedactionEvent,
-        },
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncMessageLikeEvent,
-        AnySyncRoomEvent, AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType,
-        StateEventType,
+        room::member::{MembershipState, RoomMemberEventContent},
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent,
+        GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     receipt::ReceiptType,
     serde::Raw,
+    EventId, IdParseError, MxcUri, OwnedEventId, OwnedUserId, RoomId, UserId,
+};
+#[cfg(feature = "experimental-timeline")]
+use ruma::{
+    events::{room::redaction::SyncRoomRedactionEvent, AnySyncMessageLikeEvent, AnySyncRoomEvent},
     signatures::{redact_in_place, CanonicalJsonObject},
-    EventId, IdParseError, MxcUri, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
+    RoomVersionId,
 };
 use serde::{Deserialize, Serialize};
 use sled::{
@@ -54,11 +57,12 @@ use sled::{
     Config, Db, Transactional, Tree,
 };
 use tokio::task::spawn_blocking;
-use tracing::{info, warn};
 
 #[cfg(feature = "crypto-store")]
 use super::OpenStoreError;
-use crate::encode_key::{EncodeKey, ENCODE_SEPARATOR};
+use crate::encode_key::EncodeKey;
+#[cfg(feature = "experimental-timeline")]
+use crate::encode_key::ENCODE_SEPARATOR;
 #[cfg(feature = "crypto-store")]
 pub use crate::CryptoStore;
 
@@ -107,10 +111,13 @@ impl Into<StoreError> for SledStoreError {
                 )),
             },
             SledStoreError::StoreError(e) => e,
-            _ => StoreError::Backend(anyhow!(self)),
+            _ => StoreError::backend(self),
         }
     }
 }
+const DATABASE_VERSION: u8 = 1;
+
+const VERSION_KEY: &str = "state-store-version";
 
 const ACCOUNT_DATA: &str = "account-data";
 const CUSTOM: &str = "custom";
@@ -122,6 +129,7 @@ const MEMBER: &str = "member";
 const PRESENCE: &str = "presence";
 const PROFILE: &str = "profile";
 const ROOM_ACCOUNT_DATA: &str = "room-account-data";
+#[cfg(feature = "experimental-timeline")]
 const ROOM_EVENT_ID_POSITION: &str = "room-event-id-to-position";
 const ROOM_EVENT_RECEIPT: &str = "room-event-receipt";
 const ROOM_INFO: &str = "room-info";
@@ -129,10 +137,14 @@ const ROOM_STATE: &str = "room-state";
 const ROOM_USER_RECEIPT: &str = "room-user-receipt";
 const ROOM: &str = "room";
 const SESSION: &str = "session";
+const STRIPPED_INVITED_USER_ID: &str = "stripped-invited-user-id";
+const STRIPPED_JOINED_USER_ID: &str = "stripped-joined-user-id";
 const STRIPPED_ROOM_INFO: &str = "stripped-room-info";
 const STRIPPED_ROOM_MEMBER: &str = "stripped-room-member";
 const STRIPPED_ROOM_STATE: &str = "stripped-room-state";
+#[cfg(feature = "experimental-timeline")]
 const TIMELINE_METADATA: &str = "timeline-metadata";
+#[cfg(feature = "experimental-timeline")]
 const TIMELINE: &str = "timeline";
 
 type Result<A, E = SledStoreError> = std::result::Result<A, E>;
@@ -152,6 +164,8 @@ pub struct SledStore {
     room_info: Tree,
     room_state: Tree,
     room_account_data: Tree,
+    stripped_joined_user_ids: Tree,
+    stripped_invited_user_ids: Tree,
     stripped_room_infos: Tree,
     stripped_room_state: Tree,
     stripped_members: Tree,
@@ -160,8 +174,11 @@ pub struct SledStore {
     room_event_receipts: Tree,
     media: Tree,
     custom: Tree,
+    #[cfg(feature = "experimental-timeline")]
     room_timeline: Tree,
+    #[cfg(feature = "experimental-timeline")]
     room_timeline_metadata: Tree,
+    #[cfg(feature = "experimental-timeline")]
     room_event_id_to_position: Tree,
 }
 
@@ -195,6 +212,8 @@ impl SledStore {
         let presence = db.open_tree(PRESENCE)?;
         let room_account_data = db.open_tree(ROOM_ACCOUNT_DATA)?;
 
+        let stripped_joined_user_ids = db.open_tree(STRIPPED_JOINED_USER_ID)?;
+        let stripped_invited_user_ids = db.open_tree(STRIPPED_INVITED_USER_ID)?;
         let stripped_room_infos = db.open_tree(STRIPPED_ROOM_INFO)?;
         let stripped_members = db.open_tree(STRIPPED_ROOM_MEMBER)?;
         let stripped_room_state = db.open_tree(STRIPPED_ROOM_STATE)?;
@@ -206,11 +225,14 @@ impl SledStore {
 
         let custom = db.open_tree(CUSTOM)?;
 
+        #[cfg(feature = "experimental-timeline")]
         let room_timeline = db.open_tree(TIMELINE)?;
+        #[cfg(feature = "experimental-timeline")]
         let room_timeline_metadata = db.open_tree(TIMELINE_METADATA)?;
+        #[cfg(feature = "experimental-timeline")]
         let room_event_id_to_position = db.open_tree(ROOM_EVENT_ID_POSITION)?;
 
-        Ok(Self {
+        let database = Self {
             path,
             inner: db,
             store_cipher,
@@ -225,6 +247,8 @@ impl SledStore {
             presence,
             room_state,
             room_info,
+            stripped_joined_user_ids,
+            stripped_invited_user_ids,
             stripped_room_infos,
             stripped_members,
             stripped_room_state,
@@ -232,15 +256,20 @@ impl SledStore {
             room_event_receipts,
             media,
             custom,
+            #[cfg(feature = "experimental-timeline")]
             room_timeline,
+            #[cfg(feature = "experimental-timeline")]
             room_timeline_metadata,
+            #[cfg(feature = "experimental-timeline")]
             room_event_id_to_position,
-        })
+        };
+
+        database.upgrade()?;
+        Ok(database)
     }
 
     pub fn open() -> StoreResult<Self> {
-        let db =
-            Config::new().temporary(true).open().map_err(|e| StoreError::Backend(anyhow!(e)))?;
+        let db = Config::new().temporary(true).open().map_err(StoreError::backend)?;
 
         SledStore::open_helper(db, None, None).map_err(|e| e.into())
     }
@@ -248,8 +277,7 @@ impl SledStore {
     // testing only
     #[cfg(test)]
     fn open_encrypted() -> StoreResult<Self> {
-        let db =
-            Config::new().temporary(true).open().map_err(|e| StoreError::Backend(anyhow!(e)))?;
+        let db = Config::new().temporary(true).open().map_err(StoreError::backend)?;
 
         SledStore::open_helper(
             db,
@@ -290,6 +318,40 @@ impl SledStore {
         SledStore::open_helper(db, Some(path), None)
     }
 
+    fn upgrade(&self) -> StoreResult<()> {
+        let db_version = self.inner.get(VERSION_KEY).map_err(StoreError::backend)?.map(|v| {
+            let (version_bytes, _) = v.split_at(std::mem::size_of::<u8>());
+            u8::from_be_bytes(version_bytes.try_into().unwrap_or_default())
+        });
+
+        let old_version = match db_version {
+            None => {
+                // we are fresh, let's write the current version
+                self.inner
+                    .insert(VERSION_KEY, DATABASE_VERSION.to_be_bytes().as_ref())
+                    .map_err(StoreError::backend)?;
+                self.inner.flush().map_err(StoreError::backend)?;
+                return Ok(());
+            }
+            Some(version) if version == DATABASE_VERSION => {
+                // current, we don't have to do anything
+                return Ok(());
+            }
+            Some(version) => version,
+        };
+
+        tracing::debug!(
+            old_version,
+            new_version = DATABASE_VERSION,
+            "Upgrading the Sled state store"
+        );
+
+        // FUTURE UPGRADE CODE GOES HERE
+
+        // can't upgrade from that version to the new one
+        Err(StoreError::UnsupportedDatabaseVersion(old_version.into(), DATABASE_VERSION.into()))
+    }
+
     /// Open a `CryptoStore` that uses the same database as this store.
     ///
     /// The given passphrase will be used to encrypt private data.
@@ -325,6 +387,7 @@ impl SledStore {
         }
     }
 
+    #[cfg(feature = "experimental-timeline")]
     fn encode_key_with_counter<A: EncodeKey>(&self, tablename: &str, s: A, i: usize) -> Vec<u8> {
         [
             &self.encode_key(tablename, s),
@@ -357,9 +420,8 @@ impl SledStore {
     pub async fn save_changes(&self, changes: &StateChanges) -> Result<()> {
         let now = Instant::now();
 
+        // room state & memberships
         let ret: Result<(), TransactionError<SledStoreError>> = (
-            &self.session,
-            &self.account_data,
             &self.members,
             &self.profiles,
             &self.display_names,
@@ -368,15 +430,14 @@ impl SledStore {
             &self.room_info,
             &self.room_state,
             &self.room_account_data,
-            &self.presence,
+            &self.stripped_joined_user_ids,
+            &self.stripped_invited_user_ids,
             &self.stripped_room_infos,
             &self.stripped_members,
             &self.stripped_room_state,
         )
             .transaction(
                 |(
-                    session,
-                    account_data,
                     members,
                     profiles,
                     display_names,
@@ -385,33 +446,30 @@ impl SledStore {
                     rooms,
                     state,
                     room_account_data,
-                    presence,
+                    stripped_joined,
+                    stripped_invited,
                     striped_rooms,
                     stripped_members,
                     stripped_state,
                 )| {
-                    if let Some(s) = &changes.sync_token {
-                        session.insert("sync_token".encode(), s.as_str())?;
-                    }
-
                     for (room, events) in &changes.members {
                         let profile_changes = changes.profiles.get(room);
 
                         for event in events.values() {
-                            let key = (room, &event.state_key);
+                            let key = (room, event.state_key());
 
-                            match event.content.membership {
+                            match event.membership() {
                                 MembershipState::Join => {
                                     joined.insert(
                                         self.encode_key(JOINED_USER_ID, &key),
-                                        event.state_key.as_str(),
+                                        event.state_key().as_str(),
                                     )?;
                                     invited.remove(self.encode_key(INVITED_USER_ID, &key))?;
                                 }
                                 MembershipState::Invite => {
                                     invited.insert(
                                         self.encode_key(INVITED_USER_ID, &key),
-                                        event.state_key.as_str(),
+                                        event.state_key().as_str(),
                                     )?;
                                     joined.remove(self.encode_key(JOINED_USER_ID, &key))?;
                                 }
@@ -428,7 +486,7 @@ impl SledStore {
                             )?;
 
                             if let Some(profile) =
-                                profile_changes.and_then(|p| p.get(&event.state_key))
+                                profile_changes.and_then(|p| p.get(event.state_key()))
                             {
                                 profiles.insert(
                                     self.encode_key(PROFILE, &key),
@@ -447,14 +505,6 @@ impl SledStore {
                                     .map_err(ConflictableTransactionError::Abort)?,
                             )?;
                         }
-                    }
-
-                    for (event_type, event) in &changes.account_data {
-                        account_data.insert(
-                            self.encode_key(ACCOUNT_DATA, event_type),
-                            self.serialize_event(&event)
-                                .map_err(ConflictableTransactionError::Abort)?,
-                        )?;
                     }
 
                     for (room, events) in &changes.room_account_data {
@@ -487,14 +537,6 @@ impl SledStore {
                         )?;
                     }
 
-                    for (sender, event) in &changes.presence {
-                        presence.insert(
-                            self.encode_key(PRESENCE, sender),
-                            self.serialize_event(&event)
-                                .map_err(ConflictableTransactionError::Abort)?,
-                        )?;
-                    }
-
                     for (room_id, info) in &changes.stripped_room_infos {
                         striped_rooms.insert(
                             self.encode_key(STRIPPED_ROOM_INFO, room_id),
@@ -505,11 +547,34 @@ impl SledStore {
 
                     for (room, events) in &changes.stripped_members {
                         for event in events.values() {
+                            let key = (room, &event.state_key);
+
+                            match event.content.membership {
+                                MembershipState::Join => {
+                                    stripped_joined.insert(
+                                        self.encode_key(STRIPPED_JOINED_USER_ID, &key),
+                                        event.state_key.as_str(),
+                                    )?;
+                                    stripped_invited
+                                        .remove(self.encode_key(STRIPPED_INVITED_USER_ID, &key))?;
+                                }
+                                MembershipState::Invite => {
+                                    stripped_invited.insert(
+                                        self.encode_key(STRIPPED_INVITED_USER_ID, &key),
+                                        event.state_key.as_str(),
+                                    )?;
+                                    stripped_joined
+                                        .remove(self.encode_key(STRIPPED_JOINED_USER_ID, &key))?;
+                                }
+                                _ => {
+                                    stripped_joined
+                                        .remove(self.encode_key(STRIPPED_JOINED_USER_ID, &key))?;
+                                    stripped_invited
+                                        .remove(self.encode_key(STRIPPED_INVITED_USER_ID, &key))?;
+                                }
+                            }
                             stripped_members.insert(
-                                self.encode_key(
-                                    STRIPPED_ROOM_MEMBER,
-                                    (room, event.state_key.to_string()),
-                                ),
+                                self.encode_key(STRIPPED_ROOM_MEMBER, &key),
                                 self.serialize_event(&event)
                                     .map_err(ConflictableTransactionError::Abort)?,
                             )?;
@@ -538,8 +603,8 @@ impl SledStore {
         ret?;
 
         let ret: Result<(), TransactionError<SledStoreError>> =
-            (&self.room_user_receipts, &self.room_event_receipts).transaction(
-                |(room_user_receipts, room_event_receipts)| {
+            (&self.room_user_receipts, &self.room_event_receipts, &self.presence).transaction(
+                |(room_user_receipts, room_event_receipts, presence)| {
                     for (room, content) in &changes.receipts {
                         for (event_id, receipts) in &content.0 {
                             for (receipt_type, receipts) in receipts {
@@ -577,17 +642,46 @@ impl SledStore {
                         }
                     }
 
+                    for (sender, event) in &changes.presence {
+                        presence.insert(
+                            self.encode_key(PRESENCE, sender),
+                            self.serialize_event(&event)
+                                .map_err(ConflictableTransactionError::Abort)?,
+                        )?;
+                    }
+
                     Ok(())
                 },
             );
 
         ret?;
 
+        #[cfg(feature = "experimental-timeline")]
         self.save_room_timeline(changes).await?;
+
+        // user state
+        let ret: Result<(), TransactionError<SledStoreError>> = (&self.session, &self.account_data)
+            .transaction(|(session, account_data)| {
+                if let Some(s) = &changes.sync_token {
+                    session.insert("sync_token".encode(), s.as_str())?;
+                }
+
+                for (event_type, event) in &changes.account_data {
+                    account_data.insert(
+                        self.encode_key(ACCOUNT_DATA, event_type),
+                        self.serialize_event(&event)
+                            .map_err(ConflictableTransactionError::Abort)?,
+                    )?;
+                }
+
+                Ok(())
+            });
+
+        ret?;
 
         self.inner.flush_async().await?;
 
-        info!("Saved changes in {:?}", now.elapsed());
+        tracing::info!("Saved changes in {:?}", now.elapsed());
 
         Ok(())
     }
@@ -633,7 +727,7 @@ impl SledStore {
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> Result<Option<RoomMemberEventContent>> {
+    ) -> Result<Option<MinimalStateEvent<RoomMemberEventContent>>> {
         let db = self.clone();
         let key = self.encode_key(PROFILE, (room_id, user_id));
         spawn_blocking(move || db.profiles.get(key)?.map(|p| db.deserialize_event(&p)).transpose())
@@ -644,11 +738,25 @@ impl SledStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> Result<Option<OriginalSyncRoomMemberEvent>> {
+    ) -> Result<Option<MemberEvent>> {
         let db = self.clone();
         let key = self.encode_key(MEMBER, (room_id, state_key));
-        spawn_blocking(move || db.members.get(key)?.map(|v| db.deserialize_event(&v)).transpose())
-            .await?
+        let stripped_key = self.encode_key(STRIPPED_ROOM_MEMBER, (room_id, state_key));
+        spawn_blocking(move || {
+            if let Some(e) = db.members.get(key)?.map(|v| db.deserialize_event(&v)).transpose()? {
+                Ok(Some(MemberEvent::Sync(e)))
+            } else if let Some(e) = db
+                .stripped_members
+                .get(stripped_key)?
+                .map(|v| db.deserialize_event(&v))
+                .transpose()?
+            {
+                Ok(Some(MemberEvent::Stripped(e)))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?
     }
 
     pub async fn get_user_ids_stream(
@@ -660,6 +768,15 @@ impl SledStore {
             .await?
             .chain(self.get_invited_user_ids(room_id).await?))
     }
+    pub async fn get_stripped_user_ids_stream(
+        &self,
+        room_id: &RoomId,
+    ) -> StoreResult<impl Stream<Item = StoreResult<OwnedUserId>>> {
+        Ok(self
+            .get_stripped_joined_user_ids(room_id)
+            .await?
+            .chain(self.get_stripped_invited_user_ids(room_id).await?))
+    }
 
     pub async fn get_invited_user_ids(
         &self,
@@ -669,14 +786,12 @@ impl SledStore {
         let key = self.encode_key(INVITED_USER_ID, room_id);
         spawn_blocking(move || {
             stream::iter(db.invited_user_ids.scan_prefix(key).map(|u| {
-                UserId::parse(String::from_utf8_lossy(
-                    &u.map_err(|e| StoreError::Backend(anyhow!(e)))?.1,
-                ))
-                .map_err(StoreError::Identifier)
+                UserId::parse(String::from_utf8_lossy(&u.map_err(StoreError::backend)?.1))
+                    .map_err(StoreError::Identifier)
             }))
         })
         .await
-        .map_err(|e| StoreError::Backend(anyhow!(e)))
+        .map_err(StoreError::backend)
     }
 
     pub async fn get_joined_user_ids(
@@ -687,14 +802,44 @@ impl SledStore {
         let key = self.encode_key(JOINED_USER_ID, room_id);
         spawn_blocking(move || {
             stream::iter(db.joined_user_ids.scan_prefix(key).map(|u| {
-                UserId::parse(String::from_utf8_lossy(
-                    &u.map_err(|e| StoreError::Backend(anyhow!(e)))?.1,
-                ))
-                .map_err(StoreError::Identifier)
+                UserId::parse(String::from_utf8_lossy(&u.map_err(StoreError::backend)?.1))
+                    .map_err(StoreError::Identifier)
             }))
         })
         .await
-        .map_err(|e| StoreError::Backend(anyhow!(e)))
+        .map_err(StoreError::backend)
+    }
+
+    pub async fn get_stripped_invited_user_ids(
+        &self,
+        room_id: &RoomId,
+    ) -> StoreResult<impl Stream<Item = StoreResult<OwnedUserId>>> {
+        let db = self.clone();
+        let key = self.encode_key(STRIPPED_INVITED_USER_ID, room_id);
+        spawn_blocking(move || {
+            stream::iter(db.stripped_invited_user_ids.scan_prefix(key).map(|u| {
+                UserId::parse(String::from_utf8_lossy(&u.map_err(StoreError::backend)?.1))
+                    .map_err(StoreError::Identifier)
+            }))
+        })
+        .await
+        .map_err(StoreError::backend)
+    }
+
+    pub async fn get_stripped_joined_user_ids(
+        &self,
+        room_id: &RoomId,
+    ) -> StoreResult<impl Stream<Item = StoreResult<OwnedUserId>>> {
+        let db = self.clone();
+        let key = self.encode_key(STRIPPED_JOINED_USER_ID, room_id);
+        spawn_blocking(move || {
+            stream::iter(db.stripped_joined_user_ids.scan_prefix(key).map(|u| {
+                UserId::parse(String::from_utf8_lossy(&u.map_err(StoreError::backend)?.1))
+                    .map_err(StoreError::Identifier)
+            }))
+        })
+        .await
+        .map_err(StoreError::backend)
     }
 
     pub async fn get_room_infos(&self) -> Result<impl Stream<Item = Result<RoomInfo>>> {
@@ -785,13 +930,13 @@ impl SledStore {
                 .scan_prefix(key)
                 .values()
                 .map(|u| {
-                    let v = u.map_err(|e| StoreError::Backend(anyhow!(e)))?;
-                    db.deserialize_event(&v).map_err(|e| StoreError::Backend(anyhow!(e)))
+                    let v = u.map_err(StoreError::backend)?;
+                    db.deserialize_event(&v).map_err(StoreError::backend)
                 })
                 .collect()
         })
         .await
-        .map_err(|e| StoreError::Backend(anyhow!(e)))?
+        .map_err(StoreError::backend)?
     }
 
     async fn add_media_content(&self, request: &MediaRequest, data: Vec<u8>) -> Result<()> {
@@ -970,6 +1115,7 @@ impl SledStore {
 
         ret?;
 
+        #[cfg(feature = "experimental-timeline")]
         self.remove_room_timeline(room_id).await?;
 
         self.inner.flush_async().await?;
@@ -977,6 +1123,7 @@ impl SledStore {
         Ok(())
     }
 
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline(
         &self,
         room_id: &RoomId,
@@ -992,7 +1139,7 @@ impl SledStore {
         let metadata = match metadata {
             Some(m) => m,
             None => {
-                info!("No timeline for {} was previously stored", r_id);
+                tracing::info!("No timeline for {} was previously stored", r_id);
                 return Ok(None);
             }
         };
@@ -1000,7 +1147,11 @@ impl SledStore {
         let mut position = metadata.start_position;
         let end_token = metadata.end;
 
-        info!("Found previously stored timeline for {}, with end token {:?}", r_id, end_token);
+        tracing::info!(
+            "Found previously stored timeline for {}, with end token {:?}",
+            r_id,
+            end_token
+        );
 
         let stream = stream! {
             while let Ok(Some(item)) = db.room_timeline.get(&db.encode_key_with_counter(TIMELINE, &r_id, position)) {
@@ -1012,8 +1163,9 @@ impl SledStore {
         Ok(Some((Box::pin(stream), end_token)))
     }
 
+    #[cfg(feature = "experimental-timeline")]
     async fn remove_room_timeline(&self, room_id: &RoomId) -> Result<()> {
-        info!("Remove stored timeline for {}", room_id);
+        tracing::info!("Remove stored timeline for {}", room_id);
 
         let mut timeline_batch = sled::Batch::default();
         for key in self.room_timeline.scan_prefix(self.encode_key(TIMELINE, &room_id)).keys() {
@@ -1048,6 +1200,7 @@ impl SledStore {
         Ok(())
     }
 
+    #[cfg(feature = "experimental-timeline")]
     async fn save_room_timeline(&self, changes: &StateChanges) -> Result<()> {
         let mut timeline_batch = sled::Batch::default();
         let mut event_id_to_position_batch = sled::Batch::default();
@@ -1055,13 +1208,13 @@ impl SledStore {
 
         for (room_id, timeline) in &changes.timeline {
             if timeline.sync {
-                info!("Save new timeline batch from sync response for {}", room_id);
+                tracing::info!("Save new timeline batch from sync response for {}", room_id);
             } else {
-                info!("Save new timeline batch from messages response for {}", room_id);
+                tracing::info!("Save new timeline batch from messages response for {}", room_id);
             }
 
             let metadata: Option<TimelineMetadata> = if timeline.limited {
-                info!(
+                tracing::info!(
                     "Delete stored timeline for {} because the sync response was limited",
                     room_id
                 );
@@ -1078,7 +1231,7 @@ impl SledStore {
                         // This should only happen when a developer adds a wrong timeline
                         // batch to the `StateChanges` or the server returns a wrong response
                         // to our request.
-                        warn!("Drop unexpected timeline batch for {}", room_id);
+                        tracing::warn!("Drop unexpected timeline batch for {}", room_id);
                         return Ok(());
                     }
 
@@ -1096,7 +1249,7 @@ impl SledStore {
                     }
 
                     if delete_timeline {
-                        info!(
+                        tracing::info!(
                             "Delete stored timeline for {} because of duplicated events",
                             room_id
                         );
@@ -1131,7 +1284,10 @@ impl SledStore {
                 .transpose()?
                 .and_then(|info| info.room_version().cloned())
                 .unwrap_or_else(|| {
-                    warn!("Unable to find the room version for {}, assume version 9", room_id);
+                    tracing::warn!(
+                        "Unable to find the room version for {}, assume version 9",
+                        room_id
+                    );
                     RoomVersionId::V9
                 });
 
@@ -1266,7 +1422,7 @@ impl StateStore for SledStore {
         &self,
         room_id: &RoomId,
         user_id: &UserId,
-    ) -> StoreResult<Option<RoomMemberEventContent>> {
+    ) -> StoreResult<Option<MinimalStateEvent<RoomMemberEventContent>>> {
         self.get_profile(room_id, user_id).await.map_err(Into::into)
     }
 
@@ -1274,20 +1430,32 @@ impl StateStore for SledStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> StoreResult<Option<OriginalSyncRoomMemberEvent>> {
+    ) -> StoreResult<Option<MemberEvent>> {
         self.get_member_event(room_id, state_key).await.map_err(Into::into)
     }
 
     async fn get_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        self.get_user_ids_stream(room_id).await?.try_collect().await
+        let v: Vec<OwnedUserId> = self.get_user_ids_stream(room_id).await?.try_collect().await?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+        self.get_stripped_user_ids_stream(room_id).await?.try_collect().await
     }
 
     async fn get_invited_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        self.get_invited_user_ids(room_id).await?.try_collect().await
+        let v: Vec<OwnedUserId> = self.get_invited_user_ids(room_id).await?.try_collect().await?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+        self.get_stripped_invited_user_ids(room_id).await?.try_collect().await
     }
 
     async fn get_joined_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        self.get_joined_user_ids(room_id).await?.try_collect().await
+        let v: Vec<OwnedUserId> = self.get_joined_user_ids(room_id).await?.try_collect().await?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+        self.get_stripped_joined_user_ids(room_id).await?.try_collect().await
     }
 
     async fn get_room_infos(&self) -> StoreResult<Vec<RoomInfo>> {
@@ -1379,6 +1547,7 @@ impl StateStore for SledStore {
         self.remove_room(room_id).await.map_err(Into::into)
     }
 
+    #[cfg(feature = "experimental-timeline")]
     async fn room_timeline(
         &self,
         room_id: &RoomId,
@@ -1388,6 +1557,7 @@ impl StateStore for SledStore {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "experimental-timeline")]
 struct TimelineMetadata {
     pub start: String,
     pub start_position: usize,
