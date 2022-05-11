@@ -1338,7 +1338,7 @@ impl Client {
         self.send(request, None).await
     }
 
-    pub async fn get_or_create_dm_room(&mut self, user_id: OwnedUserId) -> Result<Option<room::Joined>>  {
+    pub async fn find_dm_room(&self, user_id: &OwnedUserId) -> Result<Option<room::Joined>> {
         let direct_event:  GlobalAccountDataEvent<DirectEventContent>;
         if let Some(directs) = self.store().get_account_data_event(GlobalAccountDataEventType::Direct).await? {
             direct_event = directs.deserialize_as()?;
@@ -1348,7 +1348,7 @@ impl Client {
 
         let content = direct_event.content.0;
         for current in content {
-            if current.0 == user_id {
+            if &current.0 == user_id {
                 let dm_rooms = current.1;
                 for dm_room in dm_rooms {
                     //For each dm room for a direct user
@@ -1367,7 +1367,14 @@ impl Client {
                 }
             }
         }
-        return Ok(self.create_dm_room(user_id).await?);
+        return Ok(None);
+    }
+
+    pub async fn find_or_create_dm_room(&self, user_id: &OwnedUserId) -> Result<Option<room::Joined>>  {
+        if let Some(found) = self.find_dm_room(user_id).await? {
+            return Ok(Some(found));
+        }
+        return Ok(self.create_dm_room(user_id.clone()).await?);
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
