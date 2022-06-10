@@ -203,17 +203,22 @@ impl Common {
         };
 
         #[cfg(feature = "e2e-encryption")]
-        if let Some(machine) = self.client.olm_machine().await {
+        if let Some(machine) = self.client.olm_machine() {
             for event in http_response.chunk {
-                let decrypted_event =
-                    if let AnySyncRoomEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-                        SyncMessageLikeEvent::Original(encrypted_event),
-                    )) = event.deserialize_as::<AnySyncRoomEvent>()?
-                    {
-                        machine.decrypt_room_event(&encrypted_event, room_id).await?
+                let decrypted_event = if let Ok(AnySyncRoomEvent::MessageLike(
+                    AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(
+                        encrypted_event,
+                    )),
+                )) = event.deserialize_as::<AnySyncRoomEvent>()
+                {
+                    if let Ok(event) = machine.decrypt_room_event(&encrypted_event, room_id).await {
+                        event
                     } else {
                         RoomEvent { event, encryption_info: None }
-                    };
+                    }
+                } else {
+                    RoomEvent { event, encryption_info: None }
+                };
 
                 response.chunk.push(decrypted_event);
             }
@@ -292,7 +297,7 @@ impl Common {
     ///   }
     /// }
     ///
-    /// # Result::<_, matrix_sdk::Error>::Ok(())
+    /// # anyhow::Ok(())
     /// # });
     /// ```
     #[cfg(feature = "experimental-timeline")]
@@ -361,7 +366,7 @@ impl Common {
     ///   }
     /// }
     ///
-    /// # Result::<_, matrix_sdk::Error>::Ok(())
+    /// # anyhow::Ok(())
     /// # });
     /// ```
     #[cfg(feature = "experimental-timeline")]
@@ -425,7 +430,7 @@ impl Common {
     ///   });
     /// }
     ///
-    /// # Result::<_, matrix_sdk::Error>::Ok(())
+    /// # anyhow::Ok(())
     /// # });
     /// ```
     #[cfg(feature = "experimental-timeline")]
@@ -478,12 +483,15 @@ impl Common {
         let event = self.client.send(request, None).await?.event;
 
         #[cfg(feature = "e2e-encryption")]
-        if let AnySyncRoomEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-            SyncMessageLikeEvent::Original(encrypted_event),
-        )) = event.deserialize_as::<AnySyncRoomEvent>()?
         {
-            Ok(self.decrypt_event(&encrypted_event).await?)
-        } else {
+            if let Ok(AnySyncRoomEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                SyncMessageLikeEvent::Original(encrypted_event),
+            ))) = event.deserialize_as::<AnySyncRoomEvent>()
+            {
+                if let Ok(event) = self.decrypt_event(&encrypted_event).await {
+                    return Ok(event);
+                }
+            }
             Ok(RoomEvent { event, encryption_info: None })
         }
 
@@ -837,16 +845,16 @@ impl Common {
     ///
     ///     room.set_tag(TagName::User(user_tag), tag_info ).await?;
     /// }
-    /// # Result::<_, matrix_sdk::Error>::Ok(()) });
+    /// # anyhow::Ok(()) });
     /// ```
     pub async fn set_tag(
         &self,
         tag: TagName,
         tag_info: TagInfo,
     ) -> HttpResult<create_tag::v3::Response> {
-        let user_id = self.client.user_id().await.ok_or(HttpError::AuthenticationRequired)?;
+        let user_id = self.client.user_id().ok_or(HttpError::AuthenticationRequired)?;
         let request =
-            create_tag::v3::Request::new(&user_id, self.inner.room_id(), tag.as_ref(), tag_info);
+            create_tag::v3::Request::new(user_id, self.inner.room_id(), tag.as_ref(), tag_info);
         self.client.send(request, None).await
     }
 
@@ -857,8 +865,8 @@ impl Common {
     /// # Arguments
     /// * `tag` - The tag to remove.
     pub async fn remove_tag(&self, tag: TagName) -> HttpResult<delete_tag::v3::Response> {
-        let user_id = self.client.user_id().await.ok_or(HttpError::AuthenticationRequired)?;
-        let request = delete_tag::v3::Request::new(&user_id, self.inner.room_id(), tag.as_ref());
+        let user_id = self.client.user_id().ok_or(HttpError::AuthenticationRequired)?;
+        let request = delete_tag::v3::Request::new(user_id, self.inner.room_id(), tag.as_ref());
         self.client.send(request, None).await
     }
 
@@ -871,11 +879,8 @@ impl Common {
     /// # Arguments
     /// * `is_direct` - Whether to mark this room as direct.
     pub async fn set_is_direct(&self, is_direct: bool) -> Result<()> {
-        let user_id = self
-            .client
-            .user_id()
-            .await
-            .ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let user_id =
+            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
 
         let mut content = self
             .client
@@ -906,7 +911,7 @@ impl Common {
             content.retain(|_, list| !list.is_empty());
         }
 
-        let request = set_global_account_data::v3::Request::new(&content, &user_id)?;
+        let request = set_global_account_data::v3::Request::new(&content, user_id)?;
 
         self.client.send(request, None).await?;
         Ok(())
@@ -920,7 +925,7 @@ impl Common {
     /// Returns the decrypted event.
     #[cfg(feature = "e2e-encryption")]
     pub async fn decrypt_event(&self, event: &OriginalSyncRoomEncryptedEvent) -> Result<RoomEvent> {
-        if let Some(machine) = self.client.olm_machine().await {
+        if let Some(machine) = self.client.olm_machine() {
             Ok(machine.decrypt_room_event(event, self.inner.room_id()).await?)
         } else {
             Err(Error::NoOlmMachine)

@@ -21,13 +21,15 @@
 
 use std::collections::BTreeMap;
 
-use ruma::{encryption::KeyUsage, serde::Raw, DeviceKeyAlgorithm, OwnedDeviceKeyId, OwnedUserId};
+use ruma::{
+    encryption::KeyUsage, serde::Raw, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId,
+    OwnedUserId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::to_raw_value, Value};
 use vodozemac::Ed25519PublicKey;
 
-/// Signatures for a `CrossSigningKey` object.
-pub type CrossSigningKeySignatures = BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceKeyId, String>>;
+use super::Signatures;
 
 /// A cross signing key.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -47,8 +49,7 @@ pub struct CrossSigningKey {
     /// Signatures of the key.
     ///
     /// Only optional for master key.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub signatures: CrossSigningKeySignatures,
+    pub signatures: Signatures,
 
     #[serde(flatten)]
     other: BTreeMap<String, Value>,
@@ -61,7 +62,7 @@ impl CrossSigningKey {
         user_id: OwnedUserId,
         usage: Vec<KeyUsage>,
         keys: BTreeMap<OwnedDeviceKeyId, SigningKey>,
-        signatures: CrossSigningKeySignatures,
+        signatures: Signatures,
     ) -> Self {
         Self { user_id, usage, keys, signatures, other: BTreeMap::new() }
     }
@@ -70,6 +71,17 @@ impl CrossSigningKey {
     pub fn to_raw<T>(&self) -> Raw<T> {
         Raw::from_json(to_raw_value(&self).expect("Coulnd't serialize cross signing keys"))
     }
+
+    /// Get the Ed25519 cross-signing key (and its ID).
+    ///
+    /// Structurally, a cross-signing key could contain more than one actual
+    /// key. However, the spec [forbids this][cross_signing_key_spec] (see
+    /// the `keys` field description), so we just get the first one.
+    ///
+    /// [cross_signing_key_spec]: https//spec.matrix.org/v1.2/client-server-api/#post_matrixclientv3keysdevice_signingupload
+    pub fn get_first_key_and_id(&self) -> Option<(&DeviceKeyId, Ed25519PublicKey)> {
+        self.keys.iter().find_map(|(id, key)| Some((id.as_ref(), key.ed25519()?)))
+    }
 }
 
 /// An enum over the different key types a cross-signing key can have.
@@ -77,7 +89,7 @@ impl CrossSigningKey {
 /// Currently cross signing keys support an ed25519 keypair. The keys transport
 /// format is a base64 encoded string, any unknown key type will be left as such
 /// a string.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SigningKey {
     /// The ed25519 cross-signing key.
     Ed25519(Ed25519PublicKey),
@@ -93,6 +105,16 @@ impl SigningKey {
             SigningKey::Unknown(k) => k.to_owned(),
         }
     }
+
+    /// Get the Ed25519 key, if the cross-signing key is actually an Ed25519
+    /// key.
+    pub fn ed25519(&self) -> Option<Ed25519PublicKey> {
+        if let SigningKey::Ed25519(k) = self {
+            Some(*k)
+        } else {
+            None
+        }
+    }
 }
 
 impl From<Ed25519PublicKey> for SigningKey {
@@ -106,8 +128,8 @@ struct CrossSigningKeyHelper {
     pub user_id: OwnedUserId,
     pub usage: Vec<KeyUsage>,
     pub keys: BTreeMap<OwnedDeviceKeyId, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub signatures: CrossSigningKeySignatures,
+    #[serde(default, skip_serializing_if = "Signatures::is_empty")]
+    pub signatures: Signatures,
     #[serde(flatten)]
     other: BTreeMap<String, Value>,
 }

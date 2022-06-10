@@ -48,7 +48,7 @@ pub struct MigrationData {
     /// The list of Megolm inbound group sessions.
     inbound_group_sessions: Vec<PickledInboundGroupSession>,
     /// The Olm pickle key that was used to pickle all the Olm objects.
-    pickle_key: String,
+    pickle_key: Vec<u8>,
     /// The backup version that is currently active.
     backup_version: Option<String>,
     // The backup recovery key, as a base58 encoded string.
@@ -382,9 +382,21 @@ pub struct RoomKeyCounts {
 /// Backup keys and information we load from the store.
 pub struct BackupKeys {
     /// The recovery key as a base64 encoded string.
-    pub recovery_key: String,
+    recovery_key: Arc<BackupRecoveryKey>,
     /// The version that is used with the recovery key.
-    pub backup_version: String,
+    backup_version: String,
+}
+
+impl BackupKeys {
+    /// Get the recovery key that we're holding on to.
+    pub fn recovery_key(&self) -> Arc<BackupRecoveryKey> {
+        self.recovery_key.clone()
+    }
+
+    /// Get the backups version that we're holding on to.
+    pub fn backup_version(&self) -> String {
+        self.backup_version.to_owned()
+    }
 }
 
 impl TryFrom<matrix_sdk_crypto::store::BackupKeys> for BackupKeys {
@@ -392,7 +404,11 @@ impl TryFrom<matrix_sdk_crypto::store::BackupKeys> for BackupKeys {
 
     fn try_from(keys: matrix_sdk_crypto::store::BackupKeys) -> Result<Self, Self::Error> {
         Ok(Self {
-            recovery_key: keys.recovery_key.ok_or(())?.to_base64(),
+            recovery_key: BackupRecoveryKey {
+                inner: keys.recovery_key.ok_or(())?,
+                passphrase_info: None,
+            }
+            .into(),
             backup_version: keys.backup_version.ok_or(())?,
         })
     }
@@ -521,7 +537,9 @@ mod test {
                   "backed_up":true
                }
             ],
-            "pickle_key":"\u{0011}$xJ_N8$>{\u{0005}iJoF03eBVt\u{000e}rUU\\,GYc7J",
+            "pickle_key": [17, 36, 120, 74, 95, 78, 56, 36, 62, 123, 5, 105, 74,
+                           111, 70, 48, 51, 101, 66, 86, 116, 14, 114, 85, 85,
+                           92, 44, 71, 89, 99, 55, 74],
             "backup_version":"3",
             "backup_recovery_key":"EsTHScmRV5oT1WBhe2mj2Gn3odeYantZ4NEk7L51p6L8hrmB",
             "cross_signing":{

@@ -25,7 +25,7 @@ use ruma::{
     api::client::keys::upload_signatures::v3::{Request as SignatureUploadRequest, SignedKeys},
     encryption::KeyUsage,
     events::secret::request::SecretName,
-    OwnedUserId, UserId,
+    DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedDeviceKeyId, OwnedUserId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
@@ -128,6 +128,14 @@ impl PrivateCrossSigningIdentity {
         let has_self = self.self_signing_key.lock().await.is_some();
 
         !(has_master && has_user && has_self)
+    }
+
+    /// Get the key ID of the master key.
+    pub async fn master_key_id(&self) -> Option<OwnedDeviceKeyId> {
+        let master_key = self.master_public_key().await?.get_first_key()?.to_base64();
+        let master_key = OwnedDeviceId::from(master_key);
+
+        Some(DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, &master_key))
     }
 
     /// Can we sign our own devices, i.e. do we have a self signing key.
@@ -651,13 +659,16 @@ impl PrivateCrossSigningIdentity {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use matrix_sdk_test::async_test;
-    use ruma::{device_id, user_id, UserId};
+    use ruma::{device_id, user_id, DeviceKeyAlgorithm, DeviceKeyId, UserId};
+    use serde_json::json;
 
     use super::{PrivateCrossSigningIdentity, Signing};
     use crate::{
         identities::{ReadOnlyDevice, ReadOnlyUserIdentity},
-        olm::ReadOnlyAccount,
+        olm::{utility::SignJson, ReadOnlyAccount},
     };
 
     fn user_id() -> &'static UserId {
@@ -667,11 +678,24 @@ mod tests {
     #[test]
     fn signature_verification() {
         let signing = Signing::new();
+        let user_id = user_id();
+        let key_id = DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, "DEVICEID".into());
 
-        let message = "Hello world";
+        let json = json!({
+            "hello": "world"
+        });
 
-        let signature = signing.sign(message);
-        assert!(signing.verify(message, &signature).is_ok());
+        let signature =
+            signing.sign_json(json).expect("We should be able to sign a simple json object");
+        let signatures =
+            BTreeMap::from([(user_id, BTreeMap::from([(key_id.clone(), signature.to_base64())]))]);
+
+        let json = json!({
+            "hello": "world",
+            "signatures": signatures,
+        });
+
+        assert!(signing.verify_json(user_id, &key_id, json).is_ok());
     }
 
     #[test]
@@ -763,8 +787,11 @@ mod tests {
 
         let master = user_signing.sign_user(&bob_public).unwrap();
 
-        let num_signatures: usize = master.signatures.iter().map(|(_, u)| u.len()).sum();
-        assert_eq!(num_signatures, 1, "We're only uploading our own signature");
+        assert_eq!(
+            master.signatures.signature_count(),
+            1,
+            "We're only uploading our own signature"
+        );
 
         bob_public.master_key = master.into();
 

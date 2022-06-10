@@ -46,7 +46,7 @@ use ruma::{
     signatures::{redact_in_place, CanonicalJsonObject},
     RoomVersionId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use web_sys::IdbKeyRange;
 
@@ -275,7 +275,7 @@ impl IndexeddbStore {
         })
     }
 
-    fn deserialize_event<T: for<'b> Deserialize<'b>>(
+    fn deserialize_event<T: DeserializeOwned>(
         &self,
         event: JsValue,
     ) -> std::result::Result<T, SerializationError> {
@@ -330,7 +330,7 @@ impl IndexeddbStore {
 
         obj.put_key_val(
             &self.encode_key(KEYS::FILTER, (KEYS::FILTER, filter_name)),
-            &JsValue::from_str(filter_id),
+            &self.serialize_event(&filter_id)?,
         )?;
 
         tx.await.into_result()?;
@@ -339,13 +339,13 @@ impl IndexeddbStore {
     }
 
     pub async fn get_filter(&self, filter_name: &str) -> Result<Option<String>> {
-        Ok(self
-            .inner
+        self.inner
             .transaction_on_one_with_mode(KEYS::SESSION, IdbTransactionMode::Readonly)?
             .object_store(KEYS::SESSION)?
             .get(&self.encode_key(KEYS::FILTER, (KEYS::FILTER, filter_name)))?
             .await?
-            .and_then(|f| f.as_string()))
+            .map(|f| self.deserialize_event(f))
+            .transpose()
     }
 
     pub async fn get_sync_token(&self) -> Result<Option<String>> {
@@ -675,7 +675,7 @@ impl IndexeddbStore {
                     let metadata: Option<TimelineMetadata> = timeline_metadata_store
                         .get(&self.encode_key(KEYS::ROOM_TIMELINE_METADATA, room_id))?
                         .await?
-                        .map(|v| v.into_serde())
+                        .map(|v| self.deserialize_event(&v))
                         .transpose()?;
                     if let Some(mut metadata) = metadata {
                         if !timeline.sync && Some(&timeline.start) != metadata.end.as_ref() {
@@ -834,7 +834,7 @@ impl IndexeddbStore {
 
                 timeline_metadata_store.put_key_val_owned(
                     &self.encode_key(KEYS::ROOM_TIMELINE_METADATA, room_id),
-                    &JsValue::from_serde(&metadata)?,
+                    &self.serialize_event(&metadata)?,
                 )?;
             }
         }
@@ -1474,11 +1474,13 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use matrix_sdk_base::statestore_integration_tests;
+    use uuid::Uuid;
 
     use super::{IndexeddbStore, Result};
 
     async fn get_store() -> Result<IndexeddbStore> {
-        Ok(IndexeddbStore::open().await?)
+        let db_name = format!("test-state-plain-{}", Uuid::new_v4().as_hyphenated().to_string());
+        Ok(IndexeddbStore::open_helper(db_name, None).await?)
     }
 
     statestore_integration_tests! { integration }
