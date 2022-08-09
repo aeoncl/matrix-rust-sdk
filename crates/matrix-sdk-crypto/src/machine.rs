@@ -557,7 +557,7 @@ impl OlmMachine {
         let unsupported_warning = || {
             warn!(
                 sender = %event.sender,
-                sender_key = sender_key.to_base64(),
+                sender_key = sender_key.to_base64().as_str(),
                 algorithm = %event.algorithm(),
                 "Received room key with unsupported key algorithm",
             );
@@ -720,7 +720,7 @@ impl OlmMachine {
             Err(e) => {
                 warn!(
                     sender = decrypted.sender.as_str(),
-                    sender_key = decrypted.sender_key.to_base64(),
+                    sender_key = decrypted.sender_key.to_base64().as_str(),
                     error = ?e,
                     "Decrypted to-device event failed to be deserialized correctly"
                 );
@@ -731,7 +731,7 @@ impl OlmMachine {
 
         trace!(
             sender = decrypted.sender.as_str(),
-            sender_key = decrypted.sender_key.to_base64(),
+            sender_key = decrypted.sender_key.to_base64().as_str(),
             event_type = %event.event_type(),
             "Received a decrypted to-device event"
         );
@@ -1070,7 +1070,7 @@ impl OlmMachine {
                         sender = event.sender.as_str(),
                         room_id = room_id.as_str(),
                         session_id = session.session_id(),
-                        sender_key = session.sender_key().to_base64(),
+                        sender_key = session.sender_key().to_base64().as_str(),
                         algorithm = %session.algorithm(),
                         "Successfully decrypted a room event"
                     );
@@ -1084,7 +1084,7 @@ impl OlmMachine {
                         sender = event.sender.as_str(),
                         room_id = room_id.as_str(),
                         session_id = session.session_id(),
-                        sender_key = session.sender_key().to_base64(),
+                        sender_key = session.sender_key().to_base64().as_str(),
                         algorithm = %session.algorithm(),
                         error = ?e,
                         "Event was successfully decrypted but has an invalid format"
@@ -1151,7 +1151,7 @@ impl OlmMachine {
                 debug!(
                     sender = event.sender.as_str(),
                     room_id = room_id.as_str(),
-                    sender_key = content.sender_key().to_base64(),
+                    sender_key = content.sender_key().to_base64().as_str(),
                     session_id = content.session_id(),
                     algorithm = %content.algorithm(),
                     "Failed to decrypt a room event, the room key is missing"
@@ -1160,7 +1160,7 @@ impl OlmMachine {
                 warn!(
                     sender = event.sender.as_str(),
                     room_id = room_id.as_str(),
-                    sender_key = content.sender_key().to_base64(),
+                    sender_key = content.sender_key().to_base64().as_str(),
                     session_id = content.session_id(),
                     algorithm = %content.algorithm(),
                     error = ?e,
@@ -1377,9 +1377,9 @@ impl OlmMachine {
                 }
                 Err(e) => {
                     warn!(
-                        sender_key= key.sender_key.to_base64(),
-                        room_id = %key.room_id,
-                        session_id = key.session_id,
+                        sender_key= key.sender_key.to_base64().as_str(),
+                        room_id = key.room_id.as_str(),
+                        session_id = key.session_id.as_str(),
                         error = ?e,
                         "Couldn't import a room key from a file export."
                     );

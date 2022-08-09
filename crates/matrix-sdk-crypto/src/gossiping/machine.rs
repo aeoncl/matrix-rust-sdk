@@ -914,7 +914,7 @@ impl GossipMachine {
                 if let Some(s) = &session {
                     info!(
                         sender = event.sender.as_str(),
-                        sender_key = sender_key.to_base64(),
+                        sender_key = sender_key.to_base64().as_str(),
                         claimed_sender_key = event.content.sender_key.as_str(),
                         room_id = s.room_id().as_str(),
                         session_id = session_id.as_str(),
@@ -923,7 +923,7 @@ impl GossipMachine {
                 } else {
                     info!(
                         sender = event.sender.as_str(),
-                        sender_key = sender_key.to_base64(),
+                        sender_key = sender_key.to_base64().as_str(),
                         claimed_sender_key = event.content.sender_key.as_str(),
                         room_id = event.content.room_id.as_str(),
                         session_id = session_id.as_str(),
@@ -936,7 +936,7 @@ impl GossipMachine {
             Err(e) => {
                 warn!(
                     sender = event.sender.as_str(),
-                    sender_key = sender_key.to_base64(),
+                    sender_key = sender_key.to_base64().as_str(),
                     claimed_sender_key = event.content.sender_key.as_str(),
                     room_id = event.content.room_id.as_str(),
                     "Couldn't create a group session from a received room key"
@@ -957,7 +957,7 @@ impl GossipMachine {
         } else {
             warn!(
                 sender = event.sender.as_str(),
-                sender_key = sender_key.to_base64(),
+                sender_key = sender_key.to_base64().as_str(),
                 room_id = event.content.room_id.as_str(),
                 session_id = event.content.session_id.as_str(),
                 claimed_sender_key = event.content.sender_key.as_str(),

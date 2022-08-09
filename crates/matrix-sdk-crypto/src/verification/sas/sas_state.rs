@@ -545,7 +545,7 @@ impl SasState<Started> {
             let commitment = calculate_commitment(our_public_key, content);
 
             info!(
-                public_key = our_public_key.to_base64(),
+                public_key = our_public_key.to_base64().as_str(),
                 %commitment,
                 ?content,
                 "Calculated SAS commitment",

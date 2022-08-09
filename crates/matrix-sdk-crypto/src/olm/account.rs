@@ -169,7 +169,8 @@ impl Account {
                 if self.store.is_message_known(&message_hash).await? {
                     info!(
                         sender = sender.as_str(),
-                        sender_key, "An Olm message got replayed, decryption failed"
+                        sender_key = sender_key.as_str(), 
+                        "An Olm message got replayed, decryption failed"
                     );
 
                     Err(OlmError::ReplayedMessage(user_id, sender_key))
@@ -189,7 +190,7 @@ impl Account {
         if content.recipient_key != self.identity_keys().curve25519 {
             warn!(
                 sender = sender.as_str(),
-                sender_key = content.sender_key.to_base64(),
+                sender_key = content.sender_key.to_base64().as_str(),
                 "Olm event doesn't contain a ciphertext for our key"
             );
 
@@ -303,7 +304,7 @@ impl Account {
                 OlmMessage::Normal(_) => {
                     warn!(
                         sender = sender.as_str(),
-                        sender_key = sender_key.to_base64(),
+                        sender_key = sender_key.to_base64().as_str(),
                         "Failed to decrypt a non-pre-key message with all \
                         available sessions",
                     );
@@ -317,7 +318,7 @@ impl Account {
                         Err(e) => {
                             warn!(
                                 sender = sender.as_str(),
-                                sender_key = sender_key.to_base64(),
+                                sender_key = sender_key.to_base64().as_str(),
                                 error = ?e,
                                 "Failed to create a new Olm session from a \
                                 prekey message",
@@ -347,7 +348,7 @@ impl Account {
 
         trace!(
             sender = sender.as_str(),
-            sender_key = sender_key.to_base64(),
+            sender_key = sender_key.to_base64().as_str(),
             "Successfully decrypted an Olm message"
         );
 
@@ -373,7 +374,7 @@ impl Account {
 
                 warn!(
                     sender = sender.as_str(),
-                    sender_key = sender_key.to_base64(),
+                    sender_key = sender_key.to_base64().as_str(),
                     error = ?e,
                     "A to-device message was successfully decrypted but \
                     parsing and checking the event fields failed"

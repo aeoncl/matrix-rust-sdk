@@ -217,7 +217,7 @@ pub fn receive_mac_event(
         trace!(
             %sender,
             device_id = %ids.other_device.device_id(),
-            key_id,
+            key_id = key_id.as_str(),
             "Checking a SAS MAC",
         );
 
