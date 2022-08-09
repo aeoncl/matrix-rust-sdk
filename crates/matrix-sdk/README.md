@@ -25,7 +25,6 @@ some event handlers and then syncing.
 This is demonstrated in the example below.
 
 ```rust,no_run
-use std::convert::TryFrom;
 use matrix_sdk::{
     Client, config::SyncSettings,
     ruma::{user_id, events::room::message::SyncRoomMessageEvent},
@@ -37,13 +36,11 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::builder().user_id(alice).build().await?;
 
     // First we need to log in.
-    client.login(alice, "password", None, None).await?;
+    client.login_username(alice, "password").send().await?;
 
-    client
-        .register_event_handler(|ev: SyncRoomMessageEvent| async move {
-            println!("Received a message {:?}", ev);
-        })
-        .await;
+    client.add_event_handler(|ev: SyncRoomMessageEvent| async move {
+        println!("Received a message {:?}", ev);
+    });
 
     // Syncing is important to synchronize the client state with the server.
     // This method will never return.

@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = [
     "e2e-encryption",
     "sled",
-    "native-tls"
+    "native-tls",
 ]
 
 e2e-encryption = [
@@ -28,18 +28,18 @@ e2e-encryption = [
     "matrix-sdk-indexeddb?/e2e-encryption",   # activate on indexeddb if given
 ]
 
-sled = ["matrix-sdk-sled/state-store"]
-indexeddb = ["matrix-sdk-indexeddb"]
+sled = ["dep:matrix-sdk-sled", "matrix-sdk-sled?/state-store"]
+indexeddb = ["dep:matrix-sdk-indexeddb"]
 
 qrcode = ["e2e-encryption", "matrix-sdk-base/qrcode"]
 markdown = ["ruma/markdown"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
 socks = ["reqwest/socks"]
-sso-login = ["warp", "rand", "tokio-stream"]
-appservice = ["ruma/appservice-api-s", "ruma/appservice-api-helper"]
-image-proc = ["image"]
-image-rayon = ["image-proc", "image/jpeg_rayon"]
+sso-login = ["warp", "dep:rand", "dep:tokio-stream"]
+appservice = ["ruma/appservice-api-s"]
+image-proc = ["dep:image"]
+image-rayon = ["image-proc", "image?/jpeg_rayon"]
 
 experimental-timeline = [
     "matrix-sdk-base/experimental-timeline",
@@ -65,6 +65,7 @@ dashmap = "5.2.0"
 event-listener = "2.5.2"
 eyre = { version = "0.6.8", optional = true }
 futures-core = "0.3.21"
+futures-signals = { version = "0.3.30", default-features = false }
 futures-util = { version = "0.3.21", default-features = false }
 http = "0.2.6"
 matrix-sdk-common = { version = "0.5.0", path = "../matrix-sdk-common" }
@@ -109,8 +110,9 @@ version = "0.11.10"
 default_features = false
 
 [dependencies.ruma]
-version = "0.6.1"
-features = ["client-api-c", "compat", "rand", "unstable-msc2448"]
+git = "https://github.com/ruma/ruma"
+rev = "ca8c66c885241a7ba3805399604eda4a38979f6b"
+features = ["client-api-c", "compat", "rand", "unstable-msc2448", "unstable-msc2965"]
 
 [dependencies.tokio-stream]
 version = "0.1.8"
@@ -135,8 +137,7 @@ anyhow = "1.0.57"
 dirs = "4.0.0"
 futures = { version = "0.3.21", default-features = false, features = ["executor"] }
 matches = "0.1.9"
-matrix-sdk-test = { version = "0.5.0", path = "../matrix-sdk-test" }
-mockito = "0.31.0"
+matrix-sdk-test = { version = "0.5.0", path = "../../testing/matrix-sdk-test" }
 once_cell = "1.10.0"
 serde_json = "1.0.79"
 tempfile = "3.3.0"
@@ -148,15 +149,4 @@ wasm-bindgen-test = "0.3.30"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.17.0", default-features = false, features = ["rt-multi-thread", "macros"] }
-
-[[example]]
-name = "cross_signing_bootstrap"
-required-features = ["e2e-encryption"]
-
-[[example]]
-name = "emoji_verification"
-required-features = ["e2e-encryption"]
-
-[[example]]
-name = "timeline"
-required-features = ["sled", "experimental-timeline"]
+wiremock = "0.5.13"

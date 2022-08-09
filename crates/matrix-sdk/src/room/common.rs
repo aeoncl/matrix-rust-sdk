@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{collections::BTreeMap, future::Future, ops::Deref, sync::Arc};
 
 #[cfg(feature = "experimental-timeline")]
 use futures_core::stream::Stream;
@@ -28,7 +28,10 @@ use ruma::{
     assign,
     events::{
         direct::DirectEvent,
-        room::{history_visibility::HistoryVisibility, MediaSource},
+        room::{
+            history_visibility::HistoryVisibility, server_acl::RoomServerAclEventContent,
+            MediaSource,
+        },
         tag::{TagInfo, TagName},
         AnyRoomAccountDataEvent, AnyStateEvent, AnySyncStateEvent, GlobalAccountDataEventType,
         RedactContent, RedactedEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
@@ -36,10 +39,12 @@ use ruma::{
         SyncStateEvent,
     },
     serde::Raw,
-    uint, EventId, RoomId, UInt, UserId,
+    uint, EventId, MatrixToUri, MatrixUri, OwnedEventId, OwnedServerName, RoomId, UInt, UserId,
 };
+use serde::de::DeserializeOwned;
 
 use crate::{
+    event_handler::{EventHandler, EventHandlerHandle, EventHandlerResult, SyncEvent},
     media::{MediaFormat, MediaRequest},
     room::RoomType,
     BaseRoom, Client, Error, HttpError, HttpResult, Result, RoomMember,
@@ -135,9 +140,7 @@ impl Common {
     /// let client = Client::new(homeserver).await.unwrap();
     /// client.login(user, "password", None, None).await.unwrap();
     /// let room_id = room_id!("!roomid:example.com");
-    /// let room = client
-    ///     .get_joined_room(&room_id)
-    ///     .unwrap();
+    /// let room = client.get_joined_room(&room_id).unwrap();
     /// if let Some(avatar) = room.avatar(MediaFormat::File).await.unwrap() {
     ///     std::fs::write("avatar.png", avatar);
     /// }
@@ -162,7 +165,6 @@ impl Common {
     ///
     /// # Examples
     /// ```no_run
-    /// # use std::convert::TryFrom;
     /// use matrix_sdk::{room::MessagesOptions, Client};
     /// # use matrix_sdk::ruma::{
     /// #     api::client::filter::RoomEventFilter,
@@ -173,13 +175,12 @@ impl Common {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// # use futures::executor::block_on;
     /// # block_on(async {
-    /// let request = MessagesOptions::backward("t47429-4392820_219380_26003_2265");
+    /// let options =
+    ///     MessagesOptions::backward().from("t47429-4392820_219380_26003_2265");
     ///
     /// let mut client = Client::new(homeserver).await.unwrap();
-    /// let room = client
-    ///    .get_joined_room(room_id!("!roomid:example.com"))
-    ///    .unwrap();
-    /// assert!(room.messages(request).await.is_ok());
+    /// let room = client.get_joined_room(room_id!("!roomid:example.com")).unwrap();
+    /// assert!(room.messages(options).await.is_ok());
     /// # });
     /// ```
     pub async fn messages(&self, options: MessagesOptions<'_>) -> Result<Messages> {
@@ -206,12 +207,10 @@ impl Common {
         if let Some(machine) = self.client.olm_machine() {
             for event in http_response.chunk {
                 let decrypted_event = if let Ok(AnySyncRoomEvent::MessageLike(
-                    AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(
-                        encrypted_event,
-                    )),
+                    AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(_)),
                 )) = event.deserialize_as::<AnySyncRoomEvent>()
                 {
-                    if let Ok(event) = machine.decrypt_room_event(&encrypted_event, room_id).await {
+                    if let Ok(event) = machine.decrypt_room_event(event.cast_ref(), room_id).await {
                         event
                     } else {
                         RoomEvent { event, encryption_info: None }
@@ -232,6 +231,24 @@ impl Common {
         }
 
         Ok(response)
+    }
+
+    /// Register a handler for events of a specific type, within this room.
+    ///
+    /// This method works the same way as [`Client::add_event_handler`], except
+    /// that the handler will only be called for events within this room. See
+    /// that method for more details on event handler functions.
+    ///
+    /// `room.add_event_handler(hdl)` is equivalent to
+    /// `client.add_room_event_handler(room_id, hdl)`. Use whichever one is more
+    /// convenient in your use case.
+    pub fn add_event_handler<Ev, Ctx, H>(&self, handler: H) -> EventHandlerHandle
+    where
+        Ev: SyncEvent + DeserializeOwned + Send + 'static,
+        H: EventHandler<Ev, Ctx>,
+        <H::Future as Future>::Output: EventHandlerResult,
+    {
+        self.client.add_room_event_handler(self.room_id(), handler)
     }
 
     /// Get a stream for the timeline of this `Room`
@@ -260,8 +277,7 @@ impl Common {
     ///
     /// # Examples
     /// ```no_run
-    /// # use std::convert::TryFrom;
-    /// use matrix_sdk::{room::MessagesOptions, Client};
+    /// use matrix_sdk::Client;
     /// # use matrix_sdk::ruma::{
     /// #     api::client::filter::RoomEventFilter,
     /// #     room_id,
@@ -276,25 +292,26 @@ impl Common {
     ///
     /// let mut client = Client::new(homeserver).await?;
     ///
-    /// if let Some(room) = client.get_joined_room(room_id!("!roomid:example.com")) {
-    ///   let (forward_stream, backward_stream) = room.timeline().await?;
+    /// if let Some(room) = client.get_joined_room(room_id!("!roomid:example.com"))
+    /// {
+    ///     let (forward_stream, backward_stream) = room.timeline().await?;
     ///
-    ///   tokio::spawn(async move {
-    ///       pin_mut!(backward_stream);
+    ///     tokio::spawn(async move {
+    ///         pin_mut!(backward_stream);
     ///
-    ///       while let Some(item) = backward_stream.next().await {
-    ///           match item {
-    ///               Ok(event) => println!("{:?}", event),
-    ///               Err(_) => println!("Some error occurred!"),
-    ///           }
-    ///       }
-    ///   });
+    ///         while let Some(item) = backward_stream.next().await {
+    ///             match item {
+    ///                 Ok(event) => println!("{:?}", event),
+    ///                 Err(_) => println!("Some error occurred!"),
+    ///             }
+    ///         }
+    ///     });
     ///
-    ///   pin_mut!(forward_stream);
+    ///     pin_mut!(forward_stream);
     ///
-    ///   while let Some(event) = forward_stream.next().await {
-    ///       println!("{:?}", event);
-    ///   }
+    ///     while let Some(event) = forward_stream.next().await {
+    ///         println!("{:?}", event);
+    ///     }
     /// }
     ///
     /// # anyhow::Ok(())
@@ -312,8 +329,10 @@ impl Common {
             for await item in backward_store {
                 match item {
                     Ok(event) => yield Ok(event),
-                    Err(TimelineStreamError::EndCache { fetch_more_token }) => if let Err(error) = room.request_messages(&fetch_more_token).await {
-                        yield Err(error);
+                    Err(TimelineStreamError::EndCache { fetch_more_token }) => {
+                        if let Err(error) = room.request_messages(&fetch_more_token).await {
+                            yield Err(error);
+                        }
                     },
                     Err(TimelineStreamError::Store(error)) => yield Err(error.into()),
                 }
@@ -340,8 +359,7 @@ impl Common {
     ///
     /// # Examples
     /// ```no_run
-    /// # use std::convert::TryFrom;
-    /// use matrix_sdk::{room::MessagesOptions, Client};
+    /// use matrix_sdk::Client;
     /// # use matrix_sdk::ruma::{
     /// #     api::client::filter::RoomEventFilter,
     /// #     room_id,
@@ -356,14 +374,15 @@ impl Common {
     ///
     /// let mut client = Client::new(homeserver).await?;
     ///
-    /// if let Some(room) = client.get_joined_room(room_id!("!roomid:example.com")) {
-    ///   let forward_stream = room.timeline_forward().await?;
+    /// if let Some(room) = client.get_joined_room(room_id!("!roomid:example.com"))
+    /// {
+    ///     let forward_stream = room.timeline_forward().await?;
     ///
-    ///   pin_mut!(forward_stream);
+    ///     pin_mut!(forward_stream);
     ///
-    ///   while let Some(event) = forward_stream.next().await {
-    ///       println!("{:?}", event);
-    ///   }
+    ///     while let Some(event) = forward_stream.next().await {
+    ///         println!("{:?}", event);
+    ///     }
     /// }
     ///
     /// # anyhow::Ok(())
@@ -399,8 +418,7 @@ impl Common {
     ///
     /// # Examples
     /// ```no_run
-    /// # use std::convert::TryFrom;
-    /// use matrix_sdk::{room::MessagesOptions, Client};
+    /// use matrix_sdk::Client;
     /// # use matrix_sdk::ruma::{
     /// #     api::client::filter::RoomEventFilter,
     /// #     room_id,
@@ -415,19 +433,20 @@ impl Common {
     ///
     /// let mut client = Client::new(homeserver).await?;
     ///
-    /// if let Some(room) = client.get_joined_room(room_id!("!roomid:example.com")) {
-    ///   let backward_stream = room.timeline_backward().await?;
+    /// if let Some(room) = client.get_joined_room(room_id!("!roomid:example.com"))
+    /// {
+    ///     let backward_stream = room.timeline_backward().await?;
     ///
-    ///   tokio::spawn(async move {
-    ///       pin_mut!(backward_stream);
+    ///     tokio::spawn(async move {
+    ///         pin_mut!(backward_stream);
     ///
-    ///       while let Some(item) = backward_stream.next().await {
-    ///           match item {
-    ///               Ok(event) => println!("{:?}", event),
-    ///               Err(_) => println!("Some error occurred!"),
-    ///           }
-    ///       }
-    ///   });
+    ///         while let Some(item) = backward_stream.next().await {
+    ///             match item {
+    ///                 Ok(event) => println!("{:?}", event),
+    ///                 Err(_) => println!("Some error occurred!"),
+    ///             }
+    ///         }
+    ///     });
     /// }
     ///
     /// # anyhow::Ok(())
@@ -442,8 +461,10 @@ impl Common {
             for await item in backward_store {
                 match item {
                     Ok(event) => yield Ok(event),
-                    Err(TimelineStreamError::EndCache { fetch_more_token }) => if let Err(error) = room.request_messages(&fetch_more_token).await {
-                        yield Err(error);
+                    Err(TimelineStreamError::EndCache { fetch_more_token }) => {
+                        if let Err(error) = room.request_messages(&fetch_more_token).await {
+                            yield Err(error);
+                        }
                     },
                     Err(TimelineStreamError::Store(error)) => yield Err(error.into()),
                 }
@@ -458,7 +479,8 @@ impl Common {
         let filter = assign!(RoomEventFilter::default(), {
             lazy_load_options: LazyLoadOptions::Enabled { include_redundant_members: false },
         });
-        let options = assign!(MessagesOptions::backward(token), {
+        let options = assign!(MessagesOptions::backward(), {
+            from: Some(token),
             limit: uint!(10),
             filter,
         });
@@ -485,10 +507,10 @@ impl Common {
         #[cfg(feature = "e2e-encryption")]
         {
             if let Ok(AnySyncRoomEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-                SyncMessageLikeEvent::Original(encrypted_event),
+                SyncMessageLikeEvent::Original(_),
             ))) = event.deserialize_as::<AnySyncRoomEvent>()
             {
-                if let Ok(event) = self.decrypt_event(&encrypted_event).await {
+                if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
                     return Ok(event);
                 }
             }
@@ -707,9 +729,12 @@ impl Common {
     /// ```no_run
     /// # async {
     /// # let room: matrix_sdk::room::Common = todo!();
-    /// use matrix_sdk::ruma::{events::room::member::SyncRoomMemberEvent, serde::Raw};
+    /// use matrix_sdk::ruma::{
+    ///     events::room::member::SyncRoomMemberEvent, serde::Raw,
+    /// };
     ///
-    /// let room_members: Vec<Raw<SyncRoomMemberEvent>> = room.get_state_events_static().await?;
+    /// let room_members: Vec<Raw<SyncRoomMemberEvent>> =
+    ///     room.get_state_events_static().await?;
     /// # anyhow::Ok(())
     /// # };
     /// ```
@@ -745,7 +770,8 @@ impl Common {
     /// use matrix_sdk::ruma::events::room::power_levels::SyncRoomPowerLevelsEvent;
     ///
     /// let power_levels: SyncRoomPowerLevelsEvent = room
-    ///     .get_state_event_static("").await?
+    ///     .get_state_event_static("")
+    ///     .await?
     ///     .expect("every room has a power_levels event")
     ///     .deserialize()?;
     /// # anyhow::Ok(())
@@ -784,7 +810,9 @@ impl Common {
     /// use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
     ///
     /// match room.account_data_static::<FullyReadEventContent>().await? {
-    ///     Some(fully_read) => println!("Found read marker: {:?}", fully_read.deserialize()?),
+    ///     Some(fully_read) => {
+    ///         println!("Found read marker: {:?}", fully_read.deserialize()?)
+    ///     }
     ///     None => println!("No read marker for this room"),
     /// }
     /// # anyhow::Ok(())
@@ -843,7 +871,7 @@ impl Common {
     ///     tag_info.order = Some(0.9);
     ///     let user_tag = UserTagName::from_str("u.work")?;
     ///
-    ///     room.set_tag(TagName::User(user_tag), tag_info ).await?;
+    ///     room.set_tag(TagName::User(user_tag), tag_info).await?;
     /// }
     /// # anyhow::Ok(()) });
     /// ```
@@ -924,18 +952,159 @@ impl Common {
     ///
     /// Returns the decrypted event.
     #[cfg(feature = "e2e-encryption")]
-    pub async fn decrypt_event(&self, event: &OriginalSyncRoomEncryptedEvent) -> Result<RoomEvent> {
+    pub async fn decrypt_event(
+        &self,
+        event: &Raw<OriginalSyncRoomEncryptedEvent>,
+    ) -> Result<RoomEvent> {
         if let Some(machine) = self.client.olm_machine() {
-            Ok(machine.decrypt_room_event(event, self.inner.room_id()).await?)
+            Ok(machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await?)
         } else {
             Err(Error::NoOlmMachine)
         }
+    }
+
+    /// Get a list of servers that should know this room.
+    ///
+    /// Uses the synced members of the room and the suggested [routing
+    /// algorithm] from the Matrix spec.
+    ///
+    /// Returns at most three servers.
+    ///
+    /// [routing algorithm]: https://spec.matrix.org/v1.3/appendices/#routing
+    pub async fn route(&self) -> Result<Vec<OwnedServerName>> {
+        let acl_ev = self
+            .get_state_event_static::<RoomServerAclEventContent>("")
+            .await?
+            .and_then(|ev| ev.deserialize().ok());
+        let acl = acl_ev.as_ref().and_then(|ev| ev.as_original()).map(|ev| &ev.content);
+
+        // Filter out server names that:
+        // - Are blocked due to server ACLs
+        // - Are IP addresses
+        let members: Vec<_> = self
+            .joined_members_no_sync()
+            .await?
+            .into_iter()
+            .filter(|member| {
+                let server = member.user_id().server_name();
+                acl.filter(|acl| !acl.is_allowed(server)).is_none() && !server.is_ip_literal()
+            })
+            .collect();
+
+        // Get the server of the highest power level user in the room, provided
+        // they are at least power level 50.
+        let max = members
+            .iter()
+            .max_by_key(|member| member.power_level())
+            .filter(|max| max.power_level() >= 50)
+            .map(|member| member.user_id().server_name());
+
+        // Sort the servers by population.
+        let servers = members
+            .iter()
+            .map(|member| member.user_id().server_name())
+            .filter(|server| max.filter(|max| max == server).is_none())
+            .fold(BTreeMap::<_, u32>::new(), |mut servers, server| {
+                *servers.entry(server).or_default() += 1;
+                servers
+            });
+        let mut servers: Vec<_> = servers.into_iter().collect();
+        servers.sort_unstable_by(|(_, count_a), (_, count_b)| count_b.cmp(count_a));
+
+        Ok(max
+            .into_iter()
+            .chain(servers.into_iter().map(|(name, _)| name))
+            .take(3)
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    /// Get a `matrix.to` permalink to this room.
+    ///
+    /// If this room has an alias, we use it. Otherwise, we try to use the
+    /// synced members in the room for [routing] the room ID.
+    ///
+    /// [routing]: https://spec.matrix.org/v1.3/appendices/#routing
+    pub async fn matrix_to_permalink(&self) -> Result<MatrixToUri> {
+        if let Some(alias) = self.canonical_alias().or_else(|| self.alt_aliases().pop()) {
+            return Ok(alias.matrix_to_uri());
+        }
+
+        let via = self.route().await?;
+        Ok(self.room_id().matrix_to_uri_via(via))
+    }
+
+    /// Get a `matrix:` permalink to this room.
+    ///
+    /// If this room has an alias, we use it. Otherwise, we try to use the
+    /// synced members in the room for [routing] the room ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `join` - Whether the user should join the room.
+    ///
+    /// [routing]: https://spec.matrix.org/v1.3/appendices/#routing
+    pub async fn matrix_permalink(&self, join: bool) -> Result<MatrixUri> {
+        if let Some(alias) = self.canonical_alias().or_else(|| self.alt_aliases().pop()) {
+            return Ok(alias.matrix_uri(join));
+        }
+
+        let via = self.route().await?;
+        Ok(self.room_id().matrix_uri_via(via, join))
+    }
+
+    /// Get a `matrix.to` permalink to an event in this room.
+    ///
+    /// We try to use the synced members in the room for [routing] the room ID.
+    ///
+    /// *Note*: This method does not check if the given event ID is actually
+    /// part of this room. It needs to be checked before calling this method
+    /// otherwise the permalink won't work.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_id` - The ID of the event.
+    ///
+    /// [routing]: https://spec.matrix.org/v1.3/appendices/#routing
+    pub async fn matrix_to_event_permalink(
+        &self,
+        event_id: impl Into<OwnedEventId>,
+    ) -> Result<MatrixToUri> {
+        // Don't use the alias because an event is tied to a room ID, but an
+        // alias might point to another room, e.g. after a room upgrade.
+        let via = self.route().await?;
+        Ok(self.room_id().matrix_to_event_uri_via(event_id, via))
+    }
+
+    /// Get a `matrix:` permalink to an event in this room.
+    ///
+    /// We try to use the synced members in the room for [routing] the room ID.
+    ///
+    /// *Note*: This method does not check if the given event ID is actually
+    /// part of this room. It needs to be checked before calling this method
+    /// otherwise the permalink won't work.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_id` - The ID of the event.
+    ///
+    /// [routing]: https://spec.matrix.org/v1.3/appendices/#routing
+    pub async fn matrix_event_permalink(
+        &self,
+        event_id: impl Into<OwnedEventId>,
+    ) -> Result<MatrixUri> {
+        // Don't use the alias because an event is tied to a room ID, but an
+        // alias might point to another room, e.g. after a room upgrade.
+        let via = self.route().await?;
+        Ok(self.room_id().matrix_event_uri_via(event_id, via))
     }
 }
 
 /// Options for [`messages`][Common::messages].
 ///
-/// See that method for details.
+/// See that method and
+/// <https://spec.matrix.org/v1.3/client-server-api/#get_matrixclientv3roomsroomidmessages>
+/// for details.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct MessagesOptions<'a> {
@@ -944,7 +1113,11 @@ pub struct MessagesOptions<'a> {
     /// This token can be obtained from a `prev_batch` token returned for each
     /// room from the sync API, or from a start or end token returned by a
     /// previous `messages` call.
-    pub from: &'a str,
+    ///
+    /// If `from` isn't provided the homeserver shall return a list of messages
+    /// from the first or last (per the value of the dir parameter) visible
+    /// event in the room history for the requesting user.
+    pub from: Option<&'a str>,
 
     /// The token to stop returning events at.
     ///
@@ -966,27 +1139,42 @@ pub struct MessagesOptions<'a> {
 }
 
 impl<'a> MessagesOptions<'a> {
-    /// Creates `MessagesOptions` with the given start token and direction.
+    /// Creates `MessagesOptions` with the given direction.
     ///
     /// All other parameters will be defaulted.
-    pub fn new(from: &'a str, dir: Direction) -> Self {
-        Self { from, to: None, dir, limit: uint!(10), filter: RoomEventFilter::default() }
+    pub fn new(dir: Direction) -> Self {
+        Self { from: None, to: None, dir, limit: uint!(10), filter: RoomEventFilter::default() }
     }
 
-    /// Creates `MessagesOptions` with the given start token, and `dir` set to
-    /// `Backward`.
-    pub fn backward(from: &'a str) -> Self {
-        Self::new(from, Direction::Backward)
+    /// Creates `MessagesOptions` with `dir` set to `Backward`.
+    ///
+    /// If no `from` token is set afterwards, pagination will start at the
+    /// end of (the accessible part of) the room timeline.
+    pub fn backward() -> Self {
+        Self::new(Direction::Backward)
     }
 
-    /// Creates `MessagesOptions` with the given start token, and `dir` set to
-    /// `Forward`.
-    pub fn forward(from: &'a str) -> Self {
-        Self::new(from, Direction::Forward)
+    /// Creates `MessagesOptions` with `dir` set to `Forward`.
+    ///
+    /// If no `from` token is set afterwards, pagination will start at the
+    /// beginning of (the accessible part of) the room timeline.
+    pub fn forward() -> Self {
+        Self::new(Direction::Forward)
+    }
+
+    /// Creates a new `MessagesOptions` from `self` with the `from` field set to
+    /// the given value.
+    ///
+    /// Since the field is public, you can also assign to it directly. This
+    /// method merely acts as a shorthand for that, because it is very
+    /// common to set this field.
+    pub fn from(self, from: impl Into<Option<&'a str>>) -> Self {
+        Self { from: from.into(), ..self }
     }
 
     fn into_request(self, room_id: &'a RoomId) -> get_message_events::v3::Request<'_> {
-        assign!(get_message_events::v3::Request::new(room_id, self.from, self.dir), {
+        assign!(get_message_events::v3::Request::new(room_id, self.dir), {
+            from: self.from,
             to: self.to,
             limit: self.limit,
             filter: self.filter,

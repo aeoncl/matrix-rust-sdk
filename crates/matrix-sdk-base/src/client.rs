@@ -14,14 +14,14 @@
 // limitations under the License.
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::Arc,
 };
-#[allow(unused_imports)]
 #[cfg(feature = "e2e-encryption")]
-use std::{ops::Deref, result::Result as StdResult};
+use std::{ops::Deref, sync::Arc};
 
+use futures_signals::signal::ReadOnlyMutable;
 #[cfg(feature = "experimental-timeline")]
 use matrix_sdk_common::deserialized_responses::TimelineSlice;
 use matrix_sdk_common::{
@@ -30,13 +30,13 @@ use matrix_sdk_common::{
         SyncRoomEvent, Timeline,
     },
     instant::Instant,
-    locks::RwLock,
 };
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     store::{CryptoStore, MemoryStore as MemoryCryptoStore},
     EncryptionSettings, MegolmError, OlmError, OlmMachine, ToDeviceRequest,
 };
+#[cfg(feature = "e2e-encryption")]
 use once_cell::sync::OnceCell;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
@@ -63,13 +63,11 @@ use crate::error::Error;
 use crate::{
     error::Result,
     rooms::{Room, RoomInfo, RoomType},
-    session::Session,
     store::{
         ambiguity_map::AmbiguityCache, Result as StoreResult, StateChanges, Store, StoreConfig,
     },
+    Session, SessionMeta, SessionTokens, StateStore,
 };
-
-pub type Token = String;
 
 /// A no IO Client implementation.
 ///
@@ -77,8 +75,6 @@ pub type Token = String;
 /// accordingly updates its state.
 #[derive(Clone)]
 pub struct BaseClient {
-    /// The current sync token that should be used for the next sync call.
-    pub(crate) sync_token: Arc<RwLock<Option<Token>>>,
     /// Database
     store: Store,
     /// The store used for encryption
@@ -95,8 +91,9 @@ pub struct BaseClient {
 impl fmt::Debug for BaseClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
-            .field("session", &self.session())
-            .field("sync_token", &self.sync_token)
+            .field("session_meta", &self.store.session_meta())
+            .field("session_tokens", &self.store.session_tokens)
+            .field("sync_token", &self.store.sync_token)
             .finish()
     }
 }
@@ -117,16 +114,38 @@ impl BaseClient {
         let store = config.state_store.map(Store::new).unwrap_or_else(Store::open_memory_store);
         #[cfg(feature = "e2e-encryption")]
         let crypto_store =
-            config.crypto_store.unwrap_or_else(|| Box::new(MemoryCryptoStore::default())).into();
+            config.crypto_store.unwrap_or_else(|| Arc::new(MemoryCryptoStore::default()));
 
         BaseClient {
-            sync_token: store.sync_token.clone(),
             store,
             #[cfg(feature = "e2e-encryption")]
             crypto_store,
             #[cfg(feature = "e2e-encryption")]
             olm_machine: Default::default(),
         }
+    }
+
+    /// Get the session meta information.
+    ///
+    /// If the client is currently logged in, this will return a
+    /// [`SessionMeta`] object which contains the user ID and device ID.
+    /// Otherwise it returns `None`.
+    pub fn session_meta(&self) -> Option<&SessionMeta> {
+        self.store.session_meta()
+    }
+
+    /// Get the session tokens.
+    ///
+    /// If the client is currently logged in, this will return a
+    /// [`SessionTokens`] object which contains the access token and optional
+    /// refresh token. Otherwise it returns `None`.
+    pub fn session_tokens(&self) -> ReadOnlyMutable<Option<SessionTokens>> {
+        self.store.session_tokens()
+    }
+
+    /// Set the session tokens.
+    pub fn set_session_tokens(&self, tokens: SessionTokens) {
+        self.store.set_session_tokens(tokens)
     }
 
     /// Get the user login session.
@@ -137,18 +156,29 @@ impl BaseClient {
     ///
     /// Returns a session object if the client is logged in. Otherwise returns
     /// `None`.
-    pub fn session(&self) -> Arc<OnceCell<Session>> {
+    pub fn session(&self) -> Option<Session> {
         self.store.session()
     }
 
+    /// Get all the rooms this client knows about.
+    pub fn get_rooms(&self) -> Vec<Room> {
+        self.store.get_rooms()
+    }
+
+    /// Get all the rooms this client knows about.
+    pub fn get_stripped_rooms(&self) -> Vec<Room> {
+        self.store.get_stripped_rooms()
+    }
+
     /// Get a reference to the store.
-    pub fn store(&self) -> &Store {
-        &self.store
+    #[allow(unknown_lints, clippy::explicit_auto_deref)]
+    pub fn store(&self) -> &dyn StateStore {
+        &*self.store
     }
 
     /// Is the client logged in.
     pub fn logged_in(&self) -> bool {
-        self.store.session.get().is_some()
+        self.store.session_meta().is_some()
     }
 
     /// Receive a login response and update the session of the client.
@@ -156,14 +186,14 @@ impl BaseClient {
     /// # Arguments
     ///
     /// * `response` - A successful login response that contains our access
-    ///   token
-    /// and device id.
+    ///   token and device ID.
     pub async fn receive_login_response(
         &self,
         response: &api::session::login::v3::Response,
     ) -> Result<()> {
         let session = Session {
             access_token: response.access_token.clone(),
+            refresh_token: response.refresh_token.clone(),
             device_id: response.device_id.clone(),
             user_id: response.user_id.clone(),
         };
@@ -174,9 +204,10 @@ impl BaseClient {
     ///
     /// # Arguments
     ///
-    /// * `session` - An session that the user already has from a
-    /// previous login call.
+    /// * `session` - An session that the user already has from a previous login
+    ///   call.
     pub async fn restore_login(&self, session: Session) -> Result<()> {
+        debug!(user_id = %session.user_id, device_id = %session.device_id, "Restoring login");
         self.store.restore_session(session.clone()).await?;
 
         #[cfg(feature = "e2e-encryption")]
@@ -200,7 +231,7 @@ impl BaseClient {
     /// Get the current, if any, sync token of the client.
     /// This will be None if the client didn't sync at least once.
     pub async fn sync_token(&self) -> Option<String> {
-        self.sync_token.read().await.clone()
+        self.store.sync_token.read().await.clone()
     }
 
     #[cfg(feature = "e2e-encryption")]
@@ -299,11 +330,12 @@ impl BaseClient {
                         #[cfg(feature = "e2e-encryption")]
                         AnySyncRoomEvent::MessageLike(e) => match e {
                             AnySyncMessageLikeEvent::RoomEncrypted(
-                                SyncMessageLikeEvent::Original(encrypted),
+                                SyncMessageLikeEvent::Original(_),
                             ) => {
                                 if let Some(olm) = self.olm_machine() {
-                                    if let Ok(decrypted) =
-                                        olm.decrypt_room_event(encrypted, room_id).await
+                                    if let Ok(decrypted) = olm
+                                        .decrypt_room_event(event.event.cast_ref(), room_id)
+                                        .await
                                     {
                                         event = decrypted.into();
                                     }
@@ -336,25 +368,19 @@ impl BaseClient {
                     }
 
                     if let Some(context) = &push_context {
-                        if event
-                            .event
-                            .get_field::<OwnedUserId>("sender")?
-                            .map_or(false, |id| id != user_id)
-                        {
-                            let actions = push_rules.get_actions(&event.event, context).to_vec();
+                        let actions = push_rules.get_actions(&event.event, context);
 
-                            if actions.iter().any(|a| matches!(a, Action::Notify)) {
-                                changes.add_notification(
-                                    room_id,
-                                    Notification::new(
-                                        actions,
-                                        event.event.clone(),
-                                        false,
-                                        room_id.to_owned(),
-                                        MilliSecondsSinceUnixEpoch::now(),
-                                    ),
-                                );
-                            }
+                        if actions.iter().any(|a| matches!(a, Action::Notify)) {
+                            changes.add_notification(
+                                room_id,
+                                Notification::new(
+                                    actions.to_owned(),
+                                    event.event.clone(),
+                                    false,
+                                    room_id.to_owned(),
+                                    MilliSecondsSinceUnixEpoch::now(),
+                                ),
+                            );
                         }
                         // TODO if there is an
                         // Action::SetTweak(Tweak::Highlight) we need to store
@@ -400,8 +426,8 @@ impl BaseClient {
                 }
                 Err(err) => {
                     warn!(
-                        "Couldn't deserialize stripped state event for room {}: {:?}",
-                        room_info.room_id, err
+                        room_id = %room_info.room_id,
+                        "Couldn't deserialize stripped state event: {err:?}",
                     );
                 }
             }
@@ -429,10 +455,7 @@ impl BaseClient {
             let event = match raw_event.deserialize() {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(
-                        "Couldn't deserialize state event for room {}: {:?} {:#?}",
-                        room_id, e, raw_event
-                    );
+                    warn!(%room_id, "Couldn't deserialize state event: {e:?}");
                     continue;
                 }
             };
@@ -454,7 +477,7 @@ impl BaseClient {
                 // having confusing profile changes when a member gets
                 // kicked/banned.
                 if member.state_key() == member.sender() {
-                    profiles.insert(member.sender().to_owned(), (&member).into());
+                    profiles.insert(member.sender().to_owned(), member.borrow().into());
                 }
 
                 members.insert(member.state_key().to_owned(), member);
@@ -554,7 +577,7 @@ impl BaseClient {
         // The server might respond multiple times with the same sync token, in
         // that case we already received this response and there's nothing to
         // do.
-        if self.sync_token.read().await.as_ref() == Some(&next_batch) {
+        if self.store.sync_token.read().await.as_ref() == Some(&next_batch) {
             return Ok(SyncResponse::new(next_batch));
         }
 
@@ -580,7 +603,7 @@ impl BaseClient {
         };
 
         let mut changes = StateChanges::new(next_batch.clone());
-        let mut ambiguity_cache = AmbiguityCache::new(self.store.clone());
+        let mut ambiguity_cache = AmbiguityCache::new(self.store.inner.clone());
 
         self.handle_account_data(&account_data.events, &mut changes).await;
 
@@ -751,7 +774,7 @@ impl BaseClient {
         changes.ambiguity_maps = ambiguity_cache.cache;
 
         self.store.save_changes(&changes).await?;
-        *self.sync_token.write().await = Some(next_batch.clone());
+        *self.store.sync_token.write().await = Some(next_batch.clone());
         self.apply_changes(&changes).await;
 
         info!("Processed a sync response in {:?}", now.elapsed());
@@ -831,13 +854,13 @@ impl BaseClient {
             .filter_map(|event| match event.deserialize() {
                 Ok(ev) => Some(ev),
                 Err(e) => {
-                    debug!(?event, "Failed to deserialize m.room.member event: {}", e);
+                    debug!(?event, "Failed to deserialize m.room.member event: {e}");
                     None
                 }
             })
             .collect();
 
-        let mut ambiguity_cache = AmbiguityCache::new(self.store.clone());
+        let mut ambiguity_cache = AmbiguityCache::new(self.store.inner.clone());
 
         if let Some(room) = self.store.get_room(room_id) {
             let mut room_info = room.clone_info();
@@ -867,7 +890,7 @@ impl BaseClient {
                             .profiles
                             .entry(room_id.to_owned())
                             .or_default()
-                            .insert(member.sender().to_owned(), (&member).into());
+                            .insert(member.sender().to_owned(), member.borrow().into());
                     }
 
                     changes
@@ -1002,8 +1025,8 @@ impl BaseClient {
             .transpose()?
         {
             Ok(event.content.global)
-        } else if let Some(session) = self.store.session.get() {
-            Ok(Ruleset::server_default(&session.user_id))
+        } else if let Some(session_meta) = self.store.session_meta() {
+            Ok(Ruleset::server_default(&session_meta.user_id))
         } else {
             Ok(Ruleset::new())
         }
@@ -1060,6 +1083,7 @@ impl BaseClient {
         };
 
         Ok(Some(PushConditionRoomCtx {
+            user_id: user_id.to_owned(),
             room_id: room_id.to_owned(),
             member_count: UInt::new(member_count).unwrap_or(UInt::MAX),
             user_display_name,
@@ -1116,7 +1140,10 @@ impl Default for BaseClient {
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk_test::{async_test, response_from_file, EventBuilder};
+    use matrix_sdk_test::{
+        async_test, response_from_file, EventBuilder, InvitedRoomBuilder, LeftRoomBuilder,
+        StrippedStateTestEvent, TimelineTestEvent,
+    };
     use ruma::{
         api::{client as api, IncomingResponse},
         room_id, user_id,
@@ -1135,6 +1162,7 @@ mod tests {
         client
             .restore_login(Session {
                 access_token: "token".to_owned(),
+                refresh_token: None,
                 user_id: user_id.to_owned(),
                 device_id: "FOOBAR".into(),
             })
@@ -1144,9 +1172,8 @@ mod tests {
         let mut ev_builder = EventBuilder::new();
 
         let response = ev_builder
-            .add_custom_left_event(
-                room_id,
-                json!({
+            .add_left_room(LeftRoomBuilder::new(room_id).add_timeline_event(
+                TimelineTestEvent::Custom(json!({
                     "content": {
                         "displayname": "Alice",
                         "membership": "left",
@@ -1156,16 +1183,15 @@ mod tests {
                     "sender": user_id,
                     "state_key": user_id,
                     "type": "m.room.member",
-                }),
-            )
+                })),
+            ))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().room_type(), RoomType::Left);
 
         let response = ev_builder
-            .add_custom_invited_event(
-                room_id,
-                json!({
+            .add_invited_room(InvitedRoomBuilder::new(room_id).add_state_event(
+                StrippedStateTestEvent::Custom(json!({
                     "content": {
                         "displayname": "Alice",
                         "membership": "invite",
@@ -1175,8 +1201,8 @@ mod tests {
                     "sender": "@example:example.org",
                     "state_key": user_id,
                     "type": "m.room.member",
-                }),
-            )
+                })),
+            ))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().room_type(), RoomType::Invited);
@@ -1191,6 +1217,7 @@ mod tests {
         client
             .restore_login(Session {
                 access_token: "token".to_owned(),
+                refresh_token: None,
                 user_id: user_id.to_owned(),
                 device_id: "FOOBAR".into(),
             })

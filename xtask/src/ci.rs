@@ -12,6 +12,9 @@ pub struct CiArgs {
     cmd: Option<CiCommand>,
 }
 
+const WASM_TIMEOUT_ENV_KEY: &str = "WASM_BINDGEN_TEST_TIMEOUT";
+const WASM_TIMEOUT_VALUE: &str = "120";
+
 #[derive(Subcommand)]
 enum CiCommand {
     /// Check style
@@ -22,8 +25,6 @@ enum CiCommand {
     Clippy,
     /// Check documentation
     Docs,
-    /// Run default tests
-    Test,
     /// Run tests with a specific feature set
     TestFeatures {
         #[clap(subcommand)]
@@ -43,6 +44,8 @@ enum CiCommand {
     },
     /// Run tests for the different crypto crate features
     TestCrypto,
+    /// Check that the examples compile
+    Examples,
 }
 
 #[derive(Subcommand, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,6 +74,7 @@ enum WasmFeatureSet {
     MatrixSdkIndexeddbStores,
     IndexeddbNoCrypto,
     IndexeddbWithCrypto,
+    Indexeddb,
     MatrixSdkCommandBot,
 }
 
@@ -84,28 +88,33 @@ impl CiArgs {
                 CiCommand::Typos => check_typos(),
                 CiCommand::Clippy => check_clippy(),
                 CiCommand::Docs => check_docs(),
-                CiCommand::Test => run_tests(),
                 CiCommand::TestFeatures { cmd } => run_feature_tests(cmd),
                 CiCommand::TestAppservice => run_appservice_tests(),
                 CiCommand::Wasm { cmd } => run_wasm_checks(cmd),
                 CiCommand::WasmPack { cmd } => run_wasm_pack_tests(cmd),
                 CiCommand::TestCrypto => run_crypto_tests(),
+                CiCommand::Examples => check_examples(),
             },
             None => {
                 check_style()?;
                 check_clippy()?;
                 check_typos()?;
                 check_docs()?;
-                run_tests()?;
                 run_feature_tests(None)?;
                 run_appservice_tests()?;
                 run_wasm_checks(None)?;
                 run_crypto_tests()?;
+                check_examples()?;
 
                 Ok(())
             }
         }
     }
+}
+
+fn check_examples() -> Result<()> {
+    cmd!("rustup run stable cargo check -p example-*").run()?;
+    Ok(())
 }
 
 fn check_style() -> Result<()> {
@@ -141,12 +150,6 @@ fn check_docs() -> Result<()> {
     build_docs([], DenyWarnings::Yes)
 }
 
-fn run_tests() -> Result<()> {
-    cmd!("rustup run stable cargo test").run()?;
-    cmd!("rustup run beta cargo test").run()?;
-    Ok(())
-}
-
 fn run_feature_tests(cmd: Option<FeatureSet>) -> Result<()> {
     let args = BTreeMap::from([
         (FeatureSet::NoEncryption, "--no-default-features --features sled,native-tls"),
@@ -164,7 +167,12 @@ fn run_feature_tests(cmd: Option<FeatureSet>) -> Result<()> {
     ]);
 
     let run = |arg_set: &str| {
-        cmd!("rustup run stable cargo test -p matrix-sdk").args(arg_set.split_whitespace()).run()
+        cmd!("rustup run stable cargo nextest run -p matrix-sdk")
+            .args(arg_set.split_whitespace())
+            .run()?;
+        cmd!("rustup run stable cargo test --doc -p matrix-sdk")
+            .args(arg_set.split_whitespace())
+            .run()
     };
 
     match cmd {
@@ -186,20 +194,28 @@ fn run_crypto_tests() -> Result<()> {
         "rustup run stable cargo clippy -p matrix-sdk-crypto --features=backups_v1 -- -D warnings"
     )
     .run()?;
-    cmd!("rustup run stable cargo test -p matrix-sdk-crypto --features=backups_v1").run()?;
-    cmd!("rustup run stable cargo test -p matrix-sdk-crypto-ffi").run()?;
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --features=backups_v1").run()?;
+    cmd!("rustup run stable cargo test --doc -p matrix-sdk-crypto --features=backups_v1").run()?;
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto-ffi").run()?;
 
     Ok(())
 }
 
 fn run_appservice_tests() -> Result<()> {
     cmd!("rustup run stable cargo clippy -p matrix-sdk-appservice -- -D warnings").run()?;
-    cmd!("rustup run stable cargo test -p matrix-sdk-appservice").run()?;
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-appservice").run()?;
+    cmd!("rustup run stable cargo test --doc -p matrix-sdk-appservice").run()?;
 
     Ok(())
 }
 
 fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
+    if let Some(WasmFeatureSet::Indexeddb) = cmd {
+        run_wasm_checks(Some(WasmFeatureSet::IndexeddbNoCrypto))?;
+        run_wasm_checks(Some(WasmFeatureSet::IndexeddbWithCrypto))?;
+        return Ok(());
+    }
+
     let args = BTreeMap::from([
         (WasmFeatureSet::MatrixSdkQrcode, "-p matrix-sdk-qrcode"),
         (
@@ -228,14 +244,16 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
         cmd!("rustup run stable cargo clippy --target wasm32-unknown-unknown")
             .args(arg_set.split_whitespace())
             .args(["--", "-D", "warnings"])
+            .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
             .run()
     };
 
     let test_command_bot = || {
-        let _p = pushd("crates/matrix-sdk/examples/wasm_command_bot");
+        let _p = pushd("examples/wasm_command_bot");
 
         cmd!("rustup run stable cargo clippy --target wasm32-unknown-unknown")
             .args(["--", "-D", "warnings", "-A", "clippy::unused-unit"])
+            .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
             .run()
     };
 
@@ -261,6 +279,11 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
 }
 
 fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
+    if let Some(WasmFeatureSet::Indexeddb) = cmd {
+        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbNoCrypto))?;
+        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbWithCrypto))?;
+        return Ok(());
+    }
     let args = BTreeMap::from([
         (WasmFeatureSet::MatrixSdkQrcode, ("matrix-sdk-qrcode", "")),
         (
@@ -289,16 +312,24 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
     ]);
 
     let run = |(folder, arg_set): (&str, &str)| {
-        let _p = pushd(format!("crates/{}", folder));
-        cmd!("pwd").run()?; // print dir so we know what might have failed
-        cmd!("wasm-pack test --node -- ").args(arg_set.split_whitespace()).run()?;
-        cmd!("wasm-pack test --firefox --headless --").args(arg_set.split_whitespace()).run()
+        let _p = pushd(format!("crates/{folder}"));
+        cmd!("pwd").env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE).run()?; // print dir so we know what might have failed
+        cmd!("wasm-pack test --node -- ")
+            .args(arg_set.split_whitespace())
+            .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
+            .run()?;
+        cmd!("wasm-pack test --firefox --headless --")
+            .args(arg_set.split_whitespace())
+            .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
+            .run()
     };
 
     let test_command_bot = || {
-        let _p = pushd("crates/matrix-sdk/examples/wasm_command_bot");
-        cmd!("wasm-pack test --node").run()?;
-        cmd!("wasm-pack test --firefox --headless").run()
+        let _p = pushd("examples/wasm_command_bot");
+        cmd!("wasm-pack test --node").env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE).run()?;
+        cmd!("wasm-pack test --firefox --headless")
+            .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
+            .run()
     };
 
     match cmd {

@@ -380,9 +380,13 @@ impl VerificationRequest {
         let mut inner = self.inner.lock().unwrap();
 
         inner.accept(methods).map(|c| match c {
-            OutgoingContent::ToDevice(content) => {
-                ToDeviceRequest::new(self.other_user(), inner.other_device_id(), content).into()
-            }
+            OutgoingContent::ToDevice(content) => ToDeviceRequest::with_id(
+                self.other_user(),
+                inner.other_device_id(),
+                content,
+                TransactionId::new(),
+            )
+            .into(),
             OutgoingContent::Room(room_id, content) => {
                 RoomMessageRequest { room_id, txn_id: TransactionId::new(), content }.into()
             }
@@ -435,7 +439,13 @@ impl VerificationRequest {
                     )
                     .into()
                 } else {
-                    ToDeviceRequest::new(self.other_user(), other_device, content).into()
+                    ToDeviceRequest::with_id(
+                        self.other_user(),
+                        other_device,
+                        content,
+                        TransactionId::new(),
+                    )
+                    .into()
                 }
             }
             OutgoingContent::Room(room_id, content) => {
@@ -627,10 +637,11 @@ impl VerificationRequest {
                     self.verification_cache.insert_sas(sas.clone());
 
                     let request = match content {
-                        OutgoingContent::ToDevice(content) => ToDeviceRequest::new(
+                        OutgoingContent::ToDevice(content) => ToDeviceRequest::with_id(
                             self.other_user(),
                             inner.other_device_id(),
                             content,
+                            TransactionId::new(),
                         )
                         .into(),
                         OutgoingContent::Room(room_id, content) => {
@@ -823,7 +834,7 @@ struct Requested {
     /// The verification methods supported by the sender.
     pub their_methods: Vec<VerificationMethod>,
 
-    /// The device id of the device that responded to the verification request.
+    /// The device ID of the device that responded to the verification request.
     pub other_device_id: OwnedDeviceId,
 }
 
@@ -905,7 +916,7 @@ struct Ready {
     /// The verification methods supported by the us.
     pub our_methods: Vec<VerificationMethod>,
 
-    /// The device id of the device that responded to the verification request.
+    /// The device ID of the device that responded to the verification request.
     pub other_device_id: OwnedDeviceId,
 }
 
@@ -1098,18 +1109,17 @@ impl RequestState<Ready> {
                             // before the other side tried to do the same; ignore it if we did and
                             // we're the lexicographically smaller user ID (or device ID if equal).
                             use std::cmp::Ordering;
-                            match (sender.cmp(own_user_id), device.device_id().cmp(own_device_id)) {
-                                (Ordering::Greater, _) | (Ordering::Equal, Ordering::Greater) => {
-                                    false
-                                }
-                                _ => true,
-                            }
+                            !matches!(
+                                (sender.cmp(own_user_id), device.device_id().cmp(own_device_id)),
+                                (Ordering::Greater, _) | (Ordering::Equal, Ordering::Greater)
+                            )
                         } else {
                             true
                         };
+
                         if start_new {
                             info!("Started a new SAS verification.");
-                            self.verification_cache.insert_sas(s);
+                            self.verification_cache.replace_sas(s);
                         }
                     }
                     Err(c) => {
@@ -1199,7 +1209,7 @@ impl RequestState<Ready> {
 
 #[derive(Clone, Debug)]
 struct Passive {
-    /// The device id of the device that responded to the verification request.
+    /// The device ID of the device that responded to the verification request.
     #[allow(dead_code)]
     pub other_device_id: OwnedDeviceId,
 }
@@ -1212,72 +1222,19 @@ mod tests {
 
     use std::convert::{TryFrom, TryInto};
 
-    use matrix_sdk_common::locks::Mutex;
     use matrix_sdk_test::async_test;
-    use ruma::{device_id, event_id, room_id, user_id, DeviceId, UserId};
+    use ruma::{event_id, room_id};
 
     use super::VerificationRequest;
     use crate::{
-        olm::{PrivateCrossSigningIdentity, ReadOnlyAccount},
-        store::{Changes, CryptoStore, MemoryStore},
         verification::{
             cache::VerificationCache,
             event_enums::{OutgoingContent, ReadyContent, RequestContent, StartContent},
-            FlowId, VerificationStore,
+            test::{alice_id, bob_id, setup_stores},
+            FlowId,
         },
         ReadOnlyDevice,
     };
-
-    fn alice_id() -> &'static UserId {
-        user_id!("@alice:example.org")
-    }
-
-    fn alice_device_id() -> &'static DeviceId {
-        device_id!("JLAFKJWSCS")
-    }
-
-    fn bob_id() -> &'static UserId {
-        user_id!("@bob:example.org")
-    }
-
-    fn bob_device_id() -> &'static DeviceId {
-        device_id!("BOBDEVCIE")
-    }
-
-    async fn setup_stores() -> (VerificationStore, VerificationStore) {
-        let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
-        let alice_store: Box<dyn CryptoStore> = Box::new(MemoryStore::new());
-        let alice_identity = Mutex::new(PrivateCrossSigningIdentity::empty(alice_id()));
-
-        let alice_store = VerificationStore {
-            account: alice,
-            inner: alice_store.into(),
-            private_identity: alice_identity.into(),
-        };
-
-        let bob = ReadOnlyAccount::new(bob_id(), bob_device_id());
-        let bob_store: Box<dyn CryptoStore> = Box::new(MemoryStore::new());
-        let bob_identity = Mutex::new(PrivateCrossSigningIdentity::empty(bob_id()));
-
-        let bob_store = VerificationStore {
-            account: bob.clone(),
-            inner: bob_store.into(),
-            private_identity: bob_identity.into(),
-        };
-
-        let alice_device = ReadOnlyDevice::from_account(&alice_store.account).await;
-        let bob_device = ReadOnlyDevice::from_account(&bob_store.account).await;
-
-        let mut changes = Changes::default();
-        changes.devices.new.push(bob_device.clone());
-        alice_store.save_changes(changes).await.unwrap();
-
-        let mut changes = Changes::default();
-        changes.devices.new.push(alice_device.clone());
-        bob_store.save_changes(changes).await.unwrap();
-
-        (alice_store, bob_store)
-    }
 
     #[async_test]
     async fn test_request_accepting() {

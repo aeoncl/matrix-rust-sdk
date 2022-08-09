@@ -28,6 +28,7 @@ use std::{
     sync::Arc,
 };
 
+use futures_signals::signal::{Mutable, ReadOnlyMutable};
 use once_cell::sync::OnceCell;
 
 #[cfg(any(test, feature = "testing"))]
@@ -38,17 +39,16 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use matrix_sdk_common::{locks::RwLock, AsyncTraitDeps};
 #[cfg(feature = "e2e-encryption")]
-use matrix_sdk_crypto::store::CryptoStore;
+use matrix_sdk_crypto::store::{CryptoStore, IntoCryptoStore};
 use ruma::{
     api::client::push::get_notifications::v3::Notification,
     events::{
         presence::PresenceEvent,
-        receipt::{Receipt, ReceiptEventContent},
+        receipt::{Receipt, ReceiptEventContent, ReceiptType},
         room::member::{StrippedRoomMemberEvent, SyncRoomMemberEvent},
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
-    receipt::ReceiptType,
     serde::Raw,
     EventId, MxcUri, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
@@ -62,7 +62,7 @@ use crate::{
     deserialized_responses::MemberEvent,
     media::MediaRequest,
     rooms::{RoomInfo, RoomType},
-    MinimalRoomMemberEvent, Room, Session,
+    MinimalRoomMemberEvent, Room, Session, SessionMeta, SessionTokens,
 };
 
 pub(crate) mod ambiguity_map;
@@ -107,7 +107,7 @@ pub enum StoreError {
     ///
     /// This should never happen.
     #[error("Redaction failed: {0}")]
-    Redaction(#[source] ruma::signatures::Error),
+    Redaction(#[source] ruma::canonical_json::RedactionError),
 }
 
 impl StoreError {
@@ -375,15 +375,45 @@ pub trait StateStore: AsyncTraitDeps {
     ) -> Result<Option<(BoxStream<Result<SyncRoomEvent>>, Option<String>)>>;
 }
 
+/// A type that can be type-erased into `Arc<dyn StateStore>`.
+///
+/// This trait is not meant to be implemented directly outside
+/// `matrix-sdk-crypto`, but it is automatically implemented for everything that
+/// implements `StateStore`.
+pub trait IntoStateStore {
+    #[doc(hidden)]
+    fn into_state_store(self) -> Arc<dyn StateStore>;
+}
+
+impl<T> IntoStateStore for T
+where
+    T: StateStore + Sized + 'static,
+{
+    fn into_state_store(self) -> Arc<dyn StateStore> {
+        Arc::new(self)
+    }
+}
+
+impl<T> IntoStateStore for Arc<T>
+where
+    T: StateStore + 'static,
+{
+    fn into_state_store(self) -> Arc<dyn StateStore> {
+        self
+    }
+}
+
 /// A state store wrapper for the SDK.
 ///
 /// This adds additional higher level store functionality on top of a
 /// `StateStore` implementation.
 #[derive(Debug, Clone)]
-pub struct Store {
-    inner: Arc<dyn StateStore>,
-    pub(crate) session: Arc<OnceCell<Session>>,
-    pub(crate) sync_token: Arc<RwLock<Option<String>>>,
+pub(crate) struct Store {
+    pub(super) inner: Arc<dyn StateStore>,
+    session_meta: Arc<OnceCell<SessionMeta>>,
+    pub(super) session_tokens: Mutable<Option<SessionTokens>>,
+    /// The current sync token that should be used for the next sync call.
+    pub(super) sync_token: Arc<RwLock<Option<String>>>,
     rooms: Arc<DashMap<OwnedRoomId, Room>>,
     stripped_rooms: Arc<DashMap<OwnedRoomId, Room>>,
 }
@@ -391,7 +421,7 @@ pub struct Store {
 impl Store {
     /// Create a new Store with the default `MemoryStore`
     pub fn open_memory_store() -> Self {
-        let inner = Box::new(MemoryStore::new());
+        let inner = Arc::new(MemoryStore::new());
 
         Self::new(inner)
     }
@@ -399,10 +429,11 @@ impl Store {
 
 impl Store {
     /// Create a new store, wrappning the given `StateStore`
-    pub fn new(inner: Box<dyn StateStore>) -> Self {
+    pub fn new(inner: Arc<dyn StateStore>) -> Self {
         Self {
-            inner: inner.into(),
-            session: Default::default(),
+            inner,
+            session_meta: Default::default(),
+            session_tokens: Default::default(),
             sync_token: Default::default(),
             rooms: Default::default(),
             stripped_rooms: Default::default(),
@@ -423,17 +454,37 @@ impl Store {
         }
 
         let token = self.get_sync_token().await?;
-
         *self.sync_token.write().await = token;
-        self.session.set(session).expect("A session was already set");
+
+        let (session_meta, session_tokens) = session.into_parts();
+        self.session_meta.set(session_meta).expect("Session IDs were already set");
+        self.session_tokens.set(Some(session_tokens));
 
         Ok(())
     }
 
-    /// The current [`Session`] containing our user id, device id and access
-    /// token.
-    pub fn session(&self) -> Arc<OnceCell<Session>> {
-        self.session.clone()
+    /// The current [`SessionMeta`] containing our user ID and device ID.
+    pub fn session_meta(&self) -> Option<&SessionMeta> {
+        self.session_meta.get()
+    }
+
+    /// The current [`SessionTokens`] containing our access token and optional
+    /// refresh token.
+    pub fn session_tokens(&self) -> ReadOnlyMutable<Option<SessionTokens>> {
+        self.session_tokens.read_only()
+    }
+
+    /// Set the current [`SessionTokens`].
+    pub fn set_session_tokens(&self, tokens: SessionTokens) {
+        self.session_tokens.set(Some(tokens));
+    }
+
+    /// The current [`Session`] containing our user id, device ID, access
+    /// token and optional refresh token.
+    pub fn session(&self) -> Option<Session> {
+        let meta = self.session_meta.get()?;
+        let tokens = self.session_tokens.get_cloned()?;
+        Some(Session::from_parts(meta.to_owned(), tokens))
     }
 
     /// Get all the rooms this store knows about.
@@ -466,7 +517,8 @@ impl Store {
     /// Lookup the stripped Room for the given RoomId, or create one, if it
     /// didn't exist yet in the store
     pub async fn get_or_create_stripped_room(&self, room_id: &RoomId) -> Room {
-        let user_id = &self.session.get().expect("Creating room while not being logged in").user_id;
+        let user_id =
+            &self.session_meta.get().expect("Creating room while not being logged in").user_id;
 
         self.stripped_rooms
             .entry(room_id.to_owned())
@@ -481,7 +533,8 @@ impl Store {
             return self.get_or_create_stripped_room(room_id).await;
         }
 
-        let user_id = &self.session.get().expect("Creating room while not being logged in").user_id;
+        let user_id =
+            &self.session_meta.get().expect("Creating room while not being logged in").user_id;
 
         self.rooms
             .entry(room_id.to_owned())
@@ -494,7 +547,7 @@ impl Deref for Store {
     type Target = dyn StateStore;
 
     fn deref(&self) -> &Self::Target {
-        &*self.inner
+        self.inner.deref()
     }
 }
 
@@ -650,11 +703,11 @@ impl StateChanges {
 ///
 /// let store_config = StoreConfig::new();
 /// ```
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StoreConfig {
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) crypto_store: Option<Box<dyn CryptoStore>>,
-    pub(crate) state_store: Option<Box<dyn StateStore>>,
+    pub(crate) crypto_store: Option<Arc<dyn CryptoStore>>,
+    pub(crate) state_store: Option<Arc<dyn StateStore>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -675,14 +728,14 @@ impl StoreConfig {
     ///
     /// The crypto store must be opened before being set.
     #[cfg(feature = "e2e-encryption")]
-    pub fn crypto_store(mut self, store: Box<dyn CryptoStore>) -> Self {
-        self.crypto_store = Some(store);
+    pub fn crypto_store(mut self, store: impl IntoCryptoStore) -> Self {
+        self.crypto_store = Some(store.into_crypto_store());
         self
     }
 
     /// Set a custom implementation of a `StateStore`.
-    pub fn state_store(mut self, store: Box<dyn StateStore>) -> Self {
-        self.state_store = Some(store);
+    pub fn state_store(mut self, store: impl IntoStateStore) -> Self {
+        self.state_store = Some(store.into_state_store());
         self
     }
 }

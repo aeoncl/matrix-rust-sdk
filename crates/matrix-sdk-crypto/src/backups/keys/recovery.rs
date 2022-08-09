@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use std::{
-    convert::TryFrom,
     io::{Cursor, Read},
+    ops::DerefMut,
 };
 
 use bs58;
@@ -144,7 +144,7 @@ impl RecoveryKey {
         let mut expected_parity = [0u8; 1];
 
         decoded.read_exact(&mut prefix)?;
-        decoded.read_exact(&mut *key)?;
+        decoded.read_exact(key.deref_mut())?;
         decoded.read_exact(&mut expected_parity)?;
 
         let expected_parity = expected_parity[0];

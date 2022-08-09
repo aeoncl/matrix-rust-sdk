@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ruma::{signatures::CanonicalJsonError, IdParseError, OwnedDeviceId, OwnedRoomId, OwnedUserId};
+use ruma::{CanonicalJsonError, IdParseError, OwnedDeviceId, OwnedRoomId, OwnedUserId};
 use serde_json::Error as SerdeError;
 use thiserror::Error;
 
@@ -39,7 +39,7 @@ pub enum OlmError {
 
     /// The received room key couldn't be converted into a valid Megolm session.
     #[error(transparent)]
-    SessionCreation(#[from] vodozemac::megolm::SessionKeyDecodeError),
+    SessionCreation(#[from] SessionCreationError),
 
     /// The storage layer returned an error.
     #[error("failed to read or write to the crypto store {0}")]
@@ -135,7 +135,7 @@ pub enum EventError {
 
     #[error(
         "the room id of the room key doesn't match the room id of the \
-        decrypted event: expected {0}, got {:1}"
+        decrypted event: expected {0}, got {1:?}"
     )]
     MismatchedRoom(OwnedRoomId, Option<OwnedRoomId>),
 }
@@ -178,6 +178,10 @@ pub enum SignatureError {
     /// The public key isn't a valid ed25519 key.
     #[error(transparent)]
     InvalidKey(#[from] vodozemac::KeyError),
+
+    /// The signature could not be decoded.
+    #[error("the given signature is not valid and can't be decoded")]
+    InvalidSignature,
 
     /// The signed object couldn't be deserialized.
     #[error(transparent)]

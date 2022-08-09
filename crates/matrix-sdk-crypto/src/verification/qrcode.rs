@@ -134,7 +134,7 @@ impl QrVerification {
         self.identities.other_user_id()
     }
 
-    /// Get the device id of the other side.
+    /// Get the device ID of the other side.
     pub fn other_device_id(&self) -> &DeviceId {
         self.identities.other_device_id()
     }
@@ -291,10 +291,11 @@ impl QrVerification {
             OutgoingContent::Room(room_id, content) => {
                 RoomMessageRequest { room_id, txn_id: TransactionId::new(), content }.into()
             }
-            OutgoingContent::ToDevice(c) => ToDeviceRequest::new(
+            OutgoingContent::ToDevice(c) => ToDeviceRequest::with_id(
                 self.identities.other_user_id(),
                 self.identities.other_device_id().to_owned(),
                 c,
+                TransactionId::new(),
             )
             .into(),
         }
@@ -787,7 +788,7 @@ impl QrState<Reciprocated> {
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::TryFrom, sync::Arc};
+    use std::sync::Arc;
 
     use matrix_sdk_common::locks::Mutex;
     use matrix_sdk_qrcode::QrVerificationData;

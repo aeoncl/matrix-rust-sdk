@@ -37,6 +37,7 @@ use crate::{
 
 fn encode_key_info(info: &SecretInfo) -> String {
     match info {
+        #[allow(deprecated)]
         SecretInfo::KeyRequest(info) => {
             format!("{}{}{}{}", info.room_id, info.sender_key, info.algorithm, info.session_id)
         }
@@ -313,6 +314,7 @@ impl CryptoStore for MemoryStore {
 mod tests {
     use matrix_sdk_test::async_test;
     use ruma::room_id;
+    use vodozemac::Curve25519PublicKey;
 
     use crate::{
         identities::device::testing::get_device,
@@ -342,13 +344,15 @@ mod tests {
     async fn test_group_session_store() {
         let (account, _) = get_account_and_session().await;
         let room_id = room_id!("!test:localhost");
+        let curve_key = "Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw";
 
         let (outbound, _) = account.create_group_session_pair_with_defaults(room_id).await;
         let inbound = InboundGroupSession::new(
-            "test_key",
+            Curve25519PublicKey::from_base64(curve_key).unwrap(),
             "test_key",
             room_id,
-            outbound.session_key().await,
+            &outbound.session_key().await,
+            outbound.settings().algorithm.to_owned(),
             None,
         );
 
@@ -356,7 +360,7 @@ mod tests {
         store.save_inbound_group_sessions(vec![inbound.clone()]).await;
 
         let loaded_session = store
-            .get_inbound_group_session(room_id, "test_key", outbound.session_id())
+            .get_inbound_group_session(room_id, curve_key, outbound.session_id())
             .await
             .unwrap()
             .unwrap();
