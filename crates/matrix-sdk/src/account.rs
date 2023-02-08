@@ -34,7 +34,7 @@ use ruma::{
     assign,
     events::{
         room::MediaSource, AnyGlobalAccountDataEventContent, GlobalAccountDataEventContent,
-        GlobalAccountDataEventType, StaticEventContent, GlobalAccountDataEvent, direct::DirectEventContent,
+        GlobalAccountDataEventType, StaticEventContent, direct::DirectEventContent, GlobalAccountDataEvent,
     },
     serde::Raw,
     thirdparty::Medium,

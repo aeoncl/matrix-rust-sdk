@@ -62,7 +62,7 @@ use ruma::{
         MatrixVersion, OutgoingRequest, SendAccessToken,
     },
     assign, DeviceId, OwnedDeviceId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
-    RoomOrAliasId, ServerName, UInt, UserId, OwnedUserId, events::{room::member::{MembershipState, RoomMemberEventContent}, GlobalAccountDataEvent, GlobalAccountDataEventType, direct::DirectEventContent, SyncStateEvent},
+    RoomOrAliasId, ServerName, UInt, UserId, events::{GlobalAccountDataEvent, direct::DirectEventContent, GlobalAccountDataEventType, SyncStateEvent, room::member::{RoomMemberEventContent, MembershipState}},
 };
 use serde::de::DeserializeOwned;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1604,14 +1604,14 @@ impl Client {
         Ok(room::Joined::new(self, base_room).unwrap())
     }
 
-    pub async fn find_or_create_dm_room(&self, user_id: &OwnedUserId) -> Result<room::Joined>  {
+    pub async fn find_or_create_dm_room(&self, user_id: &UserId) -> Result<room::Joined>  {
         if let Some(found) = self.find_dm_room(user_id).await? {
             return Ok(found);
         }
-        return self.create_dm_room(user_id.clone()).await;
+        return self.create_dm_room(user_id.to_owned()).await;
     }
 
-    pub async fn find_dm_room(&self, user_id: &OwnedUserId) -> Result<Option<room::Joined>> {
+    pub async fn find_dm_room(&self, user_id: &UserId) -> Result<Option<room::Joined>> {
         let direct_event:  GlobalAccountDataEvent<DirectEventContent>;
         if let Some(directs) = self.store().get_account_data_event(GlobalAccountDataEventType::Direct).await? {
             direct_event = directs.deserialize_as()?;
