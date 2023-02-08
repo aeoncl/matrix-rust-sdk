@@ -19,21 +19,21 @@
 
 pub use matrix_sdk_common::*;
 
-#[cfg(feature = "experimental-timeline")]
-pub use crate::timeline_stream::TimelineStreamError;
 pub use crate::{
     error::{Error, Result},
     session::{Session, SessionMeta, SessionTokens},
 };
 
 mod client;
+pub mod deserialized_responses;
 mod error;
 pub mod media;
 mod rooms;
 mod session;
+#[cfg(feature = "experimental-sliding-sync")]
+mod sliding_sync;
 pub mod store;
-#[cfg(feature = "experimental-timeline")]
-mod timeline_stream;
+pub mod sync;
 mod utils;
 
 pub use client::BaseClient;
@@ -47,3 +47,13 @@ pub use store::{StateChanges, StateStore, StoreError};
 pub use utils::{
     MinimalRoomMemberEvent, MinimalStateEvent, OriginalMinimalStateEvent, RedactedMinimalStateEvent,
 };
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[ctor::ctor]
+fn init_logging() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .init();
+}

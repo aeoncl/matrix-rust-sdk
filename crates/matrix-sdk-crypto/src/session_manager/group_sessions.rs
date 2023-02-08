@@ -68,7 +68,7 @@ impl GroupSessionCache {
         // and put it in the cache.
         if let Some(s) = self.sessions.get(room_id) {
             Ok(Some(s.clone()))
-        } else if let Some(s) = self.store.get_outbound_group_sessions(room_id).await? {
+        } else if let Some(s) = self.store.get_outbound_group_session(room_id).await? {
             for request_id in s.pending_request_ids() {
                 self.sessions_being_shared.insert(request_id, s.clone());
             }
@@ -365,8 +365,16 @@ impl GroupSessionManager {
 
         for user_id in users {
             let user_devices = self.store.get_user_devices_filtered(user_id).await?;
-            let non_blacklisted_devices: Vec<Device> =
-                user_devices.devices().filter(|d| !d.is_blacklisted()).collect();
+            let non_blacklisted_devices: Vec<Device> = user_devices
+                .devices()
+                .filter(|d| {
+                    if settings.only_allow_trusted_devices {
+                        !d.is_blacklisted() && d.is_verified()
+                    } else {
+                        !d.is_blacklisted()
+                    }
+                })
+                .collect();
 
             // If we haven't already concluded that the session should be
             // rotated for other reasons, we also need to check whether any
@@ -625,11 +633,11 @@ mod tests {
         },
         device_id,
         events::room::history_visibility::HistoryVisibility,
-        room_id, user_id, DeviceId, EventEncryptionAlgorithm, TransactionId, UserId,
+        room_id, user_id, DeviceId, TransactionId, UserId,
     };
     use serde_json::{json, Value};
 
-    use crate::{EncryptionSettings, OlmMachine};
+    use crate::{types::EventEncryptionAlgorithm, EncryptionSettings, LocalTrust, OlmMachine};
 
     fn alice_id() -> &'static UserId {
         user_id!("@alice:example.org")
@@ -866,10 +874,37 @@ mod tests {
             .await
             .expect("We should be able to collect the session recipients");
 
-        assert!(!recipients.is_empty());
+        assert!(!recipients[user_id].is_empty());
 
         // Make sure that our own device isn't part of the recipients.
         assert!(!recipients[user_id]
+            .iter()
+            .any(|d| d.user_id() == user_id && d.device_id() == device_id));
+
+        let settings =
+            EncryptionSettings { only_allow_trusted_devices: true, ..Default::default() };
+        let users = [user_id].into_iter();
+
+        let (_, recipients) = machine
+            .group_session_manager
+            .collect_session_recipients(users, &settings, &outbound)
+            .await
+            .expect("We should be able to collect the session recipients");
+
+        assert!(recipients[user_id].is_empty());
+
+        let device_id = "AFGUOBTZWM".into();
+        let device = machine.get_device(user_id, device_id, None).await.unwrap().unwrap();
+        device.set_local_trust(LocalTrust::Verified).await.unwrap();
+        let users = [user_id].into_iter();
+
+        let (_, recipients) = machine
+            .group_session_manager
+            .collect_session_recipients(users, &settings, &outbound)
+            .await
+            .expect("We should be able to collect the session recipients");
+
+        assert!(recipients[user_id]
             .iter()
             .any(|d| d.user_id() == user_id && d.device_id() == device_id));
     }

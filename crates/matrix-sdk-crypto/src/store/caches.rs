@@ -70,8 +70,7 @@ impl SessionStore {
 #[derive(Debug, Default, Clone)]
 /// In-memory store that holds inbound group sessions.
 pub struct GroupSessionStore {
-    #[allow(clippy::type_complexity)]
-    entries: Arc<DashMap<OwnedRoomId, HashMap<String, HashMap<String, InboundGroupSession>>>>,
+    entries: Arc<DashMap<OwnedRoomId, HashMap<String, InboundGroupSession>>>,
 }
 
 impl GroupSessionStore {
@@ -88,8 +87,6 @@ impl GroupSessionStore {
         self.entries
             .entry((*session.room_id).to_owned())
             .or_default()
-            .entry(session.sender_key.to_base64())
-            .or_default()
             .insert(session.session_id().to_owned(), session)
             .is_none()
     }
@@ -98,18 +95,13 @@ impl GroupSessionStore {
     pub fn get_all(&self) -> Vec<InboundGroupSession> {
         self.entries
             .iter()
-            .flat_map(|d| {
-                d.value()
-                    .values()
-                    .flat_map(|t| t.values().cloned().collect::<Vec<InboundGroupSession>>())
-                    .collect::<Vec<InboundGroupSession>>()
-            })
+            .flat_map(|keys| keys.values().cloned().collect::<Vec<InboundGroupSession>>())
             .collect()
     }
 
     /// Get the number of `InboundGroupSession`s we have.
     pub fn count(&self) -> usize {
-        self.entries.iter().map(|d| d.value().values().map(|t| t.len()).sum::<usize>()).sum()
+        self.entries.iter().map(|d| d.value().len()).sum()
     }
 
     /// Get a inbound group session from our store.
@@ -117,18 +109,9 @@ impl GroupSessionStore {
     /// # Arguments
     /// * `room_id` - The room id of the room that the session belongs to.
     ///
-    /// * `sender_key` - The sender key that sent us the session.
-    ///
     /// * `session_id` - The unique id of the session.
-    pub fn get(
-        &self,
-        room_id: &RoomId,
-        sender_key: &str,
-        session_id: &str,
-    ) -> Option<InboundGroupSession> {
-        self.entries
-            .get(room_id)
-            .and_then(|m| m.get(sender_key).and_then(|m| m.get(session_id).cloned()))
+    pub fn get(&self, room_id: &RoomId, session_id: &str) -> Option<InboundGroupSession> {
+        self.entries.get(room_id)?.get(session_id).cloned()
     }
 }
 
@@ -184,7 +167,7 @@ impl DeviceStore {
 mod tests {
     use matrix_sdk_test::async_test;
     use ruma::room_id;
-    use vodozemac::Curve25519PublicKey;
+    use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
     use crate::{
         identities::device::testing::get_device,
@@ -239,17 +222,18 @@ mod tests {
 
         let inbound = InboundGroupSession::new(
             Curve25519PublicKey::from_base64(curve_key).unwrap(),
-            "test_key",
+            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
             room_id,
             &outbound.session_key().await,
             outbound.settings().algorithm.to_owned(),
             None,
-        );
+        )
+        .unwrap();
 
         let store = GroupSessionStore::new();
         store.add(inbound.clone());
 
-        let loaded_session = store.get(room_id, curve_key, outbound.session_id()).unwrap();
+        let loaded_session = store.get(room_id, outbound.session_id()).unwrap();
         assert_eq!(inbound, loaded_session);
     }
 

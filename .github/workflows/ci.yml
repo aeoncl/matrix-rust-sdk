@@ -16,17 +16,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-
-  cancel-others:
+  xtask:
     runs-on: ubuntu-latest
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.9.1
+      - name: Checkout repo
+        uses: actions/checkout@v2
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
         with:
-          access_token: ${{ github.token }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check xtask cache
+        uses: actions/cache@v3
+        id: xtask-cache
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
+
+      - name: Install rust stable toolchain
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Build
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: -p xtask
 
   test-matrix-sdk-features:
     name: 🐧 [m], ${{ matrix.name }}
+    needs: xtask
     if: github.event_name == 'push' || !github.event.pull_request.draft
 
     runs-on: ubuntu-latest
@@ -60,6 +85,12 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
+
       - name: Test
         uses: actions-rs/cargo@v1
         with:
@@ -68,59 +99,73 @@ jobs:
 
   test-matrix-sdk-examples:
     name: 🐧 [m]-examples
+    needs: xtask
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
-    - name: Checkout the repo
-      uses: actions/checkout@v3
+      - name: Checkout the repo
+        uses: actions/checkout@v3
 
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        override: true
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
 
-    - name: Load cache
-      uses: Swatinem/rust-cache@v1
+      - name: Load cache
+        uses: Swatinem/rust-cache@v1
 
-    - name: Install nextest
-      uses: taiki-e/install-action@nextest
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
 
-    - name: Test
-      uses: actions-rs/cargo@v1
-      with:
-        command: run
-        args: -p xtask -- ci examples
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
+
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: -p xtask -- ci examples
 
   test-matrix-sdk-crypto:
     name: 🐧 [m]-crypto
+    needs: xtask
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
-    - name: Checkout the repo
-      uses: actions/checkout@v3
+      - name: Checkout the repo
+        uses: actions/checkout@v3
 
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        profile: minimal
-        override: true
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
 
-    - name: Load cache
-      uses: Swatinem/rust-cache@v1
+      - name: Load cache
+        uses: Swatinem/rust-cache@v1
 
-    - name: Install nextest
-      uses: taiki-e/install-action@nextest
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
 
-    - name: Test
-      uses: actions-rs/cargo@v1
-      with:
-        command: run
-        args: -p xtask -- ci test-crypto
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
+
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: -p xtask -- ci test-crypto
 
   test-all-crates:
     name: ${{ matrix.name }}
@@ -147,6 +192,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v1
 
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -164,7 +214,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: nextest
-          args: run --workspace --exclude matrix-sdk-integration-testing
+          args: run --workspace --exclude matrix-sdk-integration-testing --exclude sliding-sync-integration-test
 
       - name: Test documentation
         uses: actions-rs/cargo@v1
@@ -174,6 +224,7 @@ jobs:
 
   test-wasm:
     name: 🕸️ ${{ matrix.name }}
+    needs: xtask
     if: github.event_name == 'push' || !github.event.pull_request.draft
 
     runs-on: ubuntu-latest
@@ -223,15 +274,21 @@ jobs:
           override: true
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.3.0
+        uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.10.3
 
       - name: Load cache
         uses: Swatinem/rust-cache@v1
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Rust Check
         uses: actions-rs/cargo@v1
@@ -244,6 +301,124 @@ jobs:
         with:
           command: run
           args: -p xtask -- ci wasm-pack ${{ matrix.cmd }}
+
+  test-appservice:
+    name: ${{ matrix.os-name }} [m]-appservice
+    needs: xtask
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os-name: 🐧
+
+          - os: macos-latest
+            os-name: 🍏
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v1
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Load cache
+        uses: Swatinem/rust-cache@v1
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
+
+      - name: Run checks
+        uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: -p xtask -- ci test-appservice
+
+  formatting:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          components: rustfmt
+          profile: minimal
+          override: true
+
+      - name: Cargo fmt
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: -- --check
+
+  typos:
+    name: Spell Check with Typos
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+
+    steps:
+      - name: Checkout Actions Repository
+        uses: actions/checkout@v3
+
+      - name: Check the spelling of the files in our repo
+        uses: crate-ci/typos@v1.13.0
+
+  clippy:
+    name: Run clippy
+    needs: xtask
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@v3
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          components: clippy
+          profile: minimal
+          override: true
+
+      - name: Load cache
+        uses: Swatinem/rust-cache@v1
+
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-${{ hashFiles('xtask/**') }}
+
+      - name: Clippy
+        uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: -p xtask -- ci clippy
 
   integration-tests:
     name: Integration test
@@ -272,15 +447,86 @@ jobs:
         with:
           python-version: 3.8
 
-      - uses: gnunicorn/setup-matrix-synapse@main
+      - uses: michaelkaye/setup-matrix-synapse@main
         with:
           uploadLogs: true
           httpPort: 8228
           disableRateLimiting: true
-          serverName: "matrix-sdk.rs"
 
       - name: Test
         uses: actions-rs/cargo@v1
         with:
           command: nextest
           args: run -p matrix-sdk-integration-testing
+
+
+  sliding-sync-integration-tests:
+    name: Sliding Sync Integration test
+    # disabled until we can figure out the weird docker-not-starting-situation
+    if: false
+    # if: github.event_name == 'push' || !github.event.pull_request.draft
+
+    runs-on: ubuntu-latest
+    # Service containers to run with `runner-job`
+    services:
+      # Label used to access the service container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        # Provide the password for postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: syncv3
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps tcp port 5432 on service container to the host
+          - 5432:5432
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Load cache
+        uses: Swatinem/rust-cache@v1
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: 3.8
+
+      # local synapse
+      - uses: michaelkaye/setup-matrix-synapse@main
+        with:
+          uploadLogs: true
+          httpPort: 8228
+          disableRateLimiting: true
+
+      # latest sliding sync proxy
+
+      - uses: addnab/docker-run-action@v3
+        with:
+          registry: gcr.io
+          image: "matrix-org/sliding-sync:v0.98.0"
+          docker_network: "host"
+          options: '-e "SYNCV3_SERVER=http://locahost:8228" -e "SYNCV3_SECRET=SUPER_CI_SECRET" -e "SYNCV3_BINDADDR=:8118" -e "SYNCV3_DB=user=postgres password=postgres dbname=syncv3 sslmode=disable host=postgres" -p 8118:8118'
+
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: nextest
+          args: run -p sliding-sync-integration-tests

@@ -1,7 +1,28 @@
 use ruma::{
+    assign,
     events::{
-        room::member::{MembershipState, RoomMemberEventContent},
-        RedactContent, RedactedEventContent, StateEventContent, StrippedStateEvent, SyncStateEvent,
+        room::{
+            avatar::{RoomAvatarEventContent, StrippedRoomAvatarEvent},
+            canonical_alias::{RoomCanonicalAliasEventContent, StrippedRoomCanonicalAliasEvent},
+            create::{RoomCreateEventContent, StrippedRoomCreateEvent},
+            guest_access::{
+                RedactedRoomGuestAccessEventContent, RoomGuestAccessEventContent,
+                StrippedRoomGuestAccessEvent,
+            },
+            history_visibility::{
+                RoomHistoryVisibilityEventContent, StrippedRoomHistoryVisibilityEvent,
+            },
+            join_rules::{RoomJoinRulesEventContent, StrippedRoomJoinRulesEvent},
+            member::{MembershipState, RoomMemberEventContent},
+            name::{RoomNameEventContent, StrippedRoomNameEvent},
+            tombstone::{
+                RedactedRoomTombstoneEventContent, RoomTombstoneEventContent,
+                StrippedRoomTombstoneEvent,
+            },
+            topic::{RedactedRoomTopicEventContent, RoomTopicEventContent, StrippedRoomTopicEvent},
+        },
+        RedactContent, RedactedStateEventContent, StateEventContent, StaticStateEventContent,
+        SyncStateEvent,
     },
     EventId, OwnedEventId, RoomVersionId,
 };
@@ -20,9 +41,13 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// event ID. The event ID is optional so this type can also hold events from
 /// invited rooms, where event IDs are not available.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(bound(
+    serialize = "C: Serialize, C::Redacted: Serialize",
+    deserialize = "C: DeserializeOwned, C::Redacted: DeserializeOwned"
+))]
 pub enum MinimalStateEvent<C: StateEventContent + RedactContent>
 where
-    C::Redacted: StateEventContent + RedactedEventContent + DeserializeOwned,
+    C::Redacted: RedactedStateEventContent,
 {
     /// An unredacted event.
     Original(OriginalMinimalStateEvent<C>),
@@ -50,7 +75,7 @@ where
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RedactedMinimalStateEvent<C>
 where
-    C: StateEventContent + RedactedEventContent,
+    C: RedactedStateEventContent,
 {
     /// The event's content.
     pub content: C,
@@ -61,7 +86,7 @@ where
 impl<C> MinimalStateEvent<C>
 where
     C: StateEventContent + RedactContent,
-    C::Redacted: StateEventContent + RedactedEventContent + DeserializeOwned,
+    C::Redacted: RedactedStateEventContent,
 {
     /// Get the inner event's ID.
     pub fn event_id(&self) -> Option<&EventId> {
@@ -118,10 +143,29 @@ impl MinimalRoomMemberEvent {
     }
 }
 
+impl<C> From<SyncStateEvent<C>> for MinimalStateEvent<C>
+where
+    C: StaticStateEventContent + RedactContent,
+    C::Redacted: RedactedStateEventContent,
+{
+    fn from(ev: SyncStateEvent<C>) -> Self {
+        match ev {
+            SyncStateEvent::Original(ev) => Self::Original(OriginalMinimalStateEvent {
+                content: ev.content,
+                event_id: Some(ev.event_id),
+            }),
+            SyncStateEvent::Redacted(ev) => Self::Redacted(RedactedMinimalStateEvent {
+                content: ev.content,
+                event_id: Some(ev.event_id),
+            }),
+        }
+    }
+}
+
 impl<C> From<&SyncStateEvent<C>> for MinimalStateEvent<C>
 where
-    C: Clone + StateEventContent + RedactContent,
-    C::Redacted: Clone + StateEventContent + RedactedEventContent + DeserializeOwned,
+    C: Clone + StaticStateEventContent + RedactContent,
+    C::Redacted: Clone + RedactedStateEventContent,
 {
     fn from(ev: &SyncStateEvent<C>) -> Self {
         match ev {
@@ -137,12 +181,106 @@ where
     }
 }
 
-impl<C> From<&StrippedStateEvent<C>> for MinimalStateEvent<C>
-where
-    C: Clone + StateEventContent + RedactContent,
-    C::Redacted: StateEventContent + RedactedEventContent + DeserializeOwned,
+impl From<&StrippedRoomAvatarEvent> for MinimalStateEvent<RoomAvatarEventContent> {
+    fn from(event: &StrippedRoomAvatarEvent) -> Self {
+        let content = assign!(RoomAvatarEventContent::new(), {
+            info: event.content.info.clone(),
+            url: event.content.url.clone(),
+        });
+        // event might actually be redacted, there is no way to tell for
+        // stripped state events.
+        Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+    }
+}
+
+impl From<&StrippedRoomNameEvent> for MinimalStateEvent<RoomNameEventContent> {
+    fn from(event: &StrippedRoomNameEvent) -> Self {
+        let content = RoomNameEventContent::new(event.content.name.clone());
+        Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+    }
+}
+
+impl From<&StrippedRoomCreateEvent> for MinimalStateEvent<RoomCreateEventContent> {
+    fn from(event: &StrippedRoomCreateEvent) -> Self {
+        let content = assign!(RoomCreateEventContent::new(event.content.creator.clone()), {
+            federate: event.content.federate,
+            room_version: event.content.room_version.clone(),
+            predecessor: event.content.predecessor.clone(),
+            room_type: event.content.room_type.clone(),
+        });
+        Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+    }
+}
+
+impl From<&StrippedRoomHistoryVisibilityEvent>
+    for MinimalStateEvent<RoomHistoryVisibilityEventContent>
 {
-    fn from(ev: &StrippedStateEvent<C>) -> Self {
-        Self::Original(OriginalMinimalStateEvent { content: ev.content.clone(), event_id: None })
+    fn from(event: &StrippedRoomHistoryVisibilityEvent) -> Self {
+        let content =
+            RoomHistoryVisibilityEventContent::new(event.content.history_visibility.clone());
+        Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+    }
+}
+
+impl From<&StrippedRoomGuestAccessEvent> for MinimalStateEvent<RoomGuestAccessEventContent> {
+    fn from(event: &StrippedRoomGuestAccessEvent) -> Self {
+        match &event.content.guest_access {
+            Some(guest_access) => {
+                let content = RoomGuestAccessEventContent::new(guest_access.clone());
+                Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+            }
+            None => {
+                let content = RedactedRoomGuestAccessEventContent::new();
+                Self::Redacted(RedactedMinimalStateEvent { content, event_id: None })
+            }
+        }
+    }
+}
+
+impl From<&StrippedRoomJoinRulesEvent> for MinimalStateEvent<RoomJoinRulesEventContent> {
+    fn from(event: &StrippedRoomJoinRulesEvent) -> Self {
+        let content = RoomJoinRulesEventContent::new(event.content.join_rule.clone());
+        Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+    }
+}
+
+impl From<&StrippedRoomCanonicalAliasEvent> for MinimalStateEvent<RoomCanonicalAliasEventContent> {
+    fn from(event: &StrippedRoomCanonicalAliasEvent) -> Self {
+        let content = assign!(RoomCanonicalAliasEventContent::new(), {
+            alias: event.content.alias.clone(),
+            alt_aliases: event.content.alt_aliases.clone(),
+        });
+        Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+    }
+}
+
+impl From<&StrippedRoomTopicEvent> for MinimalStateEvent<RoomTopicEventContent> {
+    fn from(event: &StrippedRoomTopicEvent) -> Self {
+        match &event.content.topic {
+            Some(topic) => {
+                let content = RoomTopicEventContent::new(topic.clone());
+                Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+            }
+            None => {
+                let content = RedactedRoomTopicEventContent::new();
+                Self::Redacted(RedactedMinimalStateEvent { content, event_id: None })
+            }
+        }
+    }
+}
+
+impl From<&StrippedRoomTombstoneEvent> for MinimalStateEvent<RoomTombstoneEventContent> {
+    fn from(event: &StrippedRoomTombstoneEvent) -> Self {
+        match (&event.content.body, &event.content.replacement_room) {
+            (Some(body), Some(replacement_room)) => {
+                let content =
+                    RoomTombstoneEventContent::new(body.clone(), replacement_room.clone());
+                Self::Original(OriginalMinimalStateEvent { content, event_id: None })
+            }
+            _ => {
+                let content = RedactedRoomTombstoneEventContent::new();
+                Self::Redacted(RedactedMinimalStateEvent { content, event_id: None })
+            }
+        }
     }
 }

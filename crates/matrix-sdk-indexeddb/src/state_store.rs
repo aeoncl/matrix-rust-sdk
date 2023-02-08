@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -23,26 +23,18 @@ use std::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use derive_builder::Builder;
-#[cfg(feature = "experimental-timeline")]
-use futures_util::stream;
+use gloo_utils::format::JsValueSerdeExt;
 use indexed_db_futures::prelude::*;
 use js_sys::Date as JsDate;
 use matrix_sdk_base::{
-    deserialized_responses::MemberEvent,
+    deserialized_responses::RawMemberEvent,
     media::{MediaRequest, UniqueKey},
     store::{Result as StoreResult, StateChanges, StateStore, StoreError},
     MinimalStateEvent, RoomInfo,
 };
-#[cfg(feature = "experimental-timeline")]
-use matrix_sdk_base::{deserialized_responses::SyncRoomEvent, store::BoxStream};
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
-#[cfg(feature = "experimental-timeline")]
 use ruma::{
-    canonical_json::redact_in_place,
-    events::{room::redaction::SyncRoomRedactionEvent, AnySyncMessageLikeEvent, AnySyncRoomEvent},
-    CanonicalJsonObject, RoomVersionId,
-};
-use ruma::{
+    canonical_json::redact,
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptType},
@@ -51,11 +43,10 @@ use ruma::{
         GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, UserId,
+    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-#[cfg(feature = "experimental-timeline")]
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use wasm_bindgen::JsValue;
 use web_sys::IdbKeyRange;
 
@@ -108,17 +99,7 @@ impl From<IndexeddbStateStoreError> for StoreError {
         match e {
             IndexeddbStateStoreError::Json(e) => StoreError::Json(e),
             IndexeddbStateStoreError::StoreError(e) => e,
-            IndexeddbStateStoreError::Encryption(e) => match e {
-                EncryptionError::Random(e) => StoreError::Encryption(e.to_string()),
-                EncryptionError::Serialization(e) => StoreError::Json(e),
-                EncryptionError::Encryption(e) => StoreError::Encryption(e.to_string()),
-                EncryptionError::Version(found, expected) => StoreError::Encryption(format!(
-                    "Bad Database Encryption Version: expected {expected}, found {found}",
-                )),
-                EncryptionError::Length(found, expected) => StoreError::Encryption(format!(
-                    "The database key an invalid length: expected {expected}, found {found}",
-                )),
-            },
+            IndexeddbStateStoreError::Encryption(e) => StoreError::Encryption(e),
             _ => StoreError::backend(e),
         }
     }
@@ -157,13 +138,6 @@ mod KEYS {
     pub const ROOM_USER_RECEIPTS: &str = "room_user_receipts";
     pub const ROOM_EVENT_RECEIPTS: &str = "room_event_receipts";
 
-    #[cfg(feature = "experimental-timeline")]
-    pub const ROOM_TIMELINE: &str = "room_timeline";
-    #[cfg(feature = "experimental-timeline")]
-    pub const ROOM_TIMELINE_METADATA: &str = "room_timeline_metadata";
-    #[cfg(feature = "experimental-timeline")]
-    pub const ROOM_EVENT_ID_TO_POSITION: &str = "room_event_id_to_position";
-
     pub const MEDIA: &str = "media";
 
     pub const CUSTOM: &str = "custom";
@@ -193,12 +167,6 @@ mod KEYS {
         MEDIA,
         CUSTOM,
         SYNC_TOKEN,
-        #[cfg(feature = "experimental-timeline")]
-        ROOM_TIMELINE,
-        #[cfg(feature = "experimental-timeline")]
-        ROOM_TIMELINE_METADATA,
-        #[cfg(feature = "experimental-timeline")]
-        ROOM_EVENT_ID_TO_POSITION,
     ];
 
     // static keys
@@ -225,7 +193,7 @@ fn create_stores(db: &IdbDatabase) -> Result<(), JsValue> {
 
 async fn backup(source: &IdbDatabase, meta: &IdbDatabase) -> Result<()> {
     let now = JsDate::now();
-    let backup_name = format!("backup-{}-{}", source.name(), now);
+    let backup_name = format!("backup-{}-{now}", source.name());
 
     let mut db_req: OpenDbRequest = IdbDatabase::open_f64(&backup_name, source.version())?;
     db_req.set_on_upgrade_needed(Some(move |evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
@@ -291,7 +259,7 @@ impl IndexeddbStateStoreBuilder {
             .unwrap_or(MigrationConflictStrategy::BackupAndDrop);
         let name = self.name.clone().unwrap_or_else(|| "state".to_owned());
 
-        let meta_name = format!("{}::{}", name, KEYS::INTERNAL_STATE);
+        let meta_name = format!("{name}::{}", KEYS::INTERNAL_STATE);
 
         let mut db_req: OpenDbRequest =
             IdbDatabase::open_f64(&meta_name, KEYS::CURRENT_META_DB_VERSION)?;
@@ -326,9 +294,13 @@ impl IndexeddbStateStoreBuilder {
                 StoreCipher::import(passphrase, &inner)?
             } else {
                 let cipher = StoreCipher::new()?;
+                #[cfg(not(test))]
+                let export = cipher.export(passphrase)?;
+                #[cfg(test)]
+                let export = cipher._insecure_export_fast_for_testing(passphrase)?;
                 ob.put_key_val(
                     &JsValue::from_str(KEYS::STORE_KEY),
-                    &JsValue::from_serde(&StoreKeyWrapper(cipher.export(passphrase)?))?,
+                    &JsValue::from_serde(&StoreKeyWrapper(export))?,
                 )?;
                 cipher
             };
@@ -448,31 +420,6 @@ impl IndexeddbStateStore {
             .and_then(|c| c.value().as_string()))
     }
 
-    #[allow(dead_code)]
-    #[deprecated(note = "Use IndexeddbStateStoreBuilder instead.")]
-    pub async fn open() -> StoreResult<Self> {
-        IndexeddbStateStore::builder()
-            .name("state".to_owned())
-            .build()
-            .await
-            .map_err(StoreError::backend)
-    }
-
-    #[deprecated(note = "Use IndexeddbStateStoreBuilder instead.")]
-    pub async fn open_with_passphrase(name: String, passphrase: &str) -> StoreResult<Self> {
-        IndexeddbStateStore::builder()
-            .name(name)
-            .passphrase(passphrase.to_owned())
-            .build()
-            .await
-            .map_err(StoreError::backend)
-    }
-
-    #[deprecated(note = "Use IndexeddbStateStoreBuilder instead.")]
-    pub async fn open_with_name(name: String) -> StoreResult<Self> {
-        IndexeddbStateStore::builder().name(name).build().await.map_err(StoreError::backend)
-    }
-
     fn serialize_event(&self, event: &impl Serialize) -> Result<JsValue> {
         Ok(match &self.store_cipher {
             Some(cipher) => JsValue::from_serde(&cipher.encrypt_value_typed(event)?)?,
@@ -506,17 +453,6 @@ impl IndexeddbStateStore {
             None => key.encode_to_range(),
         }
         .map_err(|e| IndexeddbStateStoreError::StoreError(StoreError::Backend(anyhow!(e).into())))
-    }
-
-    #[cfg(feature = "experimental-timeline")]
-    fn encode_key_with_counter<T>(&self, table_name: &str, key: &T, i: usize) -> JsValue
-    where
-        T: SafeEncode,
-    {
-        match &self.store_cipher {
-            Some(cipher) => key.encode_with_counter_secure(table_name, cipher, i),
-            None => key.encode_with_counter(i),
-        }
     }
 
     pub async fn save_filter(&self, filter_name: &str, filter_id: &str) -> Result<()> {
@@ -557,26 +493,32 @@ impl IndexeddbStateStore {
     }
 
     pub async fn save_changes(&self, changes: &StateChanges) -> Result<()> {
-        let mut stores: Vec<&'static str> = [
+        let mut stores: HashSet<&'static str> = [
             (changes.sync_token.is_some(), KEYS::SYNC_TOKEN),
             (changes.session.is_some(), KEYS::SESSION),
             (!changes.ambiguity_maps.is_empty(), KEYS::DISPLAY_NAMES),
             (!changes.account_data.is_empty(), KEYS::ACCOUNT_DATA),
             (!changes.presence.is_empty(), KEYS::PRESENCE),
             (!changes.profiles.is_empty(), KEYS::PROFILES),
-            (!changes.state.is_empty(), KEYS::ROOM_STATE),
             (!changes.room_account_data.is_empty(), KEYS::ROOM_ACCOUNT_DATA),
-            #[cfg(feature = "experimental-timeline")]
-            (!changes.room_infos.is_empty() || !changes.timeline.is_empty(), KEYS::ROOM_INFOS),
-            #[cfg(not(feature = "experimental-timeline"))]
-            (!changes.room_infos.is_empty(), KEYS::ROOM_INFOS),
             (!changes.receipts.is_empty(), KEYS::ROOM_EVENT_RECEIPTS),
             (!changes.stripped_state.is_empty(), KEYS::STRIPPED_ROOM_STATE),
-            (!changes.stripped_room_infos.is_empty(), KEYS::STRIPPED_ROOM_INFOS),
         ]
         .iter()
         .filter_map(|(id, key)| if *id { Some(*key) } else { None })
         .collect();
+
+        if !changes.state.is_empty() {
+            stores.extend([KEYS::ROOM_STATE, KEYS::STRIPPED_ROOM_STATE]);
+        }
+
+        if !changes.redactions.is_empty() {
+            stores.extend([KEYS::ROOM_STATE, KEYS::ROOM_INFOS]);
+        }
+
+        if !changes.room_infos.is_empty() || !changes.stripped_room_infos.is_empty() {
+            stores.extend([KEYS::ROOM_INFOS, KEYS::STRIPPED_ROOM_INFOS]);
+        }
 
         if !changes.members.is_empty() {
             stores.extend([
@@ -584,6 +526,9 @@ impl IndexeddbStateStore {
                 KEYS::MEMBERS,
                 KEYS::INVITED_USER_IDS,
                 KEYS::JOINED_USER_IDS,
+                KEYS::STRIPPED_MEMBERS,
+                KEYS::STRIPPED_INVITED_USER_IDS,
+                KEYS::STRIPPED_JOINED_USER_IDS,
             ])
         }
 
@@ -599,20 +544,12 @@ impl IndexeddbStateStore {
             stores.extend([KEYS::ROOM_EVENT_RECEIPTS, KEYS::ROOM_USER_RECEIPTS])
         }
 
-        #[cfg(feature = "experimental-timeline")]
-        if !changes.timeline.is_empty() {
-            stores.extend([
-                KEYS::ROOM_TIMELINE,
-                KEYS::ROOM_TIMELINE_METADATA,
-                KEYS::ROOM_EVENT_ID_TO_POSITION,
-            ])
-        }
-
         if stores.is_empty() {
             // nothing to do, quit early
             return Ok(());
         }
 
+        let stores: Vec<&'static str> = stores.into_iter().collect();
         let tx =
             self.inner.transaction_on_multi_with_mode(&stores, IdbTransactionMode::Readwrite)?;
 
@@ -653,24 +590,28 @@ impl IndexeddbStateStore {
         }
 
         if !changes.state.is_empty() {
-            let store = tx.object_store(KEYS::ROOM_STATE)?;
+            let state = tx.object_store(KEYS::ROOM_STATE)?;
+            let stripped_state = tx.object_store(KEYS::STRIPPED_ROOM_STATE)?;
             for (room, event_types) in &changes.state {
                 for (event_type, events) in event_types {
                     for (state_key, event) in events {
                         let key = self.encode_key(KEYS::ROOM_STATE, (room, event_type, state_key));
-                        store.put_key_val(&key, &self.serialize_event(&event)?)?;
+                        state.put_key_val(&key, &self.serialize_event(&event)?)?;
+                        stripped_state.delete(&key)?;
                     }
                 }
             }
         }
 
         if !changes.room_infos.is_empty() {
-            let store = tx.object_store(KEYS::ROOM_INFOS)?;
+            let room_infos = tx.object_store(KEYS::ROOM_INFOS)?;
+            let stripped_room_infos = tx.object_store(KEYS::STRIPPED_ROOM_INFOS)?;
             for (room_id, room_info) in &changes.room_infos {
-                store.put_key_val(
+                room_infos.put_key_val(
                     &self.encode_key(KEYS::ROOM_INFOS, room_id),
                     &self.serialize_event(&room_info)?,
                 )?;
+                stripped_room_infos.delete(&self.encode_key(KEYS::STRIPPED_ROOM_INFOS, room_id))?;
             }
         }
 
@@ -685,12 +626,14 @@ impl IndexeddbStateStore {
         }
 
         if !changes.stripped_room_infos.is_empty() {
-            let store = tx.object_store(KEYS::STRIPPED_ROOM_INFOS)?;
+            let stripped_room_infos = tx.object_store(KEYS::STRIPPED_ROOM_INFOS)?;
+            let room_infos = tx.object_store(KEYS::ROOM_INFOS)?;
             for (room_id, info) in &changes.stripped_room_infos {
-                store.put_key_val(
+                stripped_room_infos.put_key_val(
                     &self.encode_key(KEYS::STRIPPED_ROOM_INFOS, room_id),
                     &self.serialize_event(&info)?,
                 )?;
+                room_infos.delete(&self.encode_key(KEYS::ROOM_INFOS, room_id))?;
             }
         }
 
@@ -698,8 +641,18 @@ impl IndexeddbStateStore {
             let store = tx.object_store(KEYS::STRIPPED_MEMBERS)?;
             let joined = tx.object_store(KEYS::STRIPPED_JOINED_USER_IDS)?;
             let invited = tx.object_store(KEYS::STRIPPED_INVITED_USER_IDS)?;
-            for (room, events) in &changes.stripped_members {
-                for event in events.values() {
+            for (room, raw_events) in &changes.stripped_members {
+                for raw_event in raw_events.values() {
+                    let event = match raw_event.deserialize() {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            let event_id: Option<String> =
+                                raw_event.get_field("event_id").ok().flatten();
+                            debug!(event_id, "Failed to deserialize stripped member event: {e}");
+                            continue;
+                        }
+                    };
+
                     let key = (room, &event.state_key);
 
                     match event.content.membership {
@@ -726,7 +679,7 @@ impl IndexeddbStateStore {
                     }
                     store.put_key_val(
                         &self.encode_key(KEYS::STRIPPED_MEMBERS, key),
-                        &self.serialize_event(&event)?,
+                        &self.serialize_event(&raw_event)?,
                     )?;
                 }
             }
@@ -746,16 +699,34 @@ impl IndexeddbStateStore {
         }
 
         if !changes.members.is_empty() {
-            let profiles_store = tx.object_store(KEYS::PROFILES)?;
+            let profiles = tx.object_store(KEYS::PROFILES)?;
             let joined = tx.object_store(KEYS::JOINED_USER_IDS)?;
             let invited = tx.object_store(KEYS::INVITED_USER_IDS)?;
             let members = tx.object_store(KEYS::MEMBERS)?;
+            let stripped_members = tx.object_store(KEYS::STRIPPED_MEMBERS)?;
+            let stripped_joined = tx.object_store(KEYS::STRIPPED_JOINED_USER_IDS)?;
+            let stripped_invited = tx.object_store(KEYS::STRIPPED_INVITED_USER_IDS)?;
 
-            for (room, events) in &changes.members {
+            for (room, raw_events) in &changes.members {
                 let profile_changes = changes.profiles.get(room);
 
-                for event in events.values() {
+                for raw_event in raw_events.values() {
+                    let event = match raw_event.deserialize() {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            let event_id: Option<String> =
+                                raw_event.get_field("event_id").ok().flatten();
+                            debug!(event_id, "Failed to deserialize member event: {e}");
+                            continue;
+                        }
+                    };
+
                     let key = (room, event.state_key());
+
+                    stripped_joined
+                        .delete(&self.encode_key(KEYS::STRIPPED_JOINED_USER_IDS, key))?;
+                    stripped_invited
+                        .delete(&self.encode_key(KEYS::STRIPPED_INVITED_USER_IDS, key))?;
 
                     match event.membership() {
                         MembershipState::Join => {
@@ -780,11 +751,12 @@ impl IndexeddbStateStore {
 
                     members.put_key_val_owned(
                         &self.encode_key(KEYS::MEMBERS, key),
-                        &self.serialize_event(&event)?,
+                        &self.serialize_event(&raw_event)?,
                     )?;
+                    stripped_members.delete(&self.encode_key(KEYS::STRIPPED_MEMBERS, key))?;
 
                     if let Some(profile) = profile_changes.and_then(|p| p.get(event.state_key())) {
-                        profiles_store.put_key_val_owned(
+                        profiles.put_key_val_owned(
                             &self.encode_key(KEYS::PROFILES, key),
                             &self.serialize_event(&profile)?,
                         )?;
@@ -834,202 +806,50 @@ impl IndexeddbStateStore {
             }
         }
 
-        #[cfg(feature = "experimental-timeline")]
-        if !changes.timeline.is_empty() {
-            let timeline_store = tx.object_store(KEYS::ROOM_TIMELINE)?;
-            let timeline_metadata_store = tx.object_store(KEYS::ROOM_TIMELINE_METADATA)?;
-            let event_id_to_position_store = tx.object_store(KEYS::ROOM_EVENT_ID_TO_POSITION)?;
-            let room_infos = tx.object_store(KEYS::ROOM_INFOS)?;
+        if !changes.redactions.is_empty() {
+            let state = tx.object_store(KEYS::ROOM_STATE)?;
+            let room_info = tx.object_store(KEYS::ROOM_INFOS)?;
 
-            for (room_id, timeline) in &changes.timeline {
-                if timeline.sync {
-                    info!(%room_id, "Saving new timeline batch from sync response");
-                } else {
-                    info!(%room_id, "Saving new timeline batch from messages response");
+            for (room_id, redactions) in &changes.redactions {
+                let range = self.encode_to_range(KEYS::ROOM_STATE, room_id)?;
+                let Some(cursor) = state.open_cursor_with_range(&range)?.await? else { continue };
+
+                let mut room_version = None;
+
+                while let Some(key) = cursor.key() {
+                    let raw_evt =
+                        self.deserialize_event::<Raw<AnySyncStateEvent>>(cursor.value())?;
+                    if let Ok(Some(event_id)) = raw_evt.get_field::<OwnedEventId>("event_id") {
+                        if let Some(redaction) = redactions.get(&event_id) {
+                            let version = {
+                                if room_version.is_none() {
+                                    room_version.replace(room_info
+                                        .get(&self.encode_key(KEYS::ROOM_INFOS, room_id))?
+                                        .await?
+                                        .and_then(|f| self.deserialize_event::<RoomInfo>(f).ok())
+                                        .and_then(|info| info.room_version().cloned())
+                                        .unwrap_or_else(|| {
+                                            warn!(?room_id, "Unable to find the room version, assume version 9");
+                                            RoomVersionId::V9
+                                        })
+                                    );
+                                }
+                                room_version.as_ref().unwrap()
+                            };
+
+                            let redacted = redact(
+                                raw_evt.deserialize_as::<CanonicalJsonObject>()?,
+                                version,
+                                Some(redaction.try_into()?),
+                            )
+                            .map_err(StoreError::Redaction)?;
+                            state.put_key_val(&key, &self.serialize_event(&redacted)?)?;
+                        }
+                    }
+
+                    // move forward.
+                    cursor.advance(1)?.await?;
                 }
-                let metadata: Option<TimelineMetadata> = if timeline.limited {
-                    info!(
-                        %room_id,
-                        "Deleting stored timeline because the sync response was limited",
-                    );
-
-                    let stores = &[
-                        (KEYS::ROOM_TIMELINE, &timeline_store),
-                        (KEYS::ROOM_TIMELINE_METADATA, &timeline_metadata_store),
-                        (KEYS::ROOM_EVENT_ID_TO_POSITION, &event_id_to_position_store),
-                    ];
-                    for (table_name, store) in stores {
-                        let range = self.encode_to_range(table_name, room_id)?;
-                        for key in store.get_all_keys_with_key(&range)?.await?.iter() {
-                            store.delete(&key)?;
-                        }
-                    }
-
-                    None
-                } else {
-                    let metadata: Option<TimelineMetadata> = timeline_metadata_store
-                        .get(&self.encode_key(KEYS::ROOM_TIMELINE_METADATA, room_id))?
-                        .await?
-                        .map(|v| self.deserialize_event(v))
-                        .transpose()?;
-                    if let Some(mut metadata) = metadata {
-                        if !timeline.sync && Some(&timeline.start) != metadata.end.as_ref() {
-                            // This should only happen when a developer adds a wrong timeline
-                            // batch to the `StateChanges` or the server returns a wrong response
-                            // to our request.
-                            warn!(%room_id, "Dropping unexpected timeline batch");
-                            return Ok(());
-                        }
-
-                        // Check if the event already exists in the store
-                        let mut delete_timeline = false;
-                        for event in &timeline.events {
-                            if let Some(event_id) = event.event_id() {
-                                let event_key = self.encode_key(
-                                    KEYS::ROOM_EVENT_ID_TO_POSITION,
-                                    (room_id, event_id),
-                                );
-                                if event_id_to_position_store
-                                    .count_with_key_owned(event_key)?
-                                    .await?
-                                    > 0
-                                {
-                                    delete_timeline = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if delete_timeline {
-                            info!(
-                                %room_id,
-                                "Deleting stored timeline because of duplicated events",
-                            );
-
-                            let stores = &[
-                                (KEYS::ROOM_TIMELINE, &timeline_store),
-                                (KEYS::ROOM_TIMELINE_METADATA, &timeline_metadata_store),
-                                (KEYS::ROOM_EVENT_ID_TO_POSITION, &event_id_to_position_store),
-                            ];
-                            for (table_name, store) in stores {
-                                let range = self.encode_to_range(table_name, room_id)?;
-                                for key in store.get_all_keys_with_key(&range)?.await?.iter() {
-                                    store.delete(&key)?;
-                                }
-                            }
-
-                            None
-                        } else if timeline.sync {
-                            metadata.start = timeline.start.clone();
-                            Some(metadata)
-                        } else {
-                            metadata.end = timeline.end.clone();
-                            Some(metadata)
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                let mut metadata = if let Some(metadata) = metadata {
-                    metadata
-                } else {
-                    TimelineMetadata {
-                        start: timeline.start.clone(),
-                        end: timeline.end.clone(),
-                        start_position: usize::MAX / 2 + 1,
-                        end_position: usize::MAX / 2,
-                    }
-                };
-
-                if timeline.sync {
-                    let room_version = room_infos
-                        .get(&self.encode_key(KEYS::ROOM_INFOS, room_id))?
-                        .await?
-                        .map(|r| self.deserialize_event::<RoomInfo>(r))
-                        .transpose()?
-                        .and_then(|info| info.room_version().cloned())
-                        .unwrap_or_else(|| {
-                            warn!(
-                                "Unable to find the room version for {room_id}, assume version 9",
-                            );
-                            RoomVersionId::V9
-                        });
-                    for event in &timeline.events {
-                        // Redact events already in store only on sync response
-                        if let Ok(AnySyncRoomEvent::MessageLike(
-                            AnySyncMessageLikeEvent::RoomRedaction(
-                                SyncRoomRedactionEvent::Original(redaction),
-                            ),
-                        )) = event.event.deserialize()
-                        {
-                            let redacts_key = self.encode_key(
-                                KEYS::ROOM_EVENT_ID_TO_POSITION,
-                                (room_id, &redaction.redacts),
-                            );
-                            if let Some(position_key) =
-                                event_id_to_position_store.get_owned(redacts_key)?.await?
-                            {
-                                if let Some(mut full_event) = timeline_store
-                                    .get(&position_key)?
-                                    .await?
-                                    .map(|e| {
-                                        self.deserialize_event::<SyncRoomEvent>(e)
-                                            .map_err(StoreError::from)
-                                    })
-                                    .transpose()?
-                                {
-                                    let mut event_json: CanonicalJsonObject =
-                                        full_event.event.deserialize_as()?;
-                                    redact_in_place(&mut event_json, &room_version)
-                                        .map_err(StoreError::Redaction)?;
-                                    full_event.event = Raw::new(&event_json)?.cast();
-                                    timeline_store.put_key_val_owned(
-                                        position_key,
-                                        &self.serialize_event(&full_event)?,
-                                    )?;
-                                }
-                            }
-                        }
-
-                        metadata.start_position -= 1;
-                        let key = self.encode_key_with_counter(
-                            KEYS::ROOM_TIMELINE,
-                            room_id,
-                            metadata.start_position,
-                        );
-                        // Only add event with id to the position map
-                        if let Some(event_id) = event.event_id() {
-                            let event_key = self
-                                .encode_key(KEYS::ROOM_EVENT_ID_TO_POSITION, (room_id, event_id));
-                            event_id_to_position_store.put_key_val(&event_key, &key)?;
-                        }
-
-                        timeline_store.put_key_val_owned(&key, &self.serialize_event(&event)?)?;
-                    }
-                } else {
-                    for event in &timeline.events {
-                        metadata.end_position += 1;
-                        let key = self.encode_key_with_counter(
-                            KEYS::ROOM_TIMELINE,
-                            room_id,
-                            metadata.end_position,
-                        );
-                        // Only add event with id to the position map
-                        if let Some(event_id) = event.event_id() {
-                            let event_key = self
-                                .encode_key(KEYS::ROOM_EVENT_ID_TO_POSITION, (room_id, event_id));
-                            event_id_to_position_store.put_key_val(&event_key, &key)?;
-                        }
-
-                        timeline_store.put_key_val_owned(key, &self.serialize_event(&event)?)?;
-                    }
-                }
-
-                timeline_metadata_store.put_key_val_owned(
-                    &self.encode_key(KEYS::ROOM_TIMELINE_METADATA, room_id),
-                    &self.serialize_event(&metadata)?,
-                )?;
             }
         }
 
@@ -1096,18 +916,8 @@ impl IndexeddbStateStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> Result<Option<MemberEvent>> {
+    ) -> Result<Option<RawMemberEvent>> {
         if let Some(e) = self
-            .inner
-            .transaction_on_one_with_mode(KEYS::MEMBERS, IdbTransactionMode::Readonly)?
-            .object_store(KEYS::MEMBERS)?
-            .get(&self.encode_key(KEYS::MEMBERS, (room_id, state_key)))?
-            .await?
-            .map(|f| self.deserialize_event(f))
-            .transpose()?
-        {
-            Ok(Some(MemberEvent::Sync(e)))
-        } else if let Some(e) = self
             .inner
             .transaction_on_one_with_mode(KEYS::STRIPPED_MEMBERS, IdbTransactionMode::Readonly)?
             .object_store(KEYS::STRIPPED_MEMBERS)?
@@ -1116,7 +926,17 @@ impl IndexeddbStateStore {
             .map(|f| self.deserialize_event(f))
             .transpose()?
         {
-            Ok(Some(MemberEvent::Stripped(e)))
+            Ok(Some(RawMemberEvent::Stripped(e)))
+        } else if let Some(e) = self
+            .inner
+            .transaction_on_one_with_mode(KEYS::MEMBERS, IdbTransactionMode::Readonly)?
+            .object_store(KEYS::MEMBERS)?
+            .get(&self.encode_key(KEYS::MEMBERS, (room_id, state_key)))?
+            .await?
+            .map(|f| self.deserialize_event(f))
+            .transpose()?
+        {
+            Ok(Some(RawMemberEvent::Sync(e)))
         } else {
             Ok(None)
         }
@@ -1330,9 +1150,7 @@ impl IndexeddbStateStore {
     }
 
     async fn get_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let jskey = &JsValue::from_str(
-            core::str::from_utf8(key).map_err(|e| StoreError::Codec(format!("{:}", e)))?,
-        );
+        let jskey = &JsValue::from_str(core::str::from_utf8(key).map_err(StoreError::Codec)?);
         self.get_custom_value_for_js(jskey).await
     }
 
@@ -1347,9 +1165,7 @@ impl IndexeddbStateStore {
     }
 
     async fn set_custom_value(&self, key: &[u8], value: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let jskey = JsValue::from_str(
-            core::str::from_utf8(key).map_err(|e| StoreError::Codec(format!("{:}", e)))?,
-        );
+        let jskey = JsValue::from_str(core::str::from_utf8(key).map_err(StoreError::Codec)?);
 
         let prev = self.get_custom_value_for_js(&jskey).await?;
 
@@ -1401,12 +1217,6 @@ impl IndexeddbStateStore {
             KEYS::ROOM_USER_RECEIPTS,
             KEYS::STRIPPED_ROOM_STATE,
             KEYS::STRIPPED_MEMBERS,
-            #[cfg(feature = "experimental-timeline")]
-            KEYS::ROOM_TIMELINE,
-            #[cfg(feature = "experimental-timeline")]
-            KEYS::ROOM_TIMELINE_METADATA,
-            #[cfg(feature = "experimental-timeline")]
-            KEYS::ROOM_EVENT_ID_TO_POSITION,
         ];
 
         let all_stores = {
@@ -1432,47 +1242,6 @@ impl IndexeddbStateStore {
             }
         }
         tx.await.into_result().map_err(|e| e.into())
-    }
-
-    #[cfg(feature = "experimental-timeline")]
-    async fn room_timeline(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Option<(BoxStream<StoreResult<SyncRoomEvent>>, Option<String>)>> {
-        let tx = self.inner.transaction_on_multi_with_mode(
-            &[KEYS::ROOM_TIMELINE, KEYS::ROOM_TIMELINE_METADATA],
-            IdbTransactionMode::Readonly,
-        )?;
-        let timeline = tx.object_store(KEYS::ROOM_TIMELINE)?;
-        let metadata = tx.object_store(KEYS::ROOM_TIMELINE_METADATA)?;
-
-        let tlm: TimelineMetadata = match metadata
-            .get(&self.encode_key(KEYS::ROOM_TIMELINE_METADATA, room_id))?
-            .await?
-            .map(|v| v.into_serde())
-            .transpose()?
-        {
-            Some(tl) => tl,
-            _ => {
-                info!(%room_id, "Couldn't find a previously stored timeline");
-                return Ok(None);
-            }
-        };
-
-        let end_token = tlm.end;
-        #[allow(clippy::needless_collect)]
-        let timeline: Vec<StoreResult<SyncRoomEvent>> = timeline
-            .get_all_with_key(&self.encode_to_range(KEYS::ROOM_TIMELINE, room_id)?)?
-            .await?
-            .iter()
-            .map(|v| self.deserialize_event(v).map_err(|e| e.into()))
-            .collect();
-
-        let stream = Box::pin(stream::iter(timeline.into_iter()));
-
-        info!(%room_id, ?end_token, "Found previously stored timeline");
-
-        Ok(Some((stream, end_token)))
     }
 }
 
@@ -1531,32 +1300,32 @@ impl StateStore for IndexeddbStateStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> StoreResult<Option<MemberEvent>> {
+    ) -> StoreResult<Option<RawMemberEvent>> {
         self.get_member_event(room_id, state_key).await.map_err(|e| e.into())
     }
 
     async fn get_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        let ids: Vec<OwnedUserId> = self.get_user_ids_stream(room_id).await?;
+        let ids: Vec<OwnedUserId> = self.get_stripped_user_ids_stream(room_id).await?;
         if !ids.is_empty() {
             return Ok(ids);
         }
-        self.get_stripped_user_ids_stream(room_id).await.map_err(|e| e.into())
+        self.get_user_ids_stream(room_id).await.map_err(|e| e.into())
     }
 
     async fn get_invited_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        let ids: Vec<OwnedUserId> = self.get_invited_user_ids(room_id).await?;
+        let ids: Vec<OwnedUserId> = self.get_stripped_invited_user_ids(room_id).await?;
         if !ids.is_empty() {
             return Ok(ids);
         }
-        self.get_stripped_invited_user_ids(room_id).await.map_err(|e| e.into())
+        self.get_invited_user_ids(room_id).await.map_err(|e| e.into())
     }
 
     async fn get_joined_user_ids(&self, room_id: &RoomId) -> StoreResult<Vec<OwnedUserId>> {
-        let ids: Vec<OwnedUserId> = self.get_joined_user_ids(room_id).await?;
+        let ids: Vec<OwnedUserId> = self.get_stripped_joined_user_ids(room_id).await?;
         if !ids.is_empty() {
             return Ok(ids);
         }
-        self.get_stripped_joined_user_ids(room_id).await.map_err(|e| e.into())
+        self.get_joined_user_ids(room_id).await.map_err(|e| e.into())
     }
 
     async fn get_room_infos(&self) -> StoreResult<Vec<RoomInfo>> {
@@ -1637,23 +1406,6 @@ impl StateStore for IndexeddbStateStore {
     async fn remove_room(&self, room_id: &RoomId) -> StoreResult<()> {
         self.remove_room(room_id).await.map_err(|e| e.into())
     }
-
-    #[cfg(feature = "experimental-timeline")]
-    async fn room_timeline(
-        &self,
-        room_id: &RoomId,
-    ) -> StoreResult<Option<(BoxStream<StoreResult<SyncRoomEvent>>, Option<String>)>> {
-        self.room_timeline(room_id).await.map_err(|e| e.into())
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg(feature = "experimental-timeline")]
-struct TimelineMetadata {
-    pub start: String,
-    pub start_position: usize,
-    pub end: Option<String>,
-    pub end_position: usize,
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1671,7 +1423,7 @@ mod tests {
         Ok(IndexeddbStateStore::builder().name(db_name).build().await?)
     }
 
-    statestore_integration_tests! { integration }
+    statestore_integration_tests!(with_media_tests);
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1690,7 +1442,7 @@ mod encrypted_tests {
         Ok(IndexeddbStateStore::builder().name(db_name).passphrase(passphrase).build().await?)
     }
 
-    statestore_integration_tests! { integration }
+    statestore_integration_tests!(with_media_tests);
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

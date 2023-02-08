@@ -140,7 +140,7 @@ async function main() {
 
     // Let's pretend we have received changes and events from a
     // `/sync` endpoint of a Matrix homeserver, …
-    const toDeviceEvents = "{}"; // JSON-encoded
+    const toDeviceEvents = "[]"; // JSON-encoded list of events
     const changedDevices = new DeviceLists();
     const oneTimeKeyCounts = {};
     const unusedFallbackKeys = [];
@@ -186,7 +186,11 @@ to learn more about the `RUST_LOG`/`MATRIX_LOG` environment variable.
 
 ## Documentation
 
-To generate the documentation, please run the following command:
+[The documentation can be found
+online](https://matrix-org.github.io/matrix-rust-sdk/bindings/matrix-sdk-crypto-nodejs/).
+
+To generate the documentation locally, please run the following
+command:
 
 ```sh
 $ npm run doc

@@ -14,12 +14,12 @@ struct UserProfile {
 }
 
 /// This function calls the GET profile endpoint
-/// Spec: https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-profile-userid
-/// Ruma: https://docs.rs/ruma-client-api/0.9.0/ruma_client_api/r0/profile/get_profile/index.html
+/// Spec: <https://matrix.org/docs/spec/client_server/r0.6.1#get-matrix-client-r0-profile-userid>
+/// Ruma: <https://docs.rs/ruma-client-api/0.9.0/ruma_client_api/r0/profile/get_profile/index.html>
 async fn get_profile(client: Client, mxid: &UserId) -> MatrixResult<UserProfile> {
     // First construct the request you want to make
     // See https://docs.rs/ruma-client-api/0.9.0/ruma_client_api/index.html for all available Endpoints
-    let request = profile::get_profile::v3::Request::new(mxid);
+    let request = profile::get_profile::v3::Request::new(mxid.to_owned());
 
     // Start the request using matrix_sdk::Client::send
     let resp = client.send(request, None).await?;
@@ -39,11 +39,7 @@ async fn login(
     let homeserver_url = Url::parse(&homeserver_url).expect("Couldn't parse the homeserver URL");
     let client = Client::new(homeserver_url).await.unwrap();
 
-    client
-        .login_username(username, password)
-        .initial_device_display_name("rust-sdk")
-        .send()
-        .await?;
+    client.login_username(username, password).initial_device_display_name("rust-sdk").await?;
 
     Ok(client)
 }
@@ -68,6 +64,6 @@ async fn main() -> anyhow::Result<()> {
 
     let user_id = UserId::parse(username).expect("Couldn't parse the MXID");
     let profile = get_profile(client, &user_id).await?;
-    println!("{:#?}", profile);
+    println!("{profile:#?}");
     Ok(())
 }

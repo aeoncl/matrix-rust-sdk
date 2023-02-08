@@ -2,10 +2,7 @@
 use std::io::Cursor;
 #[cfg(feature = "e2e-encryption")]
 use std::sync::Arc;
-use std::{
-    io::{BufReader, Read, Seek},
-    ops::Deref,
-};
+use std::{borrow::Borrow, ops::Deref};
 
 use matrix_sdk_common::instant::{Duration, Instant};
 #[cfg(feature = "e2e-encryption")]
@@ -26,7 +23,10 @@ use ruma::{
         typing::create_typing_event::v3::{Request as TypingRequest, Typing},
     },
     assign,
-    events::{room::message::RoomMessageEventContent, MessageLikeEventContent, StateEventContent},
+    events::{
+        room::message::RoomMessageEventContent, EmptyStateKey, MessageLikeEventContent,
+        StateEventContent,
+    },
     serde::Raw,
     EventId, OwnedTransactionId, TransactionId, UserId,
 };
@@ -35,13 +35,15 @@ use tracing::debug;
 #[cfg(feature = "e2e-encryption")]
 use tracing::instrument;
 
-#[cfg(feature = "image-proc")]
-use crate::{attachment::generate_image_thumbnail, error::ImageError};
+use super::Left;
 use crate::{
-    attachment::{AttachmentConfig, Thumbnail},
-    error::HttpResult,
-    room::Common,
-    BaseRoom, Client, Result, RoomType,
+    attachment::AttachmentConfig, error::HttpResult, room::Common, BaseRoom, Client, Result,
+    RoomType,
+};
+#[cfg(feature = "image-proc")]
+use crate::{
+    attachment::{generate_image_thumbnail, Thumbnail},
+    error::ImageError,
 };
 
 const TYPING_NOTICE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -73,17 +75,16 @@ impl Joined {
     /// * `client` - The client used to make requests.
     ///
     /// * `room` - The underlying room.
-    pub fn new(client: Client, room: BaseRoom) -> Option<Self> {
-        // TODO: Make this private
+    pub(crate) fn new(client: &Client, room: BaseRoom) -> Option<Self> {
         if room.room_type() == RoomType::Joined {
-            Some(Self { inner: Common::new(client, room) })
+            Some(Self { inner: Common::new(client.clone(), room) })
         } else {
             None
         }
     }
 
     /// Leave this room.
-    pub async fn leave(&self) -> Result<()> {
+    pub async fn leave(&self) -> Result<Left> {
         self.inner.leave().await
     }
 
@@ -95,8 +96,10 @@ impl Joined {
     ///
     /// * `reason` - The reason for banning this user.
     pub async fn ban_user(&self, user_id: &UserId, reason: Option<&str>) -> Result<()> {
-        let request =
-            assign!(ban_user::v3::Request::new(self.inner.room_id(), user_id), { reason });
+        let request = assign!(
+            ban_user::v3::Request::new(self.inner.room_id().to_owned(), user_id.to_owned()),
+            { reason: reason.map(ToOwned::to_owned) }
+        );
         self.client.send(request, None).await?;
         Ok(())
     }
@@ -110,8 +113,10 @@ impl Joined {
     ///
     /// * `reason` - Optional reason why the room member is being kicked out.
     pub async fn kick_user(&self, user_id: &UserId, reason: Option<&str>) -> Result<()> {
-        let request =
-            assign!(kick_user::v3::Request::new(self.inner.room_id(), user_id), { reason });
+        let request = assign!(
+            kick_user::v3::Request::new(self.inner.room_id().to_owned(), user_id.to_owned()),
+            { reason: reason.map(ToOwned::to_owned) }
+        );
         self.client.send(request, None).await?;
         Ok(())
     }
@@ -122,9 +127,9 @@ impl Joined {
     ///
     /// * `user_id` - The `UserId` of the user to invite to the room.
     pub async fn invite_user_by_id(&self, user_id: &UserId) -> Result<()> {
-        let recipient = InvitationRecipient::UserId { user_id };
+        let recipient = InvitationRecipient::UserId { user_id: user_id.to_owned() };
 
-        let request = invite_user::v3::Request::new(self.inner.room_id(), recipient);
+        let request = invite_user::v3::Request::new(self.inner.room_id().to_owned(), recipient);
         self.client.send(request, None).await?;
 
         Ok(())
@@ -135,9 +140,9 @@ impl Joined {
     /// # Arguments
     ///
     /// * `invite_id` - A third party id of a user to invite to the room.
-    pub async fn invite_user_by_3pid(&self, invite_id: Invite3pid<'_>) -> Result<()> {
+    pub async fn invite_user_by_3pid(&self, invite_id: Invite3pid) -> Result<()> {
         let recipient = InvitationRecipient::ThirdPartyId(invite_id);
-        let request = invite_user::v3::Request::new(self.inner.room_id(), recipient);
+        let request = invite_user::v3::Request::new(self.inner.room_id().to_owned(), recipient);
         self.client.send(request, None).await?;
 
         Ok(())
@@ -213,8 +218,11 @@ impl Joined {
                 Typing::No
             };
 
-            let request =
-                TypingRequest::new(self.inner.own_user_id(), self.inner.room_id(), typing);
+            let request = TypingRequest::new(
+                self.inner.own_user_id().to_owned(),
+                self.inner.room_id().to_owned(),
+                typing,
+            );
             self.client.send(request, None).await?;
         }
 
@@ -229,8 +237,11 @@ impl Joined {
     /// * `event_id` - The `EventId` specifies the event to set the read receipt
     ///   on.
     pub async fn read_receipt(&self, event_id: &EventId) -> Result<()> {
-        let request =
-            create_receipt::v3::Request::new(self.inner.room_id(), ReceiptType::Read, event_id);
+        let request = create_receipt::v3::Request::new(
+            self.inner.room_id().to_owned(),
+            ReceiptType::Read,
+            event_id.to_owned(),
+        );
 
         self.client.send(request, None).await?;
         Ok(())
@@ -250,10 +261,10 @@ impl Joined {
         fully_read: &EventId,
         read_receipt: Option<&EventId>,
     ) -> Result<()> {
-        let request =
-            assign!(set_read_marker::v3::Request::new(self.inner.room_id(), fully_read), {
-                read_receipt
-            });
+        let request = assign!(set_read_marker::v3::Request::new(self.inner.room_id().to_owned()), {
+            fully_read: Some(fully_read.to_owned()),
+            read_receipt: read_receipt.map(ToOwned::to_owned),
+        });
 
         self.client.send(request, None).await?;
         Ok(())
@@ -296,10 +307,10 @@ impl Joined {
         };
         const SYNC_WAIT_TIME: Duration = Duration::from_secs(3);
 
-        if !self.is_encrypted() {
+        if !self.is_encrypted().await? {
             let content =
                 RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-            self.send_state_event(content, "").await?;
+            self.send_state_event(content).await?;
 
             // TODO do we want to return an error here if we time out? This
             // could be quite useful if someone wants to enable encryption and
@@ -317,15 +328,16 @@ impl Joined {
     ///
     /// Does nothing if no room key needs to be shared.
     #[cfg(feature = "e2e-encryption")]
+    #[instrument(skip_all, fields(room_id = ?self.room_id()))]
     async fn preshare_room_key(&self) -> Result<()> {
-        // TODO expose this publicly so people can pre-share a group session if
+        // TODO: expose this publicly so people can pre-share a group session if
         // e.g. a user starts to type a message for a room.
         if let Some(mutex) =
             self.client.inner.group_session_locks.get(self.inner.room_id()).map(|m| m.clone())
         {
-            // If a group session share request is already going on,
-            // await the release of the lock.
-            mutex.lock().await;
+            // If a group session share request is already going on, await the
+            // release of the lock.
+            _ = mutex.lock().await;
         } else {
             // Otherwise create a new lock and share the group
             // session.
@@ -368,8 +380,8 @@ impl Joined {
     /// # Panics
     ///
     /// Panics if the client isn't logged in.
-    #[instrument]
     #[cfg(feature = "e2e-encryption")]
+    #[instrument(skip_all)]
     async fn share_room_key(&self) -> Result<()> {
         let requests = self.client.base_client().share_room_key(self.inner.room_id()).await?;
 
@@ -380,6 +392,19 @@ impl Joined {
         }
 
         Ok(())
+    }
+
+    /// Wait for the room to be fully synced.
+    ///
+    /// This method makes sure the room that was returned when joining a room
+    /// has been echoed back in the sync.
+    /// Warning: This waits until a sync happens and does not return if no sync
+    /// is happening! It can also return early when the room is not a joined
+    /// room anymore!
+    pub async fn sync_up(&self) {
+        while !self.is_synced() && self.room_type() == RoomType::Joined {
+            self.client.inner.sync_beat.listen().wait_timeout(Duration::from_secs(1));
+        }
     }
 
     /// Send a room message to this room.
@@ -543,19 +568,19 @@ impl Joined {
         #[cfg(not(feature = "e2e-encryption"))]
         let content = {
             debug!(
-                room_id = %self.room_id(),
+                room_id = ?self.room_id(),
                 "Sending plaintext event to room because we don't have encryption support.",
             );
             Raw::new(&content)?.cast()
         };
 
         #[cfg(feature = "e2e-encryption")]
-        let (content, event_type) = if self.is_encrypted() {
+        let (content, event_type) = if self.is_encrypted().await? {
             // Reactions are currently famously not encrypted, skip encrypting
             // them until they are.
             if event_type == "m.reaction" {
                 debug!(
-                    room_id = %self.room_id(),
+                    room_id = ?self.room_id(),
                     "Sending plaintext event because the event type is {event_type}",
                 );
                 (Raw::new(&content)?.cast(), event_type)
@@ -581,7 +606,7 @@ impl Joined {
             }
         } else {
             debug!(
-                room_id = %self.room_id(),
+                room_id = ?self.room_id(),
                 "Sending plaintext event because the room is NOT encrypted.",
             );
 
@@ -589,8 +614,8 @@ impl Joined {
         };
 
         let request = send_message_event::v3::Request::new_raw(
-            self.inner.room_id(),
-            &txn_id,
+            self.inner.room_id().to_owned(),
+            txn_id,
             event_type.into(),
             content,
         );
@@ -625,7 +650,7 @@ impl Joined {
     /// # Examples
     ///
     /// ```no_run
-    /// # use std::{path::PathBuf, fs::File, io::Read};
+    /// # use std::fs;
     /// # use matrix_sdk::{Client, ruma::room_id, attachment::AttachmentConfig};
     /// # use url::Url;
     /// # use mime;
@@ -634,56 +659,51 @@ impl Joined {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
     /// # let room_id = room_id!("!test:localhost");
-    /// let path = PathBuf::from("/home/example/my-cat.jpg");
-    /// let mut image = File::open(path)?;
+    /// let mut image = fs::read("/home/example/my-cat.jpg")?;
     ///
     /// if let Some(room) = client.get_joined_room(&room_id) {
     ///     room.send_attachment(
     ///         "My favorite cat",
     ///         &mime::IMAGE_JPEG,
-    ///         &mut image,
+    ///         image,
     ///         AttachmentConfig::new(),
     ///     ).await?;
     /// }
     /// # anyhow::Ok(()) });
     /// ```
-    pub async fn send_attachment<R: Read + Seek, T: Read>(
+    pub async fn send_attachment(
         &self,
         body: &str,
         content_type: &Mime,
-        reader: &mut R,
-        config: AttachmentConfig<'_, T>,
+        data: Vec<u8>,
+        config: AttachmentConfig,
     ) -> Result<send_message_event::v3::Response> {
-        let reader = &mut BufReader::new(reader);
-
-        #[cfg(feature = "image-proc")]
-        let mut cursor;
-
         if config.thumbnail.is_some() {
-            self.prepare_and_send_attachment(body, content_type, reader, config).await
+            self.prepare_and_send_attachment(body, content_type, data, config).await
         } else {
             #[cfg(not(feature = "image-proc"))]
-            let thumbnail = Thumbnail::NONE;
+            let thumbnail = None;
 
             #[cfg(feature = "image-proc")]
+            let data_slot;
+            #[cfg(feature = "image-proc")]
             let thumbnail = if config.generate_thumbnail {
-                match generate_image_thumbnail(content_type, reader, config.thumbnail_size) {
+                match generate_image_thumbnail(
+                    content_type,
+                    Cursor::new(&data),
+                    config.thumbnail_size,
+                ) {
                     Ok((thumbnail_data, thumbnail_info)) => {
-                        reader.rewind()?;
-
-                        cursor = Cursor::new(thumbnail_data);
+                        data_slot = thumbnail_data;
                         Some(Thumbnail {
-                            reader: &mut cursor,
-                            content_type: &mime::IMAGE_JPEG,
+                            data: data_slot,
+                            content_type: mime::IMAGE_JPEG,
                             info: Some(thumbnail_info),
                         })
                     }
                     Err(
                         ImageError::ThumbnailBiggerThanOriginal | ImageError::FormatNotSupported,
-                    ) => {
-                        reader.rewind()?;
-                        None
-                    }
+                    ) => None,
                     Err(error) => return Err(error.into()),
                 }
             } else {
@@ -700,7 +720,7 @@ impl Joined {
                 thumbnail_size: None,
             };
 
-            self.prepare_and_send_attachment(body, content_type, reader, config).await
+            self.prepare_and_send_attachment(body, content_type, data, config).await
         }
     }
 
@@ -726,46 +746,92 @@ impl Joined {
     /// media.
     ///
     /// * `config` - Metadata and configuration for the attachment.
-    async fn prepare_and_send_attachment<R: Read, T: Read>(
+    async fn prepare_and_send_attachment(
         &self,
         body: &str,
         content_type: &Mime,
-        reader: &mut R,
-        config: AttachmentConfig<'_, T>,
+        data: Vec<u8>,
+        config: AttachmentConfig,
     ) -> Result<send_message_event::v3::Response> {
         #[cfg(feature = "e2e-encryption")]
-        let content = if self.is_encrypted() {
+        let content = if self.is_encrypted().await? {
             self.client
                 .prepare_encrypted_attachment_message(
                     body,
                     content_type,
-                    reader,
+                    data,
                     config.info,
                     config.thumbnail,
                 )
                 .await?
         } else {
             self.client
-                .prepare_attachment_message(
-                    body,
-                    content_type,
-                    reader,
-                    config.info,
-                    config.thumbnail,
-                )
+                .media()
+                .prepare_attachment_message(body, content_type, data, config.info, config.thumbnail)
                 .await?
         };
 
         #[cfg(not(feature = "e2e-encryption"))]
         let content = self
             .client
-            .prepare_attachment_message(body, content_type, reader, config.info, config.thumbnail)
+            .media()
+            .prepare_attachment_message(body, content_type, data, config.info, config.thumbnail)
             .await?;
 
-        self.send(RoomMessageEventContent::new(content), config.txn_id).await
+        self.send(RoomMessageEventContent::new(content), config.txn_id.as_deref()).await
     }
 
-    /// Send a room state event to the homeserver.
+    /// Send a state event with an empty state key to the homeserver.
+    ///
+    /// For state events with a non-empty state key, see
+    /// [`send_state_event_for_key`][Self::send_state_event_for_key].
+    ///
+    /// Returns the parsed response from the server.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The content of the state event.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use serde::{Deserialize, Serialize};
+    /// # async {
+    /// # let joined_room: matrix_sdk::room::Joined = todo!();
+    /// use matrix_sdk::ruma::{
+    ///     events::{
+    ///         macros::EventContent, room::encryption::RoomEncryptionEventContent,
+    ///         EmptyStateKey,
+    ///     },
+    ///     EventEncryptionAlgorithm,
+    /// };
+    ///
+    /// let encryption_event_content = RoomEncryptionEventContent::new(
+    ///     EventEncryptionAlgorithm::MegolmV1AesSha2,
+    /// );
+    /// joined_room.send_state_event(encryption_event_content).await?;
+    ///
+    /// // Custom event:
+    /// #[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
+    /// #[ruma_event(
+    ///     type = "org.matrix.msc_9000.xxx",
+    ///     kind = State,
+    ///     state_key_type = EmptyStateKey,
+    /// )]
+    /// struct XxxStateEventContent {/* fields... */}
+    ///
+    /// let content: XxxStateEventContent = todo!();
+    /// joined_room.send_state_event(content).await?;
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn send_state_event(
+        &self,
+        content: impl StateEventContent<StateKey = EmptyStateKey>,
+    ) -> Result<send_state_event::v3::Response> {
+        self.send_state_event_for_key(&EmptyStateKey, content).await
+    }
+
+    /// Send a state event to the homeserver.
     ///
     /// Returns the parsed response from the server.
     ///
@@ -774,12 +840,14 @@ impl Joined {
     /// * `content` - The content of the state event.
     ///
     /// * `state_key` - A unique key which defines the overwriting semantics for
-    /// this piece of room state. This value is often a zero-length string.
+    ///   this piece of room state.
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use serde::{Deserialize, Serialize};
+    /// # async {
+    /// # let joined_room: matrix_sdk::room::Joined = todo!();
     /// use matrix_sdk::ruma::{
     ///     events::{
     ///         macros::EventContent,
@@ -787,37 +855,37 @@ impl Joined {
     ///     },
     ///     mxc_uri,
     /// };
-    /// # futures::executor::block_on(async {
-    /// # let homeserver = url::Url::parse("http://localhost:8080")?;
-    /// # let mut client = matrix_sdk::Client::new(homeserver).await?;
-    /// # let room_id = matrix_sdk::ruma::room_id!("!test:localhost");
     ///
     /// let avatar_url = mxc_uri!("mxc://example.org/avatar").to_owned();
     /// let mut content = RoomMemberEventContent::new(MembershipState::Join);
     /// content.avatar_url = Some(avatar_url);
     ///
-    /// if let Some(room) = client.get_joined_room(&room_id) {
-    ///     room.send_state_event(content, "").await?;
-    /// }
+    /// joined_room.send_state_event_for_key(ruma::user_id!("@foo:bar.com"), content).await?;
     ///
     /// // Custom event:
     /// #[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
     /// #[ruma_event(type = "org.matrix.msc_9000.xxx", kind = State, state_key_type = String)]
     /// struct XxxStateEventContent { /* fields... */ }
-    /// let content: XxxStateEventContent = todo!();
     ///
-    /// if let Some(room) = client.get_joined_room(&room_id) {
-    ///     room.send_state_event(content, "").await?;
-    /// }
-    /// # anyhow::Ok(()) });
+    /// let content: XxxStateEventContent = todo!();
+    /// joined_room.send_state_event_for_key("foo", content).await?;
+    /// # anyhow::Ok(()) };
     /// ```
-    pub async fn send_state_event(
+    pub async fn send_state_event_for_key<C, K>(
         &self,
-        content: impl StateEventContent,
-        state_key: &str,
-    ) -> Result<send_state_event::v3::Response> {
-        let request =
-            send_state_event::v3::Request::new(self.inner.room_id(), state_key, &content)?;
+        state_key: &K,
+        content: C,
+    ) -> Result<send_state_event::v3::Response>
+    where
+        C: StateEventContent,
+        C::StateKey: Borrow<K>,
+        K: AsRef<str> + ?Sized,
+    {
+        let request = send_state_event::v3::Request::new(
+            self.inner.room_id().to_owned(),
+            state_key,
+            &content,
+        )?;
         let response = self.client.send(request, None).await?;
         Ok(response)
     }
@@ -863,9 +931,9 @@ impl Joined {
     ) -> Result<send_state_event::v3::Response> {
         let content = Raw::new(&content)?.cast();
         let request = send_state_event::v3::Request::new_raw(
-            self.inner.room_id(),
+            self.inner.room_id().to_owned(),
             event_type.into(),
-            state_key,
+            state_key.to_owned(),
             content,
         );
 
@@ -912,10 +980,10 @@ impl Joined {
         txn_id: Option<OwnedTransactionId>,
     ) -> HttpResult<redact_event::v3::Response> {
         let txn_id = txn_id.unwrap_or_else(TransactionId::new);
-        let request =
-            assign!(redact_event::v3::Request::new(self.inner.room_id(), event_id, &txn_id), {
-                reason
-            });
+        let request = assign!(
+            redact_event::v3::Request::new(self.inner.room_id().to_owned(), event_id.to_owned(), txn_id),
+            { reason: reason.map(ToOwned::to_owned) }
+        );
 
         self.client.send(request, None).await
     }

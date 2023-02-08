@@ -4,6 +4,7 @@
 //! client or client library in any of the language targets Uniffi supports.
 
 #![warn(missing_docs)]
+#![allow(unused_qualifications)]
 
 mod backup_recovery_key;
 mod device;
@@ -11,10 +12,11 @@ mod error;
 mod logger;
 mod machine;
 mod responses;
+mod uniffi_api;
 mod users;
 mod verification;
 
-use std::{borrow::Borrow, collections::HashMap, str::FromStr, sync::Arc};
+use std::{borrow::Borrow, collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 pub use backup_recovery_key::{
     BackupRecoveryKey, DecodeError, MegolmV1BackupKey, PassphraseInfo, PkDecryptionError,
@@ -25,17 +27,28 @@ pub use error::{
 };
 use js_int::UInt;
 pub use logger::{set_logger, Logger};
-pub use machine::{KeyRequestPair, OlmMachine};
+pub use machine::{KeyRequestPair, OlmMachine, SignatureVerification};
+use matrix_sdk_common::deserialized_responses::VerificationState;
+use matrix_sdk_crypto::{
+    backups::SignatureState,
+    types::{EventEncryptionAlgorithm as RustEventEncryptionAlgorithm, SigningKey},
+    EncryptionSettings as RustEncryptionSettings, LocalTrust,
+};
+use matrix_sdk_sqlite::SqliteCryptoStore;
 pub use responses::{
     BootstrapCrossSigningResult, DeviceLists, KeysImportResult, OutgoingVerificationRequest,
     Request, RequestType, SignatureUploadRequest, UploadSigningKeysRequest,
 };
-use ruma::{DeviceId, DeviceKeyAlgorithm, OwnedUserId, RoomId, SecondsSinceUnixEpoch, UserId};
+use ruma::{
+    events::room::history_visibility::HistoryVisibility as RustHistoryVisibility, DeviceId,
+    DeviceKeyAlgorithm, OwnedUserId, RoomId, SecondsSinceUnixEpoch, UserId,
+};
 use serde::{Deserialize, Serialize};
 pub use users::UserIdentity;
 pub use verification::{
-    CancelInfo, ConfirmVerificationResult, QrCode, RequestVerificationResult, Sas, ScanResult,
-    StartSasResult, Verification, VerificationRequest,
+    CancelInfo, ConfirmVerificationResult, QrCode, QrCodeListener, QrCodeState,
+    RequestVerificationResult, Sas, SasListener, SasState, ScanResult, StartSasResult,
+    Verification, VerificationRequest, VerificationRequestListener, VerificationRequestState,
 };
 
 /// Struct collecting data that is important to migrate to the rust-sdk
@@ -152,6 +165,20 @@ impl From<anyhow::Error> for MigrationError {
 /// * `progress_listener` - A callback that can be used to introspect the
 /// progress of the migration.
 pub fn migrate(
+    data: MigrationData,
+    path: &str,
+    passphrase: Option<String>,
+    progress_listener: Box<dyn ProgressListener>,
+) -> anyhow::Result<()> {
+    use tokio::runtime::Runtime;
+    let runtime = Runtime::new()?;
+    runtime.block_on(async move {
+        migrate_data(data, path, passphrase, progress_listener).await?;
+        Ok(())
+    })
+}
+
+async fn migrate_data(
     mut data: MigrationData,
     path: &str,
     passphrase: Option<String>,
@@ -161,8 +188,6 @@ pub fn migrate(
         olm::PrivateCrossSigningIdentity,
         store::{Changes as RustChanges, CryptoStore, RecoveryKey},
     };
-    use matrix_sdk_sled::SledCryptoStore;
-    use tokio::runtime::Runtime;
     use vodozemac::{
         megolm::InboundGroupSession,
         olm::{Account, Session},
@@ -184,8 +209,7 @@ pub fn migrate(
         progress_listener.on_progress(progress as i32, total as i32)
     };
 
-    let store = SledCryptoStore::open_with_passphrase(path, passphrase.as_deref())?;
-    let runtime = Runtime::new()?;
+    let store = SqliteCryptoStore::open(path, passphrase.as_deref()).await?;
 
     processed_steps += 1;
     listener(processed_steps, total_steps);
@@ -257,14 +281,18 @@ pub fn migrate(
             signing_key: session
                 .signing_key
                 .into_iter()
-                .map(|(k, v)| Ok((DeviceKeyAlgorithm::try_from(k)?, v)))
+                .map(|(k, v)| {
+                    let algorithm = DeviceKeyAlgorithm::try_from(k)?;
+                    let key = SigningKey::from_parts(&algorithm, v)?;
+
+                    Ok((algorithm, key))
+                })
                 .collect::<anyhow::Result<_>>()?,
             room_id: RoomId::parse(session.room_id)?,
-            forwarding_chains: session.forwarding_chains,
             imported: session.imported,
             backed_up: session.backed_up,
             history_visibility: None,
-            algorithm: ruma::EventEncryptionAlgorithm::MegolmV1AesSha2,
+            algorithm: RustEventEncryptionAlgorithm::MegolmV1AesSha2,
         };
 
         let session = matrix_sdk_crypto::olm::InboundGroupSession::from_pickle(pickle)?;
@@ -278,11 +306,13 @@ pub fn migrate(
         data.backup_recovery_key.map(|k| RecoveryKey::from_base58(k.as_str())).transpose()?;
 
     let cross_signing = PrivateCrossSigningIdentity::empty((*user_id).into());
-    runtime.block_on(cross_signing.import_secrets_unchecked(
-        data.cross_signing.master_key.as_deref(),
-        data.cross_signing.self_signing_key.as_deref(),
-        data.cross_signing.user_signing_key.as_deref(),
-    ))?;
+    cross_signing
+        .import_secrets_unchecked(
+            data.cross_signing.master_key.as_deref(),
+            data.cross_signing.self_signing_key.as_deref(),
+            data.cross_signing.user_signing_key.as_deref(),
+        )
+        .await?;
 
     data.cross_signing.master_key.zeroize();
     data.cross_signing.self_signing_key.zeroize();
@@ -298,8 +328,7 @@ pub fn migrate(
         .collect::<anyhow::Result<_>>()?;
 
     let tracked_users: Vec<_> = tracked_users.iter().map(|(u, d)| (&**u, *d)).collect();
-
-    runtime.block_on(store.save_tracked_users(tracked_users.as_slice()))?;
+    store.save_tracked_users(tracked_users.as_slice()).await?;
 
     processed_steps += 1;
     listener(processed_steps, total_steps);
@@ -313,7 +342,7 @@ pub fn migrate(
         backup_version: data.backup_version,
         ..Default::default()
     };
-    runtime.block_on(store.save_changes(changes))?;
+    store.save_changes(changes).await?;
 
     processed_steps += 1;
     listener(processed_steps, total_steps);
@@ -339,6 +368,99 @@ impl<T: Fn(i32, i32)> ProgressListener for T {
     }
 }
 
+/// An encryption algorithm to be used to encrypt messages sent to a room.
+pub enum EventEncryptionAlgorithm {
+    /// Olm version 1 using Curve25519, AES-256, and SHA-256.
+    OlmV1Curve25519AesSha2,
+    /// Megolm version 1 using AES-256 and SHA-256.
+    MegolmV1AesSha2,
+}
+
+impl From<EventEncryptionAlgorithm> for RustEventEncryptionAlgorithm {
+    fn from(a: EventEncryptionAlgorithm) -> Self {
+        match a {
+            EventEncryptionAlgorithm::OlmV1Curve25519AesSha2 => {
+                RustEventEncryptionAlgorithm::OlmV1Curve25519AesSha2
+            }
+            EventEncryptionAlgorithm::MegolmV1AesSha2 => {
+                RustEventEncryptionAlgorithm::MegolmV1AesSha2
+            }
+        }
+    }
+}
+
+/// Who can see a room's history.
+pub enum HistoryVisibility {
+    /// Previous events are accessible to newly joined members from the point
+    /// they were invited onwards.
+    ///
+    /// Events stop being accessible when the member's state changes to
+    /// something other than *invite* or *join*.
+    Invited,
+
+    /// Previous events are accessible to newly joined members from the point
+    /// they joined the room onwards.
+    /// Events stop being accessible when the member's state changes to
+    /// something other than *join*.
+    Joined,
+
+    /// Previous events are always accessible to newly joined members.
+    ///
+    /// All events in the room are accessible, even those sent when the member
+    /// was not a part of the room.
+    Shared,
+
+    /// All events while this is the `HistoryVisibility` value may be shared by
+    /// any participating homeserver with anyone, regardless of whether they
+    /// have ever joined the room.
+    WorldReadable,
+}
+
+impl From<HistoryVisibility> for RustHistoryVisibility {
+    fn from(h: HistoryVisibility) -> Self {
+        match h {
+            HistoryVisibility::Invited => RustHistoryVisibility::Invited,
+            HistoryVisibility::Joined => RustHistoryVisibility::Joined,
+            HistoryVisibility::Shared => RustHistoryVisibility::Shared,
+            HistoryVisibility::WorldReadable => RustHistoryVisibility::Shared,
+        }
+    }
+}
+
+/// Settings that should be used when a room key is shared.
+///
+/// These settings control which algorithm the room key should use, how long a
+/// room key should be used and some other important information that determines
+/// the lifetime of a room key.
+pub struct EncryptionSettings {
+    /// The encryption algorithm that should be used in the room.
+    pub algorithm: EventEncryptionAlgorithm,
+    /// How long can the room key be used before it should be rotated. Time in
+    /// seconds.
+    pub rotation_period: u64,
+    /// How many messages should be sent before the room key should be rotated.
+    pub rotation_period_msgs: u64,
+    /// The current history visibility of the room. The visibility will be
+    /// tracked by the room key and the key will be rotated if the visibility
+    /// changes.
+    pub history_visibility: HistoryVisibility,
+    /// Should untrusted devices receive the room key, or should they be
+    /// excluded from the conversation.
+    pub only_allow_trusted_devices: bool,
+}
+
+impl From<EncryptionSettings> for RustEncryptionSettings {
+    fn from(v: EncryptionSettings) -> Self {
+        RustEncryptionSettings {
+            algorithm: v.algorithm.into(),
+            rotation_period: Duration::from_secs(v.rotation_period),
+            rotation_period_msgs: v.rotation_period_msgs,
+            history_visibility: v.history_visibility.into(),
+            only_allow_trusted_devices: v.only_allow_trusted_devices,
+        }
+    }
+}
+
 /// An event that was successfully decrypted.
 pub struct DecryptedEvent {
     /// The decrypted version of the event.
@@ -351,6 +473,10 @@ pub struct DecryptedEvent {
     /// key to us. Is empty if the key came directly from the sender of the
     /// event.
     pub forwarding_curve25519_chain: Vec<String>,
+    /// The verification state of the device that sent us the event, note this
+    /// is the state of the device at the time of decryption. It may change in
+    /// the future if a device gets verified or deleted.
+    pub verification_state: VerificationState,
 }
 
 /// Struct representing the state of our private cross signing keys, it shows
@@ -380,6 +506,7 @@ pub struct CrossSigningKeyExport {
 }
 
 /// Struct holding the number of room keys we have.
+#[derive(uniffi::Record)]
 pub struct RoomKeyCounts {
     /// The total number of room keys.
     pub total: i64,
@@ -388,6 +515,7 @@ pub struct RoomKeyCounts {
 }
 
 /// Backup keys and information we load from the store.
+#[derive(uniffi::Object)]
 pub struct BackupKeys {
     /// The recovery key as a base64 encoded string.
     recovery_key: Arc<BackupRecoveryKey>,
@@ -395,6 +523,7 @@ pub struct BackupKeys {
     backup_version: String,
 }
 
+#[uniffi::export]
 impl BackupKeys {
     /// Get the recovery key that we're holding on to.
     pub fn recovery_key(&self) -> Arc<BackupRecoveryKey> {
@@ -462,13 +591,17 @@ fn parse_user_id(user_id: &str) -> Result<OwnedUserId, CryptoStoreError> {
     ruma::UserId::parse(user_id).map_err(|e| CryptoStoreError::InvalidUserId(user_id.to_owned(), e))
 }
 
-#[allow(warnings)]
-mod generated {
-    use super::*;
-    include!(concat!(env!("OUT_DIR"), "/olm.uniffi.rs"));
+mod uniffi_types {
+    pub use crate::{
+        backup_recovery_key::{
+            BackupRecoveryKey, DecodeError, MegolmV1BackupKey, PassphraseInfo, PkDecryptionError,
+        },
+        error::CryptoStoreError,
+        machine::OlmMachine,
+        responses::Request,
+        BackupKeys, RoomKeyCounts,
+    };
 }
-
-pub use generated::*;
 
 #[cfg(test)]
 mod test {
@@ -578,7 +711,7 @@ mod test {
             "JGgPQRuYj3ScMdPS+A0P+k/1qS9Hr3qeKXLscI+hS78"
         );
 
-        let room_keys = machine.runtime.block_on(machine.inner.export_keys(|_| true))?;
+        let room_keys = machine.runtime.block_on(machine.inner.export_room_keys(|_| true))?;
         assert_eq!(room_keys.len(), 2);
 
         let cross_signing_status = machine.cross_signing_status();

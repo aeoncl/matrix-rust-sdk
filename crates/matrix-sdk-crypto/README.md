@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use matrix_sdk_crypto::{OlmMachine, OlmError};
 use ruma::{
-    api::client::sync::sync_events::v3::{ToDevice, DeviceLists},
+    api::client::sync::sync_events::{v3::ToDevice, DeviceLists},
     device_id, user_id,
 };
 
@@ -30,14 +30,13 @@ async fn main() -> Result<(), OlmError> {
     let alice = user_id!("@alice:example.org");
     let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
 
-    let to_device_events = ToDevice::default();
     let changed_devices = DeviceLists::default();
     let one_time_key_counts = BTreeMap::default();
     let unused_fallback_keys = Some(Vec::new());
 
     // Push changes that the server sent to us in a sync response.
     let decrypted_to_device = machine.receive_sync_changes(
-        to_device_events,
+        vec![],
         &changed_devices,
         &one_time_key_counts,
         unused_fallback_keys.as_deref(),

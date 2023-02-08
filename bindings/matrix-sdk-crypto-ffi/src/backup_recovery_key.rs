@@ -18,7 +18,8 @@ pub struct BackupRecoveryKey {
 }
 
 /// Error type for the decryption of backed up room keys.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum PkDecryptionError {
     /// An internal libolm error happened during decryption.
     #[error("Error decryption a PkMessage {0}")]
@@ -26,7 +27,8 @@ pub enum PkDecryptionError {
 }
 
 /// Error type for the decoding and storing of the backup key.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum DecodeError {
     /// An error happened while decoding the recovery key.
     #[error(transparent)]
@@ -39,7 +41,7 @@ pub enum DecodeError {
 
 /// Struct containing info about the way the backup key got derived from a
 /// passphrase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct PassphraseInfo {
     /// The salt that was used during key derivation.
     pub private_key_salt: String,
@@ -48,6 +50,7 @@ pub struct PassphraseInfo {
 }
 
 /// The public part of the backup key.
+#[derive(uniffi::Record)]
 pub struct MegolmV1BackupKey {
     /// The actual base64 encoded public key.
     pub public_key: String,
@@ -57,6 +60,19 @@ pub struct MegolmV1BackupKey {
     pub passphrase_info: Option<PassphraseInfo>,
     /// Get the full name of the backup algorithm this backup key supports.
     pub backup_algorithm: String,
+}
+
+#[uniffi::export]
+impl BackupRecoveryKey {
+    /// Convert the recovery key to a base 58 encoded string.
+    pub fn to_base58(&self) -> String {
+        self.inner.to_base58()
+    }
+
+    /// Convert the recovery key to a base 64 encoded string.
+    pub fn to_base64(&self) -> String {
+        self.inner.to_base64()
+    }
 }
 
 impl BackupRecoveryKey {
@@ -115,7 +131,10 @@ impl BackupRecoveryKey {
             }),
         }
     }
+}
 
+#[uniffi::export]
+impl BackupRecoveryKey {
     /// Get the public part of the backup key.
     pub fn megolm_v1_public_key(&self) -> MegolmV1BackupKey {
         let public_key = self.inner.megolm_v1_public_key();
@@ -132,16 +151,6 @@ impl BackupRecoveryKey {
             passphrase_info: self.passphrase_info.clone(),
             backup_algorithm: public_key.backup_algorithm().to_owned(),
         }
-    }
-
-    /// Convert the recovery key to a base 58 encoded string.
-    pub fn to_base58(&self) -> String {
-        self.inner.to_base58()
-    }
-
-    /// Convert the recovery key to a base 64 encoded string.
-    pub fn to_base64(&self) -> String {
-        self.inner.to_base64()
     }
 
     /// Try to decrypt a message that was encrypted using the public part of the

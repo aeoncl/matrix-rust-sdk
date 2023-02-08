@@ -1,8 +1,94 @@
-const { OlmMachine, UserId, DeviceId, RoomId, DeviceLists, RequestType, KeysUploadRequest, KeysQueryRequest, KeysClaimRequest, EncryptionSettings, DecryptedRoomEvent, VerificationState } = require('../pkg/matrix_sdk_crypto_js');
+const {
+    CrossSigningStatus,
+    DecryptedRoomEvent,
+    DeviceId,
+    DeviceKeyId,
+    DeviceLists,
+    EncryptionSettings,
+    EventId,
+    InboundGroupSession,
+    KeysClaimRequest,
+    KeysQueryRequest,
+    KeysUploadRequest,
+    MaybeSignature,
+    OlmMachine,
+    OwnUserIdentity,
+    RequestType,
+    RoomId,
+    RoomMessageRequest,
+    SignatureUploadRequest,
+    ToDeviceRequest,
+    UserId,
+    UserIdentity,
+    VerificationRequest,
+    VerificationState,
+} = require('../pkg/matrix_sdk_crypto_js');
+const { addMachineToMachine } = require('./helper');
+require('fake-indexeddb/auto');
 
 describe(OlmMachine.name, () => {
     test('can be instantiated with the async initializer', async () => {
-        expect(await new OlmMachine(new UserId('@foo:bar.org'), new DeviceId('baz'))).toBeInstanceOf(OlmMachine);
+        expect(await OlmMachine.initialize(new UserId('@foo:bar.org'), new DeviceId('baz'))).toBeInstanceOf(OlmMachine);
+    });
+
+    test('can be instantiated with a store', async () => {
+        let store_name = 'hello';
+        let store_passphrase = 'world';
+
+        const by_store_name = db => db.name.startsWith(store_name);
+
+        // No databases.
+        expect((await indexedDB.databases()).filter(by_store_name)).toHaveLength(0);
+
+        // Creating a new Olm machine.
+        expect(await OlmMachine.initialize(new UserId('@foo:bar.org'), new DeviceId('baz'), store_name, store_passphrase)).toBeInstanceOf(OlmMachine);
+
+        // Oh, there is 2 databases now, prefixed by `store_name`.
+        let databases = (await indexedDB.databases()).filter(by_store_name);
+
+        expect(databases).toHaveLength(2);
+        expect(databases).toStrictEqual([
+            { name: `${store_name}::matrix-sdk-crypto-meta`, version: 1 },
+            { name: `${store_name}::matrix-sdk-crypto`, version: 1 },
+        ]);
+
+        // Creating a new Olm machine, with the stored state.
+        expect(await OlmMachine.initialize(new UserId('@foo:bar.org'), new DeviceId('baz'), store_name, store_passphrase)).toBeInstanceOf(OlmMachine);
+
+        // Same number of databases.
+        expect((await indexedDB.databases()).filter(by_store_name)).toHaveLength(2);
+    });
+
+    describe('cannot be instantiated with a store', () => {
+        test('store name is missing', async () => {
+            let store_name = null;
+            let store_passphrase = 'world';
+
+            let err = null;
+
+            try {
+                await OlmMachine.initialize(new UserId('@foo:bar.org'), new DeviceId('baz'), store_name, store_passphrase);
+            } catch (error) {
+                err = error;
+            }
+
+            expect(err).toBeDefined();
+        });
+
+        test('store passphrase is missing', async () => {
+            let store_name = 'hello';
+            let store_passphrase = null;
+
+            let err = null;
+
+            try {
+                await OlmMachine.initialize(new UserId('@foo:bar.org'), new DeviceId('baz'), store_name, store_passphrase);
+            } catch (error) {
+                err = error;
+            }
+
+            expect(err).toBeDefined();
+        });
     });
 
     const user = new UserId('@alice:example.org');
@@ -10,8 +96,47 @@ describe(OlmMachine.name, () => {
     const room = new RoomId('!baz:matrix.org');
 
     function machine(new_user, new_device) {
-        return new OlmMachine(new_user || user, new_device || device);
+        return OlmMachine.initialize(new_user || user, new_device || device);
     }
+
+    test('can drop/close', async () => {
+        m = await machine();
+        m.close();
+    });
+
+    test('can drop/close with a store', async () => {
+        let store_name = 'temporary';
+        let store_passphrase = 'temporary';
+
+        const by_store_name = db => db.name.startsWith(store_name);
+
+        // No databases.
+        expect((await indexedDB.databases()).filter(by_store_name)).toHaveLength(0);
+
+        // Creating a new Olm machine.
+        const m = await OlmMachine.initialize(new UserId('@foo:bar.org'), new DeviceId('baz'), store_name, store_passphrase);
+        expect(m).toBeInstanceOf(OlmMachine);
+
+        // Oh, there is 2 databases now, prefixed by `store_name`.
+        let databases = (await indexedDB.databases()).filter(by_store_name);
+
+        expect(databases).toHaveLength(2);
+        expect(databases).toStrictEqual([
+            { name: `${store_name}::matrix-sdk-crypto-meta`, version: 1 },
+            { name: `${store_name}::matrix-sdk-crypto`, version: 1 },
+        ]);
+
+        // Let's force to close the `OlmMachine`.
+        m.close();
+
+        // Now we can delete the databases!
+        for (const database_name of [`${store_name}::matrix-sdk-crypto`, `${store_name}::matrix-sdk-crypto-meta`]) {
+            const deleting = indexedDB.deleteDatabase(database_name);
+            deleting.onsuccess = () => {};
+            deleting.onerror = () => { throw new Error('failed to remove the database (error)') };
+            deleting.onblocked = () => { throw new Error('failed to remove the database (blocked)') };
+        }
+    });
 
     test('can read user ID', async () => {
         expect((await machine()).userId.toString()).toStrictEqual(user.toString());
@@ -33,7 +158,8 @@ describe(OlmMachine.name, () => {
     });
 
     test('can read tracked users', async () => {
-        const trackedUsers = (await machine()).trackedUsers();
+        const m = await machine();
+        const trackedUsers = await m.trackedUsers();
 
         expect(trackedUsers).toBeInstanceOf(Set);
         expect(trackedUsers.size).toStrictEqual(0);
@@ -47,26 +173,26 @@ describe(OlmMachine.name, () => {
 
     test('can receive sync changes', async () => {
         const m = await machine();
-        const toDeviceEvents = JSON.stringify({});
+        const toDeviceEvents = JSON.stringify([]);
         const changedDevices = new DeviceLists();
         const oneTimeKeyCounts = new Map();
         const unusedFallbackKeys = new Set();
 
         const receiveSyncChanges = JSON.parse(await m.receiveSyncChanges(toDeviceEvents, changedDevices, oneTimeKeyCounts, unusedFallbackKeys));
 
-        expect(receiveSyncChanges).toEqual({});
+        expect(receiveSyncChanges).toEqual([]);
     });
 
     test('can get the outgoing requests that need to be send out', async () => {
         const m = await machine();
-        const toDeviceEvents = JSON.stringify({});
+        const toDeviceEvents = JSON.stringify([]);
         const changedDevices = new DeviceLists();
         const oneTimeKeyCounts = new Map();
         const unusedFallbackKeys = new Set();
 
         const receiveSyncChanges = JSON.parse(await m.receiveSyncChanges(toDeviceEvents, changedDevices, oneTimeKeyCounts, unusedFallbackKeys));
 
-        expect(receiveSyncChanges).toEqual({});
+        expect(receiveSyncChanges).toEqual([]);
 
         const outgoingRequests = await m.outgoingRequests();
 
@@ -76,6 +202,7 @@ describe(OlmMachine.name, () => {
             expect(outgoingRequests[0]).toBeInstanceOf(KeysUploadRequest);
             expect(outgoingRequests[0].id).toBeDefined();
             expect(outgoingRequests[0].type).toStrictEqual(RequestType.KeysUpload);
+            expect(outgoingRequests[0].body).toBeDefined();
 
             const body = JSON.parse(outgoingRequests[0].body);
             expect(body.device_keys).toBeDefined();
@@ -86,6 +213,7 @@ describe(OlmMachine.name, () => {
             expect(outgoingRequests[1]).toBeInstanceOf(KeysQueryRequest);
             expect(outgoingRequests[1].id).toBeDefined();
             expect(outgoingRequests[1].type).toStrictEqual(RequestType.KeysQuery);
+            expect(outgoingRequests[1].body).toBeDefined();
 
             const body = JSON.parse(outgoingRequests[1].body);
             expect(body.timeout).toBeDefined();
@@ -101,7 +229,7 @@ describe(OlmMachine.name, () => {
         beforeAll(async () => {
             m = await machine(new UserId('@alice:example.org'), new DeviceId('DEVICEID'));
 
-            const toDeviceEvents = JSON.stringify({});
+            const toDeviceEvents = JSON.stringify([]);
             const changedDevices = new DeviceLists();
             const oneTimeKeyCounts = new Map();
             const unusedFallbackKeys = new Set();
@@ -175,7 +303,7 @@ describe(OlmMachine.name, () => {
         beforeAll(async () => {
             m = await machine(user, device);
         });
-        
+
         test('can pass keysquery and keysclaim requests directly', async () => {
             {
                 // derived from https://github.com/matrix-org/matrix-rust-sdk/blob/7f49618d350fab66b7e1dc4eaf64ec25ceafd658/benchmarks/benches/crypto_bench/keys_query.json
@@ -339,5 +467,357 @@ describe(OlmMachine.name, () => {
             expect(decrypted.forwardingCurve25519KeyChain).toHaveLength(0);
             expect(decrypted.verificationState).toStrictEqual(VerificationState.Trusted);
         });
+    });
+
+    test("failure to decrypt returns a valid error", async () => {
+        const m = await machine();
+        const evt = {
+            type: "m.room.encrypted",
+            event_id: "$xxxxx:example.org",
+            origin_server_ts: Date.now(),
+            sender: user.toString(),
+            content: {
+                algorithm: "m.megolm.v1.aes-sha2",
+                ciphertext: "blah",
+            },
+        };
+        await expect(() => m.decryptRoomEvent(JSON.stringify(evt), room)).rejects.toThrowError();
+    });
+
+    test('can read cross-signing status', async () => {
+        const m = await machine();
+        const crossSigningStatus = await m.crossSigningStatus();
+
+        expect(crossSigningStatus).toBeInstanceOf(CrossSigningStatus);
+        expect(crossSigningStatus.hasMaster).toStrictEqual(false);
+        expect(crossSigningStatus.hasSelfSigning).toStrictEqual(false);
+        expect(crossSigningStatus.hasUserSigning).toStrictEqual(false);
+    });
+
+    test('can sign a message', async () => {
+        const m = await machine();
+        const signatures = await m.sign('foo');
+
+        expect(signatures.isEmpty()).toStrictEqual(false);
+        expect(signatures.count).toStrictEqual(1);
+
+        let base64;
+
+        // `get`
+        {
+            const signature = signatures.get(user);
+
+            expect(signature.has('ed25519:foobar')).toStrictEqual(true);
+
+            const s = signature.get('ed25519:foobar');
+
+            expect(s).toBeInstanceOf(MaybeSignature);
+
+            expect(s.isValid()).toStrictEqual(true);
+            expect(s.isInvalid()).toStrictEqual(false);
+            expect(s.invalidSignatureSource).toBeUndefined();
+
+            base64 = s.signature.toBase64();
+
+            expect(base64).toMatch(/^[A-Za-z0-9\+/]+$/);
+            expect(s.signature.ed25519.toBase64()).toStrictEqual(base64);
+        }
+
+        // `getSignature`
+        {
+            const signature = signatures.getSignature(user, new DeviceKeyId('ed25519:foobar'));
+            expect(signature.toBase64()).toStrictEqual(base64);
+        }
+
+        // Unknown signatures.
+        {
+            expect(signatures.get(new UserId('@hello:example.org'))).toBeUndefined();
+            expect(signatures.getSignature(user, new DeviceKeyId('world:foobar'))).toBeUndefined();
+        }
+    });
+
+    test('can get a user identities', async () => {
+        const m = await machine();
+        let _ = m.bootstrapCrossSigning(true);
+
+        const identity = await m.getIdentity(user);
+
+        expect(identity).toBeInstanceOf(OwnUserIdentity);
+
+        const signatureUploadRequest = await identity.verify();
+        expect(signatureUploadRequest).toBeInstanceOf(SignatureUploadRequest);
+
+        const [verificationRequest, outgoingVerificationRequest] = await identity.requestVerification();
+        expect(verificationRequest).toBeInstanceOf(VerificationRequest);
+        expect(outgoingVerificationRequest).toBeInstanceOf(ToDeviceRequest);
+
+        const isTrusted = await identity.trustsOurOwnDevice();
+
+        expect(isTrusted).toStrictEqual(false);
+    });
+
+    describe('can export/import room keys', () => {
+        let m;
+        let exportedRoomKeys;
+
+        test('can export room keys', async () => {
+            m = await machine();
+            await m.shareRoomKey(room, [new UserId('@bob:example.org')], new EncryptionSettings());
+
+            exportedRoomKeys = await m.exportRoomKeys(session => {
+                expect(session).toBeInstanceOf(InboundGroupSession);
+                expect(session.roomId.toString()).toStrictEqual(room.toString());
+                expect(session.sessionId).toBeDefined();
+                expect(session.hasBeenImported()).toStrictEqual(false);
+
+                return true;
+            });
+
+            const roomKeys = JSON.parse(exportedRoomKeys);
+            expect(roomKeys).toHaveLength(1);
+            expect(roomKeys[0]).toMatchObject({
+                algorithm: expect.any(String),
+                room_id: room.toString(),
+                sender_key: expect.any(String),
+                session_id: expect.any(String),
+                session_key: expect.any(String),
+                sender_claimed_keys: {
+                    ed25519: expect.any(String),
+                },
+                forwarding_curve25519_key_chain: [],
+            });
+        });
+
+        let encryptedExportedRoomKeys;
+        let encryptionPassphrase = 'Hello, Matrix!';
+
+        test('can encrypt the exported room keys', () => {
+            encryptedExportedRoomKeys = OlmMachine.encryptExportedRoomKeys(
+                exportedRoomKeys,
+                encryptionPassphrase,
+                100_000,
+            );
+
+            expect(encryptedExportedRoomKeys).toMatch(/^-----BEGIN MEGOLM SESSION DATA-----/);
+        });
+
+        test('can decrypt the exported room keys', () => {
+            const decryptedExportedRoomKeys = OlmMachine.decryptExportedRoomKeys(
+                encryptedExportedRoomKeys,
+                encryptionPassphrase,
+            );
+
+            expect(decryptedExportedRoomKeys).toStrictEqual(exportedRoomKeys);
+        });
+
+        test('can import room keys', async () => {
+            const progressListener = (progress, total) => {
+                expect(progress).toBeLessThan(total);
+
+                // Since it's called only once, let's be crazy.
+                expect(progress).toStrictEqual(0n);
+                expect(total).toStrictEqual(1n);
+            };
+
+            const result = JSON.parse(await m.importRoomKeys(exportedRoomKeys, progressListener));
+
+            expect(result).toMatchObject({
+                imported_count: expect.any(Number),
+                total_count: expect.any(Number),
+                keys: expect.any(Object),
+            });
+        });
+    });
+
+    describe('can do in-room verification', () => {
+        let m;
+        const user = new UserId('@alice:example.org');
+        const device = new DeviceId('JLAFKJWSCS');
+        const room = new RoomId('!test:localhost');
+
+        beforeAll(async () => {
+            m = await machine(user, device);
+        });
+
+        test('can inject devices from someone else', async () => {
+            {
+                const hypothetical_response = JSON.stringify({
+                    "device_keys": {
+                        "@example:morpheus.localhost": {
+                            "ATRLDCRXAC": {
+                                "algorithms": [
+                                    "m.olm.v1.curve25519-aes-sha2",
+                                    "m.megolm.v1.aes-sha2"
+                                ],
+                                "device_id": "ATRLDCRXAC",
+                                "keys": {
+                                    "curve25519:ATRLDCRXAC": "cAVT5Es3Z3F5pFD+2w3HT7O9+R3PstzYVkzD51X/FWQ",
+                                    "ed25519:ATRLDCRXAC": "V2w/T/x7i7AXiCCtS6JldrpbvRliRoef3CqTUNqMRHA"
+                                },
+                                "signatures": {
+                                    "@example:morpheus.localhost": {
+                                        "ed25519:ATRLDCRXAC": "ro2BjO5J6089B/JOANHnFmGrogrC2TIdMlgJbJO00DjOOcGxXfvOezCFIORTwZNHvkHU617YIGl/4keTDIWvBQ"
+                                    }
+                                },
+                                "user_id": "@example:morpheus.localhost",
+                                "unsigned": {
+                                    "device_display_name": "Element Desktop: Linux"
+                                }
+                            },
+                            "EYYGYTCTNC": {
+                                "algorithms": [
+                                    "m.olm.v1.curve25519-aes-sha2",
+                                    "m.megolm.v1.aes-sha2"
+                                ],
+                                "device_id": "EYYGYTCTNC",
+                                "keys": {
+                                    "curve25519:EYYGYTCTNC": "Pqu50fo472wgb6NjKkaUxjuqoAIEAmhln2gw/zSQ7Ek",
+                                    "ed25519:EYYGYTCTNC": "Pf/2QPvui8lDty6TCTglVPRVM+irNHYavNNkyv5yFpU"
+                                },
+                                "signatures": {
+                                    "@example:morpheus.localhost": {
+                                        "ed25519:EYYGYTCTNC": "pnP5BYLEUUaxDgrvdzCznkjNDbvY1/MFBr1JejdnLiXlcmxRULQpIWZUCO7QTbULsCwMsYQNGn50nfmjBQX3CQ"
+                                    }
+                                },
+                                "user_id": "@example:morpheus.localhost",
+                                "unsigned": {
+                                    "device_display_name": "WeeChat-Matrix-rs"
+                                }
+                            },
+                            "SUMODVLSIU": {
+                                "algorithms": [
+                                    "m.olm.v1.curve25519-aes-sha2",
+                                    "m.megolm.v1.aes-sha2"
+                                ],
+                                "device_id": "SUMODVLSIU",
+                                "keys": {
+                                    "curve25519:SUMODVLSIU": "geQXWGWc++gcUHk0JcFmEVSjyzDOnk2mjVsUQwbNqQU",
+                                    "ed25519:SUMODVLSIU": "ccktaQ3g+B18E6FwVhTBYie26OlHbvDUzDEtxOQ4Qcs"
+                                },
+                                "signatures": {
+                                    "@example:morpheus.localhost": {
+                                        "ed25519:SUMODVLSIU": "Yn+AOxHRt1GQpY2xT2Jcqqn8jh5+Vw23ctA7NXyDiWPsLPLNTpjGWHMjZdpUqflQvpiKfhODPICoIa7Pu0iSAg",
+                                        "ed25519:rUiMNDjIu6gqsrhJPbj3phyIzuEtuQGrLOEa9mCbtTM": "Cio6k/sq289XNTOvTCWre7Q6zg+A3euzMUe7Uy1T3gPqYFzX+kt7EAxrhbPqx1HyXAEz9zD0D/uw9VEXFCvWBQ"
+                                    }
+                                },
+                                "user_id": "@example:morpheus.localhost",
+                                "unsigned": {
+                                    "device_display_name": "Element Desktop (Linux)"
+                                }
+                            }
+                        }
+                    },
+                    "failures": {},
+                    "master_keys": {
+                        "@example:morpheus.localhost": {
+                            "user_id": "@example:morpheus.localhost",
+                            "usage": [
+                                "master"
+                            ],
+                            "keys": {
+                                "ed25519:ZzU4WCyBfOFitdGmfKCq6F39iQCDk/zhNNTsi+tWH7A": "ZzU4WCyBfOFitdGmfKCq6F39iQCDk/zhNNTsi+tWH7A"
+                            },
+                            "signatures": {
+                                "@example:morpheus.localhost": {
+                                    "ed25519:SUMODVLSIU": "RL6WOuuzB/mZ+edfUFG/KeEcmKh+NaWpM6m2bUYmDnJrtTCYyoU+pgHJuL2/6nynemmONo18JEHBuqtNcMq2AQ"
+                                }
+                            }
+                        }
+                    },
+                    "self_signing_keys": {
+                        "@example:morpheus.localhost": {
+                            "user_id": "@example:morpheus.localhost",
+                            "usage": [
+                                "self_signing"
+                            ],
+                            "keys": {
+                                "ed25519:rUiMNDjIu6gqsrhJPbj3phyIzuEtuQGrLOEa9mCbtTM": "rUiMNDjIu6gqsrhJPbj3phyIzuEtuQGrLOEa9mCbtTM"
+                            },
+                            "signatures": {
+                                "@example:morpheus.localhost": {
+                                    "ed25519:ZzU4WCyBfOFitdGmfKCq6F39iQCDk/zhNNTsi+tWH7A": "uCBn9rpeg6umY8H97ejN26UMp6QDwNL98869t1DoVGL50J8adLN05OZd8lYk9QzwTr2d56ZTGYSYX8kv28SDDA"
+                                }
+                            }
+                        }
+                    },
+                    "user_signing_keys": {
+                        "@example:morpheus.localhost": {
+                            "user_id": "@example:morpheus.localhost",
+                            "usage": [
+                                "user_signing"
+                            ],
+                            "keys": {
+                                "ed25519:GLhEKLQ50jnF6IMEPsO2ucpHUNIUEnbBXs5gYbHg4Aw": "GLhEKLQ50jnF6IMEPsO2ucpHUNIUEnbBXs5gYbHg4Aw"
+                            },
+                            "signatures": {
+                                "@example:morpheus.localhost": {
+                                    "ed25519:ZzU4WCyBfOFitdGmfKCq6F39iQCDk/zhNNTsi+tWH7A": "4fIyWlVzuz1pgoegNLZASycORXqKycVS0dNq5vmmwsVEudp1yrPhndnaIJ3fjF8LDHvwzXTvohOid7DiU1j0AA"
+                                }
+                            }
+                        }
+                    }
+                });
+                const marked = await m.markRequestAsSent('foo', RequestType.KeysQuery, hypothetical_response);
+            }
+        });
+
+        test('can start an in-room SAS verification', async () => {
+            let _ = m.bootstrapCrossSigning(true);
+            const identity = await m.getIdentity(new UserId('@example:morpheus.localhost'));
+
+            expect(identity).toBeInstanceOf(UserIdentity);
+            expect(identity.isVerified()).toStrictEqual(false);
+
+            const eventId = new EventId('$Rqnc-F-dvnEYJTyHq_iKxU2bZ1CI92-kuZq3a5lr5Zg');
+            const verificationRequest = await identity.requestVerification(room, eventId);
+            expect(verificationRequest).toBeInstanceOf(VerificationRequest);
+
+            await m.receiveVerificationEvent(
+                JSON.stringify({
+                    "sender": "@example:morpheus.localhost",
+                    "type": "m.key.verification.ready",
+                    "event_id": "$QguWmaeMt6Hao7Ea6XHDInvr8ndknev79t9a2eBxlz0",
+                    "origin_server_ts": 1674037263075,
+                    "content": {
+                        "methods": [
+                            "m.sas.v1",
+                            "m.qr_code.show.v1",
+                            "m.reciprocate.v1"
+                        ],
+                        "from_device": "SUMODVLSIU",
+                        "m.relates_to": {
+                            "rel_type": "m.reference",
+                            "event_id": eventId.toString(),
+                        }
+                    }
+                }),
+                room
+            );
+
+            expect(verificationRequest.roomId.toString()).toStrictEqual(room.toString());
+
+            const [_sas, outgoingVerificationRequest] = await verificationRequest.startSas();
+
+            expect(outgoingVerificationRequest).toBeInstanceOf(RoomMessageRequest);
+            expect(outgoingVerificationRequest.id).toBeDefined();
+            expect(outgoingVerificationRequest.room_id).toStrictEqual(room.toString());
+            expect(outgoingVerificationRequest.txn_id).toBeDefined();
+            expect(outgoingVerificationRequest.event_type).toStrictEqual('m.key.verification.start');
+            expect(outgoingVerificationRequest.body).toBeDefined();
+
+            const body = JSON.parse(outgoingVerificationRequest.body);
+            expect(body).toMatchObject({
+                from_device: expect.any(String),
+                method: 'm.sas.v1',
+                key_agreement_protocols: [expect.any(String)],
+                hashes: [expect.any(String)],
+                message_authentication_codes: [expect.any(String), expect.any(String)],
+                short_authentication_string: ['decimal', 'emoji'],
+                'm.relates_to': {
+                    rel_type: 'm.reference',
+                    event_id: eventId.toString(),
+                }
+            });
+        })
     });
 });

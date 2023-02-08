@@ -17,7 +17,7 @@ pub struct Attachment;
 impl Attachment {
     /// Encrypt the content of the `Uint8Array`.
     ///
-    /// It produces an `EncryptedAttachment`, we can be used to
+    /// It produces an `EncryptedAttachment`, which can be used to
     /// retrieve the media encryption information, or the encrypted
     /// data.
     #[napi]
@@ -50,14 +50,11 @@ impl Attachment {
     /// by calling `EncryptedAttachment.mediaEncryptionInfo`.
     #[napi]
     pub fn decrypt(attachment: &mut EncryptedAttachment) -> napi::Result<Uint8Array> {
-        let media_encryption_info = match attachment.media_encryption_info.take() {
-            Some(media_encryption_info) => media_encryption_info,
-            None => {
-                return Err(napi::Error::from_reason(
-                    "The media encryption info are absent from the given encrypted attachment"
-                        .to_owned(),
-                ))
-            }
+        let Some(media_encryption_info) = attachment.media_encryption_info.take() else {
+            return Err(napi::Error::from_reason(
+                "The media encryption info are absent from the given encrypted attachment"
+                    .to_owned(),
+            ));
         };
 
         let encrypted_data: &[u8] = attachment.encrypted_data.deref();

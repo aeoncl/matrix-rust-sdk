@@ -12,33 +12,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use ruma::{api::client::sync::sync_events, presence::PresenceState};
 
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
 /// Settings for a sync call.
-pub struct SyncSettings<'a> {
-    pub(crate) filter: Option<sync_events::v3::Filter<'a>>,
+#[derive(Clone)]
+pub struct SyncSettings {
+    pub(crate) filter: Option<sync_events::v3::Filter>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) token: Option<String>,
     pub(crate) full_state: bool,
-    pub(crate) set_presence: PresenceState
+    pub(crate) set_presence: PresenceState,
 }
 
-impl<'a> Default for SyncSettings<'a> {
+impl Default for SyncSettings {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a> SyncSettings<'a> {
+impl fmt::Debug for SyncSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("SyncSettings");
+
+        macro_rules! opt_field {
+            ($field:ident) => {
+                if let Some(value) = &self.$field {
+                    s.field(stringify!($field), value);
+                }
+            };
+        }
+
+        opt_field!(filter);
+        opt_field!(timeout);
+
+        s.field("full_state", &self.full_state).finish()
+    }
+}
+
+impl SyncSettings {
     /// Create new default sync settings.
     #[must_use]
     pub fn new() -> Self {
-        Self { filter: None, timeout: Some(DEFAULT_SYNC_TIMEOUT), token: None, full_state: false, set_presence: PresenceState::Online }
+        Self {
+            filter: None,
+            timeout: Some(DEFAULT_SYNC_TIMEOUT),
+            token: None,
+            full_state: false,
+            set_presence: PresenceState::Online,
+        }
     }
 
     /// Set the sync token.
@@ -72,7 +97,7 @@ impl<'a> SyncSettings<'a> {
     /// * `filter` - The filter configuration that should be used for the sync
     ///   call.
     #[must_use]
-    pub fn filter(mut self, filter: sync_events::v3::Filter<'a>) -> Self {
+    pub fn filter(mut self, filter: sync_events::v3::Filter) -> Self {
         self.filter = Some(filter);
         self
     }
@@ -90,14 +115,21 @@ impl<'a> SyncSettings<'a> {
         self
     }
 
-    /// Sets the presence upon calling Sync.
+    /// Set the presence state
+    ///
+    /// `PresenceState::Online` - The client is marked as being online. This is
+    /// the default preset.
+    ///
+    /// `PresenceState::Offline` - The client is not marked as being online.
+    ///
+    /// `PresenceState::Unavailable` - The client is marked as being idle.
     ///
     /// # Arguments
-    /// * `set_presence` - An enum representing the availlable presence states.
+    /// * `set_presence` - The `PresenceState` that the server should set for
+    ///   the client.
     #[must_use]
-    pub fn set_presence(mut self, set_presence: PresenceState) -> Self {
-        self.set_presence = set_presence;
+    pub fn set_presence(mut self, presence: PresenceState) -> Self {
+        self.set_presence = presence;
         self
     }
-
 }

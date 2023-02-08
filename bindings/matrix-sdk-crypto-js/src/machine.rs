@@ -2,18 +2,20 @@
 
 use std::collections::BTreeMap;
 
-use js_sys::{Array, Map, Promise, Set};
+use js_sys::{Array, Function, Map, Promise, Set};
 use ruma::{serde::Raw, DeviceKeyAlgorithm, OwnedTransactionId, UInt};
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use wasm_bindgen::prelude::*;
 
 use crate::{
-    downcast, encryption,
+    device, encryption,
     future::future_to_promise,
-    identifiers, requests,
+    identifiers, identities,
+    js::downcast,
+    olm, requests,
     requests::OutgoingRequest,
     responses::{self, response_from_string},
-    sync_events,
+    store, sync_events, types, verification, vodozemac,
 };
 
 /// State machine implementation of the Olm/Megolm encryption protocol
@@ -26,24 +28,100 @@ pub struct OlmMachine {
 
 #[wasm_bindgen]
 impl OlmMachine {
-    /// Create a new memory based `OlmMachine`.
+    /// Constructor will always fail. To create a new `OlmMachine`, please use
+    /// the `initialize` method.
     ///
-    /// The created machine will keep the encryption keys only in
-    /// memory and once the objects is dropped, the keys will be lost.
-    ///
-    /// `user_id` represents the unique ID of the user that owns this
-    /// machine. `device_id` represents the unique ID of the device
-    /// that owns this machine.
+    /// Why this pattern? `initialize` returns a `Promise`. Returning a
+    // `Promise` from a constructor is not idiomatic in JavaScript.
     #[wasm_bindgen(constructor)]
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(user_id: &identifiers::UserId, device_id: &identifiers::DeviceId) -> Promise {
+    pub fn new() -> Result<OlmMachine, JsError> {
+        Err(JsError::new("To build an `OlmMachine`, please use the `initialize` method"))
+    }
+
+    /// Create a new `OlmMachine`.
+    ///
+    /// The created machine will keep the encryption keys either in a IndexedDB
+    /// based store, or in a memory store and once the objects is dropped,
+    /// the keys will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - represents the unique ID of the user that owns this
+    /// machine.
+    ///
+    /// * `device_id` - represents the unique ID of the device
+    /// that owns this machine.
+    ///
+    /// * `store_name` - The name that should be used to open the IndexedDB
+    ///   based database. If this isn't provided, a memory-only store will be
+    ///   used. *Note* the memory-only store will lose your E2EE keys when the
+    ///   `OlmMachine` gets dropped.
+    ///
+    /// * `store_passphrase` - The passphrase that should be used to encrypt the
+    ///   IndexedDB based
+    pub fn initialize(
+        user_id: &identifiers::UserId,
+        device_id: &identifiers::DeviceId,
+        store_name: Option<String>,
+        store_passphrase: Option<String>,
+    ) -> Promise {
         let user_id = user_id.inner.clone();
         let device_id = device_id.inner.clone();
 
         future_to_promise(async move {
+            let store = match (store_name, store_passphrase) {
+                (Some(store_name), Some(mut store_passphrase)) => {
+                    use zeroize::Zeroize;
+
+                    let store = Some(
+                        matrix_sdk_indexeddb::IndexeddbCryptoStore::open_with_passphrase(
+                            &store_name,
+                            &store_passphrase,
+                        )
+                        .await?,
+                    );
+
+                    store_passphrase.zeroize();
+
+                    store
+                }
+
+                (Some(store_name), None) => Some(
+                    matrix_sdk_indexeddb::IndexeddbCryptoStore::open_with_name(&store_name).await?,
+                ),
+
+                (None, Some(_)) => {
+                    return Err(anyhow::Error::msg(
+                        "The `store_passphrase` has been set, but it has an effect only if \
+                        `store_name` is set, which is not; please provide one",
+                    ))
+                }
+
+                (None, None) => None,
+            };
+
             Ok(OlmMachine {
-                inner: matrix_sdk_crypto::OlmMachine::new(user_id.as_ref(), device_id.as_ref())
-                    .await,
+                inner: match store {
+                    // We need this `#[cfg]` because `IndexeddbCryptoStore`
+                    // implements `CryptoStore` only on `target_arch =
+                    // "wasm32"`. Without that, we could have a compilation
+                    // error when checking the entire workspace. In practice,
+                    // it doesn't impact this crate because it's always
+                    // compiled for `wasm32`.
+                    #[cfg(target_arch = "wasm32")]
+                    Some(store) => {
+                        matrix_sdk_crypto::OlmMachine::with_store(
+                            user_id.as_ref(),
+                            device_id.as_ref(),
+                            store,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        matrix_sdk_crypto::OlmMachine::new(user_id.as_ref(), device_id.as_ref())
+                            .await
+                    }
+                },
             })
         })
     }
@@ -62,7 +140,7 @@ impl OlmMachine {
 
     /// Get the public parts of our Olm identity keys.
     #[wasm_bindgen(getter, js_name = "identityKeys")]
-    pub fn identity_keys(&self) -> IdentityKeys {
+    pub fn identity_keys(&self) -> vodozemac::IdentityKeys {
         self.inner.identity_keys().into()
     }
 
@@ -74,30 +152,42 @@ impl OlmMachine {
         future_to_promise(async move { Ok(me.display_name().await?) })
     }
 
-    /// Get all the tracked users of our own device.
+    /// Get the list of users whose devices we are currently tracking.
+    ///
+    /// A user can be marked for tracking using the
+    /// [`update_tracked_users`](#method.update_tracked_users) method.
     ///
     /// Returns a `Set<UserId>`.
     #[wasm_bindgen(js_name = "trackedUsers")]
-    pub fn tracked_users(&self) -> Set {
+    pub fn tracked_users(&self) -> Result<Promise, JsError> {
         let set = Set::new(&JsValue::UNDEFINED);
+        let me = self.inner.clone();
 
-        for user in self.inner.tracked_users() {
-            set.add(&identifiers::UserId::from(user).into());
-        }
-
-        set
+        Ok(future_to_promise(async move {
+            for user in me.tracked_users().await? {
+                set.add(&identifiers::UserId::from(user).into());
+            }
+            Ok(set)
+        }))
     }
 
-    /// Update the tracked users.
+    /// Update the list of tracked users.
     ///
-    /// `users` is an iterator over user IDs that should be marked for
-    /// tracking.
+    /// The OlmMachine maintains a list of users whose devices we are keeping
+    /// track of: these are known as "tracked users". These must be users
+    /// that we share a room with, so that the server sends us updates for
+    /// their device lists.
     ///
-    /// This will mark users that weren't seen before for a key query
-    /// and tracking.
+    /// # Arguments
     ///
-    /// If the user is already known to the Olm machine, it will not
-    /// be considered for a key query.
+    /// * `users` - An array of user ids that should be added to the list of
+    ///   tracked users
+    ///
+    /// Any users that hadn't been seen before will be flagged for a key query
+    /// immediately, and whenever `receive_sync_changes` receives a
+    /// "changed" notification for that user in the future.
+    ///
+    /// Users that were already in the list are unaffected.
     #[wasm_bindgen(js_name = "updateTrackedUsers")]
     pub fn update_tracked_users(&self, users: &Array) -> Result<Promise, JsError> {
         let users = users
@@ -108,7 +198,7 @@ impl OlmMachine {
         let me = self.inner.clone();
 
         Ok(future_to_promise(async move {
-            me.update_tracked_users(users.iter().map(AsRef::as_ref)).await;
+            me.update_tracked_users(users.iter().map(AsRef::as_ref)).await?;
             Ok(JsValue::UNDEFINED)
         }))
     }
@@ -282,6 +372,98 @@ impl OlmMachine {
         }))
     }
 
+    /// Get the status of the private cross signing keys.
+    ///
+    /// This can be used to check which private cross signing keys we
+    /// have stored locally.
+    #[wasm_bindgen(js_name = "crossSigningStatus")]
+    pub fn cross_signing_status(&self) -> Promise {
+        let me = self.inner.clone();
+
+        future_to_promise::<_, olm::CrossSigningStatus>(async move {
+            Ok(me.cross_signing_status().await.into())
+        })
+    }
+
+    /// Export all the private cross signing keys we have.
+    ///
+    /// The export will contain the seed for the ed25519 keys as a
+    /// unpadded base64 encoded string.
+    ///
+    /// This method returns None if we don’t have any private cross
+    /// signing keys.
+    #[wasm_bindgen(js_name = "exportCrossSigningKeys")]
+    pub fn export_cross_signing_keys(&self) -> Promise {
+        let me = self.inner.clone();
+
+        future_to_promise(async move {
+            Ok(me.export_cross_signing_keys().await.map(store::CrossSigningKeyExport::from))
+        })
+    }
+
+    /// Import our private cross signing keys.
+    ///
+    /// The export needs to contain the seed for the ed25519 keys as
+    /// an unpadded base64 encoded string.
+    #[wasm_bindgen(js_name = "importCrossSigningKeys")]
+    pub fn import_cross_signing_keys(&self, export: store::CrossSigningKeyExport) -> Promise {
+        let me = self.inner.clone();
+        let export = export.inner;
+
+        future_to_promise(async move {
+            Ok(me.import_cross_signing_keys(export).await.map(olm::CrossSigningStatus::from)?)
+        })
+    }
+
+    /// Create a new cross signing identity and get the upload request
+    /// to push the new public keys to the server.
+    ///
+    /// Warning: This will delete any existing cross signing keys that
+    /// might exist on the server and thus will reset the trust
+    /// between all the devices.
+    ///
+    /// Uploading these keys will require user interactive auth.
+    #[wasm_bindgen(js_name = "bootstrapCrossSigning")]
+    pub fn bootstrap_cross_signing(&self, reset: bool) -> Promise {
+        let me = self.inner.clone();
+
+        future_to_promise(async move {
+            let (upload_signing_keys_request, upload_signatures_request) =
+                me.bootstrap_cross_signing(reset).await?;
+
+            let tuple = Array::new();
+            tuple.set(
+                0,
+                requests::SigningKeysUploadRequest::try_from(&upload_signing_keys_request)?.into(),
+            );
+            tuple.set(
+                1,
+                requests::SignatureUploadRequest::try_from(&upload_signatures_request)?.into(),
+            );
+
+            Ok(tuple)
+        })
+    }
+
+    /// Get the cross signing user identity of a user.
+    #[wasm_bindgen(js_name = "getIdentity")]
+    pub fn get_identity(&self, user_id: &identifiers::UserId) -> Promise {
+        let me = self.inner.clone();
+        let user_id = user_id.inner.clone();
+
+        future_to_promise(async move {
+            Ok(me.get_identity(user_id.as_ref(), None).await?.map(identities::UserIdentities::from))
+        })
+    }
+
+    /// Sign the given message using our device key and if available
+    /// cross-signing master key.
+    pub fn sign(&self, message: String) -> Promise {
+        let me = self.inner.clone();
+
+        future_to_promise::<_, types::Signatures>(async move { Ok(me.sign(&message).await.into()) })
+    }
+
     /// Invalidate the currently active outbound group session for the
     /// given room.
     ///
@@ -328,10 +510,8 @@ impl OlmMachine {
     /// Get the a key claiming request for the user/device pairs that
     /// we are missing Olm sessions for.
     ///
-    /// Returns `NULL` if no key claiming request needs to be sent
-    /// out, otherwise it returns an `Array` where the first key is
-    /// the transaction ID as a string, and the second key is the keys
-    /// claim request serialized to JSON.
+    /// Returns `null` if no key claiming request needs to be sent
+    /// out, otherwise it returns a `KeysClaimRequest` object.
     ///
     /// Sessions need to be established between devices so group
     /// sessions for a room can be shared with them.
@@ -374,70 +554,214 @@ impl OlmMachine {
             }
         }))
     }
-}
 
-/// An Ed25519 public key, used to verify digital signatures.
-#[wasm_bindgen]
-#[derive(Debug, Clone)]
-pub struct Ed25519PublicKey {
-    inner: vodozemac::Ed25519PublicKey,
-}
+    /// Get a map holding all the devices of a user.
+    ///
+    /// `user_id` represents the unique ID of the user that the
+    /// devices belong to.
+    #[wasm_bindgen(js_name = "getUserDevices")]
+    pub fn get_user_devices(&self, user_id: &identifiers::UserId) -> Promise {
+        let user_id = user_id.inner.clone();
 
-#[wasm_bindgen]
-impl Ed25519PublicKey {
-    /// The number of bytes an Ed25519 public key has.
-    #[wasm_bindgen(getter)]
-    pub fn length(&self) -> usize {
-        vodozemac::Ed25519PublicKey::LENGTH
+        let me = self.inner.clone();
+
+        future_to_promise::<_, device::UserDevices>(async move {
+            Ok(me.get_user_devices(&user_id, None).await.map(Into::into)?)
+        })
     }
 
-    /// Serialize an Ed25519 public key to an unpadded base64
-    /// representation.
-    #[wasm_bindgen(js_name = "toBase64")]
-    pub fn to_base64(&self) -> String {
-        self.inner.to_base64()
+    /// Get a specific device of a user if one is found and the crypto store
+    /// didn't throw an error.
+    ///
+    /// `user_id` represents the unique ID of the user that the
+    /// identity belongs to. `device_id` represents the unique ID of
+    /// the device.
+    #[wasm_bindgen(js_name = "getDevice")]
+    pub fn get_device(
+        &self,
+        user_id: &identifiers::UserId,
+        device_id: &identifiers::DeviceId,
+    ) -> Promise {
+        let user_id = user_id.inner.clone();
+        let device_id = device_id.inner.clone();
+
+        let me = self.inner.clone();
+
+        future_to_promise::<_, Option<device::Device>>(async move {
+            Ok(me.get_device(&user_id, &device_id, None).await?.map(Into::into))
+        })
     }
-}
 
-/// A Curve25519 public key.
-#[wasm_bindgen]
-#[derive(Debug, Clone)]
-pub struct Curve25519PublicKey {
-    inner: vodozemac::Curve25519PublicKey,
-}
-
-#[wasm_bindgen]
-impl Curve25519PublicKey {
-    /// The number of bytes a Curve25519 public key has.
-    #[wasm_bindgen(getter)]
-    pub fn length(&self) -> usize {
-        vodozemac::Curve25519PublicKey::LENGTH
+    /// Get a verification object for the given user ID with the given
+    /// flow ID (a to-device request ID if the verification has been
+    /// requested by a to-device request, or a room event ID if the
+    /// verification has been requested by a room event).
+    ///
+    /// It returns a “`Verification` object”, which is either a `Sas`
+    /// or `Qr` object.
+    #[wasm_bindgen(js_name = "getVerification")]
+    pub fn get_verification(
+        &self,
+        user_id: &identifiers::UserId,
+        flow_id: &str,
+    ) -> Result<JsValue, JsError> {
+        self.inner
+            .get_verification(&user_id.inner, flow_id)
+            .map(verification::Verification)
+            .map(JsValue::try_from)
+            .transpose()
+            .map(JsValue::from)
     }
 
-    /// Serialize an Curve25519 public key to an unpadded base64
-    /// representation.
-    #[wasm_bindgen(js_name = "toBase64")]
-    pub fn to_base64(&self) -> String {
-        self.inner.to_base64()
+    /// Get a verification request object with the given flow ID.
+    #[wasm_bindgen(js_name = "getVerificationRequest")]
+    pub fn get_verification_request(
+        &self,
+        user_id: &identifiers::UserId,
+        flow_id: &str,
+    ) -> Option<verification::VerificationRequest> {
+        self.inner.get_verification_request(&user_id.inner, flow_id).map(Into::into)
     }
-}
 
-/// Struct holding the two public identity keys of an account.
-#[wasm_bindgen(getter_with_clone)]
-#[derive(Debug)]
-pub struct IdentityKeys {
-    /// The Ed25519 public key, used for signing.
-    pub ed25519: Ed25519PublicKey,
-
-    /// The Curve25519 public key, used for establish shared secrets.
-    pub curve25519: Curve25519PublicKey,
-}
-
-impl From<matrix_sdk_crypto::olm::IdentityKeys> for IdentityKeys {
-    fn from(value: matrix_sdk_crypto::olm::IdentityKeys) -> Self {
-        Self {
-            ed25519: Ed25519PublicKey { inner: value.ed25519 },
-            curve25519: Curve25519PublicKey { inner: value.curve25519 },
-        }
+    /// Get all the verification requests of a given user.
+    #[wasm_bindgen(js_name = "getVerificationRequests")]
+    pub fn get_verification_requests(&self, user_id: &identifiers::UserId) -> Array {
+        self.inner
+            .get_verification_requests(&user_id.inner)
+            .into_iter()
+            .map(verification::VerificationRequest::from)
+            .map(JsValue::from)
+            .collect()
     }
+
+    /// Receive a verification event.
+    ///
+    /// This method can be used to pass verification events that are happening
+    /// in rooms to the `OlmMachine`. The event should be in the decrypted form.
+    #[wasm_bindgen(js_name = "receiveVerificationEvent")]
+    pub fn receive_verification_event(
+        &self,
+        event: &str,
+        room_id: &identifiers::RoomId,
+    ) -> Result<Promise, JsError> {
+        let room_id = room_id.inner.clone();
+        let event: ruma::events::AnySyncMessageLikeEvent = serde_json::from_str(event)?;
+        let event = event.into_full_event(room_id);
+
+        let me = self.inner.clone();
+
+        Ok(future_to_promise(async move {
+            Ok(me.receive_verification_event(&event).await.map(|_| JsValue::UNDEFINED)?)
+        }))
+    }
+
+    /// Export the keys that match the given predicate.
+    ///
+    /// `predicate` is a closure that will be called for every known
+    /// `InboundGroupSession`, which represents a room key. If the closure
+    /// returns `true`, the `InboundGroupSession` will be included in the
+    /// export, otherwise it won't.
+    #[wasm_bindgen(js_name = "exportRoomKeys")]
+    pub fn export_room_keys(&self, predicate: Function) -> Promise {
+        let me = self.inner.clone();
+
+        future_to_promise(async move {
+            Ok(serde_json::to_string(
+                &me.export_room_keys(|session| {
+                    let session = session.clone();
+
+                    predicate
+                        .call1(&JsValue::NULL, &olm::InboundGroupSession::from(session).into())
+                        .expect("Predicate function passed to `export_room_keys` failed")
+                        .as_bool()
+                        .unwrap_or(false)
+                })
+                .await?,
+            )?)
+        })
+    }
+
+    /// Import the given room keys into our store.
+    ///
+    /// `exported_keys` is a list of previously exported keys that should be
+    /// imported into our store. If we already have a better version of a key,
+    /// the key will _not_ be imported.
+    ///
+    /// `progress_listener` is a closure that takes 2 arguments: `progress` and
+    /// `total`, and returns nothing.
+    #[wasm_bindgen(js_name = "importRoomKeys")]
+    pub fn import_room_keys(
+        &self,
+        exported_room_keys: &str,
+        progress_listener: Function,
+    ) -> Result<Promise, JsError> {
+        let me = self.inner.clone();
+        let exported_room_keys: Vec<matrix_sdk_crypto::olm::ExportedRoomKey> =
+            serde_json::from_str(exported_room_keys)?;
+
+        Ok(future_to_promise(async move {
+            let matrix_sdk_crypto::RoomKeyImportResult { imported_count, total_count, keys } = me
+                .import_room_keys(exported_room_keys, false, |progress, total| {
+                    let progress: u64 = progress.try_into().unwrap();
+                    let total: u64 = total.try_into().unwrap();
+
+                    progress_listener
+                        .call2(&JsValue::NULL, &JsValue::from(progress), &JsValue::from(total))
+                        .expect("Progress listener passed to `import_room_keys` failed");
+                })
+                .await?;
+
+            Ok(serde_json::to_string(&json!({
+                "imported_count": imported_count,
+                "total_count": total_count,
+                "keys": keys,
+            }))?)
+        }))
+    }
+
+    /// Encrypt the list of exported room keys using the given passphrase.
+    ///
+    /// `exported_room_keys` is a list of sessions that should be encrypted
+    /// (it's generally returned by `export_room_keys`). `passphrase` is the
+    /// passphrase that will be used to encrypt the exported room keys. And
+    /// `rounds` is the number of rounds that should be used for the key
+    /// derivation when the passphrase gets turned into an AES key. More rounds
+    /// are increasingly computationnally intensive and as such help against
+    /// brute-force attacks. Should be at least `10_000`, while values in the
+    /// `100_000` ranges should be preferred.
+    #[wasm_bindgen(js_name = "encryptExportedRoomKeys")]
+    pub fn encrypt_exported_room_keys(
+        exported_room_keys: &str,
+        passphrase: &str,
+        rounds: u32,
+    ) -> Result<String, JsError> {
+        let exported_room_keys: Vec<matrix_sdk_crypto::olm::ExportedRoomKey> =
+            serde_json::from_str(exported_room_keys)?;
+
+        Ok(matrix_sdk_crypto::encrypt_room_key_export(&exported_room_keys, passphrase, rounds)?)
+    }
+
+    /// Try to decrypt a reader into a list of exported room keys.
+    ///
+    /// `encrypted_exported_room_keys` is the result from
+    /// `encrypt_exported_room_keys`. `passphrase` is the passphrase that was
+    /// used when calling `encrypt_exported_room_keys`.
+    #[wasm_bindgen(js_name = "decryptExportedRoomKeys")]
+    pub fn decrypt_exported_room_keys(
+        encrypted_exported_room_keys: &str,
+        passphrase: &str,
+    ) -> Result<String, JsError> {
+        Ok(serde_json::to_string(&matrix_sdk_crypto::decrypt_room_key_export(
+            encrypted_exported_room_keys.as_bytes(),
+            passphrase,
+        )?)?)
+    }
+
+    /// Shut down the `OlmMachine`.
+    ///
+    /// The `OlmMachine` cannot be used after this method has been called.
+    ///
+    /// All associated resources will be closed too, like IndexedDB
+    /// connections.
+    pub fn close(self) {}
 }

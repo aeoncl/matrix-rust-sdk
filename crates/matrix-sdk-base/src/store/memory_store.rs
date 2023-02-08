@@ -12,27 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "experimental-timeline")]
-use std::collections::{BTreeMap, HashMap};
 use std::{
     collections::BTreeSet,
     sync::{Arc, RwLock},
 };
 
-#[cfg(feature = "experimental-timeline")]
-use async_stream::stream;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
-use lru::LruCache;
 #[allow(unused_imports)]
 use matrix_sdk_common::{instant::Instant, locks::Mutex};
-#[cfg(feature = "experimental-timeline")]
 use ruma::{
-    canonical_json::redact_in_place,
-    events::{room::redaction::SyncRoomRedactionEvent, AnySyncMessageLikeEvent, AnySyncRoomEvent},
-    CanonicalJsonObject, RoomVersionId,
-};
-use ruma::{
+    canonical_json::redact,
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptType},
@@ -41,20 +31,13 @@ use ruma::{
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    EventId, MxcUri, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
+    RoomVersionId, UserId,
 };
-use tracing::info;
+use tracing::{debug, info, warn};
 
-#[cfg(feature = "experimental-timeline")]
-use super::BoxStream;
-use super::{Result, RoomInfo, StateChanges, StateStore};
-use crate::{
-    deserialized_responses::MemberEvent,
-    media::{MediaRequest, UniqueKey},
-    MinimalRoomMemberEvent,
-};
-#[cfg(feature = "experimental-timeline")]
-use crate::{deserialized_responses::SyncRoomEvent, StoreError};
+use super::{Result, RoomInfo, StateChanges, StateStore, StoreError};
+use crate::{deserialized_responses::RawMemberEvent, media::MediaRequest, MinimalRoomMemberEvent};
 
 /// In-Memory, non-persistent implementation of the `StateStore`
 ///
@@ -65,7 +48,7 @@ pub struct MemoryStore {
     sync_token: Arc<RwLock<Option<String>>>,
     filters: Arc<DashMap<String, String>>,
     account_data: Arc<DashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>>,
-    members: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, SyncRoomMemberEvent>>>,
+    members: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, Raw<SyncRoomMemberEvent>>>>,
     profiles: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, MinimalRoomMemberEvent>>>,
     display_names: Arc<DashMap<OwnedRoomId, DashMap<String, BTreeSet<OwnedUserId>>>>,
     joined_user_ids: Arc<DashMap<OwnedRoomId, DashSet<OwnedUserId>>>,
@@ -79,7 +62,7 @@ pub struct MemoryStore {
     stripped_room_state: Arc<
         DashMap<OwnedRoomId, DashMap<StateEventType, DashMap<String, Raw<AnyStrippedStateEvent>>>>,
     >,
-    stripped_members: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, StrippedRoomMemberEvent>>>,
+    stripped_members: Arc<DashMap<OwnedRoomId, DashMap<OwnedUserId, Raw<StrippedRoomMemberEvent>>>>,
     stripped_joined_user_ids: Arc<DashMap<OwnedRoomId, DashSet<OwnedUserId>>>,
     stripped_invited_user_ids: Arc<DashMap<OwnedRoomId, DashSet<OwnedUserId>>>,
     presence: Arc<DashMap<OwnedUserId, Raw<PresenceEvent>>>,
@@ -88,10 +71,7 @@ pub struct MemoryStore {
     room_event_receipts: Arc<
         DashMap<OwnedRoomId, DashMap<String, DashMap<OwnedEventId, DashMap<OwnedUserId, Receipt>>>>,
     >,
-    media: Arc<Mutex<LruCache<String, Vec<u8>>>>,
     custom: Arc<DashMap<Vec<u8>, Vec<u8>>>,
-    #[cfg(feature = "experimental-timeline")]
-    room_timeline: Arc<DashMap<OwnedRoomId, TimelineData>>,
 }
 
 impl Default for MemoryStore {
@@ -124,10 +104,11 @@ impl MemoryStore {
             presence: Default::default(),
             room_user_receipts: Default::default(),
             room_event_receipts: Default::default(),
-            media: Arc::new(Mutex::new(LruCache::new(100))),
+            #[cfg(feature = "memory-media-cache")]
+            media: Arc::new(Mutex::new(LruCache::new(
+                100.try_into().expect("100 is a non-zero usize"),
+            ))),
             custom: DashMap::new().into(),
-            #[cfg(feature = "experimental-timeline")]
-            room_timeline: Default::default(),
         }
     }
 
@@ -152,8 +133,21 @@ impl MemoryStore {
             *self.sync_token.write().unwrap() = Some(s.to_owned());
         }
 
-        for (room, events) in &changes.members {
-            for event in events.values() {
+        for (room, raw_events) in &changes.members {
+            for raw_event in raw_events.values() {
+                let event = match raw_event.deserialize() {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let event_id: Option<String> =
+                            raw_event.get_field("event_id").ok().flatten();
+                        debug!(event_id, "Failed to deserialize member event: {e}");
+                        continue;
+                    }
+                };
+
+                self.stripped_joined_user_ids.remove(room);
+                self.stripped_invited_user_ids.remove(room);
+
                 match event.membership() {
                     MembershipState::Join => {
                         self.joined_user_ids
@@ -190,7 +184,8 @@ impl MemoryStore {
                 self.members
                     .entry(room.clone())
                     .or_default()
-                    .insert(event.state_key().to_owned(), event.clone());
+                    .insert(event.state_key().to_owned(), raw_event.clone());
+                self.stripped_members.remove(room);
             }
         }
 
@@ -234,12 +229,14 @@ impl MemoryStore {
                         .entry(event_type.clone())
                         .or_default()
                         .insert(state_key.to_owned(), event.clone());
+                    self.stripped_room_state.remove(room);
                 }
             }
         }
 
         for (room_id, room_info) in &changes.room_infos {
             self.room_info.insert(room_id.clone(), room_info.clone());
+            self.stripped_room_infos.remove(room_id);
         }
 
         for (sender, event) in &changes.presence {
@@ -248,39 +245,50 @@ impl MemoryStore {
 
         for (room_id, info) in &changes.stripped_room_infos {
             self.stripped_room_infos.insert(room_id.clone(), info.clone());
+            self.room_info.remove(room_id);
         }
 
-        for (room, events) in &changes.stripped_members {
-            for event in events.values() {
+        for (room, raw_events) in &changes.stripped_members {
+            for raw_event in raw_events.values() {
+                let event = match raw_event.deserialize() {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let event_id: Option<String> =
+                            raw_event.get_field("event_id").ok().flatten();
+                        debug!(event_id, "Failed to deserialize stripped member event: {e}");
+                        continue;
+                    }
+                };
+
                 match event.content.membership {
                     MembershipState::Join => {
                         self.stripped_joined_user_ids
                             .entry(room.clone())
-                            .or_insert_with(DashSet::new)
+                            .or_default()
                             .insert(event.state_key.clone());
                         self.stripped_invited_user_ids
                             .entry(room.clone())
-                            .or_insert_with(DashSet::new)
+                            .or_default()
                             .remove(&event.state_key);
                     }
                     MembershipState::Invite => {
                         self.stripped_invited_user_ids
                             .entry(room.clone())
-                            .or_insert_with(DashSet::new)
+                            .or_default()
                             .insert(event.state_key.clone());
                         self.stripped_joined_user_ids
                             .entry(room.clone())
-                            .or_insert_with(DashSet::new)
+                            .or_default()
                             .remove(&event.state_key);
                     }
                     _ => {
                         self.stripped_joined_user_ids
                             .entry(room.clone())
-                            .or_insert_with(DashSet::new)
+                            .or_default()
                             .remove(&event.state_key);
                         self.stripped_invited_user_ids
                             .entry(room.clone())
-                            .or_insert_with(DashSet::new)
+                            .or_default()
                             .remove(&event.state_key);
                     }
                 }
@@ -288,7 +296,7 @@ impl MemoryStore {
                 self.stripped_members
                     .entry(room.clone())
                     .or_default()
-                    .insert(event.state_key.clone(), event.clone());
+                    .insert(event.state_key.clone(), raw_event.clone());
             }
         }
 
@@ -342,112 +350,34 @@ impl MemoryStore {
             }
         }
 
-        #[cfg(feature = "experimental-timeline")]
-        for (room_id, timeline) in &changes.timeline {
-            use tracing::warn;
+        let make_room_version = |room_id| {
+            self.room_info
+                .get(room_id)
+                .and_then(|info| info.room_version().cloned())
+                .unwrap_or_else(|| {
+                    warn!(?room_id, "Unable to find the room version, assuming version 9");
+                    RoomVersionId::V9
+                })
+        };
 
-            if timeline.sync {
-                info!(%room_id, "Saving new timeline batch from sync response");
-            } else {
-                info!(%room_id, "Saving new timeline batch from messages response");
-            }
-
-            let mut delete_timeline = false;
-            if timeline.limited {
-                info!(%room_id, "Deleting stored timeline because the sync response was limited");
-                delete_timeline = true;
-            } else if let Some(mut data) = self.room_timeline.get_mut(room_id) {
-                if !timeline.sync && Some(&timeline.start) != data.end.as_ref() {
-                    // This should only happen when a developer adds a wrong timeline
-                    // batch to the `StateChanges` or the server returns a wrong response
-                    // to our request.
-                    warn!(%room_id, "Dropping unexpected timeline batch");
-                    return Ok(());
-                }
-
-                // Check if the event already exists in the store
-                for event in &timeline.events {
-                    if let Some(event_id) = event.event_id() {
-                        if data.event_id_to_position.contains_key(&event_id) {
-                            delete_timeline = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !delete_timeline {
-                    if timeline.sync {
-                        data.start = timeline.start.clone();
-                    } else {
-                        data.end = timeline.end.clone();
-                    }
-                }
-            }
-
-            if delete_timeline {
-                info!(%room_id, "Deleting stored timeline because of duplicated events");
-                self.room_timeline.remove(room_id);
-            }
-
-            let mut data =
-                self.room_timeline.entry(room_id.to_owned()).or_insert_with(|| TimelineData {
-                    start: timeline.start.clone(),
-                    end: timeline.end.clone(),
-                    ..Default::default()
-                });
-
-            let make_room_version = || {
-                self.room_info
-                    .get(room_id)
-                    .and_then(|info| info.room_version().cloned())
-                    .unwrap_or_else(|| {
-                        warn!(%room_id, "Unable to find the room version, assuming version 9");
-                        RoomVersionId::V9
-                    })
-            };
-
-            if timeline.sync {
-                let mut room_version = None;
-                for event in &timeline.events {
-                    // Redact events already in store only on sync response
-                    if let Ok(AnySyncRoomEvent::MessageLike(
-                        AnySyncMessageLikeEvent::RoomRedaction(SyncRoomRedactionEvent::Original(
-                            redaction,
-                        )),
-                    )) = event.event.deserialize()
-                    {
-                        let pos = data.event_id_to_position.get(&redaction.redacts).copied();
-
-                        if let Some(position) = pos {
-                            if let Some(mut full_event) = data.events.get_mut(&position.clone()) {
-                                let mut event_json: CanonicalJsonObject =
-                                    full_event.event.deserialize_as()?;
-                                let v = room_version.get_or_insert_with(make_room_version);
-
-                                redact_in_place(&mut event_json, v)
-                                    .map_err(StoreError::Redaction)?;
-                                full_event.event = Raw::new(&event_json)?.cast();
+        for (room_id, redactions) in &changes.redactions {
+            let mut room_version = None;
+            if let Some(room) = self.room_state.get_mut(room_id) {
+                for mut ref_room_mu in room.iter_mut() {
+                    for mut ref_evt_mu in ref_room_mu.value_mut().iter_mut() {
+                        let raw_evt = ref_evt_mu.value_mut();
+                        if let Ok(Some(event_id)) = raw_evt.get_field::<OwnedEventId>("event_id") {
+                            if let Some(redaction) = redactions.get(&event_id) {
+                                let redacted = redact(
+                                    raw_evt.deserialize_as::<CanonicalJsonObject>()?,
+                                    room_version.get_or_insert_with(|| make_room_version(room_id)),
+                                    Some(redaction.try_into()?),
+                                )
+                                .map_err(StoreError::Redaction)?;
+                                *raw_evt = Raw::new(&redacted)?.cast();
                             }
                         }
                     }
-
-                    data.start_position -= 1;
-                    let start_position = data.start_position;
-                    // Only add event with id to the position map
-                    if let Some(event_id) = event.event_id() {
-                        data.event_id_to_position.insert(event_id, start_position);
-                    }
-                    data.events.insert(start_position, event.clone());
-                }
-            } else {
-                for event in &timeline.events {
-                    data.end_position += 1;
-                    let end_position = data.end_position;
-                    // Only add event with id to the position map
-                    if let Some(event_id) = event.event_id() {
-                        data.event_id_to_position.insert(event_id, end_position);
-                    }
-                    data.events.insert(end_position, event.clone());
                 }
             }
         }
@@ -499,24 +429,25 @@ impl MemoryStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> Result<Option<MemberEvent>> {
-        if let Some(e) = self.members.get(room_id).and_then(|m| m.get(state_key).map(|m| m.clone()))
-        {
-            Ok(Some(MemberEvent::Sync(e)))
-        } else if let Some(e) =
+    ) -> Result<Option<RawMemberEvent>> {
+        if let Some(e) =
             self.stripped_members.get(room_id).and_then(|m| m.get(state_key).map(|m| m.clone()))
         {
-            Ok(Some(MemberEvent::Stripped(e)))
+            Ok(Some(RawMemberEvent::Stripped(e)))
+        } else if let Some(e) =
+            self.members.get(room_id).and_then(|m| m.get(state_key).map(|m| m.clone()))
+        {
+            Ok(Some(RawMemberEvent::Sync(e)))
         } else {
             Ok(None)
         }
     }
 
     fn get_user_ids(&self, room_id: &RoomId) -> Vec<OwnedUserId> {
-        if let Some(u) = self.members.get(room_id) {
+        if let Some(u) = self.stripped_members.get(room_id) {
             u.iter().map(|u| u.key().clone()).collect()
         } else {
-            self.stripped_members
+            self.members
                 .get(room_id)
                 .map(|u| u.iter().map(|u| u.key().clone()).collect())
                 .unwrap_or_default()
@@ -611,36 +542,17 @@ impl MemoryStore {
         Ok(self.custom.insert(key.to_vec(), value))
     }
 
-    async fn add_media_content(&self, request: &MediaRequest, data: Vec<u8>) -> Result<()> {
-        self.media.lock().await.put(request.unique_key(), data);
-
+    // The in-memory store doesn't cache media
+    async fn add_media_content(&self, _request: &MediaRequest, _data: Vec<u8>) -> Result<()> {
         Ok(())
     }
-
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
-        Ok(self.media.lock().await.get(&request.unique_key()).cloned())
+    async fn get_media_content(&self, _request: &MediaRequest) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        self.media.lock().await.pop(&request.unique_key());
-
+    async fn remove_media_content(&self, _request: &MediaRequest) -> Result<()> {
         Ok(())
     }
-
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<()> {
-        let mut media_store = self.media.lock().await;
-
-        let keys: Vec<String> = media_store
-            .iter()
-            .filter_map(
-                |(key, _)| if key.starts_with(&uri.to_string()) { Some(key.clone()) } else { None },
-            )
-            .collect();
-
-        for key in keys {
-            media_store.pop(&key);
-        }
-
+    async fn remove_media_content_for_uri(&self, _uri: &MxcUri) -> Result<()> {
         Ok(())
     }
 
@@ -659,33 +571,7 @@ impl MemoryStore {
         self.room_user_receipts.remove(room_id);
         self.room_event_receipts.remove(room_id);
 
-        #[cfg(feature = "experimental-timeline")]
-        self.room_timeline.remove(room_id);
-
         Ok(())
-    }
-
-    #[cfg(feature = "experimental-timeline")]
-    async fn room_timeline(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Option<(BoxStream<Result<SyncRoomEvent>>, Option<String>)>> {
-        let (events, end_token) = if let Some(data) = self.room_timeline.get(room_id) {
-            (data.events.clone(), data.end.clone())
-        } else {
-            info!(%room_id, "Couldn't find a previously stored timeline");
-            return Ok(None);
-        };
-
-        let stream = stream! {
-            for (_, item) in events {
-                yield Ok(item);
-            }
-        };
-
-        info!(%room_id, ?end_token, "Found previously stored timeline");
-
-        Ok(Some((Box::pin(stream), end_token)))
     }
 }
 
@@ -741,7 +627,7 @@ impl StateStore for MemoryStore {
         &self,
         room_id: &RoomId,
         state_key: &UserId,
-    ) -> Result<Option<MemberEvent>> {
+    ) -> Result<Option<RawMemberEvent>> {
         self.get_member_event(room_id, state_key).await
     }
 
@@ -750,19 +636,19 @@ impl StateStore for MemoryStore {
     }
 
     async fn get_invited_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        let v = self.get_invited_user_ids(room_id);
+        let v = self.get_stripped_invited_user_ids(room_id);
         if !v.is_empty() {
             return Ok(v);
         }
-        Ok(self.get_stripped_invited_user_ids(room_id))
+        Ok(self.get_invited_user_ids(room_id))
     }
 
     async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        let v = self.get_joined_user_ids(room_id);
+        let v = self.get_stripped_joined_user_ids(room_id);
         if !v.is_empty() {
             return Ok(v);
         }
-        Ok(self.get_stripped_joined_user_ids(room_id))
+        Ok(self.get_joined_user_ids(room_id))
     }
 
     async fn get_room_infos(&self) -> Result<Vec<RoomInfo>> {
@@ -845,35 +731,15 @@ impl StateStore for MemoryStore {
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
         self.remove_room(room_id).await
     }
-
-    #[cfg(feature = "experimental-timeline")]
-    async fn room_timeline(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Option<(BoxStream<Result<SyncRoomEvent>>, Option<String>)>> {
-        self.room_timeline(room_id).await
-    }
-}
-
-#[derive(Debug, Default)]
-#[cfg(feature = "experimental-timeline")]
-struct TimelineData {
-    pub start: String,
-    pub start_position: isize,
-    pub end: Option<String>,
-    pub end_position: isize,
-    pub events: BTreeMap<isize, SyncRoomEvent>,
-    pub event_id_to_position: HashMap<OwnedEventId, isize>,
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::{MemoryStore, Result, StateStore};
 
     async fn get_store() -> Result<impl StateStore> {
         Ok(MemoryStore::new())
     }
 
-    statestore_integration_tests! { integration }
+    statestore_integration_tests!();
 }

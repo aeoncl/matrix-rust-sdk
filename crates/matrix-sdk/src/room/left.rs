@@ -2,6 +2,7 @@ use std::ops::Deref;
 
 use ruma::api::client::membership::forget_room;
 
+use super::Joined;
 use crate::{room::Common, BaseRoom, Client, Result, RoomType};
 
 /// A room in the left state.
@@ -22,17 +23,16 @@ impl Left {
     /// * `client` - The client used to make requests.
     ///
     /// * `room` - The underlying room.
-    pub fn new(client: Client, room: BaseRoom) -> Option<Self> {
-        // TODO: Make this private
+    pub(crate) fn new(client: &Client, room: BaseRoom) -> Option<Self> {
         if room.room_type() == RoomType::Left {
-            Some(Self { inner: Common::new(client, room) })
+            Some(Self { inner: Common::new(client.clone(), room) })
         } else {
             None
         }
     }
 
     /// Join this room.
-    pub async fn join(&self) -> Result<()> {
+    pub async fn join(&self) -> Result<Joined> {
         self.inner.join().await
     }
 
@@ -40,7 +40,7 @@ impl Left {
     ///
     /// This communicates to the homeserver that it should forget the room.
     pub async fn forget(&self) -> Result<()> {
-        let request = forget_room::v3::Request::new(self.inner.room_id());
+        let request = forget_room::v3::Request::new(self.inner.room_id().to_owned());
         let _response = self.client.send(request, None).await?;
         self.client.store().remove_room(self.inner.room_id()).await?;
 

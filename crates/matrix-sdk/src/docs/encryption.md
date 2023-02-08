@@ -84,10 +84,10 @@ comes first.
 
 Since room keys get relatively often rotated, each room key will need to be
 stored, otherwise we won't be able to decrypt historical messages. The SDK
-stores all room keys locally in a encrypted manner.
+stores all room keys locally in an encrypted manner.
 
 Besides storing them as part of the SDK store, users can export room keys
-using the [`Encryption::export_keys`] method.
+using the [`Encryption::export_room_keys`] method.
 
 # Verification
 
@@ -150,8 +150,8 @@ module.
 
 To add interactive verification support to your client please see the
 [`verification`] module, also check out the documentation for the
-[`Device::verified()`] method, which explains in more detail what it means
-for a [`Device`] to be verified.
+[`Device::is_verified()`] method, which explains in more detail what
+it means for a [`Device`] to be verified.
 
 # Client setup
 
@@ -164,11 +164,9 @@ Please note that, unless a client is specifically set up to ignore
 unverified devices, verifying devices is **not** necessary for encryption
 to work.
 
-1. Make sure the `encryption` feature is enabled.
-2. To persist the encryption keys, you can use one of the provided backend
-constructors as described in the documentation of the [`store`] module or you
-can provide your own backend that implements [`CryptoStore`] in a
-[`StoreConfig`] or via [`ClientBuilder::crypto_store()`].
+1. Make sure the `e2e-encryption` feature is enabled.
+2. To persist the encryption keys, you can use [`ClientBuilder::store_config`]
+   or one of the other `_store` methods on [`ClientBuilder`].
 
 ## Restoring a client
 
@@ -176,6 +174,7 @@ Restoring a Client is relatively easy, still some things need to be kept in
 mind before doing so.
 
 There are two ways one might wish to restore a [`Client`]:
+
 1. Using an access token
 2. Using the password
 
@@ -189,10 +188,9 @@ have been uploaded and tied to a device ID.
 
 ### Using an access token
 
-1. Log in with the password using [`Client::login()`] setting the
-   `device_id` argument to `None`.
+1. Log in with the password using [`Client::login_username()`].
 2. Store the access token, preferably somewhere secure.
-3. Use [`Client::restore_login()`] the next time the client starts.
+3. Use [`Client::restore_session()`] the next time the client starts.
 
 **Note** that the access token is directly connected to a device ID that
 lives on a server. If you're skipping step one of this method, remember that
@@ -201,13 +199,13 @@ the device ID.
 
 ### Using a password.
 
-1. Log in using [`Client::login()`] setting the `device_id` argument to `None`.
+1. Log in using [`Client::login_username()`].
 2. Store the `device_id` that was returned in the login response from the
-server.
-3. Use [`Client::login()`] the next time the client starts, make sure to
-**set** `device_id` this time to the stored `device_id` from the previous
-step. This will replace the access token from the previous login call but
-won't create a new device.
+   server.
+3. Use [`Client::login_username()`] the next time the client starts, make sure
+   to set `device_id` to the stored `device_id` from the previous step. This
+   will replace the access token from the previous login call, but won't create
+   a new device.
 
 **Note** that the default store supports only a single device, logging in
 with a different device ID (either `None` or a device ID of another client)
@@ -217,7 +215,7 @@ is **not** supported using the default store.
 
 | Failure | Cause | Fix |
 | ------------------- | ----- | ----------- |
-| No messages get encrypted nor decrypted | The `encryption` feature is disabled | [Enable the feature in your `Cargo.toml` file] |
+| No messages get encrypted nor decrypted | The `e2e-encryption` feature is disabled | [Enable the feature in your `Cargo.toml` file] |
 | Messages that were decryptable aren't after a restart | Storage isn't setup to be persistent | Ensure you've activated the persistent storage backend feature, e.g. `sled` |
 | Messages are encrypted but can't be decrypted | The access token that the client is using is tied to another device | Clear storage to create a new device, read the [Restoring a Client] section |
 | Messages don't get encrypted but get decrypted | The `m.room.encryption` event is missing | Make sure encryption is [enabled] for the room and the event isn't [filtered] out, otherwise it might be a deserialization bug |
@@ -233,4 +231,5 @@ is **not** supported using the default store.
 [`store`]: crate::store
 [`CryptoStore`]: matrix_sdk_base::crypto::store::CryptoStore
 [`StoreConfig`]: crate::config::StoreConfig
-[`ClientBuilder::crypto_store()`]: crate::ClientBuilder::crypto_store()
+[`ClientBuilder`]: crate::ClientBuilder
+[`ClientBuilder::store_config`]: crate::ClientBuilder::store_config

@@ -28,10 +28,10 @@ use ruma::{
     uint, DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId,
     SecondsSinceUnixEpoch, TransactionId, UInt, UserId,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use super::{
-    cache::VerificationCache,
+    cache::{RequestInfo, VerificationCache},
     event_enums::{AnyEvent, AnyVerificationContent, OutgoingContent},
     requests::VerificationRequest,
     sas::Sas,
@@ -163,10 +163,15 @@ impl VerificationMachine {
             .unwrap_or_default()
     }
 
-    /// Add a new `VerificationRequest` object to the cache, this will cancel
-    /// any duplicates we have going on, including the newly inserted one, with
-    /// a given user.
+    /// Add a new `VerificationRequest` object to the cache.
+    /// If there are any existing requests with this user (and different
+    /// flow_id), both the existing and new request will be cancelled.
     fn insert_request(&self, request: VerificationRequest) {
+        if let Some(r) = self.get_request(request.other_user(), request.flow_id().as_str()) {
+            debug!(flow_id = r.flow_id().as_str(), "Ignoring known verification request",);
+            return;
+        }
+
         let entry = self.requests.entry(request.other_user().to_owned()).or_default();
         let user_requests = entry.value();
 
@@ -177,6 +182,11 @@ impl VerificationMachine {
             let old_verification = old.value();
 
             if !old_verification.is_cancelled() {
+                warn!(
+                    "Received a new verification request whilst another request \
+                    with the same user is ongoing. Cancelling both requests."
+                );
+
                 if let Some(r) = old_verification.cancel() {
                     self.verifications.add_request(r.into())
                 }
@@ -220,12 +230,13 @@ impl VerificationMachine {
         recipient: &UserId,
         recipient_device: &DeviceId,
         content: OutgoingContent,
+        request_id: Option<RequestInfo>,
     ) {
-        self.verifications.queue_up_content(recipient, recipient_device, content)
+        self.verifications.queue_up_content(recipient, recipient_device, content, request_id)
     }
 
-    pub fn mark_request_as_sent(&self, txn_id: &TransactionId) {
-        self.verifications.mark_request_as_sent(txn_id);
+    pub fn mark_request_as_sent(&self, request_id: &TransactionId) {
+        self.verifications.mark_request_as_sent(request_id);
     }
 
     pub fn outgoing_messages(&self) -> Vec<OutgoingRequest> {
@@ -280,7 +291,7 @@ impl VerificationMachine {
         match sas.mark_as_done().await? {
             VerificationResult::Ok => {
                 if let Some(c) = out_content {
-                    self.queue_up_content(sas.other_user_id(), sas.other_device_id(), c);
+                    self.queue_up_content(sas.other_user_id(), sas.other_device_id(), c, None);
                 }
             }
             VerificationResult::Cancel(c) => {
@@ -292,7 +303,7 @@ impl VerificationMachine {
                 self.verifications.add_request(r.into());
 
                 if let Some(c) = out_content {
-                    self.queue_up_content(sas.other_user_id(), sas.other_device_id(), c);
+                    self.queue_up_content(sas.other_user_id(), sas.other_device_id(), c, None);
                 }
             }
         }
@@ -300,28 +311,25 @@ impl VerificationMachine {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     pub async fn receive_any_event(
         &self,
         event: impl Into<AnyEvent<'_>>,
     ) -> Result<(), CryptoStoreError> {
         let event = event.into();
 
-        #[allow(clippy::question_mark)]
-        let flow_id = if let Ok(flow_id) = FlowId::try_from(&event) {
-            flow_id
-        } else {
+        let Ok(flow_id) = FlowId::try_from(&event) else {
             // This isn't a verification event, return early.
             return Ok(());
         };
 
         let flow_id_mismatch = || {
             warn!(
-                sender = event.sender().as_str(),
                 flow_id = flow_id.as_str(),
                 "Received a verification event with a mismatched flow id, \
-                  the verification object was created for a in-room \
-                  verification but a event was received over to-device \
-                  messaging or vice versa"
+                 the verification object was created for a in-room \
+                 verification but a event was received over to-device \
+                 messaging or vice versa"
             );
         };
 
@@ -333,173 +341,180 @@ impl VerificationMachine {
             }
         };
 
-        if let Some(content) = event.verification_content() {
-            match &content {
-                AnyVerificationContent::Request(r) => {
-                    info!(
-                        sender = event.sender().as_str(),
+        let Some(content) = event.verification_content() else { return Ok(()) };
+        match &content {
+            AnyVerificationContent::Request(r) => {
+                info!(
+                    from_device = r.from_device().as_str(),
+                    "Received a new verification request",
+                );
+
+                let Some(timestamp) = event.timestamp() else {
+                    warn!(
                         from_device = r.from_device().as_str(),
-                        "Received a new verification request",
+                        "The key verification request didn't contain a valid timestamp"
                     );
+                    return Ok(());
+                };
 
-                    if let Some(timestamp) = event.timestamp() {
-                        if Self::is_timestamp_valid(timestamp) {
-                            if !event_sent_from_us(&event, r.from_device()) {
-                                let request = VerificationRequest::from_request(
-                                    self.verifications.clone(),
-                                    self.store.clone(),
-                                    event.sender(),
-                                    flow_id,
-                                    r,
-                                );
-
-                                self.insert_request(request);
-                            } else {
-                                trace!(
-                                    sender = event.sender().as_str(),
-                                    from_device = r.from_device().as_str(),
-                                    "The received verification request was sent by us, ignoring it",
-                                );
-                            }
-                        } else {
-                            trace!(
-                                sender = event.sender().as_str(),
-                                from_device = r.from_device().as_str(),
-                                ?timestamp,
-                                "The received verification request was too old or too far into the future",
-                            );
-                        }
-                    } else {
-                        warn!(
-                            sender = event.sender().as_str(),
-                            from_device = r.from_device().as_str(),
-                            "The key verification request didn't contain a valid timestamp"
-                        );
-                    }
+                if !Self::is_timestamp_valid(timestamp) {
+                    trace!(
+                        from_device = r.from_device().as_str(),
+                        ?timestamp,
+                        "The received verification request was too old or too far into the future",
+                    );
+                    return Ok(());
                 }
-                AnyVerificationContent::Cancel(c) => {
-                    if let Some(verification) = self.get_request(event.sender(), flow_id.as_str()) {
-                        verification.receive_cancel(event.sender(), c);
-                    }
 
-                    if let Some(verification) =
-                        self.get_verification(event.sender(), flow_id.as_str())
-                    {
-                        match verification {
-                            Verification::SasV1(sas) => {
-                                // This won't produce an outgoing content
-                                let _ = sas.receive_any_event(event.sender(), &content);
-                            }
-                            #[cfg(feature = "qrcode")]
-                            Verification::QrV1(qr) => qr.receive_cancel(event.sender(), c),
-                        }
-                    }
+                if event_sent_from_us(&event, r.from_device()) {
+                    trace!(
+                        from_device = r.from_device().as_str(),
+                        "The received verification request was sent by us, ignoring it",
+                    );
+                    return Ok(());
                 }
-                AnyVerificationContent::Ready(c) => {
-                    if let Some(request) = self.get_request(event.sender(), flow_id.as_str()) {
-                        if request.flow_id() == &flow_id {
-                            request.receive_ready(event.sender(), c);
-                        } else {
-                            flow_id_mismatch();
-                        }
-                    }
-                }
-                AnyVerificationContent::Start(c) => {
-                    if let Some(request) = self.get_request(event.sender(), flow_id.as_str()) {
-                        if request.flow_id() == &flow_id {
-                            request.receive_start(event.sender(), c).await?
-                        } else {
-                            flow_id_mismatch();
-                        }
-                    } else if let FlowId::ToDevice(_) = flow_id {
-                        // TODO remove this soon, this has been deprecated by
-                        // MSC3122 https://github.com/matrix-org/matrix-doc/pull/3122
-                        if let Some(device) =
-                            self.store.get_device(event.sender(), c.from_device()).await?
-                        {
-                            let identities = self.store.get_identities(device).await?;
 
-                            match Sas::from_start_event(flow_id, c, identities, None, false) {
-                                Ok(sas) => {
-                                    self.verifications.insert_sas(sas);
-                                }
-                                Err(cancellation) => self.queue_up_content(
-                                    event.sender(),
-                                    c.from_device(),
-                                    cancellation,
-                                ),
-                            }
-                        }
-                    }
-                }
-                AnyVerificationContent::Accept(_) | AnyVerificationContent::Key(_) => {
-                    if let Some(sas) = self.get_sas(event.sender(), flow_id.as_str()) {
-                        if sas.flow_id() == &flow_id {
-                            if let Some(content) = sas.receive_any_event(event.sender(), &content) {
-                                self.queue_up_content(
-                                    sas.other_user_id(),
-                                    sas.other_device_id(),
-                                    content,
-                                );
-                            }
-                        } else {
-                            flow_id_mismatch();
-                        }
-                    }
-                }
-                AnyVerificationContent::Mac(_) => {
-                    if let Some(s) = self.get_sas(event.sender(), flow_id.as_str()) {
-                        if s.flow_id() == &flow_id {
-                            let content = s.receive_any_event(event.sender(), &content);
+                let request = VerificationRequest::from_request(
+                    self.verifications.clone(),
+                    self.store.clone(),
+                    event.sender(),
+                    flow_id,
+                    r,
+                );
 
-                            if s.is_done() {
-                                self.mark_sas_as_done(s, content).await?;
-                            } else {
-                                // Even if we are not done (yet), there might be content to send
-                                // out, e.g. in the case where we are done with our side of the
-                                // verification process, but the other side has not yet sent their
-                                // "done".
-                                if let Some(content) = content {
-                                    self.queue_up_content(
-                                        s.other_user_id(),
-                                        s.other_device_id(),
-                                        content,
-                                    );
-                                }
-                            }
-                        } else {
-                            flow_id_mismatch();
-                        }
-                    }
+                self.insert_request(request);
+            }
+            AnyVerificationContent::Cancel(c) => {
+                if let Some(verification) = self.get_request(event.sender(), flow_id.as_str()) {
+                    verification.receive_cancel(event.sender(), c);
                 }
-                AnyVerificationContent::Done(c) => {
-                    if let Some(verification) = self.get_request(event.sender(), flow_id.as_str()) {
-                        verification.receive_done(event.sender(), c);
-                    }
 
-                    #[allow(clippy::single_match)]
-                    match self.get_verification(event.sender(), flow_id.as_str()) {
-                        Some(Verification::SasV1(sas)) => {
-                            let content = sas.receive_any_event(event.sender(), &content);
-
-                            if sas.is_done() {
-                                self.mark_sas_as_done(sas, content).await?;
-                            }
+                if let Some(verification) = self.get_verification(event.sender(), flow_id.as_str())
+                {
+                    match verification {
+                        Verification::SasV1(sas) => {
+                            // This won't produce an outgoing content
+                            let _ = sas.receive_any_event(event.sender(), &content);
                         }
                         #[cfg(feature = "qrcode")]
-                        Some(Verification::QrV1(qr)) => {
-                            let (cancellation, request) = qr.receive_done(c).await?;
-
-                            if let Some(c) = cancellation {
-                                self.verifications.add_request(c.into())
-                            }
-
-                            if let Some(s) = request {
-                                self.verifications.add_request(s.into())
-                            }
-                        }
-                        None => (),
+                        Verification::QrV1(qr) => qr.receive_cancel(event.sender(), c),
                     }
+                }
+            }
+            AnyVerificationContent::Ready(c) => {
+                let Some(request) = self.get_request(event.sender(), flow_id.as_str()) else {
+                    return Ok(());
+                };
+
+                if request.flow_id() == &flow_id {
+                    request.receive_ready(event.sender(), c);
+                } else {
+                    flow_id_mismatch();
+                }
+            }
+            AnyVerificationContent::Start(c) => {
+                if let Some(request) = self.get_request(event.sender(), flow_id.as_str()) {
+                    if request.flow_id() == &flow_id {
+                        request.receive_start(event.sender(), c).await?
+                    } else {
+                        flow_id_mismatch();
+                    }
+                } else if let FlowId::ToDevice(_) = flow_id {
+                    // TODO remove this soon, this has been deprecated by
+                    // MSC3122 https://github.com/matrix-org/matrix-doc/pull/3122
+                    if let Some(device) =
+                        self.store.get_device(event.sender(), c.from_device()).await?
+                    {
+                        let identities = self.store.get_identities(device).await?;
+
+                        match Sas::from_start_event(flow_id, c, identities, None, false) {
+                            Ok(sas) => {
+                                self.verifications.insert_sas(sas);
+                            }
+                            Err(cancellation) => self.queue_up_content(
+                                event.sender(),
+                                c.from_device(),
+                                cancellation,
+                                None,
+                            ),
+                        }
+                    }
+                }
+            }
+            AnyVerificationContent::Accept(_) | AnyVerificationContent::Key(_) => {
+                let Some(sas) = self.get_sas(event.sender(), flow_id.as_str()) else {
+                    return Ok(());
+                };
+
+                if sas.flow_id() != &flow_id {
+                    flow_id_mismatch();
+                    return Ok(());
+                }
+
+                let Some((content, request_info)) =
+                    sas.receive_any_event(event.sender(), &content) else { return Ok(()) };
+
+                self.queue_up_content(
+                    sas.other_user_id(),
+                    sas.other_device_id(),
+                    content,
+                    request_info,
+                );
+            }
+            AnyVerificationContent::Mac(_) => {
+                let Some(s) = self.get_sas(event.sender(), flow_id.as_str()) else { return Ok(()) };
+
+                if s.flow_id() != &flow_id {
+                    flow_id_mismatch();
+                    return Ok(());
+                }
+
+                let content = s.receive_any_event(event.sender(), &content);
+
+                if s.is_done() {
+                    self.mark_sas_as_done(s, content.map(|(c, _)| c)).await?;
+                } else {
+                    // Even if we are not done (yet), there might be content to
+                    // send out, e.g. in the case where we are done with our
+                    // side of the verification process, but the other side has
+                    // not yet sent their "done".
+                    let Some((content, request_id)) = content else { return Ok(()) };
+
+                    self.queue_up_content(
+                        s.other_user_id(),
+                        s.other_device_id(),
+                        content,
+                        request_id,
+                    );
+                }
+            }
+            AnyVerificationContent::Done(c) => {
+                if let Some(verification) = self.get_request(event.sender(), flow_id.as_str()) {
+                    verification.receive_done(event.sender(), c);
+                }
+
+                #[allow(clippy::single_match)]
+                match self.get_verification(event.sender(), flow_id.as_str()) {
+                    Some(Verification::SasV1(sas)) => {
+                        let content = sas.receive_any_event(event.sender(), &content);
+
+                        if sas.is_done() {
+                            self.mark_sas_as_done(sas, content.map(|(c, _)| c)).await?;
+                        }
+                    }
+                    #[cfg(feature = "qrcode")]
+                    Some(Verification::QrV1(qr)) => {
+                        let (cancellation, request) = qr.receive_done(c).await?;
+
+                        if let Some(c) = cancellation {
+                            self.verifications.add_request(c.into())
+                        }
+
+                        if let Some(s) = request {
+                            self.verifications.add_request(s.into())
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -510,9 +525,9 @@ impl VerificationMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
-    use matrix_sdk_common::{instant::Instant, locks::Mutex};
+    use matrix_sdk_common::locks::Mutex;
     use matrix_sdk_test::async_test;
     use ruma::TransactionId;
 
@@ -578,7 +593,7 @@ mod tests {
         let content = OutgoingContent::try_from(request).unwrap();
         let content = AcceptContent::try_from(&content).unwrap().into();
 
-        let content = bob.receive_any_event(alice.user_id(), &content).unwrap();
+        let (content, request_info) = bob.receive_any_event(alice.user_id(), &content).unwrap();
 
         let event = wrap_any_to_device_content(bob.user_id(), content);
 
@@ -596,6 +611,10 @@ mod tests {
         assert!(bob.receive_any_event(alice.user_id(), &content).is_none());
 
         assert!(alice.emoji().is_some());
+        // Bob can only show the emoji if it marks the request carrying the
+        // m.key.verification.key event as sent.
+        assert!(bob.emoji().is_none());
+        bob.mark_request_as_sent(&request_info.unwrap().request_id);
         assert!(bob.emoji().is_some());
         assert_eq!(alice.emoji(), bob.emoji());
 
@@ -618,8 +637,13 @@ mod tests {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[allow(unknown_lints, clippy::unchecked_duration_subtraction)]
     #[async_test]
     async fn timing_out() {
+        use std::time::Duration;
+
+        use matrix_sdk_common::instant::Instant;
+
         let (alice_machine, bob) = setup_verification_machine().await;
         let alice = alice_machine.get_sas(bob.user_id(), bob.flow_id().as_str()).unwrap();
 
@@ -737,5 +761,64 @@ mod tests {
         // Make sure both of them are cancelled.
         assert!(alice_request.is_cancelled());
         assert!(second_request.is_cancelled());
+    }
+
+    /// Ensure that if a duplicate request is added (i.e. matching user and
+    /// flow_id) the existing request is not cancelled and the new one is
+    /// ignored
+    #[async_test]
+    async fn ignore_identical_verification_request() {
+        let (machine, bob_store) = verification_machine().await;
+
+        // Start the first verification request.
+        let flow_id = FlowId::ToDevice("TEST_FLOW_ID".into());
+
+        let bob_request = VerificationRequest::new(
+            VerificationCache::new(),
+            bob_store.clone(),
+            flow_id.clone(),
+            alice_id(),
+            vec![],
+            None,
+        );
+
+        let request = bob_request.request_to_device();
+        let content: OutgoingContent = request.try_into().unwrap();
+
+        machine
+            .receive_any_event(&wrap_any_to_device_content(bob_request.other_user(), content))
+            .await
+            .unwrap();
+
+        let first_request =
+            machine.get_request(bob_request.other_user(), bob_request.flow_id().as_str()).unwrap();
+
+        // We're not yet cancelled.
+        assert!(!first_request.is_cancelled());
+
+        // Bob is adding a second request with the same flow_id as before
+        let bob_request = VerificationRequest::new(
+            VerificationCache::new(),
+            bob_store,
+            flow_id.clone(),
+            alice_id(),
+            vec![],
+            None,
+        );
+
+        let request = bob_request.request_to_device();
+        let content: OutgoingContent = request.try_into().unwrap();
+
+        machine
+            .receive_any_event(&wrap_any_to_device_content(bob_request.other_user(), content))
+            .await
+            .unwrap();
+
+        let second_request =
+            machine.get_request(bob_request.other_user(), bob_request.flow_id().as_str()).unwrap();
+
+        // None of the requests are cancelled
+        assert!(!first_request.is_cancelled());
+        assert!(!second_request.is_cancelled());
     }
 }

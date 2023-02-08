@@ -71,7 +71,7 @@ pub fn keys_query(c: &mut Criterion) {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SledCryptoStore::open_with_passphrase(dir.path(), None).unwrap());
+    let store = Arc::new(runtime.block_on(SledCryptoStore::open(dir.path(), None)).unwrap());
     let machine =
         runtime.block_on(OlmMachine::with_store(alice_id(), alice_device_id(), store)).unwrap();
 
@@ -119,7 +119,7 @@ pub fn keys_claiming(c: &mut Criterion) {
             || {
                 let dir = tempfile::tempdir().unwrap();
                 let store =
-                    Arc::new(SledCryptoStore::open_with_passphrase(dir.path(), None).unwrap());
+                    Arc::new(runtime.block_on(SledCryptoStore::open(dir.path(), None)).unwrap());
 
                 let machine = runtime
                     .block_on(OlmMachine::with_store(alice_id(), alice_device_id(), store))
@@ -181,7 +181,7 @@ pub fn room_key_sharing(c: &mut Criterion) {
         })
     });
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SledCryptoStore::open_with_passphrase(dir.path(), None).unwrap());
+    let store = Arc::new(runtime.block_on(SledCryptoStore::open(dir.path(), None)).unwrap());
 
     let machine =
         runtime.block_on(OlmMachine::with_store(alice_id(), alice_device_id(), store)).unwrap();
@@ -236,7 +236,7 @@ pub fn devices_missing_sessions_collecting(c: &mut Criterion) {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SledCryptoStore::open_with_passphrase(dir.path(), None).unwrap());
+    let store = Arc::new(runtime.block_on(SledCryptoStore::open(dir.path(), None)).unwrap());
 
     let machine =
         runtime.block_on(OlmMachine::with_store(alice_id(), alice_device_id(), store)).unwrap();

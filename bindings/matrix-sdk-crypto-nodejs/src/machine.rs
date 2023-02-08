@@ -36,7 +36,7 @@ impl OlmMachine {
     // the factory function. We also manually implement the
     // constructor to raise an error when called.
 
-    /// Create a new memory-based `OlmMachine` asynchronously.
+    /// Create a new `OlmMachine` asynchronously.
     ///
     /// The persistence of the encryption keys and all the inner
     /// objects are controlled by the `store_path` argument.
@@ -63,16 +63,16 @@ impl OlmMachine {
         let user_id = user_id.clone();
         let device_id = device_id.clone();
 
-        let store = store_path
-            .map(|store_path| {
-                matrix_sdk_sled::SledCryptoStore::open_with_passphrase(
-                    store_path,
-                    store_passphrase.as_deref(),
-                )
-                .map(Arc::new)
-                .map_err(into_err)
-            })
-            .transpose()?;
+        let store = if let Some(store_path) = store_path {
+            Some(
+                matrix_sdk_sled::SledCryptoStore::open(store_path, store_passphrase.as_deref())
+                    .await
+                    .map(Arc::new)
+                    .map_err(into_err)?,
+            )
+        } else {
+            None
+        };
 
         store_passphrase.zeroize();
 
@@ -100,8 +100,7 @@ impl OlmMachine {
     /// constructor because building an `OlmMachine` is
     /// asynchronous. Please use the `finalize` method.
     #[napi(constructor)]
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> napi::Result<()> {
+    pub fn new() -> napi::Result<Self> {
         Err(napi::Error::from_reason(
             "To build an `OldMachine`, please use the `initialize` method",
         ))
@@ -135,8 +134,7 @@ impl OlmMachine {
     ///
     /// # Arguments
     ///
-    /// * `to_device_events`, thhe to-device events of the current sync
-    ///   response.
+    /// * `to_device_events`, the to-device events of the current sync response.
     /// * `changed_devices`, the list of devices that changed in this sync
     ///   response.
     /// * `one_time_keys_count`, the current one-time keys counts that the sync
@@ -310,10 +308,12 @@ impl OlmMachine {
     ///
     /// * `users`, an array over user IDs that should be marked for tracking.
     #[napi(strict)]
-    pub async fn update_tracked_users(&self, users: Vec<&identifiers::UserId>) {
+    pub async fn update_tracked_users(&self, users: Vec<&identifiers::UserId>) -> napi::Result<()> {
         let users = users.into_iter().map(|user| user.inner.clone()).collect::<Vec<_>>();
 
-        self.inner.update_tracked_users(users.iter().map(AsRef::as_ref)).await;
+        self.inner.update_tracked_users(users.iter().map(AsRef::as_ref)).await.map_err(into_err)?;
+
+        Ok(())
     }
 
     /// Get to-device requests to share a room key with users in a room.

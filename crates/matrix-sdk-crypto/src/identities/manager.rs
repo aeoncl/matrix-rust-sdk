@@ -26,7 +26,7 @@ use matrix_sdk_common::{
 };
 use ruma::{
     api::client::keys::get_keys::v3::Response as KeysQueryResponse, serde::Raw, DeviceId,
-    OwnedDeviceId, OwnedUserId, UserId,
+    OwnedDeviceId, OwnedServerName, OwnedUserId, ServerName, UserId,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -39,7 +39,8 @@ use crate::{
     olm::PrivateCrossSigningIdentity,
     requests::KeysQueryRequest,
     store::{Changes, DeviceChanges, IdentityChanges, Result as StoreResult, Store},
-    types::{CrossSigningKey, DeviceKeys},
+    types::DeviceKeys,
+    utilities::FailuresCache,
     LocalTrust,
 };
 
@@ -84,12 +85,12 @@ impl KeysQueryListener {
         timeout: Duration,
         user: &UserId,
     ) -> Result<UserKeyQueryResult, ElapsedError> {
-        let users_for_key_query = self.store.users_for_key_query();
+        let users_for_key_query = self.store.users_for_key_query().await.unwrap_or_default();
 
         if users_for_key_query.contains(user) {
             if let Err(e) = self.wait(timeout).await {
                 warn!(
-                    user_id =% user,
+                    user_id = ?user,
                     "The user has a pending `/key/query` request which did \
                     not finish yet, some devices might be missing."
                 );
@@ -117,6 +118,7 @@ pub(crate) struct IdentityManager {
     user_id: Arc<UserId>,
     device_id: Arc<DeviceId>,
     keys_query_listener: KeysQueryListener,
+    failures: FailuresCache<OwnedServerName>,
     store: Store,
 }
 
@@ -126,7 +128,13 @@ impl IdentityManager {
     pub fn new(user_id: Arc<UserId>, device_id: Arc<DeviceId>, store: Store) -> Self {
         let keys_query_listener = KeysQueryListener::new(store.clone());
 
-        IdentityManager { user_id, device_id, store, keys_query_listener }
+        IdentityManager {
+            user_id,
+            device_id,
+            store,
+            keys_query_listener,
+            failures: Default::default(),
+        }
     }
 
     fn user_id(&self) -> &UserId {
@@ -156,6 +164,23 @@ impl IdentityManager {
             "Handling a keys query response"
         );
 
+        // Parse the strings into server names and filter out our own server. We should
+        // never get failures from our own server but let's remove it as a
+        // precaution anyways.
+        let failed_servers = response
+            .failures
+            .keys()
+            .filter_map(|k| ServerName::parse(k).ok())
+            .filter(|s| s != self.user_id().server_name());
+        let successful_servers = response.device_keys.keys().map(|u| u.server_name());
+
+        // Append the new failed servers and remove any successful servers. We
+        // need to explicitly remove the successful servers because the cache
+        // doesn't automatically remove entries that elapse. Instead, the effect
+        // is that elapsed servers will be retried and their delays incremented.
+        self.failures.extend(failed_servers);
+        self.failures.remove(successful_servers);
+
         let devices = self.handle_devices_from_key_query(response.device_keys.clone()).await?;
         let (identities, cross_signing_identity) = self.handle_cross_singing_keys(response).await?;
 
@@ -166,13 +191,9 @@ impl IdentityManager {
             ..Default::default()
         };
 
-        // TODO turn this into a single transaction.
         self.store.save_changes(changes).await?;
-        let updated_users: Vec<&UserId> = response.device_keys.keys().map(Deref::deref).collect();
-
-        for user_id in updated_users {
-            self.store.update_tracked_user(user_id, false).await?;
-        }
+        self.mark_tracked_users_as_up_to_date(response.device_keys.keys().map(Deref::deref))
+            .await?;
 
         let changed_devices = devices.changed.iter().fold(BTreeMap::new(), |mut acc, d| {
             acc.entry(d.user_id()).or_insert_with(BTreeSet::new).insert(d.device_id());
@@ -336,10 +357,14 @@ impl IdentityManager {
 
         for device_id in deleted_devices_set {
             if user_id == *own_user_id && *device_id == &own_device_id {
+                let identity_keys = store.account().identity_keys();
+
                 warn!(
                     user_id = own_user_id.as_str(),
                     device_id = own_device_id.as_str(),
-                    "Our own device has been deleted"
+                    curve25519_key = ?identity_keys.curve25519,
+                    ed25519_key = ?identity_keys.ed25519,
+                    "Our own device might have been deleted"
                 );
             } else if let Some(device) = stored_devices.get(*device_id) {
                 device.mark_as_deleted();
@@ -404,20 +429,16 @@ impl IdentityManager {
         let mut changes = IdentityChanges::default();
         let mut changed_identity = None;
 
-        // TODO this is a bit chunky, refactor this into smaller methods.
+        // TODO: this is a bit chunky, refactor this into smaller methods.
 
         for (user_id, master_key) in &response.master_keys {
-            match master_key.deserialize_as::<CrossSigningKey>() {
+            match master_key.deserialize_as::<MasterPubkey>() {
                 Ok(master_key) => {
-                    let master_key = MasterPubkey::from(master_key);
-
-                    let self_signing = if let Some(s) = response
+                    let Some(self_signing) = response
                         .self_signing_keys
                         .get(user_id)
-                        .and_then(|k| k.deserialize_as::<CrossSigningKey>().ok())
-                    {
-                        SelfSigningPubkey::from(s)
-                    } else {
+                        .and_then(|k| k.deserialize_as::<SelfSigningPubkey>().ok())
+                    else {
                         warn!(
                             user_id = user_id.as_str(),
                             "A user identity didn't contain a self signing pubkey \
@@ -428,14 +449,12 @@ impl IdentityManager {
 
                     let result = if let Some(mut i) = self.store.get_user_identity(user_id).await? {
                         match &mut i {
-                            ReadOnlyUserIdentities::Own(ref mut identity) => {
-                                let user_signing = if let Some(s) = response
+                            ReadOnlyUserIdentities::Own(identity) => {
+                                let Some(user_signing) = response
                                     .user_signing_keys
                                     .get(user_id)
-                                    .and_then(|k| k.deserialize_as::<CrossSigningKey>().ok())
-                                {
-                                    UserSigningPubkey::from(s)
-                                } else {
+                                    .and_then(|k| k.deserialize_as::<UserSigningPubkey>().ok())
+                                else {
                                     warn!(
                                         user_id = user_id.as_str(),
                                         "User identity for our own user didn't \
@@ -448,18 +467,16 @@ impl IdentityManager {
                                     .update(master_key, self_signing, user_signing)
                                     .map(|_| (i, false))
                             }
-                            ReadOnlyUserIdentities::Other(ref mut identity) => {
+                            ReadOnlyUserIdentities::Other(identity) => {
                                 identity.update(master_key, self_signing).map(|_| (i, false))
                             }
                         }
                     } else if user_id == self.user_id() {
-                        if let Some(s) = response
+                        if let Some(user_signing) = response
                             .user_signing_keys
                             .get(user_id)
-                            .and_then(|k| k.deserialize_as::<CrossSigningKey>().ok())
+                            .and_then(|k| k.deserialize_as::<UserSigningPubkey>().ok())
                         {
-                            let user_signing = UserSigningPubkey::from(s);
-
                             if master_key.user_id() != user_id
                                 || self_signing.user_id() != user_id
                                 || user_signing.user_id() != user_id
@@ -503,6 +520,15 @@ impl IdentityManager {
                                 if result.any_cleared() {
                                     changed_identity = Some((*private_identity).clone());
                                     info!(cleared = ?result, "Removed some or all of our private cross signing keys");
+                                } else if new && private_identity.has_master_key().await {
+                                    // If the master key didn't rotate above (`clear_if_differs`),
+                                    // then this means that the public part and the private parts of
+                                    // the master key match. We previously did a signature check, so
+                                    // this means that the private part of the master key has signed
+                                    // the identity. We can safely mark the public part of the
+                                    // identity as verified.
+                                    identity.mark_as_verified();
+                                    trace!("Received our own user identity, for which we possess the private key. Marking as verified.");
                                 }
                             }
 
@@ -548,73 +574,80 @@ impl IdentityManager {
     ///
     /// [`OlmMachine`]: struct.OlmMachine.html
     /// [`receive_keys_query_response`]: #method.receive_keys_query_response
-    pub async fn users_for_key_query(&self) -> Vec<KeysQueryRequest> {
-        let users = self.store.users_for_key_query();
+    pub async fn users_for_key_query(&self) -> StoreResult<Vec<KeysQueryRequest>> {
+        let users = self.store.users_for_key_query().await?;
 
         // We always want to track our own user, but in case we aren't in an encrypted
         // room yet, we won't be tracking ourselves yet. This ensures we are always
         // tracking ourselves.
         //
         // The check for emptiness is done first for performance.
-        let users = if users.is_empty() && !self.store.tracked_users().contains(self.user_id()) {
-            self.update_tracked_users([self.user_id()]).await;
-            self.store.users_for_key_query()
-        } else {
-            users
-        };
+        let users =
+            if users.is_empty() && !self.store.tracked_users().await?.contains(self.user_id()) {
+                self.store.mark_user_as_changed(self.user_id()).await?;
+                self.store.users_for_key_query().await?
+            } else {
+                users
+            };
 
         if users.is_empty() {
-            Vec::new()
+            Ok(Vec::new())
         } else {
-            let users: Vec<OwnedUserId> = users.into_iter().collect();
+            let users: Vec<OwnedUserId> =
+                users.into_iter().filter(|u| !self.failures.contains(u.server_name())).collect();
 
-            users
+            Ok(users
                 .chunks(Self::MAX_KEY_QUERY_USERS)
                 .map(|u| u.iter().map(|u| (u.clone(), Vec::new())).collect())
                 .map(KeysQueryRequest::new)
-                .collect()
+                .collect())
         }
     }
 
-    /// Mark that the given user has changed his devices.
+    /// Receive the list of users that contained changed devices from the
+    /// `/sync` response.
     ///
     /// This will queue up the given user for a key query.
     ///
     /// Note: The user already needs to be tracked for it to be queued up for a
     /// key query.
-    ///
-    /// Returns true if the user was queued up for a key query, false otherwise.
-    pub async fn mark_user_as_changed(&self, user_id: &UserId) -> StoreResult<bool> {
-        if self.store.is_user_tracked(user_id) {
-            self.store.update_tracked_user(user_id, true).await?;
-            Ok(true)
-        } else {
-            Ok(false)
+    pub async fn receive_device_changes(
+        &self,
+        users: impl Iterator<Item = &UserId>,
+    ) -> StoreResult<()> {
+        let mut changed_user: Vec<(&UserId, bool)> = Vec::new();
+
+        for user_id in users {
+            if self.store.is_user_tracked(user_id).await? {
+                changed_user.push((user_id, true))
+            }
         }
+
+        self.store.save_tracked_users(&changed_user).await
     }
 
-    /// Update the tracked users.
-    ///
-    /// # Arguments
-    ///
-    /// * `users` - An iterator over user ids that should be marked for
-    /// tracking.
-    ///
-    /// This will mark users that weren't seen before for a key query and
-    /// tracking.
-    ///
-    /// If the user is already known to the Olm machine it will not be
-    /// considered for a key query.
-    pub async fn update_tracked_users(&self, users: impl IntoIterator<Item = &UserId>) {
-        for user in users {
-            if self.store.is_user_tracked(user) {
-                continue;
-            }
+    /// See the docs for [`OlmMachine::update_tracked_users()`].
+    pub async fn update_tracked_users(
+        &self,
+        users: impl IntoIterator<Item = &UserId>,
+    ) -> StoreResult<()> {
+        let mut tracked_users = Vec::new();
 
-            if let Err(e) = self.store.update_tracked_user(user, true).await {
-                warn!("Error storing users for tracking: {e}");
+        for user_id in users {
+            if !self.store.is_user_tracked(user_id).await? {
+                tracked_users.push((user_id, true));
             }
         }
+
+        self.store.save_tracked_users(&tracked_users).await
+    }
+
+    pub async fn mark_tracked_users_as_up_to_date(
+        &self,
+        users: impl Iterator<Item = &UserId>,
+    ) -> StoreResult<()> {
+        let updated_users: Vec<(&UserId, bool)> = users.map(|u| (u, false)).collect();
+        self.store.save_tracked_users(&updated_users).await
     }
 }
 
@@ -635,7 +668,9 @@ pub(crate) mod testing {
         machine::testing::response_from_file,
         olm::{PrivateCrossSigningIdentity, ReadOnlyAccount},
         store::{CryptoStore, MemoryStore, Store},
+        types::DeviceKeys,
         verification::VerificationMachine,
+        UploadSigningKeysRequest,
     };
 
     pub fn user_id() -> &'static UserId {
@@ -650,8 +685,9 @@ pub(crate) mod testing {
         device_id!("WSKKLTJZCL")
     }
 
-    pub(crate) fn manager() -> IdentityManager {
-        let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(user_id())));
+    pub(crate) async fn manager() -> IdentityManager {
+        let identity = PrivateCrossSigningIdentity::new(user_id().into()).await;
+        let identity = Arc::new(Mutex::new(identity));
         let user_id = Arc::from(user_id());
         let account = ReadOnlyAccount::new(&user_id, device_id());
         let store: Arc<dyn CryptoStore> = Arc::new(MemoryStore::new());
@@ -720,10 +756,10 @@ pub(crate) mod testing {
             .expect("Can't parse the keys upload response")
     }
 
-    pub fn own_key_query() -> KeyQueryResponse {
+    pub fn own_key_query_with_user_id(user_id: &UserId) -> KeyQueryResponse {
         let data = response_from_file(&json!({
           "device_keys": {
-            "@example:localhost": {
+            user_id: {
               "WSKKLTJZCL": {
                 "algorithms": [
                   "m.olm.v1.curve25519-aes-sha2",
@@ -735,12 +771,12 @@ pub(crate) mod testing {
                   "ed25519:WSKKLTJZCL": "lQ+eshkhgKoo+qp9Qgnj3OX5PBoWMU5M9zbuEevwYqE"
                 },
                 "signatures": {
-                  "@example:localhost": {
+                  user_id: {
                     "ed25519:WSKKLTJZCL": "SKpIUnq7QK0xleav0PrIQyKjVm+TgZr7Yi8cKjLeZDtkgyToE2d4/e3Aj79dqOlLB92jFVE4d1cM/Ry04wFwCA",
                     "ed25519:0C8lCBxrvrv/O7BQfsKnkYogHZX3zAgw3RfJuyiq210": "9UGu1iC5YhFCdELGfB29YaV+QE0t/X5UDSsPf4QcdZyXIwyp9zBbHX2lh9vWudNQ+akZpaq7ZRaaM+4TCnw/Ag"
                   }
                 },
-                "user_id": "@example:localhost",
+                "user_id": user_id,
                 "unsigned": {
                   "device_display_name": "Cross signing capable"
                 }
@@ -756,11 +792,11 @@ pub(crate) mod testing {
                   "ed25519:LVWOVGOXME": "k+NC3L7CBD6fBClcHBrKLOkqCyGNSKhWXiH5Q2STRnA"
                 },
                 "signatures": {
-                  "@example:localhost": {
+                  user_id: {
                     "ed25519:LVWOVGOXME": "39Ir5Bttpc5+bQwzLj7rkjm5E5/cp/JTbMJ/t0enj6J5w9MXVBFOUqqM2hpaRaRwILMMpwYbJ8IOGjl0Y/MGAw"
                   }
                 },
-                "user_id": "@example:localhost",
+                "user_id": user_id,
                 "unsigned": {
                   "device_display_name": "Non-cross signing"
                 }
@@ -769,8 +805,8 @@ pub(crate) mod testing {
           },
           "failures": {},
           "master_keys": {
-            "@example:localhost": {
-              "user_id": "@example:localhost",
+            user_id: {
+              "user_id": user_id,
               "usage": [
                 "master"
               ],
@@ -778,15 +814,15 @@ pub(crate) mod testing {
                 "ed25519:rJ2TAGkEOP6dX41Ksll6cl8K3J48l8s/59zaXyvl2p0": "rJ2TAGkEOP6dX41Ksll6cl8K3J48l8s/59zaXyvl2p0"
               },
               "signatures": {
-                "@example:localhost": {
+                user_id: {
                   "ed25519:WSKKLTJZCL": "ZzJp1wtmRdykXAUEItEjNiFlBrxx8L6/Vaen9am8AuGwlxxJtOkuY4m+4MPLvDPOgavKHLsrRuNLAfCeakMlCQ"
                 }
               }
             }
           },
           "self_signing_keys": {
-            "@example:localhost": {
-              "user_id": "@example:localhost",
+            user_id: {
+              "user_id": user_id,
               "usage": [
                 "self_signing"
               ],
@@ -794,15 +830,15 @@ pub(crate) mod testing {
                 "ed25519:0C8lCBxrvrv/O7BQfsKnkYogHZX3zAgw3RfJuyiq210": "0C8lCBxrvrv/O7BQfsKnkYogHZX3zAgw3RfJuyiq210"
               },
               "signatures": {
-                "@example:localhost": {
+                user_id: {
                   "ed25519:rJ2TAGkEOP6dX41Ksll6cl8K3J48l8s/59zaXyvl2p0": "AC7oDUW4rUhtInwb4lAoBJ0wAuu4a5k+8e34B5+NKsDB8HXRwgVwUWN/MRWc/sJgtSbVlhzqS9THEmQQ1C51Bw"
                 }
               }
             }
           },
           "user_signing_keys": {
-            "@example:localhost": {
-              "user_id": "@example:localhost",
+            user_id: {
+              "user_id": user_id,
               "usage": [
                 "user_signing"
               ],
@@ -810,7 +846,7 @@ pub(crate) mod testing {
                 "ed25519:DU9z4gBFKFKCk7a13sW9wjT0Iyg7Hqv5f0BPM7DEhPo": "DU9z4gBFKFKCk7a13sW9wjT0Iyg7Hqv5f0BPM7DEhPo"
               },
               "signatures": {
-                "@example:localhost": {
+                user_id: {
                   "ed25519:rJ2TAGkEOP6dX41Ksll6cl8K3J48l8s/59zaXyvl2p0": "C4L2sx9frGqj8w41KyynHGqwUbbwBYRZpYCB+6QWnvQFA5Oi/1PJj8w5anwzEsoO0TWmLYmf7FXuAGewanOWDg"
                 }
               }
@@ -820,26 +856,110 @@ pub(crate) mod testing {
         KeyQueryResponse::try_from_http_response(data)
             .expect("Can't parse the keys upload response")
     }
+
+    pub fn own_key_query() -> KeyQueryResponse {
+        own_key_query_with_user_id(user_id())
+    }
+
+    pub fn key_query(
+        identity: UploadSigningKeysRequest,
+        device_keys: DeviceKeys,
+    ) -> KeyQueryResponse {
+        let json = json!({
+            "device_keys": {
+                "@example:localhost": {
+                    device_keys.device_id.to_string(): device_keys
+                }
+            },
+            "failures": {},
+            "master_keys": {
+                "@example:localhost": identity.master_key
+            },
+            "self_signing_keys": {
+                "@example:localhost": identity.self_signing_key
+            },
+            "user_signing_keys": {
+                "@example:localhost": identity.user_signing_key
+            },
+          }
+        );
+
+        KeyQueryResponse::try_from_http_response(response_from_file(&json))
+            .expect("Can't parse the keys upload response")
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::time::Duration;
+    use std::{ops::Deref, time::Duration};
 
-    use matrix_sdk_test::async_test;
-    use ruma::device_id;
+    use matrix_sdk_test::{async_test, response_from_file};
+    use ruma::{
+        api::{client::keys::get_keys::v3::Response as KeysQueryResponse, IncomingResponse},
+        device_id, user_id,
+    };
+    use serde_json::json;
 
-    use super::testing::{manager, other_key_query, other_user_id};
+    use super::testing::{device_id, key_query, manager, other_key_query, other_user_id, user_id};
+
+    fn key_query_without_failures() -> KeysQueryResponse {
+        let response = json!({
+            "device_keys": {
+                "@alice:example.org": {
+                },
+            }
+        });
+
+        let response = response_from_file(&response);
+
+        KeysQueryResponse::try_from_http_response(response).unwrap()
+    }
+    fn key_query_with_failures() -> KeysQueryResponse {
+        let response = json!({
+            "device_keys": {
+            },
+            "failures": {
+                "example.org": {
+                    "errcode": "M_RESOURCE_LIMIT_EXCEEDED",
+                    "error": "Not yet ready to retry",
+                }
+            }
+        });
+
+        let response = response_from_file(&response);
+
+        KeysQueryResponse::try_from_http_response(response).unwrap()
+    }
+
+    #[async_test]
+    async fn test_tracked_users() {
+        let manager = manager().await;
+        let alice = user_id!("@alice:example.org");
+
+        assert!(
+            manager.store.tracked_users().await.unwrap().is_empty(),
+            "No users are initially tracked"
+        );
+        manager.receive_device_changes([alice].iter().map(Deref::deref)).await.unwrap();
+        assert!(
+            !manager.store.is_user_tracked(alice).await.unwrap(),
+            "Receiving a device changes update for a user we don't track does nothing"
+        );
+        assert!(
+            !manager.store.users_for_key_query().await.unwrap().contains(alice),
+            "The user we don't track doesn't end up in the `/keys/query` request"
+        );
+    }
 
     #[async_test]
     async fn test_manager_creation() {
-        let manager = manager();
-        assert!(manager.store.tracked_users().is_empty())
+        let manager = manager().await;
+        assert!(manager.store.tracked_users().await.unwrap().is_empty())
     }
 
     #[async_test]
     async fn test_manager_key_query_response() {
-        let manager = manager();
+        let manager = manager().await;
         let other_user = other_user_id();
         let devices = manager.store.get_user_devices(other_user).await.unwrap();
         assert_eq!(devices.devices().count(), 0);
@@ -869,40 +989,102 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_manager_own_key_query_response() {
-        let manager = manager();
-        let other_user = other_user_id();
-        let devices = manager.store.get_user_devices(other_user).await.unwrap();
+        let manager = manager().await;
+        let our_user = user_id();
+        let devices = manager.store.get_user_devices(our_user).await.unwrap();
         assert_eq!(devices.devices().count(), 0);
 
-        manager.receive_keys_query_response(&other_key_query()).await.unwrap();
+        let private_identity = manager.store.private_identity();
+        let private_identity = private_identity.lock().await;
+        let identity_request = private_identity.as_upload_request().await;
+        drop(private_identity);
 
-        let devices = manager.store.get_user_devices(other_user).await.unwrap();
+        let device_keys = manager.store.account().device_keys().await;
+        manager
+            .receive_keys_query_response(&key_query(identity_request, device_keys))
+            .await
+            .unwrap();
+
+        let identity = manager.store.get_user_identity(our_user).await.unwrap().unwrap();
+        let identity = identity.own().unwrap();
+        assert!(identity.is_verified());
+
+        let devices = manager.store.get_user_devices(our_user).await.unwrap();
         assert_eq!(devices.devices().count(), 1);
 
-        let device = manager
-            .store
-            .get_readonly_device(other_user, device_id!("SKISMLNIMH"))
-            .await
-            .unwrap()
-            .unwrap();
-        let identity = manager.store.get_user_identity(other_user).await.unwrap().unwrap();
-        let identity = identity.other().unwrap();
+        let device =
+            manager.store.get_readonly_device(our_user, device_id!(device_id())).await.unwrap();
 
-        identity.is_device_signed(&device).unwrap();
+        assert!(device.is_some());
     }
 
     #[async_test]
     async fn no_tracked_users_key_query_request() {
-        let manager = manager();
+        let manager = manager().await;
 
-        assert!(manager.store.tracked_users().is_empty(), "No users are initially tracked");
+        assert!(
+            manager.store.tracked_users().await.unwrap().is_empty(),
+            "No users are initially tracked"
+        );
 
-        let requests = manager.users_for_key_query().await;
+        let requests = manager.users_for_key_query().await.unwrap();
 
         assert!(!requests.is_empty(), "We query the keys for our own user");
         assert!(
-            manager.store.tracked_users().contains(manager.user_id()),
+            manager.store.tracked_users().await.unwrap().contains(manager.user_id()),
             "Our own user is now tracked"
         );
+    }
+
+    #[async_test]
+    async fn failure_handling() {
+        let manager = manager().await;
+        let alice = user_id!("@alice:example.org");
+
+        assert!(
+            manager.store.tracked_users().await.unwrap().is_empty(),
+            "No users are initially tracked"
+        );
+        manager.store.mark_user_as_changed(alice).await.unwrap();
+
+        assert!(
+            manager.store.tracked_users().await.unwrap().contains(alice),
+            "Alice is tracked after being marked as tracked"
+        );
+        assert!(manager
+            .users_for_key_query()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.device_keys.contains_key(alice)));
+
+        let response = key_query_with_failures();
+
+        manager.receive_keys_query_response(&response).await.unwrap();
+        assert!(manager.failures.contains(alice.server_name()));
+        assert!(!manager
+            .users_for_key_query()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.device_keys.contains_key(alice)));
+
+        let response = key_query_without_failures();
+        manager.receive_keys_query_response(&response).await.unwrap();
+        assert!(!manager.failures.contains(alice.server_name()));
+        assert!(!manager
+            .users_for_key_query()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.device_keys.contains_key(alice)));
+
+        manager.store.mark_user_as_changed(alice).await.unwrap();
+        assert!(manager
+            .users_for_key_query()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.device_keys.contains_key(alice)));
     }
 }

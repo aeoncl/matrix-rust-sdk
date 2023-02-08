@@ -20,16 +20,14 @@ use dashmap::{DashMap, DashSet};
 pub(crate) use machine::GossipMachine;
 use ruma::{
     events::{
-        room_key_request::{
-            Action, RequestedKeyInfo, ToDeviceRoomKeyRequestEvent,
-            ToDeviceRoomKeyRequestEventContent,
-        },
+        room_key_request::{Action, ToDeviceRoomKeyRequestEventContent},
         secret::request::{
             RequestAction, SecretName, ToDeviceSecretRequestEvent as SecretRequestEvent,
             ToDeviceSecretRequestEventContent as SecretRequestEventContent,
         },
-        AnyToDeviceEventContent,
+        AnyToDeviceEventContent, ToDeviceEventType,
     },
+    serde::Raw,
     to_device::DeviceIdOrAllDevices,
     DeviceId, OwnedDeviceId, OwnedTransactionId, OwnedUserId, TransactionId, UserId,
 };
@@ -39,6 +37,9 @@ use tracing::error;
 
 use crate::{
     requests::{OutgoingRequest, ToDeviceRequest},
+    types::events::room_key_request::{
+        RoomKeyRequestContent, RoomKeyRequestEvent, SupportedKeyInfo,
+    },
     Device,
 };
 
@@ -76,35 +77,36 @@ pub struct GossipRequest {
 }
 
 /// An enum over the various secret request types we can have.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SecretInfo {
     /// Info for the `m.room_key_request` variant
-    KeyRequest(RequestedKeyInfo),
+    KeyRequest(SupportedKeyInfo),
     /// Info for the `m.secret.request` variant
     SecretRequest(SecretName),
 }
 
 impl SecretInfo {
     /// Serialize `SecretInfo` into `String` for usage as database keys and
-    /// comparison
+    /// comparison.
     pub fn as_key(&self) -> String {
         match &self {
-            #[allow(deprecated)]
-            SecretInfo::KeyRequest(ref info) => format!(
-                "keyRequest:{:}:{:}:{:}:{:}",
-                info.room_id.as_str(),
-                info.sender_key,
-                info.session_id,
-                &info.algorithm
+            SecretInfo::KeyRequest(info) => format!(
+                "keyRequest:{}:{}:{}",
+                info.room_id().as_str(),
+                info.session_id(),
+                &info.algorithm(),
             ),
-            SecretInfo::SecretRequest(ref sname) => format!("secretName:{:}", sname),
+            SecretInfo::SecretRequest(sname) => format!("secretName:{sname}"),
         }
     }
 }
 
-impl From<RequestedKeyInfo> for SecretInfo {
-    fn from(i: RequestedKeyInfo) -> Self {
-        Self::KeyRequest(i)
+impl<T> From<T> for SecretInfo
+where
+    T: Into<SupportedKeyInfo>,
+{
+    fn from(v: T) -> Self {
+        Self::KeyRequest(v.into())
     }
 }
 
@@ -133,30 +135,41 @@ impl GossipRequest {
     }
 
     fn to_request(&self, own_device_id: &DeviceId) -> OutgoingRequest {
-        let content = match &self.info {
+        let request = match &self.info {
             SecretInfo::KeyRequest(r) => {
-                AnyToDeviceEventContent::RoomKeyRequest(ToDeviceRoomKeyRequestEventContent::new(
-                    Action::Request,
-                    Some(r.clone()),
+                let content = RoomKeyRequestContent::new_request(
+                    r.clone().into(),
                     own_device_id.to_owned(),
+                    self.request_id.to_owned(),
+                );
+                let content = Raw::new(&content)
+                    .expect("We can always serialize a room key request info")
+                    .cast();
+
+                ToDeviceRequest::with_id_raw(
+                    &self.request_recipient,
+                    DeviceIdOrAllDevices::AllDevices,
+                    content,
+                    ToDeviceEventType::RoomKeyRequest,
                     self.request_id.clone(),
-                ))
+                )
             }
             SecretInfo::SecretRequest(s) => {
-                AnyToDeviceEventContent::SecretRequest(SecretRequestEventContent::new(
-                    RequestAction::Request(s.clone()),
-                    own_device_id.to_owned(),
+                let content =
+                    AnyToDeviceEventContent::SecretRequest(SecretRequestEventContent::new(
+                        RequestAction::Request(s.clone()),
+                        own_device_id.to_owned(),
+                        self.request_id.clone(),
+                    ));
+
+                ToDeviceRequest::with_id(
+                    &self.request_recipient,
+                    DeviceIdOrAllDevices::AllDevices,
+                    content,
                     self.request_id.clone(),
-                ))
+                )
             }
         };
-
-        let request = ToDeviceRequest::with_id(
-            &self.request_recipient,
-            DeviceIdOrAllDevices::AllDevices,
-            content,
-            self.request_id.clone(),
-        );
 
         OutgoingRequest { request_id: request.txn_id.clone(), request: Arc::new(request.into()) }
     }
@@ -194,11 +207,7 @@ impl GossipRequest {
 impl PartialEq for GossipRequest {
     fn eq(&self, other: &Self) -> bool {
         let is_info_equal = match (&self.info, &other.info) {
-            (SecretInfo::KeyRequest(first), SecretInfo::KeyRequest(second)) => {
-                first.algorithm == second.algorithm
-                    && first.room_id == second.room_id
-                    && first.session_id == second.session_id
-            }
+            (SecretInfo::KeyRequest(first), SecretInfo::KeyRequest(second)) => first == second,
             (SecretInfo::SecretRequest(first), SecretInfo::SecretRequest(second)) => {
                 first == second
             }
@@ -210,9 +219,9 @@ impl PartialEq for GossipRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum RequestEvent {
-    KeyShare(ToDeviceRoomKeyRequestEvent),
+    KeyShare(RoomKeyRequestEvent),
     Secret(SecretRequestEvent),
 }
 
@@ -222,8 +231,8 @@ impl From<SecretRequestEvent> for RequestEvent {
     }
 }
 
-impl From<ToDeviceRoomKeyRequestEvent> for RequestEvent {
-    fn from(e: ToDeviceRoomKeyRequestEvent) -> Self {
+impl From<RoomKeyRequestEvent> for RequestEvent {
+    fn from(e: RoomKeyRequestEvent) -> Self {
         Self::KeyShare(e)
     }
 }

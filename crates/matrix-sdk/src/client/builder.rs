@@ -13,18 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 #[cfg(target_arch = "wasm32")]
 use async_once_cell::OnceCell;
 use matrix_sdk_base::{
     locks::{Mutex, RwLock},
     store::StoreConfig,
-    BaseClient, StateStore,
+    BaseClient,
 };
 use ruma::{
     api::{client::discovery::discover_homeserver, error::FromHttpResponseError, MatrixVersion},
-    OwnedServerName, ServerName, UserId,
+    OwnedServerName, ServerName,
 };
 use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,7 +82,7 @@ use crate::{
 pub struct ClientBuilder {
     homeserver_cfg: Option<HomeserverConfig>,
     http_cfg: Option<HttpConfig>,
-    store_config: StoreConfig,
+    store_config: BuilderStoreConfig,
     request_config: RequestConfig,
     respect_login_well_known: bool,
     appservice_mode: bool,
@@ -95,7 +95,7 @@ impl ClientBuilder {
         Self {
             homeserver_cfg: None,
             http_cfg: None,
-            store_config: Default::default(),
+            store_config: BuilderStoreConfig::Custom(StoreConfig::default()),
             request_config: Default::default(),
             respect_login_well_known: true,
             appservice_mode: false,
@@ -106,23 +106,12 @@ impl ClientBuilder {
 
     /// Set the homeserver URL to use.
     ///
-    /// This method is mutually exclusive with [`user_id()`][Self::user_id], if
-    /// you set both whatever was set last will be used.
+    /// This method is mutually exclusive with
+    /// [`server_name()`][Self::server_name], if you set both whatever was set
+    /// last will be used.
     pub fn homeserver_url(mut self, url: impl AsRef<str>) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::Url(url.as_ref().to_owned()));
         self
-    }
-
-    /// Set the user ID to discover the homeserver from.
-    ///
-    /// `builder.user_id(id)` is a shortcut for
-    /// `builder.server_name(id.server_name())`.
-    ///
-    /// This method is mutually exclusive with
-    /// [`homeserver_url()`][Self::homeserver_url], if you set both whatever was
-    /// set last will be used.
-    pub fn user_id(self, user_id: &UserId) -> Self {
-        self.server_name(user_id.server_name())
     }
 
     /// Set the server name to discover the homeserver from.
@@ -137,37 +126,42 @@ impl ClientBuilder {
 
     /// Set up the store configuration for a sled store.
     ///
-    /// This is a shorthand for
+    /// This is the same as
     /// <code>.[store_config](Self::store_config)([matrix_sdk_sled]::[make_store_config](matrix_sdk_sled::make_store_config)(path, passphrase)?)</code>.
+    /// except it delegates the actual store config creation to when
+    /// `.build().await` is called.
     #[cfg(feature = "sled")]
     pub fn sled_store(
-        self,
+        mut self,
         path: impl AsRef<std::path::Path>,
         passphrase: Option<&str>,
-    ) -> Result<Self, matrix_sdk_sled::OpenStoreError> {
-        let config = matrix_sdk_sled::make_store_config(path, passphrase)?;
-        Ok(self.store_config(config))
+    ) -> Self {
+        self.store_config = BuilderStoreConfig::Sled {
+            path: path.as_ref().to_owned(),
+            passphrase: passphrase.map(ToOwned::to_owned),
+        };
+        self
     }
 
     /// Set up the store configuration for a IndexedDB store.
     ///
-    /// This is a shorthand for
-    /// <code>.[store_config](Self::store_config)([matrix_sdk_indexeddb]::[make_store_config](matrix_sdk_indexeddb::make_store_config)(path, passphrase).await?)</code>.
+    /// This is the same as
+    /// <code>.[store_config](Self::store_config)([matrix_sdk_indexeddb]::[make_store_config](matrix_sdk_indexeddb::make_store_config)(path, passphrase).await?)</code>,
+    /// except it delegates the actual store config creation to when
+    /// `.build().await` is called.
     #[cfg(feature = "indexeddb")]
-    pub async fn indexeddb_store(
-        self,
-        name: &str,
-        passphrase: Option<&str>,
-    ) -> Result<Self, matrix_sdk_indexeddb::OpenStoreError> {
-        let config = matrix_sdk_indexeddb::make_store_config(name, passphrase).await?;
-        Ok(self.store_config(config))
+    pub fn indexeddb_store(mut self, name: &str, passphrase: Option<&str>) -> Self {
+        self.store_config = BuilderStoreConfig::IndexedDb {
+            name: name.to_owned(),
+            passphrase: passphrase.map(ToOwned::to_owned),
+        };
+        self
     }
 
     /// Set up the store configuration.
     ///
     /// The easiest way to get a [`StoreConfig`] is to use the
-    /// [`make_store_config`] method from the [`store`] module or directly from
-    /// one of the store crates.
+    /// `make_store_config` method from one of the store crates.
     ///
     /// # Arguments
     ///
@@ -183,40 +177,8 @@ impl ClientBuilder {
     /// let store_config = StoreConfig::new().state_store(custom_state_store);
     /// let client_builder = Client::builder().store_config(store_config);
     /// ```
-    /// [`make_store_config`]: crate::store::make_store_config
-    /// [`store`]: crate::store
     pub fn store_config(mut self, store_config: StoreConfig) -> Self {
-        self.store_config = store_config;
-        self
-    }
-
-    /// Set a custom implementation of a `StateStore`.
-    ///
-    /// The state store should be opened before being set.
-    #[deprecated = "\
-        Use [`store_config`](#method.store_config), \
-        [`sled_store`](#method.sled_store) or \
-        [`indexeddb_store`](#method.indexeddb_store) instead
-    "]
-    pub fn state_store(mut self, store: impl StateStore + 'static) -> Self {
-        self.store_config = self.store_config.state_store(store);
-        self
-    }
-
-    /// Set a custom implementation of a `CryptoStore`.
-    ///
-    /// The crypto store should be opened before being set.
-    #[deprecated = "\
-        Use [`store_config`](#method.store_config), \
-        [`sled_store`](#method.sled_store) or \
-        [`indexeddb_store`](#method.indexeddb_store) instead
-    "]
-    #[cfg(feature = "e2e-encryption")]
-    pub fn crypto_store(
-        mut self,
-        store: impl matrix_sdk_base::crypto::store::CryptoStore + 'static,
-    ) -> Self {
-        self.store_config = self.store_config.crypto_store(store);
+        self.store_config = BuilderStoreConfig::Custom(store_config);
         self
     }
 
@@ -346,7 +308,7 @@ impl ClientBuilder {
     ///
     /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
     /// [`UnknownToken`]: ruma::api::client::error::ErrorKind::UnknownToken
-    /// [restore the session]: Client::restore_login
+    /// [restore the session]: Client::restore_session
     pub fn handle_refresh_tokens(mut self) -> Self {
         self.handle_refresh_tokens = true;
         self
@@ -380,10 +342,25 @@ impl ClientBuilder {
             HttpConfig::Custom(c) => c,
         };
 
-        let base_client = BaseClient::with_store_config(self.store_config);
+        #[allow(clippy::infallible_destructuring_match)]
+        let store_config = match self.store_config {
+            #[cfg(feature = "sled")]
+            BuilderStoreConfig::Sled { path, passphrase } => {
+                matrix_sdk_sled::make_store_config(&path, passphrase.as_deref()).await?
+            }
+            #[cfg(feature = "indexeddb")]
+            BuilderStoreConfig::IndexedDb { name, passphrase } => {
+                matrix_sdk_indexeddb::make_store_config(&name, passphrase.as_deref()).await?
+            }
+            BuilderStoreConfig::Custom(config) => config,
+        };
+
+        let base_client = BaseClient::with_store_config(store_config);
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
         let mut authentication_issuer: Option<Url> = None;
+        #[cfg(feature = "experimental-sliding-sync")]
+        let mut sliding_sync_proxy: Option<Url> = None;
         let homeserver = match homeserver_cfg {
             HomeserverConfig::Url(url) => url,
             HomeserverConfig::ServerName(server_name) => {
@@ -405,7 +382,11 @@ impl ClientBuilder {
 
                 if let Some(issuer) = well_known.authentication.map(|auth| auth.issuer) {
                     authentication_issuer = Url::parse(&issuer).ok();
-                };
+                }
+                #[cfg(feature = "experimental-sliding-sync")]
+                if let Some(proxy) = well_known.sliding_sync_proxy.map(|p| p.url) {
+                    sliding_sync_proxy = Url::parse(&proxy).ok();
+                }
 
                 well_known.homeserver.base_url
             }
@@ -413,10 +394,14 @@ impl ClientBuilder {
 
         let homeserver = RwLock::new(Url::parse(&homeserver)?);
         let authentication_issuer = authentication_issuer.map(RwLock::new);
+        #[cfg(feature = "experimental-sliding-sync")]
+        let sliding_sync_proxy = sliding_sync_proxy.map(RwLock::new);
 
         let inner = Arc::new(ClientInner {
             homeserver,
             authentication_issuer,
+            #[cfg(feature = "experimental-sliding-sync")]
+            sliding_sync_proxy,
             http_client,
             base_client,
             server_versions: OnceCell::new_with(self.server_versions),
@@ -425,10 +410,9 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             key_claim_lock: Default::default(),
             members_request_locks: Default::default(),
+            encryption_state_request_locks: Default::default(),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
-            event_handler_data: Default::default(),
-            event_handler_counter: Default::default(),
             notification_handlers: Default::default(),
             appservice_mode: self.appservice_mode,
             respect_login_well_known: self.respect_login_well_known,
@@ -482,6 +466,38 @@ impl HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self::Settings(HttpSettings::default())
+    }
+}
+
+#[derive(Clone)]
+enum BuilderStoreConfig {
+    #[cfg(feature = "sled")]
+    Sled {
+        path: std::path::PathBuf,
+        passphrase: Option<String>,
+    },
+    #[cfg(feature = "indexeddb")]
+    IndexedDb {
+        name: String,
+        passphrase: Option<String>,
+    },
+    Custom(StoreConfig),
+}
+
+impl fmt::Debug for BuilderStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[allow(clippy::infallible_destructuring_match)]
+        match self {
+            #[cfg(feature = "sled")]
+            Self::Sled { path, .. } => {
+                f.debug_struct("Sled").field("path", path).finish_non_exhaustive()
+            }
+            #[cfg(feature = "indexeddb")]
+            Self::IndexedDb { name, .. } => {
+                f.debug_struct("IndexedDb").field("name", name).finish_non_exhaustive()
+            }
+            Self::Custom(store_config) => f.debug_tuple("Custom").field(store_config).finish(),
+        }
     }
 }
 

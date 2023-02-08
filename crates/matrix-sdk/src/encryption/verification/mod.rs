@@ -35,9 +35,15 @@ mod qrcode;
 mod requests;
 mod sas;
 
+pub use matrix_sdk_base::crypto::{
+    format_emojis, AcceptSettings, AcceptedProtocols, CancelInfo, Emoji, EmojiShortAuthString,
+    SasState,
+};
 #[cfg(feature = "qrcode")]
-pub use matrix_sdk_base::crypto::{matrix_sdk_qrcode::QrVerificationData, ScanError};
-pub use matrix_sdk_base::crypto::{AcceptSettings, CancelInfo, Emoji};
+pub use matrix_sdk_base::crypto::{
+    matrix_sdk_qrcode::{DecodingError, EncodingError, QrVerificationData},
+    ScanError,
+};
 #[cfg(feature = "qrcode")]
 pub use qrcode::QrVerification;
 pub use requests::VerificationRequest;

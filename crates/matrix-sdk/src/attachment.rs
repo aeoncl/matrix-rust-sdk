@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Types and traits for attachments.
+
 #[cfg(feature = "image-proc")]
 use std::io::{BufRead, Cursor, Seek};
-use std::{io::Read, time::Duration};
+use std::time::Duration;
 
 #[cfg(feature = "image-proc")]
 use image::GenericImageView;
@@ -24,7 +26,7 @@ use ruma::{
         message::{AudioInfo, FileInfo, VideoInfo},
         ImageInfo, ThumbnailInfo,
     },
-    TransactionId, UInt,
+    OwnedTransactionId, TransactionId, UInt,
 };
 
 #[cfg(feature = "image-proc")]
@@ -162,33 +164,28 @@ impl From<BaseThumbnailInfo> for ThumbnailInfo {
 
 /// A thumbnail to upload and send for an attachment.
 #[derive(Debug)]
-pub struct Thumbnail<'a, R: Read> {
-    /// A `Reader` that will be used to fetch the raw bytes of the thumbnail.
-    pub reader: &'a mut R,
+pub struct Thumbnail {
+    /// The raw bytes of the thumbnail.
+    pub data: Vec<u8>,
     /// The type of the thumbnail, this will be used as the content-type header.
-    pub content_type: &'a mime::Mime,
+    pub content_type: mime::Mime,
     /// The metadata of the thumbnail.
     pub info: Option<BaseThumbnailInfo>,
 }
 
-impl Thumbnail<'static, &'static [u8]> {
-    /// Typed `None` for an `<Option<Thumbnail>>`.
-    pub const NONE: Option<Thumbnail<'static, &'static [u8]>> = None;
-}
-
 /// Configuration for sending an attachment.
 #[derive(Debug)]
-pub struct AttachmentConfig<'a, R: Read> {
-    pub(crate) txn_id: Option<&'a TransactionId>,
+pub struct AttachmentConfig {
+    pub(crate) txn_id: Option<OwnedTransactionId>,
     pub(crate) info: Option<AttachmentInfo>,
-    pub(crate) thumbnail: Option<Thumbnail<'a, R>>,
+    pub(crate) thumbnail: Option<Thumbnail>,
     #[cfg(feature = "image-proc")]
     pub(crate) generate_thumbnail: bool,
     #[cfg(feature = "image-proc")]
     pub(crate) thumbnail_size: Option<(u32, u32)>,
 }
 
-impl AttachmentConfig<'static, &'static [u8]> {
+impl AttachmentConfig {
     /// Create a new default `AttachmentConfig` without providing a thumbnail.
     ///
     /// To provide a thumbnail use [`AttachmentConfig::with_thumbnail()`].
@@ -223,15 +220,7 @@ impl AttachmentConfig<'static, &'static [u8]> {
         self.thumbnail_size = size;
         self
     }
-}
 
-impl Default for AttachmentConfig<'static, &'static [u8]> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'a, R: Read> AttachmentConfig<'a, R> {
     /// Create a new default `AttachmentConfig` with a `thumbnail`.
     ///
     /// # Arguments
@@ -242,7 +231,7 @@ impl<'a, R: Read> AttachmentConfig<'a, R> {
     /// To generate automatically a thumbnail from an image, use
     /// [`AttachmentConfig::new()`] and
     /// [`AttachmentConfig::generate_thumbnail()`].
-    pub fn with_thumbnail(thumbnail: Thumbnail<'a, R>) -> Self {
+    pub fn with_thumbnail(thumbnail: Thumbnail) -> Self {
         Self {
             txn_id: Default::default(),
             info: Default::default(),
@@ -262,8 +251,8 @@ impl<'a, R: Read> AttachmentConfig<'a, R> {
     /// in its unsigned field as `transaction_id`. If not given, one is created
     /// for the message.
     #[must_use]
-    pub fn txn_id(mut self, txn_id: &'a TransactionId) -> Self {
-        self.txn_id = Some(txn_id);
+    pub fn txn_id(mut self, txn_id: &TransactionId) -> Self {
+        self.txn_id = Some(txn_id.to_owned());
         self
     }
 
@@ -277,6 +266,12 @@ impl<'a, R: Read> AttachmentConfig<'a, R> {
     pub fn info(mut self, info: AttachmentInfo) -> Self {
         self.info = Some(info);
         self
+    }
+}
+
+impl Default for AttachmentConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -341,7 +336,7 @@ impl<'a, R: Read> AttachmentConfig<'a, R> {
 #[cfg(feature = "image-proc")]
 pub fn generate_image_thumbnail<R: BufRead + Seek>(
     content_type: &mime::Mime,
-    reader: &mut R,
+    reader: R,
     size: Option<(u32, u32)>,
 ) -> Result<(Vec<u8>, BaseThumbnailInfo), ImageError> {
     let image_format = image::ImageFormat::from_mime_type(content_type);

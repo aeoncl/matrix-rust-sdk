@@ -28,33 +28,38 @@ pub use account::{OlmMessageHash, PickledAccount, ReadOnlyAccount};
 pub(crate) use group_sessions::ShareState;
 pub use group_sessions::{
     EncryptionSettings, ExportedRoomKey, InboundGroupSession, OutboundGroupSession,
-    PickledInboundGroupSession, PickledOutboundGroupSession, SessionCreationError, SessionKey,
-    ShareInfo,
+    PickledInboundGroupSession, PickledOutboundGroupSession, SessionCreationError,
+    SessionExportError, SessionKey, ShareInfo,
 };
 pub use session::{PickledSession, Session};
 pub use signing::{CrossSigningStatus, PickledCrossSigningIdentity, PrivateCrossSigningIdentity};
 pub(crate) use utility::{SignedJsonObject, VerifyJson};
-pub use vodozemac::olm::IdentityKeys;
+pub use vodozemac::{olm::IdentityKeys, Curve25519PublicKey};
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use matches::assert_matches;
+    use assert_matches::assert_matches;
     use matrix_sdk_test::async_test;
     use ruma::{
         device_id, event_id,
         events::{
-            forwarded_room_key::ToDeviceForwardedRoomKeyEventContent,
-            room::message::{Relation, Replacement, RoomMessageEventContent},
-            AnyMessageLikeEvent, AnyRoomEvent, MessageLikeEvent,
+            relation::Replacement,
+            room::message::{Relation, RoomMessageEventContent},
+            AnyMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent,
         },
         room_id, user_id, DeviceId, UserId,
     };
     use serde_json::{json, Value};
-    use vodozemac::{olm::OlmMessage, Curve25519PublicKey};
+    use vodozemac::{
+        olm::{OlmMessage, SessionConfig},
+        Curve25519PublicKey, Ed25519PublicKey,
+    };
 
     use crate::{
         olm::{ExportedRoomKey, InboundGroupSession, ReadOnlyAccount, Session},
-        types::events::room::encrypted::EncryptedEvent,
+        types::events::{
+            forwarded_room_key::ForwardedRoomKeyContent, room::encrypted::EncryptedEvent,
+        },
         utilities::json_convert,
     };
 
@@ -81,7 +86,14 @@ pub(crate) mod tests {
         bob.generate_one_time_keys_helper(1).await;
         let one_time_key = *bob.one_time_keys().await.values().next().unwrap();
         let sender_key = bob.identity_keys().curve25519;
-        let session = alice.create_outbound_session_helper(sender_key, one_time_key, false).await;
+        let session = alice
+            .create_outbound_session_helper(
+                SessionConfig::default(),
+                sender_key,
+                one_time_key,
+                false,
+            )
+            .await;
 
         (alice, session)
     }
@@ -127,8 +139,14 @@ pub(crate) mod tests {
 
         let one_time_key = *one_time_keys.values().next().unwrap();
 
-        let mut bob_session =
-            bob.create_outbound_session_helper(alice_keys.curve25519, one_time_key, false).await;
+        let mut bob_session = bob
+            .create_outbound_session_helper(
+                SessionConfig::default(),
+                alice_keys.curve25519,
+                one_time_key,
+                false,
+            )
+            .await;
 
         let plaintext = "Hello world";
 
@@ -163,12 +181,13 @@ pub(crate) mod tests {
         let inbound = InboundGroupSession::new(
             Curve25519PublicKey::from_base64("Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw")
                 .unwrap(),
-            "test_key",
+            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
             room_id,
             &outbound.session_key().await,
             outbound.settings().algorithm.to_owned(),
             None,
-        );
+        )
+        .expect("We can always create an inbound group session from an outbound one");
 
         assert_eq!(0, inbound.first_known_index());
 
@@ -205,12 +224,13 @@ pub(crate) mod tests {
         let inbound = InboundGroupSession::new(
             Curve25519PublicKey::from_base64("Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw")
                 .unwrap(),
-            "test_key",
+            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
             room_id,
             &outbound.session_key().await,
             outbound.settings().algorithm.to_owned(),
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(0, inbound.first_known_index());
 
@@ -231,7 +251,7 @@ pub(crate) mod tests {
         let event = json_convert(&event).unwrap();
         let decrypted = inbound.decrypt(&event).await.unwrap().0;
 
-        if let AnyRoomEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
+        if let AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
             MessageLikeEvent::Original(e),
         )) = decrypted.deserialize().unwrap()
         {
@@ -321,7 +341,7 @@ pub(crate) mod tests {
         let (_, inbound) = alice.create_group_session_pair_with_defaults(room_id).await;
 
         let export = inbound.export().await;
-        let export: ToDeviceForwardedRoomKeyEventContent = export.try_into().unwrap();
+        let export: ForwardedRoomKeyContent = export.try_into().unwrap();
         let export = ExportedRoomKey::try_from(export).unwrap();
 
         let imported = InboundGroupSession::from_export(&export)

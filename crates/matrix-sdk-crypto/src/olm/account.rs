@@ -28,10 +28,10 @@ use ruma::{
         upload_keys,
         upload_signatures::v3::{Request as SignatureUploadRequest, SignedKeys},
     },
-    events::{AnyToDeviceEvent, OlmV1Keys},
+    events::AnyToDeviceEvent,
     serde::Raw,
-    DeviceId, DeviceKeyAlgorithm, DeviceKeyId, EventEncryptionAlgorithm, OwnedDeviceId,
-    OwnedDeviceKeyId, OwnedUserId, RoomId, SecondsSinceUnixEpoch, UInt, UserId,
+    DeviceId, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedDeviceKeyId, OwnedUserId,
+    RoomId, SecondsSinceUnixEpoch, UInt, UserId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue as RawJsonValue, Value};
@@ -47,31 +47,37 @@ use vodozemac::{
 
 use super::{
     utility::SignJson, EncryptionSettings, InboundGroupSession, OutboundGroupSession,
-    PrivateCrossSigningIdentity, Session,
+    PrivateCrossSigningIdentity, Session, SessionCreationError as MegolmSessionCreationError,
 };
+#[cfg(feature = "experimental-algorithms")]
+use crate::types::events::room::encrypted::OlmV2Curve25519AesSha2Content;
 use crate::{
     error::{EventError, OlmResult, SessionCreationError},
     identities::{MasterPubkey, ReadOnlyDevice},
     requests::UploadSigningKeysRequest,
     store::{Changes, Store},
     types::{
-        events::room::encrypted::{
-            EncryptedToDeviceEvent, OlmV1Curve25519AesSha2Content, ToDeviceEncryptedEventContent,
+        events::{
+            olm_v1::AnyDecryptedOlmEvent,
+            room::encrypted::{
+                EncryptedToDeviceEvent, OlmV1Curve25519AesSha2Content,
+                ToDeviceEncryptedEventContent,
+            },
         },
-        CrossSigningKey, DeviceKeys, OneTimeKey, SignedKey,
+        CrossSigningKey, DeviceKeys, EventEncryptionAlgorithm, OneTimeKey, SignedKey,
     },
     utilities::encode,
     CryptoStoreError, OlmError, SignatureError,
 };
 
 #[derive(Debug, Clone)]
-pub struct Account {
+pub(crate) struct Account {
     pub inner: ReadOnlyAccount,
     pub store: Store,
 }
 
 #[derive(Debug, Clone)]
-pub enum SessionType {
+pub(crate) enum SessionType {
     New(Session),
     Existing(Session),
 }
@@ -97,15 +103,19 @@ impl SessionType {
 ///
 /// Contains the decrypted event plaintext along with some associated metadata,
 /// such as the identity (Curve25519) key of the to-device event sender.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct OlmDecryptionInfo {
-    pub sender: OwnedUserId,
     pub session: SessionType,
     pub message_hash: OlmMessageHash,
-    pub event: Raw<AnyToDeviceEvent>,
-    pub signing_key: String,
-    pub sender_key: Curve25519PublicKey,
     pub inbound_group_session: Option<InboundGroupSession>,
+    pub result: DecryptionResult,
+}
+
+#[derive(Debug)]
+pub(crate) struct DecryptionResult {
+    pub event: AnyDecryptedOlmEvent,
+    pub raw_event: Raw<AnyToDeviceEvent>,
+    pub sender_key: Curve25519PublicKey,
 }
 
 /// A hash of a successfully decrypted Olm message.
@@ -126,8 +136,8 @@ impl OlmMessageHash {
 
         let sha = Sha256::new()
             .chain_update(sender_key.as_bytes())
-            .chain_update(&[message_type as u8])
-            .chain_update(&ciphertext)
+            .chain_update([message_type as u8])
+            .chain_update(ciphertext)
             .finalize();
 
         Self { sender_key, hash: encode(sha.as_slice()) }
@@ -156,23 +166,12 @@ impl Account {
         let message_hash = OlmMessageHash::new(sender_key, ciphertext);
 
         match self.decrypt_olm_message(sender, sender_key, ciphertext).await {
-            Ok((session, event, signing_key)) => Ok(OlmDecryptionInfo {
-                sender: sender.to_owned(),
-                session,
-                message_hash,
-                event,
-                signing_key,
-                sender_key,
-                inbound_group_session: None,
-            }),
+            Ok((session, result)) => {
+                Ok(OlmDecryptionInfo { session, message_hash, result, inbound_group_session: None })
+            }
             Err(OlmError::SessionWedged(user_id, sender_key)) => {
                 if self.store.is_message_known(&message_hash).await? {
-                    info!(
-                        sender = sender.as_str(),
-                        sender_key = sender_key.as_str(), 
-                        "An Olm message got replayed, decryption failed"
-                    );
-
+                    info!(?sender_key, "An Olm message got replayed, decryption failed");
                     Err(OlmError::ReplayedMessage(user_id, sender_key))
                 } else {
                     Err(OlmError::SessionWedged(user_id, sender_key))
@@ -182,6 +181,15 @@ impl Account {
         }
     }
 
+    #[cfg(feature = "experimental-algorithms")]
+    async fn decrypt_olm_v2(
+        &self,
+        sender: &UserId,
+        content: &OlmV2Curve25519AesSha2Content,
+    ) -> OlmResult<OlmDecryptionInfo> {
+        self.decrypt_olm_helper(sender, content.sender_key, &content.ciphertext).await
+    }
+
     async fn decrypt_olm_v1(
         &self,
         sender: &UserId,
@@ -189,8 +197,7 @@ impl Account {
     ) -> OlmResult<OlmDecryptionInfo> {
         if content.recipient_key != self.identity_keys().curve25519 {
             warn!(
-                sender = sender.as_str(),
-                sender_key = content.sender_key.to_base64().as_str(),
+                sender_key = content.sender_key.to_base64(),
                 "Olm event doesn't contain a ciphertext for our key"
             );
 
@@ -204,20 +211,19 @@ impl Account {
         &self,
         event: &EncryptedToDeviceEvent,
     ) -> OlmResult<OlmDecryptionInfo> {
-        trace!(
-            sender = event.sender.as_str(),
-            algorithm = %event.content.algorithm(),
-            "Decrypting a to-device event"
-        );
+        trace!(algorithm = ?event.content.algorithm(), "Decrypting a to-device event");
 
         match &event.content {
             ToDeviceEncryptedEventContent::OlmV1Curve25519AesSha2(c) => {
                 self.decrypt_olm_v1(&event.sender, c).await
             }
+            #[cfg(feature = "experimental-algorithms")]
+            ToDeviceEncryptedEventContent::OlmV2Curve25519AesSha2(c) => {
+                self.decrypt_olm_v2(&event.sender, c).await
+            }
             ToDeviceEncryptedEventContent::Unknown(_) => {
                 warn!(
-                    sender = event.sender.as_str(),
-                    algorithm = %event.content.algorithm(),
+                    algorithm = ?event.content.algorithm(),
                     "Error decrypting an to-device event, unsupported \
                     encryption algorithm"
                 );
@@ -255,10 +261,8 @@ impl Account {
     ) -> OlmResult<Option<(Session, String)>> {
         let s = self.store.get_sessions(&sender_key.to_base64()).await?;
 
-        // We don't have any existing sessions, return early.
-        let sessions = if let Some(s) = s {
-            s
-        } else {
+        let Some(sessions) = s else {
+            // We don't have any existing sessions, return early.
             return Ok(None);
         };
 
@@ -287,73 +291,64 @@ impl Account {
         sender: &UserId,
         sender_key: Curve25519PublicKey,
         message: &OlmMessage,
-    ) -> OlmResult<(SessionType, Raw<AnyToDeviceEvent>, String)> {
+    ) -> OlmResult<(SessionType, DecryptionResult)> {
         // First try to decrypt using an existing session.
-        let (session, plaintext) = if let Some(d) =
-            self.decrypt_with_existing_sessions(sender_key, message).await?
-        {
-            // Decryption succeeded, de-structure the session/plaintext out of
-            // the Option.
-            (SessionType::Existing(d.0), d.1)
-        } else {
-            // Decryption failed with every known session, let's try to create a
-            // new session.
-            match message {
-                // A new session can only be created using a pre-key message,
-                // return with an error if it isn't one.
-                OlmMessage::Normal(_) => {
-                    warn!(
-                        sender = sender.as_str(),
-                        sender_key = sender_key.to_base64().as_str(),
-                        "Failed to decrypt a non-pre-key message with all \
-                        available sessions",
-                    );
-                    return Err(OlmError::SessionWedged(sender.to_owned(), sender_key.to_base64()));
+        let (session, plaintext) =
+            if let Some(d) = self.decrypt_with_existing_sessions(sender_key, message).await? {
+                // Decryption succeeded, de-structure the session/plaintext out of
+                // the Option.
+                (SessionType::Existing(d.0), d.1)
+            } else {
+                // Decryption failed with every known session, let's try to create a
+                // new session.
+                match message {
+                    // A new session can only be created using a pre-key message,
+                    // return with an error if it isn't one.
+                    OlmMessage::Normal(_) => {
+                        warn!(
+                            ?sender_key,
+                            "Failed to decrypt a non-pre-key message with all \
+                            available sessions",
+                        );
+
+                        return Err(OlmError::SessionWedged(sender.to_owned(), sender_key));
+                    }
+
+                    OlmMessage::PreKey(m) => {
+                        // Create the new session.
+                        let result = match self.inner.create_inbound_session(sender_key, m).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(
+                                    ?sender_key,
+                                    session_keys = ?m.session_keys(),
+                                    "Failed to create a new Olm session from a \
+                                    pre-key message: {e:?}",
+                                );
+                                return Err(OlmError::SessionWedged(sender.to_owned(), sender_key));
+                            }
+                        };
+
+                        // We need to add the new session to the session cache, otherwise
+                        // we might try to create the same session again.
+                        // TODO separate the session cache from the storage so we only add
+                        // it to the cache but don't store it.
+                        let changes = Changes {
+                            account: Some(self.inner.clone()),
+                            sessions: vec![result.session.clone()],
+                            ..Default::default()
+                        };
+                        self.store.save_changes(changes).await?;
+
+                        (SessionType::New(result.session), result.plaintext)
+                    }
                 }
+            };
 
-                OlmMessage::PreKey(m) => {
-                    // Create the new session.
-                    let result = match self.inner.create_inbound_session(sender_key, m).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(
-                                sender = sender.as_str(),
-                                sender_key = sender_key.to_base64().as_str(),
-                                error = ?e,
-                                "Failed to create a new Olm session from a \
-                                prekey message",
-                            );
-                            return Err(OlmError::SessionWedged(
-                                sender.to_owned(),
-                                sender_key.to_base64(),
-                            ));
-                        }
-                    };
+        trace!(?sender_key, "Successfully decrypted an Olm message");
 
-                    // We need to add the new session to the session cache, otherwise
-                    // we might try to create the same session again.
-                    // TODO separate the session cache from the storage so we only add
-                    // it to the cache but don't store it.
-                    let changes = Changes {
-                        account: Some(self.inner.clone()),
-                        sessions: vec![result.session.clone()],
-                        ..Default::default()
-                    };
-                    self.store.save_changes(changes).await?;
-
-                    (SessionType::New(result.session), result.plaintext)
-                }
-            }
-        };
-
-        trace!(
-            sender = sender.as_str(),
-            sender_key = sender_key.to_base64().as_str(),
-            "Successfully decrypted an Olm message"
-        );
-
-        match self.parse_decrypted_to_device_event(sender, plaintext) {
-            Ok((event, signing_key)) => Ok((session, event, signing_key)),
+        match self.parse_decrypted_to_device_event(sender, sender_key, plaintext).await {
+            Ok(result) => Ok((session, result)),
             Err(e) => {
                 // We might created a new session but decryption might still
                 // have failed, store it for the error case here, this is fine
@@ -373,8 +368,7 @@ impl Account {
                 }
 
                 warn!(
-                    sender = sender.as_str(),
-                    sender_key = sender_key.to_base64().as_str(),
+                    sender_key = sender_key.to_base64(),
                     error = ?e,
                     "A to-device message was successfully decrypted but \
                     parsing and checking the event fields failed"
@@ -385,36 +379,68 @@ impl Account {
         }
     }
 
-    /// Parse a decrypted Olm message, check that the plaintext and encrypted
-    /// senders match and that the message was meant for us.
-    fn parse_decrypted_to_device_event(
+    /// Parse the decrypted plaintext as JSON and verify that it wasn't
+    /// forwarded by a third party.
+    ///
+    /// These checks are mandated by the spec[1]:
+    ///
+    /// > Other properties are included in order to prevent an attacker from
+    /// > publishing someone else's Curve25519 keys as their own and
+    /// > subsequently claiming to have sent messages which they didn't.
+    /// > sender must correspond to the user who sent the event, recipient to
+    /// > the local user, and recipient_keys to the local Ed25519 key.
+    async fn parse_decrypted_to_device_event(
         &self,
         sender: &UserId,
+        sender_key: Curve25519PublicKey,
         plaintext: String,
-    ) -> OlmResult<(Raw<AnyToDeviceEvent>, String)> {
-        #[derive(Deserialize)]
-        struct DecryptedEvent {
-            sender: OwnedUserId,
-            recipient: OwnedUserId,
-            recipient_keys: OlmV1Keys,
-            keys: OlmV1Keys,
-        }
-
-        let event: DecryptedEvent = serde_json::from_str(&plaintext)?;
+    ) -> OlmResult<DecryptionResult> {
+        let event: AnyDecryptedOlmEvent = serde_json::from_str(&plaintext)?;
         let identity_keys = self.inner.identity_keys();
 
-        if event.recipient != self.user_id() {
-            Err(EventError::MismatchedSender(event.recipient, self.user_id().to_owned()).into())
-        } else if event.sender != sender {
-            Err(EventError::MismatchedSender(event.sender, sender.to_owned()).into())
-        } else if identity_keys.ed25519.to_base64() != event.recipient_keys.ed25519 {
+        if event.recipient() != self.user_id() {
+            Err(EventError::MismatchedSender(
+                event.recipient().to_owned(),
+                self.user_id().to_owned(),
+            )
+            .into())
+        } else if event.sender() != sender {
+            Err(EventError::MismatchedSender(event.sender().to_owned(), sender.to_owned()).into())
+        } else if identity_keys.ed25519 != event.recipient_keys().ed25519 {
             Err(EventError::MismatchedKeys(
-                identity_keys.ed25519.to_base64(),
-                event.recipient_keys.ed25519,
+                identity_keys.ed25519.into(),
+                event.recipient_keys().ed25519.into(),
             )
             .into())
         } else {
-            Ok((Raw::from_json(RawJsonValue::from_string(plaintext)?), event.keys.ed25519))
+            // If this event is an `m.room_key` event, defer the check for the
+            // Ed25519 key of the sender until we decrypt room events. This
+            // ensures that we receive the room key even if we don't have access
+            // to the device.
+            if !matches!(event, AnyDecryptedOlmEvent::RoomKey(_)) {
+                let Some(device) =
+                    self.store.get_device_from_curve_key(event.sender(), sender_key).await? else {
+                        return Err(EventError::MissingSigningKey.into());
+                    };
+
+                let Some(key) = device.ed25519_key() else {
+                    return Err(EventError::MissingSigningKey.into());
+                };
+
+                if key != event.keys().ed25519 {
+                    return Err(EventError::MismatchedKeys(
+                        key.into(),
+                        event.keys().ed25519.into(),
+                    )
+                    .into());
+                }
+            }
+
+            Ok(DecryptionResult {
+                event,
+                raw_event: Raw::from_json(RawJsonValue::from_string(plaintext)?),
+                sender_key,
+            })
         }
     }
 }
@@ -472,7 +498,11 @@ impl fmt::Debug for ReadOnlyAccount {
 impl ReadOnlyAccount {
     const ALGORITHMS: &'static [&'static EventEncryptionAlgorithm] = &[
         &EventEncryptionAlgorithm::OlmV1Curve25519AesSha2,
+        #[cfg(feature = "experimental-algorithms")]
+        &EventEncryptionAlgorithm::OlmV2Curve25519AesSha2,
         &EventEncryptionAlgorithm::MegolmV1AesSha2,
+        #[cfg(feature = "experimental-algorithms")]
+        &EventEncryptionAlgorithm::MegolmV2AesSha2,
     ];
 
     /// Create a fresh new account, this will generate the identity key-pair.
@@ -673,7 +703,7 @@ impl ReadOnlyAccount {
     /// **Note**: Use this method with caution, the `canonical_json` needs to be
     /// correctly canonicalized and make sure that the object you are checking
     /// the signature for is allowed to be signed by our own device.
-    #[cfg(feature = "backups_v1")]
+    #[cfg(any(test, feature = "backups_v1"))]
     pub fn has_signed_raw(
         &self,
         signatures: &crate::types::Signatures,
@@ -907,21 +937,23 @@ impl ReadOnlyAccount {
     /// session failed.
     ///
     /// # Arguments
-    /// * `their_identity_key` - The other account's identity/curve25519 key.
+    /// * `config` - The session config that should be used when creating the
+    /// Session.
+    /// * `identity_key` - The other account's identity/curve25519 key.
     ///
-    /// * `their_one_time_key` - A signed one-time key that the other account
+    /// * `one_time_key` - A signed one-time key that the other account
     /// created and shared with us.
+    ///
+    /// * `fallback_used` - Was the one-time key a fallback key.
     pub async fn create_outbound_session_helper(
         &self,
+        config: SessionConfig,
         identity_key: Curve25519PublicKey,
         one_time_key: Curve25519PublicKey,
         fallback_used: bool,
     ) -> Session {
-        let session = self.inner.lock().await.create_outbound_session(
-            SessionConfig::version_1(),
-            identity_key,
-            one_time_key,
-        );
+        let session =
+            self.inner.lock().await.create_outbound_session(config, identity_key, one_time_key);
 
         let now = SecondsSinceUnixEpoch::now();
         let session_id = session.session_id();
@@ -979,12 +1011,12 @@ impl ReadOnlyAccount {
             Err(e) => return Err(SessionCreationError::InvalidJson(e)),
         };
 
-        device.verify_one_time_key(&one_time_key).map_err(|e| {
-            SessionCreationError::InvalidSignature(
-                device.user_id().to_owned(),
-                device.device_id().into(),
-                e,
-            )
+        device.verify_one_time_key(&one_time_key).map_err(|error| {
+            SessionCreationError::InvalidSignature {
+                signing_key: device.ed25519_key(),
+                one_time_key: one_time_key.clone(),
+                error,
+            }
         })?;
 
         let identity_key = device.curve25519_key().ok_or_else(|| {
@@ -996,8 +1028,11 @@ impl ReadOnlyAccount {
 
         let is_fallback = one_time_key.fallback();
         let one_time_key = one_time_key.key();
+        let config = device.olm_session_config();
 
-        Ok(self.create_outbound_session_helper(identity_key, one_time_key, is_fallback).await)
+        Ok(self
+            .create_outbound_session_helper(config, identity_key, one_time_key, is_fallback)
+            .await)
     }
 
     /// Create a new session with another account given a pre-key Olm message.
@@ -1015,6 +1050,12 @@ impl ReadOnlyAccount {
         their_identity_key: Curve25519PublicKey,
         message: &PreKeyMessage,
     ) -> Result<InboundCreationResult, SessionCreationError> {
+        debug!(
+            sender_key = ?their_identity_key,
+            session_keys = ?message.session_keys(),
+            "Creating a new Olm session from a pre-key message"
+        );
+
         let result = self.inner.lock().await.create_inbound_session(their_identity_key, message)?;
 
         let now = SecondsSinceUnixEpoch::now();
@@ -1055,32 +1096,32 @@ impl ReadOnlyAccount {
         &self,
         room_id: &RoomId,
         settings: EncryptionSettings,
-    ) -> Result<(OutboundGroupSession, InboundGroupSession), ()> {
-        if settings.algorithm != EventEncryptionAlgorithm::MegolmV1AesSha2 {
-            return Err(());
-        }
+    ) -> Result<(OutboundGroupSession, InboundGroupSession), MegolmSessionCreationError> {
+        trace!(?room_id, algorithm = settings.algorithm.as_str(), "Creating a new room key");
 
         let visibility = settings.history_visibility.clone();
+        let algorithm = settings.algorithm.to_owned();
 
         let outbound = OutboundGroupSession::new(
             self.device_id.clone(),
             self.identity_keys.clone(),
             room_id,
             settings,
-        );
+        )?;
+
         let identity_keys = self.identity_keys();
 
         let sender_key = identity_keys.curve25519;
-        let signing_key = identity_keys.ed25519.to_base64();
+        let signing_key = identity_keys.ed25519;
 
         let inbound = InboundGroupSession::new(
             sender_key,
-            &signing_key,
+            signing_key,
             room_id,
             &outbound.session_key().await,
-            outbound.settings().algorithm.to_owned(),
+            algorithm,
             Some(visibility),
-        );
+        )?;
 
         Ok((outbound, inbound))
     }
@@ -1124,6 +1165,15 @@ impl ReadOnlyAccount {
             .unwrap()
             .deserialize()
             .unwrap();
+
+        #[cfg(feature = "experimental-algorithms")]
+        let content = if let ToDeviceEncryptedEventContent::OlmV2Curve25519AesSha2(c) = message {
+            c
+        } else {
+            panic!("Invalid encrypted event algorithm {}", message.algorithm());
+        };
+
+        #[cfg(not(feature = "experimental-algorithms"))]
         let content = if let ToDeviceEncryptedEventContent::OlmV1Curve25519AesSha2(c) = message {
             c
         } else {
@@ -1159,11 +1209,17 @@ mod tests {
         ops::Deref,
     };
 
+    use anyhow::Result;
     use matrix_sdk_test::async_test;
     use ruma::{device_id, user_id, DeviceId, DeviceKeyAlgorithm, DeviceKeyId, UserId};
+    use serde_json::json;
 
     use super::ReadOnlyAccount;
-    use crate::error::OlmResult as Result;
+    use crate::{
+        olm::SignedJsonObject,
+        types::{DeviceKeys, SignedKey},
+        ReadOnlyDevice,
+    };
 
     fn user_id() -> &'static UserId {
         user_id!("@alice:localhost")
@@ -1241,6 +1297,74 @@ mod tests {
         account.update_key_counts(&one_time_keys, Some(unused_fallback_keys.as_ref())).await;
         let (_, _, fallback_keys) = account.keys_for_upload().await;
         assert!(fallback_keys.is_empty());
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn fallback_key_signing() -> Result<()> {
+        let key = vodozemac::Curve25519PublicKey::from_base64(
+            "7PUPP6Ijt5R8qLwK2c8uK5hqCNF9tOzWYgGaAay5JBs",
+        )?;
+        let account = ReadOnlyAccount::new(user_id(), device_id());
+
+        let key = account.sign_key(key, true).await;
+
+        let canonical_key = key.to_canonical_json()?;
+
+        assert_eq!(
+            canonical_key,
+            "{\"fallback\":true,\"key\":\"7PUPP6Ijt5R8qLwK2c8uK5hqCNF9tOzWYgGaAay5JBs\"}"
+        );
+
+        account
+            .has_signed_raw(key.signatures(), &canonical_key)
+            .expect("Couldn't verify signature");
+
+        let device = ReadOnlyDevice::from_account(&account).await;
+        device.verify_one_time_key(&key).expect("The device can verify its own signature");
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn fallback_key_signature_verification() -> Result<()> {
+        let fallback_key = json!({
+            "fallback": true,
+            "key": "XPFqtLvBepBmW6jSAbBuJbhEpprBhQOX1IjUu+cnMF4",
+            "signatures": {
+                "@dkasak_c:matrix.org": {
+                    "ed25519:EXPDYDPWZH": "RJCBMJPL5hvjxgq8rmLmqkNOuPsaan7JeL1wsE+gW6R39G894lb2sBmzapHeKCn/KFjmkonPLkICApRDS+zyDw"
+                }
+            }
+        });
+
+        let device_keys = json!({
+            "algorithms": [
+                "m.olm.v1.curve25519-aes-sha2",
+                "m.megolm.v1.aes-sha2"
+            ],
+            "device_id": "EXPDYDPWZH",
+            "keys": {
+                "curve25519:EXPDYDPWZH": "k7f3igo0Vrdm88JSSA5d3OCuUfHYELChB2b57aOROB8",
+                "ed25519:EXPDYDPWZH": "GdjYI8fxs175gSpYRJkyN6FRfvcyTsNOhJ2OR/Ggp+E"
+            },
+            "signatures": {
+                "@dkasak_c:matrix.org": {
+                    "ed25519:EXPDYDPWZH": "kzrtfQMbJXWXQ1uzhybtwFnGk0JJBS4Mg8VPMusMu6U8MPJccwoHVZKo5+owuHTzIodI+GZYqLmMSzvfvsChAA"
+                }
+            },
+            "user_id": "@dkasak_c:matrix.org",
+            "unsigned": {}
+        });
+
+        let device_keys: DeviceKeys = serde_json::from_value(device_keys).unwrap();
+        let device = ReadOnlyDevice::try_from(&device_keys).unwrap();
+        let fallback_key: SignedKey = serde_json::from_value(fallback_key).unwrap();
+
+        device
+            .verify_one_time_key(&fallback_key)
+            .expect("The fallback key should pass the signature verification");
 
         Ok(())
     }

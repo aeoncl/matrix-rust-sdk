@@ -19,7 +19,7 @@ use ruma::{
             },
         },
         message::send_message_event::v3::Response as RoomMessageResponse,
-        sync::sync_events::v3::DeviceLists as RumaDeviceLists,
+        sync::sync_events::DeviceLists as RumaDeviceLists,
         to_device::send_event_to_device::v3::Response as ToDeviceResponse,
     },
     assign,
@@ -112,15 +112,15 @@ impl From<ToDeviceRequest> for OutgoingVerificationRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, uniffi::Enum)]
 pub enum Request {
     ToDevice { request_id: String, event_type: String, body: String },
     KeysUpload { request_id: String, body: String },
     KeysQuery { request_id: String, users: Vec<String> },
     KeysClaim { request_id: String, one_time_keys: HashMap<String, HashMap<String, String>> },
+    KeysBackup { request_id: String, version: String, rooms: String },
     RoomMessage { request_id: String, room_id: String, event_type: String, content: String },
     SignatureUpload { request_id: String, body: String },
-    KeysBackup { request_id: String, version: String, rooms: String },
 }
 
 impl From<OutgoingRequest> for Request {

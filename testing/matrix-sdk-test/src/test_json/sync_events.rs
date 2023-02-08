@@ -97,13 +97,17 @@ pub static JOIN_RULES: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
+pub static ENCRYPTION_CONTENT: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "algorithm": "m.megolm.v1.aes-sha2",
+        "rotation_period_ms": 604800000,
+        "rotation_period_msgs": 100
+    })
+});
+
 pub static ENCRYPTION: Lazy<JsonValue> = Lazy::new(|| {
     json!({
-        "content": {
-            "algorithm": "m.megolm.v1.aes-sha2",
-            "rotation_period_ms": 604800000,
-            "rotation_period_msgs": 100
-        },
+        "content": *ENCRYPTION_CONTENT,
         "event_id": "$143273582443PhrSn:example.org",
         "origin_server_ts": 1432735824653u64,
         "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
@@ -739,6 +743,7 @@ pub static TOPIC: Lazy<JsonValue> = Lazy::new(|| {
         "origin_server_ts": 151957878,
         "sender": "@example:localhost",
         "state_key": "",
+        "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
         "type": "m.room.topic",
         "prev_content": {
             "topic": "test"
@@ -761,5 +766,20 @@ pub static TYPING: Lazy<JsonValue> = Lazy::new(|| {
         },
         "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
         "type": "m.typing"
+    })
+});
+
+pub static TOPIC_REDACTION: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "content": {},
+        "redacts": "$151957878228ssqrJ:localhost",
+        "event_id": "$151957878228ssqrJ_REDACTION:localhost",
+        "origin_server_ts": 151957879,
+        "sender": "@example:localhost",
+        "type": "m.room.redaction",
+        "unsigned": {
+          "age": 1392990,
+          "prev_sender": "@example:localhost",
+        }
     })
 });

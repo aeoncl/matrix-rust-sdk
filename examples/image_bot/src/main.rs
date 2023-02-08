@@ -1,53 +1,26 @@
-use std::{
-    env,
-    fs::File,
-    io::{Seek, SeekFrom},
-    path::PathBuf,
-    process::exit,
-    sync::Arc,
-};
+use std::{env, fs, process::exit};
 
 use matrix_sdk::{
     self,
     attachment::AttachmentConfig,
     config::SyncSettings,
     room::Room,
-    ruma::events::room::message::{
-        MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent, TextMessageEventContent,
-    },
+    ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
     Client,
 };
-use tokio::sync::Mutex;
 use url::Url;
 
-async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, image: Arc<Mutex<File>>) {
-    if let Room::Joined(room) = room {
-        let msg_body = if let OriginalSyncRoomMessageEvent {
-            content:
-                RoomMessageEventContent {
-                    msgtype: MessageType::Text(TextMessageEventContent { body: msg_body, .. }),
-                    ..
-                },
-            ..
-        } = event
-        {
-            msg_body
-        } else {
-            return;
-        };
+async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room, image: Vec<u8>) {
+    let Room::Joined(room) = room else { return };
+    let MessageType::Text(text_content) = event.content.msgtype else { return };
 
-        if msg_body.contains("!image") {
-            println!("sending image");
-            let mut image = image.lock().await;
+    if text_content.body.contains("!image") {
+        println!("sending image");
+        room.send_attachment("cat", &mime::IMAGE_JPEG, image, AttachmentConfig::new())
+            .await
+            .unwrap();
 
-            room.send_attachment("cat", &mime::IMAGE_JPEG, &mut *image, AttachmentConfig::new())
-                .await
-                .unwrap();
-
-            image.seek(SeekFrom::Start(0)).unwrap();
-
-            println!("message sent");
-        }
+        println!("message sent");
     }
 }
 
@@ -55,24 +28,19 @@ async fn login_and_sync(
     homeserver_url: String,
     username: String,
     password: String,
-    image: File,
+    image: Vec<u8>,
 ) -> matrix_sdk::Result<()> {
     let homeserver_url = Url::parse(&homeserver_url).expect("Couldn't parse the homeserver URL");
     let client = Client::new(homeserver_url).await.unwrap();
 
-    client
-        .login_username(&username, &password)
-        .initial_device_display_name("command bot")
-        .send()
-        .await?;
+    client.login_username(&username, &password).initial_device_display_name("command bot").await?;
 
-    client.sync_once(SyncSettings::default()).await.unwrap();
+    let response = client.sync_once(SyncSettings::default()).await.unwrap();
 
-    let image = Arc::new(Mutex::new(image));
     client.add_event_handler(move |ev, room| on_room_message(ev, room, image.clone()));
 
-    let settings = SyncSettings::default().token(client.sync_token().await.unwrap());
-    client.sync(settings).await;
+    let settings = SyncSettings::default().token(response.next_batch);
+    client.sync(settings).await?;
 
     Ok(())
 }
@@ -93,8 +61,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
     println!("helloooo {homeserver_url} {username} {password} {image_path:#?}");
-    let path = PathBuf::from(image_path);
-    let image = File::open(path).expect("Can't open image file.");
+    let image = fs::read(&image_path).expect("Can't open image file.");
 
     login_and_sync(homeserver_url, username, password, image).await?;
     Ok(())

@@ -156,7 +156,7 @@ impl DecryptedRoomEvent {
     /// trusted.
     #[wasm_bindgen(getter, js_name = "senderDevice")]
     pub fn sender_device(&self) -> Option<identifiers::DeviceId> {
-        Some(identifiers::DeviceId::from(self.encryption_info.as_ref()?.sender_device.clone()))
+        Some(self.encryption_info.as_ref()?.sender_device.as_ref()?.clone().into())
     }
 
     /// The Curve25519 key of the device that created the megolm
@@ -182,12 +182,8 @@ impl DecryptedRoomEvent {
     /// Chain of Curve25519 keys through which this session was
     /// forwarded, via `m.forwarded_room_key` events.
     #[wasm_bindgen(getter, js_name = "forwardingCurve25519KeyChain")]
-    pub fn forwarding_curve25519_key_chain(&self) -> Option<Array> {
-        Some(match &self.encryption_info.as_ref()?.algorithm_info {
-            AlgorithmInfo::MegolmV1AesSha2 { forwarding_curve25519_key_chain, .. } => {
-                forwarding_curve25519_key_chain.iter().map(JsValue::from).collect()
-            }
-        })
+    pub fn forwarding_curve25519_key_chain(&self) -> Array {
+        Array::new()
     }
 
     /// The verification state of the device that sent us the event,
@@ -200,8 +196,8 @@ impl DecryptedRoomEvent {
     }
 }
 
-impl From<matrix_sdk_common::deserialized_responses::RoomEvent> for DecryptedRoomEvent {
-    fn from(value: matrix_sdk_common::deserialized_responses::RoomEvent) -> Self {
+impl From<matrix_sdk_common::deserialized_responses::TimelineEvent> for DecryptedRoomEvent {
+    fn from(value: matrix_sdk_common::deserialized_responses::TimelineEvent) -> Self {
         Self {
             event: value.event.json().get().to_owned().into(),
             encryption_info: value.encryption_info,

@@ -33,7 +33,7 @@ use matrix_sdk::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let alice = user_id!("@alice:example.org");
-    let client = Client::builder().user_id(alice).build().await?;
+    let client = Client::builder().server_name(alice.server_name()).build().await?;
 
     // First we need to log in.
     client.login_username(alice, "password").send().await?;
@@ -43,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Syncing is important to synchronize the client state with the server.
-    // This method will never return.
-    client.sync(SyncSettings::default()).await;
+    // This method will never return unless there is an error.
+    client.sync(SyncSettings::default()).await?;
 
     Ok(())
 }
@@ -63,6 +63,7 @@ The following crate feature flags are available:
 | `eyre`              |   No    | Better logging for event handlers that return `eyre::Result`                                                               |
 | `image-proc`        |   No    | Image processing for generating thumbnails                                                                                 |
 | `image-rayon`       |   No    | Enables faster image processing                                                                                            |
+| `js`                |   No    | Enables JavaScript API usage for things like the current system time on WASM (does nothing on other targets)               |
 | `markdown`          |   No    | Support for sending Markdown-formatted messages                                                                            |
 | `qrcode`            |   Yes   | QR code verification support                                                                                               |
 | `sled`              |   Yes   | Persistent storage of state and E2EE data (optionally, if feature `e2e-encryption` is enabled), via Sled                   |

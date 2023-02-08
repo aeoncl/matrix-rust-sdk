@@ -20,7 +20,7 @@ use std::{
 
 use dashmap::DashMap;
 use matrix_sdk_common::{
-    deserialized_responses::{AlgorithmInfo, EncryptionInfo, RoomEvent, VerificationState},
+    deserialized_responses::{AlgorithmInfo, EncryptionInfo, TimelineEvent, VerificationState},
     locks::Mutex,
 };
 use ruma::{
@@ -31,19 +31,26 @@ use ruma::{
             upload_keys,
             upload_signatures::v3::Request as UploadSignaturesRequest,
         },
-        sync::sync_events::v3::{DeviceLists, ToDevice},
+        sync::sync_events::DeviceLists,
     },
     assign,
     events::{
-        secret::request::SecretName, AnyMessageLikeEvent, AnyRoomEvent, MessageLikeEventContent,
+        secret::request::SecretName, AnyMessageLikeEvent, AnyToDeviceEvent, MessageLikeEventContent,
     },
     serde::Raw,
-    DeviceId, DeviceKeyAlgorithm, OwnedDeviceKeyId, OwnedTransactionId, OwnedUserId, RoomId,
-    TransactionId, UInt, UserId,
+    DeviceId, DeviceKeyAlgorithm, OwnedDeviceId, OwnedDeviceKeyId, OwnedTransactionId, OwnedUserId,
+    RoomId, TransactionId, UInt, UserId,
 };
 use serde_json::{value::to_raw_value, Value};
-use tracing::{debug, error, info, trace, warn};
-use vodozemac::{megolm::SessionOrdering, Curve25519PublicKey, Ed25519Signature};
+use tracing::{
+    debug, error,
+    field::{debug, display},
+    info, instrument, warn, Span,
+};
+use vodozemac::{
+    megolm::{DecryptionError, SessionOrdering},
+    Curve25519PublicKey, Ed25519Signature,
+};
 
 #[cfg(feature = "backups_v1")]
 use crate::backups::BackupMachine;
@@ -59,22 +66,24 @@ use crate::{
     requests::{IncomingResponse, OutgoingRequest, UploadSigningKeysRequest},
     session_manager::{GroupSessionManager, SessionManager},
     store::{
-        Changes, CryptoStore, DeviceChanges, IdentityChanges, MemoryStore, Result as StoreResult,
-        SecretImportError, Store,
+        Changes, CryptoStore, DeviceChanges, IdentityChanges, IntoCryptoStore, MemoryStore,
+        Result as StoreResult, SecretImportError, Store,
     },
     types::{
         events::{
+            olm_v1::{AnyDecryptedOlmEvent, DecryptedRoomKeyEvent},
             room::encrypted::{
                 EncryptedEvent, EncryptedToDeviceEvent, RoomEncryptedEventContent,
                 RoomEventEncryptionScheme, SupportedEventEncryptionSchemes,
             },
-            room_key::{RoomKeyContent, RoomKeyEvent},
+            room_key::{MegolmV1AesSha2Content, RoomKeyContent},
             ToDeviceEvents,
         },
         Signatures,
     },
     verification::{Verification, VerificationMachine, VerificationRequest},
-    CrossSigningKeyExport, ReadOnlyDevice, RoomKeyImportResult, SignatureError, ToDeviceRequest,
+    CrossSigningKeyExport, CryptoStoreError, ReadOnlyDevice, RoomKeyImportResult, SignatureError,
+    ToDeviceRequest,
 };
 
 /// State machine implementation of the Olm/Megolm encryption protocol used for
@@ -136,9 +145,7 @@ impl OlmMachine {
     ///
     /// * `device_id` - The unique id of the device that owns this machine.
     pub async fn new(user_id: &UserId, device_id: &DeviceId) -> Self {
-        let store: Arc<dyn CryptoStore> = Arc::new(MemoryStore::new());
-
-        OlmMachine::with_store(user_id, device_id, store)
+        OlmMachine::with_store(user_id, device_id, MemoryStore::new())
             .await
             .expect("Reading and writing to the memory store always succeeds")
     }
@@ -222,33 +229,46 @@ impl OlmMachine {
     /// the encryption keys.
     ///
     /// [`Cryptostore`]: trait.CryptoStore.html
+    #[instrument(skip(store), fields(ed25519_key, curve25519_key))]
     pub async fn with_store(
         user_id: &UserId,
         device_id: &DeviceId,
-        store: Arc<dyn CryptoStore>,
+        store: impl IntoCryptoStore,
     ) -> StoreResult<Self> {
+        let store = store.into_crypto_store();
         let account = match store.load_account().await? {
-            Some(a) => {
-                debug!(
-                    ed25519_key = a.identity_keys().ed25519.to_base64().as_str(),
-                    "Restored an Olm account"
-                );
-                a
+            Some(account) => {
+                if user_id != account.user_id() || device_id != account.device_id() {
+                    return Err(CryptoStoreError::MismatchedAccount {
+                        expected: (account.user_id().to_owned(), account.device_id().to_owned()),
+                        got: (user_id.to_owned(), device_id.to_owned()),
+                    });
+                } else {
+                    Span::current()
+                        .record("ed25519_key", display(account.identity_keys().ed25519))
+                        .record("curve25519_key", display(account.identity_keys().curve25519));
+                    debug!("Restored an Olm account");
+
+                    account
+                }
             }
             None => {
                 let account = ReadOnlyAccount::new(user_id, device_id);
                 let device = ReadOnlyDevice::from_account(&account).await;
 
-                debug!(
-                    ed25519_key = account.identity_keys().ed25519.to_base64().as_str(),
-                    "Created a new Olm account"
-                );
+                Span::current()
+                    .record("ed25519_key", display(account.identity_keys().ed25519))
+                    .record("curve25519_key", display(account.identity_keys().curve25519));
+
+                debug!("Created a new Olm account");
+
                 let changes = Changes {
                     account: Some(account.clone()),
                     devices: DeviceChanges { new: vec![device], ..Default::default() },
                     ..Default::default()
                 };
                 store.save_changes(changes).await?;
+
                 account
             }
         };
@@ -291,16 +311,19 @@ impl OlmMachine {
         self.store.device_display_name().await
     }
 
-    /// Get all the tracked users we know about
-    pub fn tracked_users(&self) -> HashSet<OwnedUserId> {
-        self.store.tracked_users()
+    /// Get the list of "tracked users".
+    ///
+    /// See [`update_tracked_users`](#method.update_tracked_users) for more
+    /// information.
+    pub async fn tracked_users(&self) -> StoreResult<HashSet<OwnedUserId>> {
+        self.store.tracked_users().await
     }
 
     /// Get the outgoing requests that need to be sent out.
     ///
-    /// This returns a list of `OutGoingRequest`, those requests need to be sent
-    /// out to the server and the responses need to be passed back to the state
-    /// machine using [`mark_request_as_sent`].
+    /// This returns a list of [`OutgoingRequest`]. Those requests need to be
+    /// sent out to the server and the responses need to be passed back to
+    /// the state machine using [`mark_request_as_sent`].
     ///
     /// [`mark_request_as_sent`]: #method.mark_request_as_sent
     pub async fn outgoing_requests(&self) -> StoreResult<Vec<OutgoingRequest>> {
@@ -314,7 +337,7 @@ impl OlmMachine {
             requests.push(r);
         }
 
-        for request in self.identity_manager.users_for_key_query().await.into_iter().map(|r| {
+        for request in self.identity_manager.users_for_key_query().await?.into_iter().map(|r| {
             OutgoingRequest { request_id: TransactionId::new(), request: Arc::new(r.into()) }
         }) {
             requests.push(request);
@@ -547,37 +570,71 @@ impl OlmMachine {
         Ok(decrypted)
     }
 
+    #[instrument(
+        skip_all,
+        // This function is only ever called by add_room_key via
+        // handle_decrypted_to_device_event, so sender, sender_key, and algorithm are
+        // already recorded.
+        fields(room_id = ?content.room_id, session_id)
+    )]
+    async fn handle_key(
+        &self,
+        sender_key: Curve25519PublicKey,
+        event: &DecryptedRoomKeyEvent,
+        content: &MegolmV1AesSha2Content,
+    ) -> OlmResult<Option<InboundGroupSession>> {
+        let session = InboundGroupSession::new(
+            sender_key,
+            event.keys.ed25519,
+            &content.room_id,
+            &content.session_key,
+            event.content.algorithm(),
+            None,
+        );
+
+        match session {
+            Ok(session) => {
+                tracing::Span::current().record("session_id", session.session_id());
+
+                if self.store.compare_group_session(&session).await? == SessionOrdering::Better {
+                    info!("Received a new megolm room key");
+
+                    Ok(Some(session))
+                } else {
+                    warn!(
+                        "Received a megolm room key that we already have a better version of, \
+                        discarding",
+                    );
+
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                tracing::Span::current().record("session_id", &content.session_id);
+                warn!("Received a room key event which contained an invalid session key: {e}");
+
+                Ok(None)
+            }
+        }
+    }
+
     /// Create a group session from a room key and add it to our crypto store.
+    #[instrument(skip_all, fields(algorithm = ?event.content.algorithm()))]
     async fn add_room_key(
         &self,
         sender_key: Curve25519PublicKey,
-        signing_key: &str,
-        event: &RoomKeyEvent,
+        event: &DecryptedRoomKeyEvent,
     ) -> OlmResult<Option<InboundGroupSession>> {
-        let unsupported_warning = || {
-            warn!(
-                sender = %event.sender,
-                sender_key = sender_key.to_base64().as_str(),
-                algorithm = %event.algorithm(),
-                "Received room key with unsupported key algorithm",
-            );
-        };
-
         match &event.content {
             RoomKeyContent::MegolmV1AesSha2(content) => {
-                let session = InboundGroupSession::new(
-                    sender_key,
-                    signing_key,
-                    &content.room_id,
-                    &content.session_key,
-                    event.algorithm(),
-                    None,
-                );
-
-                Ok(Some(session))
+                self.handle_key(sender_key, event, content).await
+            }
+            #[cfg(feature = "experimental-algorithms")]
+            RoomKeyContent::MegolmV2AesSha2(content) => {
+                self.handle_key(sender_key, event, content).await
             }
             RoomKeyContent::Unknown(_) => {
-                unsupported_warning();
+                warn!("Received a room key with an unsupported algorithm");
                 Ok(None)
             }
         }
@@ -699,10 +756,19 @@ impl OlmMachine {
     ///
     /// **Note**: This does not need to be called for encrypted events since
     /// those will get passed to the `OlmMachine` during decryption.
+    #[deprecated(note = "Use OlmMachine::receive_verification_event instead", since = "0.7.0")]
     pub async fn receive_unencrypted_verification_event(
         &self,
         event: &AnyMessageLikeEvent,
     ) -> StoreResult<()> {
+        self.verification_machine.receive_any_event(event).await
+    }
+
+    /// Receive a verification event.
+    ///
+    /// in rooms to the `OlmMachine`. The event should be in the decrypted form.
+    /// in rooms to the `OlmMachine`.
+    pub async fn receive_verification_event(&self, event: &AnyMessageLikeEvent) -> StoreResult<()> {
         self.verification_machine.receive_any_event(event).await
     }
 
@@ -711,53 +777,48 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `decrypted` - The decrypted event and some associated metadata.
+    #[instrument(
+        skip_all,
+        fields(
+            sender_key = ?decrypted.result.sender_key,
+            event_type = decrypted.result.event.event_type(),
+        ),
+    )]
     async fn handle_decrypted_to_device_event(
         &self,
         decrypted: &mut OlmDecryptionInfo,
     ) -> OlmResult<()> {
-        let event: ToDeviceEvents = match decrypted.event.deserialize_as() {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(
-                    sender = decrypted.sender.as_str(),
-                    sender_key = decrypted.sender_key.to_base64().as_str(),
-                    error = ?e,
-                    "Decrypted to-device event failed to be deserialized correctly"
-                );
+        debug!("Received a decrypted to-device event");
 
-                return Ok(());
-            }
-        };
-
-        trace!(
-            sender = decrypted.sender.as_str(),
-            sender_key = decrypted.sender_key.to_base64().as_str(),
-            event_type = %event.event_type(),
-            "Received a decrypted to-device event"
-        );
-
-        match event {
-            ToDeviceEvents::RoomKey(e) => {
-                let session =
-                    self.add_room_key(decrypted.sender_key, &decrypted.signing_key, &e).await?;
+        match &decrypted.result.event {
+            AnyDecryptedOlmEvent::RoomKey(e) => {
+                let session = self.add_room_key(decrypted.result.sender_key, e).await?;
                 decrypted.inbound_group_session = session;
             }
-            ToDeviceEvents::ForwardedRoomKey(e) => {
+            AnyDecryptedOlmEvent::ForwardedRoomKey(e) => {
                 let session = self
                     .key_request_machine
-                    .receive_forwarded_room_key(decrypted.sender_key, &e)
+                    .receive_forwarded_room_key(decrypted.result.sender_key, e)
                     .await?;
                 decrypted.inbound_group_session = session;
             }
-            ToDeviceEvents::SecretSend(mut e) => {
-                self.key_request_machine.receive_secret_event(decrypted.sender_key, &mut e).await?;
-                decrypted.event = Raw::from_json(to_raw_value(&e)?)
+            AnyDecryptedOlmEvent::SecretSend(e) => {
+                let name = self
+                    .key_request_machine
+                    .receive_secret_event(decrypted.result.sender_key, e)
+                    .await?;
+
+                // Set the secret name so other consumers of the event know
+                // what this event is about.
+                if let Ok(ToDeviceEvents::SecretSend(mut e)) =
+                    decrypted.result.raw_event.deserialize_as()
+                {
+                    e.content.secret_name = name;
+                    decrypted.result.raw_event = Raw::from_json(to_raw_value(&e)?);
+                }
             }
-            _ => {
-                warn!(
-                    event_type = ?event.event_type(),
-                    "Received an unexpected encrypted to-device event"
-                );
+            AnyDecryptedOlmEvent::Custom(_) => {
+                warn!("Received an unexpected encrypted to-device event");
             }
         }
 
@@ -766,7 +827,7 @@ impl OlmMachine {
 
     async fn handle_verification_event(&self, event: &ToDeviceEvents) {
         if let Err(e) = self.verification_machine.receive_any_event(event).await {
-            error!("Error handling a verification event: {:?}", e);
+            error!("Error handling a verification event: {e:?}");
         }
     }
 
@@ -828,6 +889,111 @@ impl OlmMachine {
         }
     }
 
+    fn record_message_id(event: &Raw<AnyToDeviceEvent>) {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct ContentStub<'a> {
+            #[serde(borrow, rename = "org.matrix.msgid")]
+            message_id: Option<&'a str>,
+        }
+
+        #[derive(Deserialize)]
+        struct ToDeviceStub<'a> {
+            sender: &'a str,
+            #[serde(rename = "type")]
+            event_type: &'a str,
+            #[serde(borrow)]
+            content: ContentStub<'a>,
+        }
+
+        if let Ok(event) = event.deserialize_as::<ToDeviceStub<'_>>() {
+            tracing::Span::current().record("sender", event.sender);
+            tracing::Span::current().record("event_type", event.event_type);
+            tracing::Span::current().record("message_id", event.content.message_id);
+        }
+    }
+
+    #[instrument(skip_all, fields(sender, event_type, message_id))]
+    async fn receive_to_device_event(
+        &self,
+        changes: &mut Changes,
+        mut raw_event: Raw<AnyToDeviceEvent>,
+    ) -> OlmResult<Raw<AnyToDeviceEvent>> {
+        Self::record_message_id(&raw_event);
+
+        let event: ToDeviceEvents = match raw_event.deserialize_as() {
+            Ok(e) => e,
+            Err(e) => {
+                // Skip invalid events.
+                warn!("Received an invalid to-device event: {e}");
+
+                return Ok(raw_event);
+            }
+        };
+
+        debug!("Received a to-device event");
+
+        match event {
+            ToDeviceEvents::RoomEncrypted(e) => {
+                let decrypted = match self.decrypt_to_device_event(&e).await {
+                    Ok(e) => e,
+                    Err(err) => {
+                        if let OlmError::SessionWedged(sender, curve_key) = err {
+                            if let Err(e) =
+                                self.session_manager.mark_device_as_wedged(&sender, curve_key).await
+                            {
+                                error!(
+                                    error = ?e,
+                                    "Couldn't mark device from to be unwedged",
+                                );
+                            }
+                        }
+
+                        return Ok(raw_event);
+                    }
+                };
+
+                // New sessions modify the account so we need to save that
+                // one as well.
+                match decrypted.session {
+                    SessionType::New(s) => {
+                        changes.sessions.push(s);
+                        changes.account = Some(self.account.inner.clone());
+                    }
+                    SessionType::Existing(s) => {
+                        changes.sessions.push(s);
+                    }
+                }
+
+                changes.message_hashes.push(decrypted.message_hash);
+
+                if let Some(group_session) = decrypted.inbound_group_session {
+                    changes.inbound_group_sessions.push(group_session);
+                }
+
+                match decrypted.result.raw_event.deserialize_as() {
+                    Ok(event) => {
+                        self.handle_to_device_event(&event).await;
+
+                        raw_event = event
+                            .serialize_zeroized()
+                            .expect("Zeroizing and reserializing our events should always work")
+                            .cast();
+                    }
+                    Err(e) => {
+                        warn!("Received an invalid encrypted to-device event: {e}");
+                        raw_event = decrypted.result.raw_event;
+                    }
+                }
+            }
+
+            e => self.handle_to_device_event(&e).await,
+        }
+
+        Ok(raw_event)
+    }
+
     /// Handle a to-device and one-time key counts from a sync response.
     ///
     /// This will decrypt and handle to-device events returning the decrypted
@@ -847,13 +1013,14 @@ impl OlmMachine {
     /// response returned.
     ///
     /// [`decrypt_room_event`]: #method.decrypt_room_event
+    #[instrument(skip_all)]
     pub async fn receive_sync_changes(
         &self,
-        to_device_events: ToDevice,
+        to_device_events: Vec<Raw<AnyToDeviceEvent>>,
         changed_devices: &DeviceLists,
         one_time_keys_counts: &BTreeMap<DeviceKeyAlgorithm, UInt>,
         unused_fallback_keys: Option<&[DeviceKeyAlgorithm]>,
-    ) -> OlmResult<ToDevice> {
+    ) -> OlmResult<Vec<Raw<AnyToDeviceEvent>>> {
         // Remove verification objects that have expired or are done.
         let mut events = self.verification_machine.garbage_collect();
 
@@ -864,93 +1031,16 @@ impl OlmMachine {
 
         self.update_key_counts(one_time_keys_counts, unused_fallback_keys).await;
 
-        for user_id in &changed_devices.changed {
-            if let Err(e) = self.identity_manager.mark_user_as_changed(user_id).await {
-                error!(error = ?e, "Error marking a tracked user as changed");
-            }
+        if let Err(e) = self
+            .identity_manager
+            .receive_device_changes(changed_devices.changed.iter().map(|u| u.as_ref()))
+            .await
+        {
+            error!(error = ?e, "Error marking a tracked user as changed");
         }
 
-        for mut raw_event in to_device_events.events {
-            let event: ToDeviceEvents = match raw_event.deserialize_as() {
-                Ok(e) => e,
-                Err(e) => {
-                    // Skip invalid events.
-                    warn!(
-                        error = ?e,
-                        "Received an invalid to-device event"
-                    );
-                    events.push(raw_event);
-                    continue;
-                }
-            };
-
-            trace!(
-                sender = event.sender().as_str(),
-                event_type = %event.event_type(),
-                "Received a to-device event"
-            );
-
-            match event {
-                ToDeviceEvents::RoomEncrypted(e) => {
-                    let decrypted = match self.decrypt_to_device_event(&e).await {
-                        Ok(e) => e,
-                        Err(err) => {
-                            if let OlmError::SessionWedged(sender, curve_key) = err {
-                                if let Err(e) = self
-                                    .session_manager
-                                    .mark_device_as_wedged(&sender, &curve_key)
-                                    .await
-                                {
-                                    error!(
-                                        sender = sender.as_str(),
-                                        error = ?e,
-                                        "Couldn't mark device from to be unwedged",
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                    };
-
-                    // New sessions modify the account so we need to save that
-                    // one as well.
-                    match decrypted.session {
-                        SessionType::New(s) => {
-                            changes.sessions.push(s);
-                            changes.account = Some(self.account.inner.clone());
-                        }
-                        SessionType::Existing(s) => {
-                            changes.sessions.push(s);
-                        }
-                    }
-
-                    changes.message_hashes.push(decrypted.message_hash);
-
-                    if let Some(group_session) = decrypted.inbound_group_session {
-                        changes.inbound_group_sessions.push(group_session);
-                    }
-
-                    match decrypted.event.deserialize_as() {
-                        Ok(event) => {
-                            self.handle_to_device_event(&event).await;
-
-                            raw_event = event
-                                .serialize_zeroized()
-                                .expect("Zeroizing and reserializing our events should always work")
-                                .cast();
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = ?e,
-                                "Received an invalid encrypted to-device event"
-                            );
-                            raw_event = decrypted.event;
-                        }
-                    }
-                }
-                e => self.handle_to_device_event(&e).await,
-            }
-
+        for raw_event in to_device_events {
+            let raw_event = self.receive_to_device_event(&mut changes, raw_event).await?;
             events.push(raw_event);
         }
 
@@ -960,10 +1050,7 @@ impl OlmMachine {
 
         self.store.save_changes(changes).await?;
 
-        let mut to_device = ToDevice::new();
-        to_device.events = events;
-
-        Ok(to_device)
+        Ok(events)
     }
 
     /// Request a room key from our devices.
@@ -988,131 +1075,98 @@ impl OlmMachine {
         room_id: &RoomId,
     ) -> MegolmResult<(Option<OutgoingRequest>, OutgoingRequest)> {
         let event = event.deserialize()?;
-
-        let content: SupportedEventEncryptionSchemes<'_> = match &event.content.scheme {
-            RoomEventEncryptionScheme::MegolmV1AesSha2(c) => c.into(),
-            _ => return Err(EventError::UnsupportedAlgorithm.into()),
-        };
-
-        Ok(self
-            .key_request_machine
-            .request_key(
-                room_id,
-                #[allow(deprecated)]
-                content.sender_key(),
-                content.session_id(),
-                &content.algorithm(),
-            )
-            .await?)
+        self.key_request_machine.request_key(room_id, &event).await
     }
 
+    async fn get_verification_state(
+        &self,
+        session: &InboundGroupSession,
+        sender: &UserId,
+    ) -> MegolmResult<(VerificationState, Option<OwnedDeviceId>)> {
+        Ok(
+            // First find the device corresponding to the Curve25519 identity
+            // key that sent us the session (recorded upon successful
+            // decryption of the `m.room_key` to-device message).
+            if let Some(device) = self
+                .get_user_devices(sender, None)
+                .await?
+                .devices()
+                .find(|d| d.curve25519_key() == Some(session.sender_key()))
+            {
+                // If the `Device` is confirmed to be the owner of the
+                // `InboundGroupSession` we will consider the session (i.e.
+                // "room key"), and by extension any events that are encrypted
+                // using this session, trusted if either:
+                //
+                //     a) This is our own device, or
+                //     b) The device itself is considered to be trusted.
+                if device.is_owner_of_session(session)?
+                    && (device.is_our_own_device() || device.is_verified())
+                {
+                    (VerificationState::Trusted, Some(device.device_id().to_owned()))
+                } else {
+                    (VerificationState::Untrusted, Some(device.device_id().to_owned()))
+                }
+            } else {
+                // We didn't find a device, no way to know if we should trust
+                // the `InboundGroupSession` or not.
+                (VerificationState::UnknownDevice, None)
+            },
+        )
+    }
+
+    /// Get some metadata pertaining to a given group session.
+    ///
+    /// This includes the session owner's Matrix user ID, their device ID, info
+    /// regarding the cryptographic algorithm and whether the session, and by
+    /// extension the events decrypted by the session, are trusted.
     async fn get_encryption_info(
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
-        device_id: &DeviceId,
-    ) -> StoreResult<EncryptionInfo> {
-        let verification_state = if let Some(device) = self
-            .get_device(sender, device_id, None)
-            .await?
-            .filter(|d| d.curve25519_key().map(|k| k == session.sender_key()).unwrap_or(false))
-        {
-            if (self.user_id() == device.user_id() && self.device_id() == device.device_id())
-                || device.verified()
-            {
-                VerificationState::Trusted
-            } else {
-                VerificationState::Untrusted
-            }
-        } else {
-            VerificationState::UnknownDevice
-        };
+    ) -> MegolmResult<EncryptionInfo> {
+        let (verification_state, device_id) = self.get_verification_state(session, sender).await?;
 
         let sender = sender.to_owned();
-        let device_id = device_id.to_owned();
 
         Ok(EncryptionInfo {
             sender,
             sender_device: device_id,
             algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
                 curve25519_key: session.sender_key().to_base64(),
-                sender_claimed_keys: session.signing_keys().to_owned(),
-                forwarding_curve25519_key_chain: session.forwarding_key_chain().to_vec(),
+                sender_claimed_keys: session
+                    .signing_keys()
+                    .iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_base64()))
+                    .collect(),
             },
             verification_state,
         })
     }
 
+    #[instrument(
+        skip_all,
+        // This function is only ever called by decrypt_room_event, so
+        // room_id, sender, algorithm and session_id are recorded already
+        fields(sender_key, event_type),
+    )]
     async fn decrypt_megolm_events(
         &self,
         room_id: &RoomId,
         event: &EncryptedEvent,
         content: &SupportedEventEncryptionSchemes<'_>,
-    ) -> MegolmResult<RoomEvent> {
-        if let Some(session) = self
-            .store
-            .get_inbound_group_session(
-                room_id,
-                #[allow(deprecated)]
-                &content.sender_key().to_base64(),
-                content.session_id(),
-            )
-            .await?
+    ) -> MegolmResult<TimelineEvent> {
+        if let Some(session) =
+            self.store.get_inbound_group_session(room_id, content.session_id()).await?
         {
-            // TODO check the message index.
+            tracing::Span::current().record("sender_key", session.sender_key().to_base64());
+
+            // TODO: check the message index.
             let (decrypted_event, _) = session.decrypt(event).await?;
+            let encryption_info = self.get_encryption_info(&session, &event.sender).await?;
 
-            match decrypted_event.deserialize() {
-                Ok(e) => {
-                    // TODO log the event type once `AnySyncRoomEvent` has the
-                    // method as well
-                    trace!(
-                        sender = event.sender.as_str(),
-                        room_id = room_id.as_str(),
-                        session_id = session.session_id(),
-                        sender_key = session.sender_key().to_base64().as_str(),
-                        algorithm = %session.algorithm(),
-                        "Successfully decrypted a room event"
-                    );
-
-                    if let AnyRoomEvent::MessageLike(e) = e {
-                        self.verification_machine.receive_any_event(&e).await?;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        sender = event.sender.as_str(),
-                        room_id = room_id.as_str(),
-                        session_id = session.session_id(),
-                        sender_key = session.sender_key().to_base64().as_str(),
-                        algorithm = %session.algorithm(),
-                        error = ?e,
-                        "Event was successfully decrypted but has an invalid format"
-                    );
-                }
-            }
-
-            let encryption_info = self
-                .get_encryption_info(
-                    &session,
-                    &event.sender,
-                    #[allow(deprecated)]
-                    content.device_id(),
-                )
-                .await?;
-
-            Ok(RoomEvent { encryption_info: Some(encryption_info), event: decrypted_event })
+            Ok(TimelineEvent { encryption_info: Some(encryption_info), event: decrypted_event })
         } else {
-            self.key_request_machine
-                .create_outgoing_key_request(
-                    room_id,
-                    #[allow(deprecated)]
-                    content.sender_key(),
-                    content.session_id(),
-                    &content.algorithm(),
-                )
-                .await?;
-
             Err(MegolmError::MissingRoomKey)
         }
     }
@@ -1124,68 +1178,70 @@ impl OlmMachine {
     /// * `event` - The event that should be decrypted.
     ///
     /// * `room_id` - The ID of the room where the event was sent to.
+    #[instrument(skip_all, fields(?room_id, event_id, sender, algorithm, session_id))]
     pub async fn decrypt_room_event(
         &self,
         event: &Raw<EncryptedEvent>,
         room_id: &RoomId,
-    ) -> MegolmResult<RoomEvent> {
+    ) -> MegolmResult<TimelineEvent> {
         let event = event.deserialize()?;
 
-        let content = match &event.content.scheme {
-            RoomEventEncryptionScheme::MegolmV1AesSha2(c) => c.into(),
-            RoomEventEncryptionScheme::Unknown(c) => {
-                warn!(
-                    sender = event.sender.as_str(),
-                    room_id = room_id.as_str(),
-                    algorithm = %c.algorithm,
-                    "Received an encrypted room event with an unsupported algorithm"
-                );
+        let span = tracing::Span::current();
+        span.record("sender", debug(&event.sender));
+        span.record("event_id", debug(&event.event_id));
+        span.record("algorithm", debug(event.content.algorithm()));
 
+        let content: SupportedEventEncryptionSchemes<'_> = match &event.content.scheme {
+            RoomEventEncryptionScheme::MegolmV1AesSha2(c) => c.into(),
+            #[cfg(feature = "experimental-algorithms")]
+            RoomEventEncryptionScheme::MegolmV2AesSha2(c) => c.into(),
+            RoomEventEncryptionScheme::Unknown(_) => {
+                warn!("Received an encrypted room event with an unsupported algorithm");
                 return Err(EventError::UnsupportedAlgorithm.into());
             }
         };
 
-        self.decrypt_megolm_events(room_id, &event, &content).await.map_err(|e| {
-            if let MegolmError::MissingRoomKey = e {
-                // TODO log the withheld reason if we have one.
-                debug!(
-                    sender = event.sender.as_str(),
-                    room_id = room_id.as_str(),
-                    sender_key = content.sender_key().to_base64().as_str(),
-                    session_id = content.session_id(),
-                    algorithm = %content.algorithm(),
-                    "Failed to decrypt a room event, the room key is missing"
-                );
-            } else {
-                warn!(
-                    sender = event.sender.as_str(),
-                    room_id = room_id.as_str(),
-                    sender_key = content.sender_key().to_base64().as_str(),
-                    session_id = content.session_id(),
-                    algorithm = %content.algorithm(),
-                    error = ?e,
-                    "Failed to decrypt a room event"
-                );
+        span.record("session_id", content.session_id());
+        let result = self.decrypt_megolm_events(room_id, &event, &content).await;
+
+        if let Err(e) = &result {
+            match e {
+                MegolmError::MissingRoomKey
+                | MegolmError::Decryption(DecryptionError::UnknownMessageIndex(_, _)) => {
+                    self.key_request_machine.create_outgoing_key_request(room_id, &event).await?;
+                }
+                _ => {}
             }
 
-            e
-        })
+            // TODO: log the withheld reason if we have one.
+            warn!("Failed to decrypt a room event: {e}");
+        }
+
+        result
     }
 
-    /// Update the tracked users.
+    /// Update the list of tracked users.
+    ///
+    /// The OlmMachine maintains a list of users whose devices we are keeping
+    /// track of: these are known as "tracked users". These must be users
+    /// that we share a room with, so that the server sends us updates for
+    /// their device lists.
     ///
     /// # Arguments
     ///
-    /// * `users` - An iterator over user ids that should be marked for
-    /// tracking.
+    /// * `users` - An iterator over user ids that should be added to the list
+    ///   of tracked users
     ///
-    /// This will mark users that weren't seen before for a key query and
-    /// tracking.
+    /// Any users that hadn't been seen before will be flagged for a key query
+    /// immediately, and whenever `receive_sync_changes` receives a
+    /// "changed" notification for that user in the future.
     ///
-    /// If the user is already known to the Olm machine it will not be
-    /// considered for a key query.
-    pub async fn update_tracked_users(&self, users: impl IntoIterator<Item = &UserId>) {
-        self.identity_manager.update_tracked_users(users).await;
+    /// Users that were already in the list are unaffected.
+    pub async fn update_tracked_users(
+        &self,
+        users: impl IntoIterator<Item = &UserId>,
+    ) -> StoreResult<()> {
+        self.identity_manager.update_tracked_users(users).await
     }
 
     async fn wait_if_user_pending(&self, user_id: &UserId, timeout: Option<Duration>) {
@@ -1313,18 +1369,18 @@ impl OlmMachine {
     /// # Examples
     /// ```no_run
     /// # use std::io::Cursor;
-    /// # use matrix_sdk_crypto::{OlmMachine, decrypt_key_export};
+    /// # use matrix_sdk_crypto::{OlmMachine, decrypt_room_key_export};
     /// # use ruma::{device_id, user_id};
     /// # use futures::executor::block_on;
     /// # let alice = user_id!("@alice:example.org");
     /// # block_on(async {
     /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
     /// # let export = Cursor::new("".to_owned());
-    /// let exported_keys = decrypt_key_export(export, "1234").unwrap();
-    /// machine.import_keys(exported_keys, false, |_, _| {}).await.unwrap();
+    /// let exported_keys = decrypt_room_key_export(export, "1234").unwrap();
+    /// machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
     /// # });
     /// ```
-    pub async fn import_keys(
+    pub async fn import_room_keys(
         &self,
         exported_keys: Vec<ExportedRoomKey>,
         #[allow(unused_variables)] from_backup: bool,
@@ -1351,11 +1407,7 @@ impl OlmMachine {
                 Ok(session) => {
                     let old_session = self
                         .store
-                        .get_inbound_group_session(
-                            session.room_id(),
-                            &session.sender_key.to_base64(),
-                            session.session_id(),
-                        )
+                        .get_inbound_group_session(session.room_id(), session.session_id())
                         .await?;
 
                     // Only import the session if we didn't have this session or
@@ -1377,9 +1429,9 @@ impl OlmMachine {
                 }
                 Err(e) => {
                     warn!(
-                        sender_key= key.sender_key.to_base64().as_str(),
-                        room_id = key.room_id.as_str(),
-                        session_id = key.session_id.as_str(),
+                        sender_key= key.sender_key.to_base64(),
+                        room_id = ?key.room_id,
+                        session_id = key.session_id,
                         error = ?e,
                         "Couldn't import a room key from a file export."
                     );
@@ -1417,18 +1469,18 @@ impl OlmMachine {
     /// # Examples
     ///
     /// ```no_run
-    /// # use matrix_sdk_crypto::{OlmMachine, encrypt_key_export};
+    /// # use matrix_sdk_crypto::{OlmMachine, encrypt_room_key_export};
     /// # use ruma::{device_id, user_id, room_id};
     /// # use futures::executor::block_on;
     /// # let alice = user_id!("@alice:example.org");
     /// # block_on(async {
     /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
     /// let room_id = room_id!("!test:localhost");
-    /// let exported_keys = machine.export_keys(|s| s.room_id() == room_id).await.unwrap();
-    /// let encrypted_export = encrypt_key_export(&exported_keys, "1234", 1);
+    /// let exported_keys = machine.export_room_keys(|s| s.room_id() == room_id).await.unwrap();
+    /// let encrypted_export = encrypt_room_key_export(&exported_keys, "1234", 1);
     /// # });
     /// ```
-    pub async fn export_keys(
+    pub async fn export_room_keys(
         &self,
         mut predicate: impl FnMut(&InboundGroupSession) -> bool,
     ) -> StoreResult<Vec<ExportedRoomKey>> {
@@ -1550,46 +1602,52 @@ pub(crate) mod testing {
 pub(crate) mod tests {
     use std::{collections::BTreeMap, iter, sync::Arc};
 
+    use assert_matches::assert_matches;
     use matrix_sdk_test::{async_test, test_json};
     use ruma::{
         api::{
             client::{
                 keys::{claim_keys, get_keys, upload_keys},
-                sync::sync_events::v3::ToDevice,
+                sync::sync_events::DeviceLists,
+                to_device::send_event_to_device::v3::Response as ToDeviceResponse,
             },
             IncomingResponse,
         },
         device_id,
         encryption::OneTimeKey,
-        event_id,
         events::{
             dummy::ToDeviceDummyEventContent,
             key::verification::VerificationMethod,
-            room::{
-                encrypted::OriginalSyncRoomEncryptedEvent,
-                message::{MessageType, RoomMessageEventContent},
-            },
-            AnyMessageLikeEvent, AnyMessageLikeEventContent, AnyRoomEvent, AnyToDeviceEvent,
-            MessageLikeEvent, MessageLikeUnsigned, OriginalMessageLikeEvent,
+            room::message::{MessageType, RoomMessageEventContent},
+            AnyMessageLikeEvent, AnyMessageLikeEventContent, AnyTimelineEvent, AnyToDeviceEvent,
+            MessageLikeEvent, OriginalMessageLikeEvent,
         },
         room_id,
         serde::Raw,
         uint, user_id, DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch,
         OwnedDeviceKeyId, UserId,
     };
-    use vodozemac::Ed25519PublicKey;
+    use serde_json::json;
+    use vodozemac::{
+        megolm::{GroupSession, SessionConfig},
+        Ed25519PublicKey,
+    };
 
     use super::testing::response_from_file;
     use crate::{
+        error::EventError,
         machine::OlmMachine,
         olm::VerifyJson,
         types::{
-            events::{room::encrypted::ToDeviceEncryptedEventContent, ToDeviceEvent},
-            DeviceKeys, SignedKey,
+            events::{
+                room::encrypted::{EncryptedToDeviceEvent, ToDeviceEncryptedEventContent},
+                ToDeviceEvent,
+            },
+            DeviceKeys, SignedKey, SigningKeys,
         },
         utilities::json_convert,
         verification::tests::{outgoing_request_to_event, request_to_event},
-        EncryptionSettings, ReadOnlyDevice, ToDeviceRequest,
+        EncryptionSettings, MegolmError, OlmError, ReadOnlyDevice, ToDeviceRequest,
     };
 
     /// These keys need to be periodically uploaded to the server.
@@ -1702,11 +1760,8 @@ pub(crate) mod tests {
             .unwrap();
         alice.store.save_sessions(&[session]).await.unwrap();
 
-        let event = ToDeviceEvent {
-            sender: alice.user_id().to_owned(),
-            content: content.deserialize_as().unwrap(),
-            other: Default::default(),
-        };
+        let event =
+            ToDeviceEvent::new(alice.user_id().to_owned(), content.deserialize_as().unwrap());
 
         let decrypted = bob.decrypt_to_device_event(&event).await.unwrap();
         bob.store.save_sessions(&[decrypted.session.session()]).await.unwrap();
@@ -1922,24 +1977,30 @@ pub(crate) mod tests {
         let bob_device =
             alice.get_device(&bob.user_id, &bob.device_id, None).await.unwrap().unwrap();
 
-        let event = ToDeviceEvent {
-            sender: alice.user_id().to_owned(),
-            content: bob_device
+        let event = ToDeviceEvent::new(
+            alice.user_id().to_owned(),
+            bob_device
                 .encrypt("m.dummy", serde_json::to_value(ToDeviceDummyEventContent::new()).unwrap())
                 .await
                 .unwrap()
                 .1
                 .deserialize_as()
                 .unwrap(),
-            other: Default::default(),
-        };
+        );
 
-        let event = bob.decrypt_to_device_event(&event).await.unwrap().event.deserialize().unwrap();
+        let event = bob
+            .decrypt_to_device_event(&event)
+            .await
+            .unwrap()
+            .result
+            .raw_event
+            .deserialize()
+            .unwrap();
 
         if let AnyToDeviceEvent::Dummy(e) = event {
             assert_eq!(&e.sender, alice.user_id());
         } else {
-            panic!("Wrong event type found {:?}", event);
+            panic!("Wrong event type found {event:?}");
         }
     }
 
@@ -1954,41 +2015,31 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let event = ToDeviceEvent {
-            sender: alice.user_id().to_owned(),
-            content: to_device_requests_to_content(to_device_requests),
-            other: Default::default(),
-        };
+        let event = ToDeviceEvent::new(
+            alice.user_id().to_owned(),
+            to_device_requests_to_content(to_device_requests),
+        );
         let event = json_convert(&event).unwrap();
 
         let alice_session =
             alice.group_session_manager.get_outbound_group_session(room_id).unwrap();
 
-        let mut to_device = ToDevice::new();
-        to_device.events.push(event);
-
         let decrypted = bob
-            .receive_sync_changes(to_device, &Default::default(), &Default::default(), None)
+            .receive_sync_changes(vec![event], &Default::default(), &Default::default(), None)
             .await
             .unwrap();
 
-        let event = decrypted.events[0].deserialize().unwrap();
+        let event = decrypted[0].deserialize().unwrap();
 
         if let AnyToDeviceEvent::RoomKey(event) = event {
             assert_eq!(&event.sender, alice.user_id());
             assert!(event.content.session_key.is_empty());
         } else {
-            panic!("expected RoomKeyEvent found {:?}", event);
+            panic!("expected RoomKeyEvent found {event:?}");
         }
 
-        let session = bob
-            .store
-            .get_inbound_group_session(
-                room_id,
-                &alice.account.identity_keys().curve25519.to_base64(),
-                alice_session.session_id(),
-            )
-            .await;
+        let session =
+            bob.store.get_inbound_group_session(room_id, alice_session.session_id()).await;
 
         assert!(session.unwrap().is_some());
     }
@@ -2003,11 +2054,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let event = ToDeviceEvent {
-            sender: alice.user_id().to_owned(),
-            content: to_device_requests_to_content(to_device_requests),
-            other: Default::default(),
-        };
+        let event = ToDeviceEvent::new(
+            alice.user_id().to_owned(),
+            to_device_requests_to_content(to_device_requests),
+        );
 
         let group_session =
             bob.decrypt_to_device_event(&event).await.unwrap().inbound_group_session;
@@ -2022,20 +2072,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let event = OriginalSyncRoomEncryptedEvent {
-            event_id: event_id!("$xxxxx:example.org").to_owned(),
-            origin_server_ts: MilliSecondsSinceUnixEpoch::now(),
-            sender: alice.user_id().to_owned(),
-            content: encrypted_content.deserialize_as().unwrap(),
-            unsigned: MessageLikeUnsigned::default(),
-        };
+        let event = json!({
+            "event_id": "$xxxxx:example.org",
+            "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+            "sender": alice.user_id(),
+            "type": "m.room.encrypted",
+            "content": encrypted_content,
+        });
 
         let event = json_convert(&event).unwrap();
 
         let decrypted_event =
             bob.decrypt_room_event(&event, room_id).await.unwrap().event.deserialize().unwrap();
 
-        if let AnyRoomEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
+        if let AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
             MessageLikeEvent::Original(OriginalMessageLikeEvent { sender, content, .. }),
         )) = decrypted_event
         {
@@ -2051,13 +2101,82 @@ pub(crate) mod tests {
     }
 
     #[async_test]
+    async fn test_query_ratcheted_key() {
+        let (alice, bob) = get_machine_pair_with_setup_sessions().await;
+        let room_id = room_id!("!test:example.org");
+
+        // Need a second bob session to check gossiping
+        let bob_id = user_id();
+        let bob_other_device = device_id!("OTHERBOB");
+        let bob_other_machine = OlmMachine::new(bob_id, bob_other_device).await;
+        let bob_other_device = ReadOnlyDevice::from_machine(&bob_other_machine).await;
+        bob.store.save_devices(&[bob_other_device]).await.unwrap();
+        bob.get_device(bob_id, device_id!("OTHERBOB"), None)
+            .await
+            .unwrap()
+            .expect("should exist")
+            .set_trust_state(crate::LocalTrust::Verified);
+
+        alice.create_outbound_group_session_with_defaults(room_id).await.unwrap();
+
+        let plaintext = "It is a secret to everybody";
+
+        let content = RoomMessageEventContent::text_plain(plaintext);
+
+        let content = alice
+            .encrypt_room_event(room_id, AnyMessageLikeEventContent::RoomMessage(content.clone()))
+            .await
+            .unwrap();
+
+        let room_event = json!({
+            "event_id": "$xxxxx:example.org",
+            "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+            "sender": alice.user_id(),
+            "type": "m.room.encrypted",
+            "content": content,
+        });
+
+        // should share at index 1
+        let to_device_requests = alice
+            .share_room_key(room_id, iter::once(bob.user_id()), EncryptionSettings::default())
+            .await
+            .unwrap();
+
+        let event = ToDeviceEvent::new(
+            alice.user_id().to_owned(),
+            to_device_requests_to_content(to_device_requests),
+        );
+
+        let group_session =
+            bob.decrypt_to_device_event(&event).await.unwrap().inbound_group_session;
+        bob.store.save_inbound_group_sessions(&[group_session.unwrap()]).await.unwrap();
+
+        let room_event = json_convert(&room_event).unwrap();
+
+        let decrypt_error = bob.decrypt_room_event(&room_event, room_id).await.unwrap_err();
+
+        if let MegolmError::Decryption(vodo_error) = decrypt_error {
+            if let vodozemac::megolm::DecryptionError::UnknownMessageIndex(_, _) = vodo_error {
+                // check that key has been requested
+                let outgoing_to_devices =
+                    bob.key_request_machine.outgoing_to_device_requests().await.unwrap();
+                assert_eq!(1, outgoing_to_devices.len());
+            } else {
+                panic!("Should be UnknownMessageIndex error ")
+            }
+        } else {
+            panic!("Should have been unable to decrypt")
+        }
+    }
+
+    #[async_test]
     async fn interactive_verification() {
         let (alice, bob) = get_machine_pair_with_setup_sessions().await;
 
         let bob_device =
             alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
 
-        assert!(!bob_device.verified());
+        assert!(!bob_device.is_verified());
 
         let (alice_sas, request) = bob_device.start_verification().await.unwrap();
 
@@ -2077,21 +2196,23 @@ pub(crate) mod tests {
 
         alice.handle_verification_event(&event).await;
 
-        let event = alice
+        let (event, request_id) = alice
             .verification_machine
             .outgoing_messages()
             .first()
-            .map(|r| outgoing_request_to_event(alice.user_id(), r))
+            .map(|r| (outgoing_request_to_event(alice.user_id(), r), r.request_id.to_owned()))
             .unwrap();
+        alice.mark_request_as_sent(&request_id, &ToDeviceResponse::new()).await.unwrap();
         bob.handle_verification_event(&event).await;
 
-        let event = bob
+        let (event, request_id) = bob
             .verification_machine
             .outgoing_messages()
             .first()
-            .map(|r| outgoing_request_to_event(bob.user_id(), r))
+            .map(|r| (outgoing_request_to_event(bob.user_id(), r), r.request_id.to_owned()))
             .unwrap();
         alice.handle_verification_event(&event).await;
+        bob.mark_request_as_sent(&request_id, &ToDeviceResponse::new()).await.unwrap();
 
         assert!(alice_sas.emoji().is_some());
         assert!(bob_sas.emoji().is_some());
@@ -2112,15 +2233,15 @@ pub(crate) mod tests {
         let event = request_to_event(alice.user_id(), &contents[0]);
 
         assert!(alice_sas.is_done());
-        assert!(bob_device.verified());
+        assert!(bob_device.is_verified());
 
         let alice_device =
             bob.get_device(alice.user_id(), alice.device_id(), None).await.unwrap().unwrap();
 
-        assert!(!alice_device.verified());
+        assert!(!alice_device.is_verified());
         bob.handle_verification_event(&event).await;
         assert!(bob_sas.is_done());
-        assert!(alice_device.verified());
+        assert!(alice_device.is_verified());
     }
 
     #[async_test]
@@ -2132,7 +2253,7 @@ pub(crate) mod tests {
         let bob_device =
             alice.get_device(bob.user_id(), bob.device_id(), None).await.unwrap().unwrap();
 
-        assert!(!bob_device.verified());
+        assert!(!bob_device.is_verified());
 
         // Alice sends a verification request with her desired methods to Bob
         let (alice_ver_req, request) =
@@ -2264,7 +2385,7 @@ pub(crate) mod tests {
 
         // Bob verifies that the MAC is valid and also sends a "done" message.
         let msgs = bob.verification_machine.outgoing_messages();
-        eprintln!("{:?}", msgs);
+        eprintln!("{msgs:?}");
         assert!(msgs.len() == 1);
         let event = msgs.first().map(|r| outgoing_request_to_event(bob.user_id(), r)).unwrap();
 
@@ -2272,23 +2393,118 @@ pub(crate) mod tests {
             bob.get_device(alice.user_id(), alice.device_id(), None).await.unwrap().unwrap();
 
         assert!(!bob_sas.is_done());
-        assert!(!alice_device.verified());
+        assert!(!alice_device.is_verified());
         // And Bob receives the Done message of alice.
         bob.handle_verification_event(&event_done).await;
 
         assert!(bob_sas.is_done());
-        assert!(alice_device.verified());
+        assert!(alice_device.is_verified());
 
         // ----------------------------------------------------------------------------
         // On Alice's device:
 
         assert!(!alice_sas.is_done());
-        assert!(!bob_device.verified());
+        assert!(!bob_device.is_verified());
         // Alices receives the done message
-        eprintln!("{:?}", event);
+        eprintln!("{event:?}");
         alice.handle_verification_event(&event).await;
 
         assert!(alice_sas.is_done());
-        assert!(bob_device.verified());
+        assert!(bob_device.is_verified());
+    }
+
+    #[async_test]
+    async fn room_key_over_megolm() {
+        let (alice, bob) = get_machine_pair_with_setup_sessions().await;
+        let room_id = room_id!("!test:example.org");
+
+        let to_device_requests = alice
+            .share_room_key(room_id, iter::once(bob.user_id()), EncryptionSettings::default())
+            .await
+            .unwrap();
+
+        let event = ToDeviceEvent {
+            sender: alice.user_id().to_owned(),
+            content: to_device_requests_to_content(to_device_requests),
+            other: Default::default(),
+        };
+        let event = json_convert(&event).unwrap();
+        let changed_devices = DeviceLists::new();
+        let key_counts = Default::default();
+
+        let _ = bob
+            .receive_sync_changes(vec![event], &changed_devices, &key_counts, None)
+            .await
+            .unwrap();
+
+        let group_session = GroupSession::new(SessionConfig::version_1());
+        let session_key = group_session.session_key();
+        let session_id = group_session.session_id();
+
+        let content = json!({
+            "algorithm": "m.megolm.v1.aes-sha2",
+            "room_id": room_id,
+            "session_id": session_id,
+            "session_key": session_key.to_base64(),
+
+        });
+
+        let encrypted_content =
+            alice.encrypt_room_event_raw(room_id, content, "m.room_key").await.unwrap();
+        let event = json!({
+            "sender": alice.user_id(),
+            "content": encrypted_content,
+            "type": "m.room.encrypted",
+        });
+
+        let event: EncryptedToDeviceEvent = serde_json::from_value(event).unwrap();
+
+        assert_matches!(
+            bob.decrypt_to_device_event(&event).await,
+            Err(OlmError::EventError(EventError::UnsupportedAlgorithm))
+        );
+
+        let event: Raw<AnyToDeviceEvent> = json_convert(&event).unwrap();
+
+        bob.receive_sync_changes(vec![event], &changed_devices, &key_counts, None).await.unwrap();
+
+        let session = bob.store.get_inbound_group_session(room_id, &session_id).await;
+
+        assert!(session.unwrap().is_none());
+    }
+
+    #[async_test]
+    async fn room_key_with_fake_identity_keys() {
+        let room_id = room_id!("!test:localhost");
+        let (alice, _) = get_machine_pair_with_setup_sessions().await;
+        let device = ReadOnlyDevice::from_machine(&alice).await;
+        alice.store.save_devices(&[device]).await.unwrap();
+
+        let (outbound, mut inbound) =
+            alice.account.create_group_session_pair(room_id, Default::default()).await.unwrap();
+
+        let fake_key = Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE")
+            .unwrap()
+            .into();
+        let signing_keys = SigningKeys::from([(DeviceKeyAlgorithm::Ed25519, fake_key)]);
+        inbound.signing_keys = signing_keys.into();
+
+        let content = json!({});
+        let content = outbound.encrypt(content, "m.dummy").await;
+        alice.store.save_inbound_group_sessions(&[inbound]).await.unwrap();
+
+        let event = json!({
+            "sender": alice.user_id(),
+            "event_id": "$xxxxx:example.org",
+            "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+            "type": "m.room.encrypted",
+            "content": content,
+        });
+        let event = json_convert(&event).unwrap();
+
+        assert_matches!(
+            alice.decrypt_room_event(&event, room_id).await,
+            Err(MegolmError::MismatchedIdentityKeys { .. })
+        );
     }
 }

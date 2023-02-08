@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
-use dashmap::DashSet;
+use gloo_utils::format::JsValueSerdeExt;
 use indexed_db_futures::prelude::*;
 use matrix_sdk_base::locks::Mutex;
 use matrix_sdk_crypto::{
@@ -30,9 +30,10 @@ use matrix_sdk_crypto::{
         caches::SessionStore, BackupKeys, Changes, CryptoStore, CryptoStoreError, RoomKeyCounts,
     },
     GossipRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
+    TrackedUser,
 };
 use matrix_sdk_store_encryption::StoreCipher;
-use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, RoomId, TransactionId, UserId};
+use ruma::{DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId};
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::JsValue;
 use web_sys::IdbKeyRange;
@@ -80,8 +81,6 @@ pub struct IndexeddbCryptoStore {
     store_cipher: Option<Arc<StoreCipher>>,
 
     session_cache: SessionStore,
-    tracked_users_cache: Arc<DashSet<OwnedUserId>>,
-    users_for_key_query_cache: Arc<DashSet<OwnedUserId>>,
 }
 
 impl std::fmt::Debug for IndexeddbCryptoStore {
@@ -141,12 +140,14 @@ impl IndexeddbCryptoStore {
         prefix: &str,
         store_cipher: Option<Arc<StoreCipher>>,
     ) -> Result<Self> {
-        let name = format!("{:0}::matrix-sdk-crypto", prefix);
+        let name = format!("{prefix:0}::matrix-sdk-crypto");
 
         // Open my_db v1
-        let mut db_req: OpenDbRequest = IdbDatabase::open_f64(&name, 1.0)?;
+        let mut db_req: OpenDbRequest = IdbDatabase::open_f64(&name, 1.1)?;
         db_req.set_on_upgrade_needed(Some(|evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
-            if evt.old_version() < 1.0 {
+            let old_version = evt.old_version();
+
+            if old_version < 1.0 {
                 // migrating to version 1
                 let db = evt.db();
 
@@ -165,7 +166,19 @@ impl IndexeddbCryptoStore {
                 db.create_object_store(KEYS::SECRET_REQUESTS_BY_INFO)?;
 
                 db.create_object_store(KEYS::BACKUP_KEYS)?;
+            } else if old_version < 1.1 {
+                // We changed how we store inbound group sessions, the key used to
+                // be a trippled of `(room_id, sender_key, session_id)` now it's a
+                // tuple of `(room_id, session_id)`
+                //
+                // Let's just drop the whole object store.
+
+                let db = evt.db();
+
+                db.delete_object_store(KEYS::INBOUND_GROUP_SESSIONS)?;
+                db.create_object_store(KEYS::INBOUND_GROUP_SESSIONS)?;
             }
+
             Ok(())
         }));
 
@@ -178,8 +191,6 @@ impl IndexeddbCryptoStore {
             inner: db,
             store_cipher,
             account_info: RwLock::new(None).into(),
-            tracked_users_cache: DashSet::new().into(),
-            users_for_key_query_cache: DashSet::new().into(),
         })
     }
 
@@ -219,7 +230,7 @@ impl IndexeddbCryptoStore {
 
     /// Open a new `IndexeddbCryptoStore` with given name and passphrase
     pub async fn open_with_passphrase(prefix: &str, passphrase: &str) -> Result<Self> {
-        let name = format!("{:0}::matrix-sdk-crypto-meta", prefix);
+        let name = format!("{prefix:0}::matrix-sdk-crypto-meta");
 
         let mut db_req: OpenDbRequest = IdbDatabase::open_f64(&name, 1.0)?;
         db_req.set_on_upgrade_needed(Some(|evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
@@ -245,11 +256,14 @@ impl IndexeddbCryptoStore {
             .transpose()?;
 
         let store_cipher = match store_cipher {
-            Some(key) => StoreCipher::import(passphrase, &key)
+            Some(cipher) => StoreCipher::import(passphrase, &cipher)
                 .map_err(|_| CryptoStoreError::UnpicklingError)?,
             None => {
-                let key = StoreCipher::new().map_err(CryptoStoreError::backend)?;
-                let encrypted = key.export(passphrase).map_err(CryptoStoreError::backend)?;
+                let cipher = StoreCipher::new().map_err(CryptoStoreError::backend)?;
+                #[cfg(not(test))]
+                let export = cipher.export(passphrase);
+                #[cfg(test)]
+                let export = cipher._insecure_export_fast_for_testing(passphrase);
 
                 let tx: IdbTransaction<'_> = db.transaction_on_one_with_mode(
                     "matrix-sdk-crypto",
@@ -259,12 +273,16 @@ impl IndexeddbCryptoStore {
 
                 ob.put_key_val(
                     &JsValue::from_str(KEYS::STORE_CIPHER),
-                    &JsValue::from_serde(&encrypted)?,
+                    &JsValue::from_serde(&export.map_err(CryptoStoreError::backend)?)?,
                 )?;
                 tx.await.into_result()?;
-                key
+                cipher
             }
         };
+
+        // Must release the database access manually as it's not done when
+        // dropping it.
+        db.close();
 
         IndexeddbCryptoStore::open_with_store_cipher(prefix, Some(store_cipher.into())).await
     }
@@ -353,7 +371,7 @@ impl IndexeddbCryptoStore {
         };
 
         let private_identity_pickle =
-            if let Some(i) = changes.private_identity { Some(i.pickle().await?) } else { None };
+            if let Some(i) = changes.private_identity { Some(i.pickle().await) } else { None };
 
         let recovery_key_pickle = changes.recovery_key;
         let backup_version = changes.backup_version;
@@ -401,10 +419,8 @@ impl IndexeddbCryptoStore {
 
             for session in changes.inbound_group_sessions {
                 let room_id = session.room_id();
-                let sender_key = session.sender_key().to_base64();
                 let session_id = session.session_id();
-                let key = self
-                    .encode_key(KEYS::INBOUND_GROUP_SESSIONS, (room_id, sender_key, session_id));
+                let key = self.encode_key(KEYS::INBOUND_GROUP_SESSIONS, (room_id, session_id));
                 let pickle = session.pickle().await;
 
                 sessions.put_key_val(&key, &self.serialize_value(&pickle)?)?;
@@ -418,7 +434,7 @@ impl IndexeddbCryptoStore {
                 let room_id = session.room_id();
                 let pickle = session.pickle().await;
                 sessions.put_key_val(
-                    &self.encode_key(KEYS::OUTBOUND_GROUP_SESSIONS, &room_id),
+                    &self.encode_key(KEYS::OUTBOUND_GROUP_SESSIONS, room_id),
                     &self.serialize_value(&pickle)?,
                 )?;
             }
@@ -452,7 +468,7 @@ impl IndexeddbCryptoStore {
             let identities = tx.object_store(KEYS::IDENTITIES)?;
             for identity in identity_changes.changed.iter().chain(&identity_changes.new) {
                 identities.put_key_val(
-                    &self.encode_key(KEYS::IDENTITIES, &identity.user_id()),
+                    &self.encode_key(KEYS::IDENTITIES, identity.user_id()),
                     &self.serialize_value(&identity)?,
                 )?;
             }
@@ -502,27 +518,24 @@ impl IndexeddbCryptoStore {
         Ok(())
     }
 
-    async fn load_tracked_users(&self) -> Result<()> {
+    async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>> {
         let tx = self
             .inner
             .transaction_on_one_with_mode(KEYS::TRACKED_USERS, IdbTransactionMode::Readonly)?;
         let os = tx.object_store(KEYS::TRACKED_USERS)?;
         let user_ids = os.get_all_keys()?.await?;
+
+        let mut users = Vec::new();
+
         for user_id in user_ids.iter() {
             let dirty: bool =
                 !matches!(os.get(&user_id)?.await?.map(|v| v.into_serde()), Some(Ok(false)));
-            let user = match user_id.as_string().map(UserId::parse) {
-                Some(Ok(user)) => user,
-                _ => continue,
-            };
-            self.tracked_users_cache.insert(user.clone());
+            let Some(Ok(user_id)) = user_id.as_string().map(UserId::parse) else { continue };
 
-            if dirty {
-                self.users_for_key_query_cache.insert(user);
-            }
+            users.push(TrackedUser { user_id, dirty });
         }
 
-        Ok(())
+        Ok(users)
     }
 
     async fn load_outbound_group_session(
@@ -584,8 +597,6 @@ impl IndexeddbCryptoStore {
             .get(&JsValue::from_str(KEYS::ACCOUNT))?
             .await?
         {
-            self.load_tracked_users().await?;
-
             let pickle = self.deserialize_value(pickle)?;
 
             let account = ReadOnlyAccount::from_pickle(pickle).map_err(CryptoStoreError::from)?;
@@ -628,13 +639,7 @@ impl IndexeddbCryptoStore {
         let account_info = self.get_account_info().ok_or(CryptoStoreError::AccountUnset)?;
 
         if self.session_cache.get(sender_key).is_none() {
-            let range = sender_key.encode_to_range().map_err(|e| {
-                IndexeddbCryptoStoreError::DomException {
-                    code: 0,
-                    name: "IdbKeyRangeMakeError".to_owned(),
-                    message: e,
-                }
-            })?;
+            let range = self.encode_to_range(KEYS::SESSION, sender_key)?;
             let sessions: Vec<Session> = self
                 .inner
                 .transaction_on_one_with_mode(KEYS::SESSION, IdbTransactionMode::Readonly)?
@@ -662,10 +667,9 @@ impl IndexeddbCryptoStore {
     async fn get_inbound_group_session(
         &self,
         room_id: &RoomId,
-        sender_key: &str,
         session_id: &str,
     ) -> Result<Option<InboundGroupSession>> {
-        let key = self.encode_key(KEYS::INBOUND_GROUP_SESSIONS, (room_id, sender_key, session_id));
+        let key = self.encode_key(KEYS::INBOUND_GROUP_SESSIONS, (room_id, session_id));
         if let Some(pickle) = self
             .inner
             .transaction_on_one_with_mode(
@@ -740,38 +744,18 @@ impl IndexeddbCryptoStore {
         Ok(())
     }
 
-    fn tracked_users(&self) -> HashSet<OwnedUserId> {
-        self.tracked_users_cache.to_owned().iter().map(|u| u.clone()).collect()
-    }
-
-    fn users_for_key_query(&self) -> HashSet<OwnedUserId> {
-        self.users_for_key_query_cache.iter().map(|u| u.clone()).collect()
-    }
-
-    async fn update_tracked_user(&self, user: &UserId, dirty: bool) -> Result<bool> {
-        let already_added = self.tracked_users_cache.insert(user.to_owned());
-
-        if dirty {
-            self.users_for_key_query_cache.insert(user.to_owned());
-        } else {
-            self.users_for_key_query_cache.remove(user);
-        }
-
+    async fn save_tracked_users(&self, users: &[(&UserId, bool)]) -> Result<()> {
         let tx = self
             .inner
             .transaction_on_one_with_mode(KEYS::TRACKED_USERS, IdbTransactionMode::Readwrite)?;
         let os = tx.object_store(KEYS::TRACKED_USERS)?;
 
-        os.put_key_val(
-            &JsValue::from_str(user.as_str()),
-            &match dirty {
-                true => JsValue::TRUE,
-                false => JsValue::FALSE,
-            },
-        )?;
+        for (user, dirty) in users {
+            os.put_key_val(&JsValue::from_str(user.as_str()), &JsValue::from(*dirty))?;
+        }
 
         tx.await.into_result()?;
-        Ok(already_added)
+        Ok(())
     }
 
     async fn get_device(
@@ -894,7 +878,7 @@ impl IndexeddbCryptoStore {
 
         if let Some(inner) = request {
             tx.object_store(KEYS::SECRET_REQUESTS_BY_INFO)?
-                .delete(&self.encode_key(KEYS::KEY_REQUEST, &inner.info.as_key()))?;
+                .delete(&self.encode_key(KEYS::KEY_REQUEST, inner.info.as_key()))?;
         }
 
         tx.object_store(KEYS::UNSENT_SECRET_REQUESTS)?.delete(&jskey)?;
@@ -929,6 +913,14 @@ impl IndexeddbCryptoStore {
     }
 }
 
+impl Drop for IndexeddbCryptoStore {
+    fn drop(&mut self) {
+        // Must release the database access manually as it's not done when
+        // dropping it.
+        self.inner.close();
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 impl CryptoStore for IndexeddbCryptoStore {
@@ -960,10 +952,9 @@ impl CryptoStore for IndexeddbCryptoStore {
     async fn get_inbound_group_session(
         &self,
         room_id: &RoomId,
-        sender_key: &str,
         session_id: &str,
     ) -> Result<Option<InboundGroupSession>, CryptoStoreError> {
-        self.get_inbound_group_session(room_id, sender_key, session_id).await.map_err(|e| e.into())
+        self.get_inbound_group_session(room_id, session_id).await.map_err(|e| e.into())
     }
 
     async fn get_inbound_group_sessions(
@@ -972,7 +963,7 @@ impl CryptoStore for IndexeddbCryptoStore {
         self.get_inbound_group_sessions().await.map_err(|e| e.into())
     }
 
-    async fn get_outbound_group_sessions(
+    async fn get_outbound_group_session(
         &self,
         room_id: &RoomId,
     ) -> Result<Option<OutboundGroupSession>, CryptoStoreError> {
@@ -994,32 +985,16 @@ impl CryptoStore for IndexeddbCryptoStore {
         self.reset_backup_state().await.map_err(|e| e.into())
     }
 
-    fn is_user_tracked(&self, user_id: &UserId) -> bool {
-        self.tracked_users_cache.contains(user_id)
-    }
-
-    fn has_users_for_key_query(&self) -> bool {
-        !self.users_for_key_query_cache.is_empty()
-    }
-
-    fn tracked_users(&self) -> HashSet<OwnedUserId> {
-        self.tracked_users()
-    }
-
-    fn users_for_key_query(&self) -> HashSet<OwnedUserId> {
-        self.users_for_key_query()
-    }
-
     async fn load_backup_keys(&self) -> Result<BackupKeys, CryptoStoreError> {
         self.load_backup_keys().await.map_err(|e| e.into())
     }
 
-    async fn update_tracked_user(
-        &self,
-        user: &UserId,
-        dirty: bool,
-    ) -> Result<bool, CryptoStoreError> {
-        self.update_tracked_user(user, dirty).await.map_err(|e| e.into())
+    async fn save_tracked_users(&self, users: &[(&UserId, bool)]) -> Result<(), CryptoStoreError> {
+        self.save_tracked_users(users).await.map_err(Into::into)
+    }
+
+    async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>, CryptoStoreError> {
+        self.load_tracked_users().await.map_err(Into::into)
     }
 
     async fn get_device(
@@ -1092,7 +1067,7 @@ mod tests {
                 .expect("Can't create store without passphrase"),
         }
     }
-    cryptostore_integration_tests! { integration }
+    cryptostore_integration_tests!();
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1112,5 +1087,5 @@ mod encrypted_tests {
 
     // FIXME: the tests pass, if run one by one, but run all together locally,
     //        as well as CI fails... see matrix-org/matrix-rust-sdk#661
-    //     cryptostore_integration_tests! { integration }
+    //     cryptostore_integration_tests!();
 }

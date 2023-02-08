@@ -16,7 +16,7 @@ pub enum EncryptionAlgorithm {
     MegolmV1AesSha2,
 }
 
-impl From<EncryptionAlgorithm> for ruma::EventEncryptionAlgorithm {
+impl From<EncryptionAlgorithm> for matrix_sdk_crypto::types::EventEncryptionAlgorithm {
     fn from(value: EncryptionAlgorithm) -> Self {
         use EncryptionAlgorithm::*;
 
@@ -27,9 +27,9 @@ impl From<EncryptionAlgorithm> for ruma::EventEncryptionAlgorithm {
     }
 }
 
-impl From<ruma::EventEncryptionAlgorithm> for EncryptionAlgorithm {
-    fn from(value: ruma::EventEncryptionAlgorithm) -> Self {
-        use ruma::EventEncryptionAlgorithm::*;
+impl From<matrix_sdk_crypto::types::EventEncryptionAlgorithm> for EncryptionAlgorithm {
+    fn from(value: matrix_sdk_crypto::types::EventEncryptionAlgorithm) -> Self {
+        use matrix_sdk_crypto::types::EventEncryptionAlgorithm::*;
 
         match value {
             OlmV1Curve25519AesSha2 => Self::OlmV1Curve25519AesSha2,
@@ -58,6 +58,10 @@ pub struct EncryptionSettings {
     /// The history visibility of the room when the session was
     /// created.
     pub history_visibility: events::HistoryVisibility,
+
+    /// Should untrusted devices receive the room key, or should they be
+    /// excluded from the conversation.
+    pub only_allow_trusted_devices: bool,
 }
 
 impl Default for EncryptionSettings {
@@ -77,6 +81,7 @@ impl Default for EncryptionSettings {
                 n.into()
             },
             history_visibility: default.history_visibility.into(),
+            only_allow_trusted_devices: default.only_allow_trusted_devices,
         }
     }
 }
@@ -97,6 +102,7 @@ impl From<&EncryptionSettings> for matrix_sdk_crypto::olm::EncryptionSettings {
             rotation_period: Duration::from_micros(value.rotation_period.get_u64().1),
             rotation_period_msgs: value.rotation_period_messages.get_u64().1,
             history_visibility: value.history_visibility.into(),
+            only_allow_trusted_devices: value.only_allow_trusted_devices,
         }
     }
 }

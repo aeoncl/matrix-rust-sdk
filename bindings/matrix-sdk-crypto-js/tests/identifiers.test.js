@@ -1,4 +1,13 @@
-const { UserId, DeviceId, RoomId, ServerName } = require('../pkg/matrix_sdk_crypto_js');
+const {
+    DeviceId,
+    DeviceKeyAlgorithm,
+    DeviceKeyAlgorithmName,
+    DeviceKeyId,
+    EventId,
+    RoomId,
+    ServerName,
+    UserId,
+} = require('../pkg/matrix_sdk_crypto_js');
 
 describe(UserId.name, () => {
     test('cannot be invalid', () => {
@@ -30,6 +39,52 @@ describe(DeviceId.name, () => {
     test('can read the device ID as a string', () => {
         expect(device.toString()).toStrictEqual('foo');
     })
+});
+
+describe(DeviceKeyId.name, () => {
+    for (const deviceKey of [
+        { name: 'ed25519',
+          id: 'ed25519:foobar',
+          algorithmName: DeviceKeyAlgorithmName.Ed25519,
+          algorithm: 'ed25519',
+          deviceId: 'foobar' },
+
+        { name: 'curve25519',
+          id: 'curve25519:foobar',
+          algorithmName: DeviceKeyAlgorithmName.Curve25519,
+          algorithm: 'curve25519',
+          deviceId: 'foobar' },
+
+        { name: 'signed curve25519',
+          id: 'signed_curve25519:foobar',
+          algorithmName: DeviceKeyAlgorithmName.SignedCurve25519,
+          algorithm: 'signed_curve25519',
+          deviceId: 'foobar' },
+
+        { name: 'unknown',
+          id: 'hello:foobar',
+          algorithmName: DeviceKeyAlgorithmName.Unknown,
+          algorithm: 'hello',
+          deviceId: 'foobar' },
+    ]) {
+        test(`${deviceKey.name} algorithm`, () => {
+            const dk = new DeviceKeyId(deviceKey.id);
+
+            expect(dk.algorithm.name).toStrictEqual(deviceKey.algorithmName);
+            expect(dk.algorithm.toString()).toStrictEqual(deviceKey.algorithm);
+            expect(dk.deviceId.toString()).toStrictEqual(deviceKey.deviceId);
+            expect(dk.toString()).toStrictEqual(deviceKey.id);
+        });
+    }
+});
+
+describe('DeviceKeyAlgorithmName', () => {
+    test('has the correct variants', () => {
+        expect(DeviceKeyAlgorithmName.Ed25519).toStrictEqual(0);
+        expect(DeviceKeyAlgorithmName.Curve25519).toStrictEqual(1);
+        expect(DeviceKeyAlgorithmName.SignedCurve25519).toStrictEqual(2);
+        expect(DeviceKeyAlgorithmName.Unknown).toStrictEqual(3);
+    });
 });
 
 describe(RoomId.name, () => {
@@ -70,3 +125,57 @@ describe(ServerName.name, () => {
         expect(new ServerName('foo.org').isIpLiteral()).toStrictEqual(false);
     });
 });
+
+describe(EventId.name, () => {
+    test('cannot be invalid', () => {
+        expect(() => { new EventId('%foo') }).toThrow();
+    });
+
+    describe('Versions 1 & 2', () => {
+        const room = new EventId('$h29iv0s8:foo.org');
+
+        test('localpart is present', () => {
+            expect(room.localpart).toStrictEqual('h29iv0s8');
+        });
+
+        test('server name is present', () => {
+            expect(room.serverName).toBeInstanceOf(ServerName);
+        });
+
+        test('can read the room ID as string', () => {
+            expect(room.toString()).toStrictEqual('$h29iv0s8:foo.org');
+        });
+    });
+
+    describe('Version 3', () => {
+        const room = new EventId('$acR1l0raoZnm60CBwAVgqbZqoO/mYU81xysh1u7XcJk');
+
+        test('localpart is present', () => {
+            expect(room.localpart).toStrictEqual('acR1l0raoZnm60CBwAVgqbZqoO/mYU81xysh1u7XcJk');
+        });
+
+        test('server name is present', () => {
+            expect(room.serverName).toBeUndefined();
+        });
+
+        test('can read the room ID as string', () => {
+            expect(room.toString()).toStrictEqual('$acR1l0raoZnm60CBwAVgqbZqoO/mYU81xysh1u7XcJk');
+        });
+    });
+
+    describe('Version 4', () => {
+        const room = new EventId('$Rqnc-F-dvnEYJTyHq_iKxU2bZ1CI92-kuZq3a5lr5Zg');
+
+        test('localpart is present', () => {
+            expect(room.localpart).toStrictEqual('Rqnc-F-dvnEYJTyHq_iKxU2bZ1CI92-kuZq3a5lr5Zg');
+        });
+
+        test('server name is present', () => {
+            expect(room.serverName).toBeUndefined();
+        });
+
+        test('can read the room ID as string', () => {
+            expect(room.toString()).toStrictEqual('$Rqnc-F-dvnEYJTyHq_iKxU2bZ1CI92-kuZq3a5lr5Zg');
+        });
+    });
+})

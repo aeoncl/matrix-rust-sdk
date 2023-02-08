@@ -1,4 +1,4 @@
-use ruma::{events::AnyRoomEvent, serde::Raw};
+use ruma::{events::AnyTimelineEvent, serde::Raw};
 use serde_json::Value;
 
 use crate::{event_builder::TimelineTestEvent, test_json};
@@ -19,7 +19,7 @@ pub fn value_with_room_id(value: &mut Value) {
 /// Usage is similar to [`super::EventBuilder`]
 #[derive(Debug, Default)]
 pub struct TransactionBuilder {
-    events: Vec<Raw<AnyRoomEvent>>,
+    events: Vec<Raw<AnyTimelineEvent>>,
 }
 
 impl TransactionBuilder {
@@ -28,7 +28,7 @@ impl TransactionBuilder {
     }
 
     /// Add a room event.
-    pub fn add_room_event(&mut self, event: TimelineTestEvent) -> &mut Self {
+    pub fn add_timeline_event(&mut self, event: TimelineTestEvent) -> &mut Self {
         let mut val = event.into_json_value();
         value_with_room_id(&mut val);
 
@@ -38,16 +38,9 @@ impl TransactionBuilder {
         self
     }
 
-    /// Build the transaction
-    #[cfg(feature = "appservice")]
-    pub fn build_json_transaction(&self) -> Value {
-        let body = serde_json::json! {
-            {
-                "events": self.events
-            }
-        };
-
-        body
+    /// Build the transaction as a serialized HTTP body
+    pub fn build_transaction(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "events": self.events })).unwrap()
     }
 
     pub fn clear(&mut self) {

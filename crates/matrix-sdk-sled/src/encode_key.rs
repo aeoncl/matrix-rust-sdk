@@ -6,14 +6,15 @@ use ruma::{
         receipt::ReceiptType, secret::request::SecretName, GlobalAccountDataEventType,
         RoomAccountDataEventType, StateEventType,
     },
-    DeviceId, EventEncryptionAlgorithm, EventId, MxcUri, OwnedEventId, OwnedRoomId, OwnedUserId,
-    RoomId, TransactionId, UserId,
+    DeviceId, EventId, MxcUri, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, TransactionId,
+    UserId,
 };
 
 /// Hold any data to be used as an encoding key
 /// without checking for the existence of `ENCODE_SEPARATOR` within
 pub struct EncodeUnchecked<'a>(&'a [u8]);
 
+#[cfg(feature = "state-store")]
 impl<'a> EncodeUnchecked<'a> {
     /// Wrap any `[u8]`
     pub fn from(bytes: &'a [u8]) -> Self {
@@ -118,13 +119,6 @@ impl EncodeKey for SecretName {
 }
 
 impl EncodeKey for ReceiptType {
-    fn encode_as_bytes(&self) -> Cow<'_, [u8]> {
-        let s: &str = self.as_ref();
-        s.as_bytes().into()
-    }
-}
-
-impl EncodeKey for EventEncryptionAlgorithm {
     fn encode_as_bytes(&self) -> Cow<'_, [u8]> {
         let s: &str = self.as_ref();
         s.as_bytes().into()

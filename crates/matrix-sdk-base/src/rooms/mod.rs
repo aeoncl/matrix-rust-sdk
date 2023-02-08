@@ -6,6 +6,7 @@ use std::{collections::HashSet, fmt};
 pub use members::RoomMember;
 pub use normal::{Room, RoomInfo, RoomType};
 use ruma::{
+    assign,
     events::{
         room::{
             avatar::RoomAvatarEventContent, canonical_alias::RoomCanonicalAliasEventContent,
@@ -16,12 +17,12 @@ use ruma::{
             redaction::OriginalSyncRoomRedactionEvent, tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
         },
-        AnyStrippedStateEvent, AnySyncStateEvent, RedactContent, RedactedEventContent,
-        StateEventContent, SyncStateEvent,
+        AnyStrippedStateEvent, AnySyncStateEvent, RedactContent, RedactedStateEventContent,
+        StaticStateEventContent, SyncStateEvent,
     },
     EventId, OwnedUserId, RoomVersionId,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::MinimalStateEvent;
 
@@ -158,7 +159,16 @@ impl BaseRoomInfo {
     pub fn handle_stripped_state_event(&mut self, ev: &AnyStrippedStateEvent) -> bool {
         match ev {
             AnyStrippedStateEvent::RoomEncryption(encryption) => {
-                self.encryption = Some(encryption.content.clone());
+                if let Some(algorithm) = &encryption.content.algorithm {
+                    let content = assign!(RoomEncryptionEventContent::new(algorithm.clone()), {
+                        rotation_period_ms: encryption.content.rotation_period_ms,
+                        rotation_period_msgs: encryption.content.rotation_period_msgs,
+                    });
+                    self.encryption = Some(content);
+                }
+                // If encryption event is redacted, we don't care much. When
+                // entering the room, we will fetch the proper event before
+                // sending any messages.
             }
             AnyStrippedStateEvent::RoomAvatar(a) => {
                 self.avatar = Some(a.into());
@@ -232,8 +242,8 @@ trait OptionExt {
 
 impl<C> OptionExt for Option<MinimalStateEvent<C>>
 where
-    C: StateEventContent + RedactContent,
-    C::Redacted: StateEventContent + RedactedEventContent + DeserializeOwned,
+    C: StaticStateEventContent + RedactContent,
+    C::Redacted: RedactedStateEventContent,
 {
     fn has_event_id(&self, ev_id: &EventId) -> bool {
         self.as_ref().and_then(|ev| ev.event_id()).map_or(false, |id| id == ev_id)

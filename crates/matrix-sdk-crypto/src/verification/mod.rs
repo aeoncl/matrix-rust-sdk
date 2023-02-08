@@ -26,8 +26,8 @@ use event_enums::OutgoingContent;
 pub use machine::VerificationMachine;
 use matrix_sdk_common::locks::Mutex;
 #[cfg(feature = "qrcode")]
-pub use qrcode::{QrVerification, ScanError};
-pub use requests::VerificationRequest;
+pub use qrcode::{QrVerification, QrVerificationState, ScanError};
+pub use requests::{VerificationRequest, VerificationRequestState};
 #[cfg(feature = "qrcode")]
 use ruma::events::key::verification::done::{
     KeyVerificationDoneEventContent, ToDeviceKeyVerificationDoneEventContent,
@@ -35,19 +35,17 @@ use ruma::events::key::verification::done::{
 use ruma::{
     api::client::keys::upload_signatures::v3::Request as SignatureUploadRequest,
     events::{
-        key::verification::{
-            cancel::{
-                CancelCode, KeyVerificationCancelEventContent,
-                ToDeviceKeyVerificationCancelEventContent,
-            },
-            Relation,
+        key::verification::cancel::{
+            CancelCode, KeyVerificationCancelEventContent,
+            ToDeviceKeyVerificationCancelEventContent,
         },
+        relation::Reference,
         AnyMessageLikeEventContent, AnyToDeviceEventContent,
     },
     DeviceId, EventId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedTransactionId, RoomId,
     UserId,
 };
-pub use sas::{AcceptSettings, Sas};
+pub use sas::{AcceptSettings, AcceptedProtocols, EmojiShortAuthString, Sas, SasState};
 use tracing::{error, info, trace, warn};
 
 use crate::{
@@ -81,6 +79,42 @@ pub struct Emoji {
     pub symbol: &'static str,
     /// The description of the emoji, for example 'Dog'.
     pub description: &'static str,
+}
+
+/// Format the the list of emojis as a two line string.
+///
+/// The first line will contain the emojis spread out so the second line can
+/// contain the descriptions centered bellow the emoji.
+pub fn format_emojis(emojis: [Emoji; 7]) -> String {
+    let (emojis, descriptions): (Vec<_>, Vec<_>) =
+        emojis.iter().map(|e| (e.symbol, e.description)).unzip();
+
+    let center_emoji = |emoji: &str| -> String {
+        const EMOJI_WIDTH: usize = 2;
+        // These are emojis that need VARIATION-SELECTOR-16 (U+FE0F) so that they are
+        // rendered with coloured glyphs. For these, we need to add an extra
+        // space after them so that they are rendered properly in terminals.
+        const VARIATION_SELECTOR_EMOJIS: [&str; 7] = ["☁️", "❤️", "☂️", "✏️", "✂️", "☎️", "✈️"];
+
+        // Hack to make terminals behave properly when one of the above is printed.
+        let emoji = if VARIATION_SELECTOR_EMOJIS.contains(&emoji) {
+            format!("{emoji} ")
+        } else {
+            emoji.to_owned()
+        };
+
+        // This is a trick to account for the fact that emojis are wider than other
+        // monospace characters.
+        let placeholder = ".".repeat(EMOJI_WIDTH);
+
+        format!("{placeholder:^12}").replace(&placeholder, &emoji)
+    };
+
+    let emoji_string = emojis.iter().map(|e| center_emoji(e)).collect::<Vec<_>>().join("");
+
+    let description = descriptions.iter().map(|d| format!("{d:^12}")).collect::<Vec<_>>().join("");
+
+    format!("{emoji_string}\n{description}")
 }
 
 impl VerificationStore {
@@ -283,7 +317,7 @@ impl Done {
             FlowId::InRoom(r, e) => (
                 r.to_owned(),
                 AnyMessageLikeEventContent::KeyVerificationDone(
-                    KeyVerificationDoneEventContent::new(Relation::new(e.to_owned())),
+                    KeyVerificationDoneEventContent::new(Reference::new(e.to_owned())),
                 ),
             )
                 .into(),
@@ -371,7 +405,7 @@ impl Cancelled {
                     KeyVerificationCancelEventContent::new(
                         self.reason.to_owned(),
                         self.cancel_code.clone(),
-                        Relation::new(e.clone()),
+                        Reference::new(e.clone()),
                     ),
                 ),
             )
@@ -380,44 +414,52 @@ impl Cancelled {
     }
 }
 
+/// A key verification can be requested and started by a to-device
+/// request or a room event. `FlowId` helps to represent both
+/// usecases.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub enum FlowId {
+    /// The flow ID comes from a to-device request.
     ToDevice(OwnedTransactionId),
+
+    /// The flow ID comes from a room event.
     InRoom(OwnedRoomId, OwnedEventId),
 }
 
 impl FlowId {
+    /// Get the room ID if the flow ID comes from a room event.
     pub fn room_id(&self) -> Option<&RoomId> {
-        if let FlowId::InRoom(r, _) = &self {
-            Some(r)
+        if let Self::InRoom(room_id, _) = &self {
+            Some(room_id)
         } else {
             None
         }
     }
 
+    /// Get the ID a string.
     pub fn as_str(&self) -> &str {
         match self {
-            FlowId::InRoom(_, r) => r.as_str(),
-            FlowId::ToDevice(t) => t.as_str(),
+            Self::InRoom(_, event_id) => event_id.as_str(),
+            Self::ToDevice(transaction_id) => transaction_id.as_str(),
         }
     }
 }
 
 impl From<OwnedTransactionId> for FlowId {
     fn from(transaction_id: OwnedTransactionId) -> Self {
-        FlowId::ToDevice(transaction_id)
+        Self::ToDevice(transaction_id)
     }
 }
 
 impl From<(OwnedRoomId, OwnedEventId)> for FlowId {
     fn from(ids: (OwnedRoomId, OwnedEventId)) -> Self {
-        FlowId::InRoom(ids.0, ids.1)
+        Self::InRoom(ids.0, ids.1)
     }
 }
 
 impl From<(&RoomId, &EventId)> for FlowId {
     fn from(ids: (&RoomId, &EventId)) -> Self {
-        FlowId::InRoom(ids.0.to_owned(), ids.1.to_owned())
+        Self::InRoom(ids.0.to_owned(), ids.1.to_owned())
     }
 }
 
@@ -501,8 +543,8 @@ impl IdentitiesBeingVerified {
                     }
                     Err(e) => {
                         error!(
-                            user_id = %device.user_id(),
-                            device_id = %device.device_id(),
+                            user_id = ?device.user_id(),
+                            device_id = ?device.device_id(),
                             "Error signing device keys: {e:?}",
                         );
                         None
@@ -526,7 +568,7 @@ impl IdentitiesBeingVerified {
                     Ok(r) => Some(r),
                     Err(SignatureError::MissingSigningKey) => {
                         warn!(
-                            user_id = %i.user_id(),
+                            user_id = ?i.user_id(),
                             "Can't sign the public cross signing keys, \
                              no private user signing key found",
                         );
@@ -534,7 +576,7 @@ impl IdentitiesBeingVerified {
                     }
                     Err(e) => {
                         error!(
-                            user_id = %i.user_id(),
+                            user_id = ?i.user_id(),
                             "Error signing the public cross signing keys: {e:?}",
                         );
                         None
@@ -657,45 +699,41 @@ impl IdentitiesBeingVerified {
     ) -> Result<Option<ReadOnlyDevice>, CryptoStoreError> {
         let device = self.store.get_device(self.other_user_id(), self.other_device_id()).await?;
 
-        if let Some(device) = device {
-            if device.keys() == self.device_being_verified.keys() {
-                if verified_devices.map_or(false, |v| v.contains(&device)) {
-                    trace!(
-                        user_id = device.user_id().as_str(),
-                        device_id = device.device_id().as_str(),
-                        "Marking device as verified.",
-                    );
-
-                    device.set_trust_state(LocalTrust::Verified);
-
-                    Ok(Some(device))
-                } else {
-                    info!(
-                        user_id = device.user_id().as_str(),
-                        device_id = device.device_id().as_str(),
-                        "The interactive verification process didn't verify \
-                        the device",
-                    );
-
-                    Ok(None)
-                }
-            } else {
-                warn!(
-                    user_id = device.user_id().as_str(),
-                    device_id = device.device_id().as_str(),
-                    "The device keys have changed while an interactive \
-                     verification was going on, not marking the device as verified.",
-                );
-                Ok(None)
-            }
-        } else {
+        let Some(device) = device else {
             let device = &self.device_being_verified;
-
             info!(
                 user_id = device.user_id().as_str(),
                 device_id = device.device_id().as_str(),
-                "The device was deleted while an interactive verification was \
-                 going on.",
+                "The device was deleted while an interactive verification was going on.",
+            );
+            return Ok(None);
+        };
+
+        if device.keys() != self.device_being_verified.keys() {
+            warn!(
+                user_id = device.user_id().as_str(),
+                device_id = device.device_id().as_str(),
+                "The device keys have changed while an interactive verification \
+                 was going on, not marking the device as verified.",
+            );
+            return Ok(None);
+        }
+
+        if verified_devices.map_or(false, |v| v.contains(&device)) {
+            trace!(
+                user_id = device.user_id().as_str(),
+                device_id = device.device_id().as_str(),
+                "Marking device as verified.",
+            );
+
+            device.set_trust_state(LocalTrust::Verified);
+
+            Ok(Some(device))
+        } else {
+            info!(
+                user_id = device.user_id().as_str(),
+                device_id = device.device_id().as_str(),
+                "The interactive verification process didn't verify the device",
             );
 
             Ok(None)
@@ -781,7 +819,9 @@ mod test {
 
     use super::VerificationStore;
     use crate::{
-        olm::PrivateCrossSigningIdentity, store::MemoryStore, ReadOnlyAccount, ReadOnlyDevice,
+        olm::PrivateCrossSigningIdentity,
+        store::{Changes, CryptoStore, IdentityChanges, MemoryStore},
+        ReadOnlyAccount, ReadOnlyDevice, ReadOnlyOwnUserIdentity, ReadOnlyUserIdentity,
     };
 
     pub fn alice_id() -> &'static UserId {
@@ -803,28 +843,57 @@ mod test {
     pub(crate) async fn setup_stores() -> (VerificationStore, VerificationStore) {
         let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
         let alice_store = MemoryStore::new();
-        let alice_identity = Mutex::new(PrivateCrossSigningIdentity::empty(alice_id()));
+        let (alice_private_identity, _, _) =
+            PrivateCrossSigningIdentity::with_account(&alice).await;
+        let alice_private_identity = Mutex::new(alice_private_identity);
 
         let bob = ReadOnlyAccount::new(bob_id(), bob_device_id());
         let bob_store = MemoryStore::new();
-        let bob_identity = Mutex::new(PrivateCrossSigningIdentity::empty(bob_id()));
+        let (bob_private_identity, _, _) = PrivateCrossSigningIdentity::with_account(&bob).await;
+        let bob_private_identity = Mutex::new(bob_private_identity);
+
+        let alice_public_identity =
+            ReadOnlyUserIdentity::from_private(&*alice_private_identity.lock().await).await;
+        let alice_readonly_identity =
+            ReadOnlyOwnUserIdentity::from_private(&*alice_private_identity.lock().await).await;
+        let bob_public_identity =
+            ReadOnlyUserIdentity::from_private(&*bob_private_identity.lock().await).await;
+        let bob_readonly_identity =
+            ReadOnlyOwnUserIdentity::from_private(&*bob_private_identity.lock().await).await;
 
         let alice_device = ReadOnlyDevice::from_account(&alice).await;
         let bob_device = ReadOnlyDevice::from_account(&bob).await;
 
+        let alice_changes = Changes {
+            identities: IdentityChanges {
+                new: vec![alice_readonly_identity.into(), bob_public_identity.into()],
+                changed: vec![],
+            },
+            ..Default::default()
+        };
+        alice_store.save_changes(alice_changes).await.unwrap();
         alice_store.save_devices(vec![bob_device]).await;
+
+        let bob_changes = Changes {
+            identities: IdentityChanges {
+                new: vec![bob_readonly_identity.into(), alice_public_identity.into()],
+                changed: vec![],
+            },
+            ..Default::default()
+        };
+        bob_store.save_changes(bob_changes).await.unwrap();
         bob_store.save_devices(vec![alice_device]).await;
 
         let alice_store = VerificationStore {
             account: alice,
             inner: Arc::new(alice_store),
-            private_identity: alice_identity.into(),
+            private_identity: alice_private_identity.into(),
         };
 
         let bob_store = VerificationStore {
             account: bob.clone(),
             inner: Arc::new(bob_store),
-            private_identity: bob_identity.into(),
+            private_identity: bob_private_identity.into(),
         };
 
         (alice_store, bob_store)

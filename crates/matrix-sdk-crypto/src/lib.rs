@@ -68,9 +68,9 @@ impl RoomKeyImportResult {
     }
 }
 
-pub use error::{MegolmError, OlmError, SignatureError};
+pub use error::{EventError, MegolmError, OlmError, SessionCreationError, SignatureError};
 pub use file_encryption::{
-    decrypt_key_export, encrypt_key_export, AttachmentDecryptor, AttachmentEncryptor,
+    decrypt_room_key_export, encrypt_room_key_export, AttachmentDecryptor, AttachmentEncryptor,
     DecryptorError, KeyExportError, MediaEncryptionInfo,
 };
 pub use gossiping::GossipRequest;
@@ -86,7 +86,23 @@ pub use requests::{
     IncomingResponse, KeysBackupRequest, KeysQueryRequest, OutgoingRequest, OutgoingRequests,
     OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest, UploadSigningKeysRequest,
 };
-pub use store::{CrossSigningKeyExport, CryptoStoreError, SecretImportError, SecretInfo};
-pub use verification::{AcceptSettings, CancelInfo, Emoji, Sas, Verification, VerificationRequest};
+pub use store::{
+    CrossSigningKeyExport, CryptoStoreError, SecretImportError, SecretInfo, TrackedUser,
+};
+pub use verification::{
+    format_emojis, AcceptSettings, AcceptedProtocols, CancelInfo, Emoji, EmojiShortAuthString, Sas,
+    SasState, Verification, VerificationRequest, VerificationRequestState,
+};
 #[cfg(feature = "qrcode")]
-pub use verification::{QrVerification, ScanError};
+pub use verification::{QrVerification, QrVerificationState, ScanError};
+
+/// Re-exported Error types from the [vodozemac](https://crates.io/crates/vodozemac) crate.
+pub mod vodozemac {
+    pub use vodozemac::{
+        megolm::{DecryptionError as MegolmDecryptionError, SessionKeyDecodeError},
+        olm::{
+            DecryptionError as OlmDecryptionError, SessionCreationError as OlmSessionCreationError,
+        },
+        DecodeError, KeyError, PickleError, SignatureError,
+    };
+}

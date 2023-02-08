@@ -1,4 +1,4 @@
-use std::{io::Cursor, time::Duration};
+use std::time::Duration;
 
 use matrix_sdk::{
     attachment::{
@@ -19,7 +19,7 @@ use wiremock::{
     Mock, ResponseTemplate,
 };
 
-use crate::{logged_in_client, mock_sync};
+use crate::{logged_in_client, mock_encryption_state, mock_sync};
 
 #[async_test]
 async fn invite_user_by_id() {
@@ -65,10 +65,10 @@ async fn invite_user_by_3pid() {
 
     room.invite_user_by_3pid(
         Invite3pidInit {
-            id_server: "example.org",
-            id_access_token: "IdToken",
+            id_server: "example.org".to_owned(),
+            id_access_token: "IdToken".to_owned(),
             medium: thirdparty::Medium::Email,
-            address: "address",
+            address: "address".to_owned(),
         }
         .into(),
     )
@@ -239,7 +239,8 @@ async fn room_state_event_send() {
     let member_event = assign!(RoomMemberEventContent::new(MembershipState::Join), {
         avatar_url: Some(avatar_url.to_owned())
     });
-    let response = room.send_state_event(member_event, "").await.unwrap();
+    let response =
+        room.send_state_event_for_key(user_id!("@foo:bar.com"), member_event).await.unwrap();
     assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id);
 }
 
@@ -255,6 +256,7 @@ async fn room_message_send() {
         .await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
+    mock_encryption_state(&server, false).await;
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
@@ -296,6 +298,7 @@ async fn room_attachment_send() {
         .await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
+    mock_encryption_state(&server, false).await;
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
@@ -303,10 +306,13 @@ async fn room_attachment_send() {
 
     let room = client.get_joined_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
 
-    let mut media = Cursor::new("Hello world");
-
     let response = room
-        .send_attachment("image", &mime::IMAGE_JPEG, &mut media, AttachmentConfig::new())
+        .send_attachment(
+            "image",
+            &mime::IMAGE_JPEG,
+            b"Hello world".to_vec(),
+            AttachmentConfig::new(),
+        )
         .await
         .unwrap();
 
@@ -342,14 +348,13 @@ async fn room_attachment_send_info() {
         .await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
+    mock_encryption_state(&server, false).await;
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let _response = client.sync_once(sync_settings).await.unwrap();
 
     let room = client.get_joined_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
-
-    let mut media = Cursor::new("Hello world");
 
     let config = AttachmentConfig::new().info(AttachmentInfo::Image(BaseImageInfo {
         height: Some(uint!(600)),
@@ -358,8 +363,10 @@ async fn room_attachment_send_info() {
         blurhash: None,
     }));
 
-    let response =
-        room.send_attachment("image", &mime::IMAGE_JPEG, &mut media, config).await.unwrap();
+    let response = room
+        .send_attachment("image", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)
+        .await
+        .unwrap();
 
     assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
 }
@@ -393,14 +400,13 @@ async fn room_attachment_send_wrong_info() {
         .await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
+    mock_encryption_state(&server, false).await;
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let _response = client.sync_once(sync_settings).await.unwrap();
 
     let room = client.get_joined_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
-
-    let mut media = Cursor::new("Hello world");
 
     let config = AttachmentConfig::new().info(AttachmentInfo::Video(BaseVideoInfo {
         height: Some(uint!(600)),
@@ -410,7 +416,8 @@ async fn room_attachment_send_wrong_info() {
         blurhash: None,
     }));
 
-    let response = room.send_attachment("image", &mime::IMAGE_JPEG, &mut media, config).await;
+    let response =
+        room.send_attachment("image", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config).await;
 
     response.unwrap_err();
 }
@@ -452,6 +459,7 @@ async fn room_attachment_send_info_thumbnail() {
         .await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
+    mock_encryption_state(&server, false).await;
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
@@ -459,13 +467,9 @@ async fn room_attachment_send_info_thumbnail() {
 
     let room = client.get_joined_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
 
-    let mut media = Cursor::new("Hello world");
-
-    let mut thumbnail_reader = Cursor::new("Thumbnail");
-
     let config = AttachmentConfig::with_thumbnail(Thumbnail {
-        reader: &mut thumbnail_reader,
-        content_type: &mime::IMAGE_JPEG,
+        data: b"Thumbnail".to_vec(),
+        content_type: mime::IMAGE_JPEG,
         info: Some(BaseThumbnailInfo {
             height: Some(uint!(360)),
             width: Some(uint!(480)),
@@ -479,8 +483,10 @@ async fn room_attachment_send_info_thumbnail() {
         blurhash: None,
     }));
 
-    let response =
-        room.send_attachment("image", &mime::IMAGE_JPEG, &mut media, config).await.unwrap();
+    let response = room
+        .send_attachment("image", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)
+        .await
+        .unwrap();
 
     assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
 }

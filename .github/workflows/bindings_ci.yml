@@ -18,6 +18,73 @@ env:
   MATRIX_SDK_CRYPTO_JS_PATH: bindings/matrix-sdk-crypto-js
 
 jobs:
+  xtask-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check xtask cache
+        uses: actions/cache@v3
+        id: xtask-cache
+        with:
+          path: target/debug/xtask
+          key: xtask-linux-${{ hashFiles('Cargo.toml', 'xtask/**') }}
+
+      - name: Install rust stable toolchain
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Build
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: -p xtask
+
+  test-uniffi-codegen:
+    name: Test UniFFI bindings generation
+    needs: xtask-linux
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v1
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Load cache
+        uses: Swatinem/rust-cache@v1
+
+      - name: Get xtask
+        uses: actions/cache@v3
+        with:
+          path: target/debug/xtask
+          key: xtask-linux-${{ hashFiles('Cargo.toml', 'xtask/**') }}
+
+      - name: Build library & generate bindings
+        run: target/debug/xtask ci bindings
+
   test-matrix-sdk-crypto-nodejs:
     name: ${{ matrix.os-name }} [m]-crypto-nodejs, v${{ matrix.node-version }}
     if: github.event_name == 'push' || !github.event.pull_request.draft
@@ -27,7 +94,7 @@ jobs:
       fail-fast: true
       matrix:
         os: [ubuntu-latest]
-        node-version: [14.0, 16.0, 18.0]
+        node-version: [14.0, 16.0, 18.0, 19.0]
         include:
           - os: ubuntu-latest
             os-name: 🐧
@@ -133,14 +200,53 @@ jobs:
         working-directory: ${{ env.MATRIX_SDK_CRYPTO_JS_PATH }}
         run: npm run doc
 
+  xtask-macos:
+    runs-on: macos-12
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check xtask cache
+        uses: actions/cache@v3
+        id: xtask-cache
+        with:
+          path: target/debug/xtask
+          key: xtask-macos-${{ hashFiles('Cargo.toml', 'xtask/**') }}
+
+      - name: Install rust stable toolchain
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Build
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: -p xtask
+
   test-apple:
     name: matrix-rust-components-swift
+    needs: xtask-macos
     runs-on: macos-12
     if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout
         uses: actions/checkout@v1
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
         uses: actions-rs/toolchain@v1
@@ -149,28 +255,24 @@ jobs:
           profile: minimal
           override: true
 
-      - name: Install targets
-        run: |
-          rustup target add aarch64-apple-ios-sim --toolchain nightly
-          rustup target add x86_64-apple-ios --toolchain nightly
+      - name: Install aarch64-apple-ios target
+        run: rustup target install aarch64-apple-ios
 
       - name: Load cache
         uses: Swatinem/rust-cache@v1
 
-      - name: Install Uniffi
-        uses: actions-rs/cargo@v1
+      - name: Get xtask
+        uses: actions/cache@v3
         with:
-          command: install
-          # keep in sync with uniffi dependency in Cargo.toml's
-          args: uniffi_bindgen --version ^0.18
+          path: target/debug/xtask
+          key: xtask-macos-${{ hashFiles('Cargo.toml', 'xtask/**') }}
 
-      - name: Generate .xcframework
-        run: sh bindings/apple/debug_build_xcframework.sh x86_64 ci
+      - name: Build library & bindings
+        run: target/debug/xtask swift build-library
 
       - name: Run XCTests
-        run: |
-          xcodebuild test \
-            -project bindings/apple/MatrixRustSDK.xcodeproj \
-            -scheme MatrixRustSDK \
-            -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 13'
+        working-directory: bindings/apple
+        run: swift test
+
+      - name: Build Framework
+        run: cargo xtask swift build-framework --only-target=aarch64-apple-ios

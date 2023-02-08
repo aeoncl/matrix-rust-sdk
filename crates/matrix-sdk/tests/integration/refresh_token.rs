@@ -1,19 +1,16 @@
 use std::time::Duration;
 
+use assert_matches::assert_matches;
 use futures::{
     channel::{mpsc, oneshot},
     StreamExt,
 };
 use futures_signals::signal::SignalExt;
-use matches::assert_matches;
-use matrix_sdk::{
-    config::RequestConfig, executor::spawn, HttpError, RefreshTokenError, RumaApiError, Session,
-};
+use matrix_sdk::{config::RequestConfig, executor::spawn, HttpError, RefreshTokenError, Session};
 use matrix_sdk_test::{async_test, test_json};
 use ruma::{
     api::{
-        client::{account::register, error::ErrorKind, Error as ClientApiError},
-        error::{FromHttpResponseError, ServerError},
+        client::{account::register, error::ErrorKind},
         MatrixVersion,
     },
     assign, device_id, user_id,
@@ -33,7 +30,7 @@ async fn login_username_refresh_token() {
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
         .and(body_partial_json(json!({
-            "org.matrix.msc2918.refresh_token": true,
+            "refresh_token": true,
         })))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(&*test_json::LOGIN_WITH_REFRESH_TOKEN),
@@ -57,7 +54,7 @@ async fn login_sso_refresh_token() {
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
         .and(body_partial_json(json!({
-            "org.matrix.msc2918.refresh_token": true,
+            "refresh_token": true,
         })))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(&*test_json::LOGIN_WITH_REFRESH_TOKEN),
@@ -85,7 +82,6 @@ async fn login_sso_refresh_token() {
         })
         .identity_provider_id(&idp.id)
         .request_refresh_token()
-        .send()
         .await
         .unwrap();
 
@@ -101,7 +97,7 @@ async fn register_refresh_token() {
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/register"))
         .and(body_partial_json(json!({
-            "org.matrix.msc2918.refresh_token": true,
+            "refresh_token": true,
         })))
         .respond_with(
             // Successful registration response is the same as for login,
@@ -112,8 +108,8 @@ async fn register_refresh_token() {
         .await;
 
     let req = assign!(register::v3::Request::new(), {
-        username: Some("user"),
-        password: Some("password"),
+        username: Some("user".to_owned()),
+        password: Some("password".to_owned()),
         auth: None,
         refresh_token: true,
     });
@@ -155,7 +151,7 @@ async fn refresh_token() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     let tokens = client.session_tokens().unwrap();
     assert_eq!(tokens.access_token, "1234");
@@ -211,7 +207,7 @@ async fn refresh_token_not_handled() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -229,13 +225,8 @@ async fn refresh_token_not_handled() {
         .mount(&server)
         .await;
 
-    let res = client.whoami().await;
-    assert_matches!(
-        res,
-        Err(HttpError::Api(FromHttpResponseError::Server(ServerError::Known(
-            RumaApiError::ClientApi(ClientApiError { kind, .. })
-        )))) if matches!(kind, ErrorKind::UnknownToken { .. })
-    )
+    let res = client.whoami().await.unwrap_err();
+    assert_matches!(res.client_api_error_kind(), Some(ErrorKind::UnknownToken { .. }));
 }
 
 #[async_test]
@@ -255,7 +246,7 @@ async fn refresh_token_handled_success() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     let mut tokens_stream = client.session_tokens_signal().to_stream();
     let (tokens_sender, tokens_receiver) = oneshot::channel::<()>();
@@ -330,7 +321,7 @@ async fn refresh_token_handled_failure() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -362,13 +353,8 @@ async fn refresh_token_handled_failure() {
         .mount(&server)
         .await;
 
-    let res = client.whoami().await;
-    assert_matches!(
-        res,
-        Err(HttpError::Api(FromHttpResponseError::Server(ServerError::Known(
-            RumaApiError::ClientApi(ClientApiError { kind, .. })
-        )))) if matches!(kind, ErrorKind::UnknownToken { .. })
-    )
+    let res = client.whoami().await.unwrap_err();
+    assert_matches!(res.client_api_error_kind(), Some(ErrorKind::UnknownToken { .. }))
 }
 
 #[async_test]
@@ -388,7 +374,7 @@ async fn refresh_token_handled_multi_success() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -465,7 +451,7 @@ async fn refresh_token_handled_multi_failure() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -542,7 +528,7 @@ async fn refresh_token_handled_other_error() {
         user_id: user_id!("@example:localhost").to_owned(),
         device_id: device_id!("DEVICEID").to_owned(),
     };
-    client.restore_login(session).await.unwrap();
+    client.restore_session(session).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))

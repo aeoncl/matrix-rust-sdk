@@ -17,14 +17,12 @@ use std::{collections::BTreeMap, fmt::Debug};
 use ruma::{
     events::{
         dummy::ToDeviceDummyEvent,
-        forwarded_room_key::ToDeviceForwardedRoomKeyEvent,
         key::verification::{
             accept::ToDeviceKeyVerificationAcceptEvent, cancel::ToDeviceKeyVerificationCancelEvent,
             done::ToDeviceKeyVerificationDoneEvent, key::ToDeviceKeyVerificationKeyEvent,
             mac::ToDeviceKeyVerificationMacEvent, ready::ToDeviceKeyVerificationReadyEvent,
             request::ToDeviceKeyVerificationRequestEvent, start::ToDeviceKeyVerificationStartEvent,
         },
-        room_key_request::ToDeviceRoomKeyRequestEvent,
         secret::request::{SecretName, ToDeviceSecretRequestEvent},
         EventContent, ToDeviceEventType,
     },
@@ -39,7 +37,11 @@ use serde_json::{
 use zeroize::Zeroize;
 
 use super::{
-    room::encrypted::EncryptedToDeviceEvent, room_key::RoomKeyEvent, secret_send::SecretSendEvent,
+    forwarded_room_key::{ForwardedRoomKeyContent, ForwardedRoomKeyEvent},
+    room::encrypted::EncryptedToDeviceEvent,
+    room_key::RoomKeyEvent,
+    room_key_request::RoomKeyRequestEvent,
+    secret_send::SecretSendEvent,
     EventType,
 };
 use crate::types::events::from_str;
@@ -74,9 +76,9 @@ pub enum ToDeviceEvents {
     /// The `m.room_key` to-device event.
     RoomKey(RoomKeyEvent),
     /// The `m.room_key_request` to-device event.
-    RoomKeyRequest(ToDeviceRoomKeyRequestEvent),
+    RoomKeyRequest(RoomKeyRequestEvent),
     /// The `m.forwarded_room_key` to-device event.
-    ForwardedRoomKey(ToDeviceForwardedRoomKeyEvent),
+    ForwardedRoomKey(Box<ForwardedRoomKeyEvent>),
     /// The `m.secret.send` to-device event.
     SecretSend(SecretSendEvent),
     /// The `m.secret.request` to-device event.
@@ -126,8 +128,8 @@ impl ToDeviceEvents {
 
             ToDeviceEvents::RoomEncrypted(_) => ToDeviceEventType::RoomEncrypted,
             ToDeviceEvents::RoomKey(_) => ToDeviceEventType::RoomKey,
-            ToDeviceEvents::RoomKeyRequest(e) => e.content.event_type(),
-            ToDeviceEvents::ForwardedRoomKey(e) => e.content.event_type(),
+            ToDeviceEvents::RoomKeyRequest(_) => ToDeviceEventType::RoomKeyRequest,
+            ToDeviceEvents::ForwardedRoomKey(_) => ToDeviceEventType::ForwardedRoomKey,
 
             ToDeviceEvents::SecretSend(_) => ToDeviceEventType::SecretSend,
             ToDeviceEvents::SecretRequest(e) => e.content.event_type(),
@@ -197,7 +199,13 @@ impl ToDeviceEvents {
                 Raw::from_json(raw_value)
             }
             ToDeviceEvents::ForwardedRoomKey(mut e) => {
-                e.content.session_key.zeroize();
+                match &mut e.content {
+                    ForwardedRoomKeyContent::MegolmV1AesSha2(c) => c.session_key.zeroize(),
+                    #[cfg(feature = "experimental-algorithms")]
+                    ForwardedRoomKeyContent::MegolmV2AesSha2(c) => c.session_key.zeroize(),
+                    ForwardedRoomKeyContent::Unknown(_) => (),
+                }
+
                 Raw::from_json(to_raw_value(&e)?)
             }
             ToDeviceEvents::SecretSend(mut e) => {
@@ -232,7 +240,7 @@ pub struct ToDeviceCustomEvent {
 }
 
 /// Generic to-device event with a known type and content.
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct ToDeviceEvent<C>
 where
     C: EventType + Debug + Sized + Serialize,
@@ -242,8 +250,14 @@ where
     /// The content of the to-device event.
     pub content: C,
     /// Any other unknown data of the to-device event.
-    #[serde(flatten)]
     pub(crate) other: BTreeMap<String, Value>,
+}
+
+impl<C: EventType + Debug + Sized + Serialize> ToDeviceEvent<C> {
+    /// Create a new `ToDeviceEvent`.
+    pub fn new(sender: OwnedUserId, content: C) -> ToDeviceEvent<C> {
+        ToDeviceEvent { sender, content, other: Default::default() }
+    }
 }
 
 impl<C> Serialize for ToDeviceEvent<C>
@@ -270,6 +284,40 @@ where
             Helper { sender: &self.sender, content: &self.content, event_type, other: &self.other };
 
         helper.serialize(serializer)
+    }
+}
+
+impl<'de, C> Deserialize<'de> for ToDeviceEvent<C>
+where
+    C: EventType + Debug + Sized + Deserialize<'de> + Serialize,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Helper<C> {
+            sender: OwnedUserId,
+            content: C,
+            // We're deserializing the `type` field here so it doesn't end up in `other`.
+            #[allow(dead_code)]
+            #[serde(rename = "type")]
+            event_type: String,
+            #[serde(flatten)]
+            other: BTreeMap<String, Value>,
+        }
+
+        let helper: Helper<C> = Helper::deserialize(deserializer)?;
+
+        if helper.event_type == helper.content.event_type() {
+            Ok(Self { sender: helper.sender, content: helper.content, other: helper.other })
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "Mismatched event type, got {}, expected {}",
+                helper.event_type,
+                helper.content.event_type()
+            )))
+        }
     }
 }
 
@@ -346,7 +394,7 @@ impl Serialize for ToDeviceEvents {
 
 #[cfg(test)]
 mod test {
-    use matches::assert_matches;
+    use assert_matches::assert_matches;
     use serde_json::{json, Value};
 
     use super::ToDeviceEvents;
@@ -410,7 +458,11 @@ mod test {
             "sender_claimed_ed25519_key": "aj40p+aw64yPIdsxoog8jhPu9i7l7NcFRecuOQblE3Y",
             "sender_key": "RF3s+E7RkTQTGF2d8Deol0FkQvgII2aJDf3/Jp5mxVU",
             "session_id": "X3lUlvLELLYxeTx4yOVu6UDpasGEVO0Jbu+QFnm0cKQ",
-            "session_key": "AgAAAADxKHa9uFxcXzwYoNueL5Xqi69IkD4sni8Llf..."
+            "session_key": "AQAAAAq2JpkMceK5f6JrZPJWwzQTn59zliuIv0F7apVLXDcZCCT\
+                            3LqBjD21sULYEO5YTKdpMVhi9i6ZSZhdvZvp//tzRpDT7wpWVWI\
+                            00Y3EPEjmpm/HfZ4MMAKpk+tzJVuuvfAcHBZgpnxBGzYOc/DAqa\
+                            pK7Tk3t3QJ1UMSD94HfAqlb1JF5QBPwoh0fOvD8pJdanB8zxz05\
+                            tKFdR73/vo2Q/zE3"
             },
             "type": "m.forwarded_room_key"
         })
@@ -467,6 +519,53 @@ mod test {
 
             // Unknown event
             custom_event => Custom,
+
+            // `m.key.verification.request`
+            key_verification_event => KeyVerificationRequest,
+
+            // `m.dummy`
+            dummy_event => Dummy,
+
+            // `m.room.encrypted`
+            crate::types::events::room::encrypted::test::to_device_json => RoomEncrypted,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn zeroized_deserialization() -> Result<(), serde_json::Error> {
+        use ruma::events::AnyToDeviceEvent;
+
+        macro_rules! assert_serialization_roundtrip {
+            ( $( $json:path => $to_device_events:ident ),* $(,)? ) => {
+                $(
+                    let json = $json();
+                    let event: ToDeviceEvents = serde_json::from_value(json.clone())?;
+                    let zeroized = event.serialize_zeroized()?;
+
+                    let ruma_event: AnyToDeviceEvent = zeroized.deserialize_as()?;
+
+                    assert_matches!(ruma_event, AnyToDeviceEvent::$to_device_events(_));
+                )*
+            }
+        }
+
+        assert_serialization_roundtrip!(
+            // `m.room_key
+            crate::types::events::room_key::test::json => RoomKey,
+
+            // `m.forwarded_room_key`
+            forwarded_room_key_event => ForwardedRoomKey,
+
+            // `m.room_key_request`
+            room_key_request_event => RoomKeyRequest,
+
+            // `m.secret.send`
+            crate::types::events::secret_send::test::json => SecretSend,
+
+            // `m.secret.request`
+            secret_request_event => SecretRequest,
 
             // `m.key.verification.request`
             key_verification_event => KeyVerificationRequest,

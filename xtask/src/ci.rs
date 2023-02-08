@@ -1,10 +1,9 @@
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::collections::BTreeMap;
 
 use clap::{Args, Subcommand};
-use serde::Deserialize;
 use xshell::{cmd, pushd};
 
-use crate::{build_docs, DenyWarnings, Result};
+use crate::{build_docs, workspace, DenyWarnings, Result};
 
 #[derive(Args)]
 pub struct CiArgs {
@@ -19,31 +18,43 @@ const WASM_TIMEOUT_VALUE: &str = "120";
 enum CiCommand {
     /// Check style
     Style,
+
     /// Check for typos
     Typos,
+
     /// Check clippy lints
     Clippy,
+
     /// Check documentation
     Docs,
+
     /// Run tests with a specific feature set
     TestFeatures {
         #[clap(subcommand)]
         cmd: Option<FeatureSet>,
     },
+
     /// Run tests for the appservice crate
     TestAppservice,
+
     /// Run checks for the wasm target
     Wasm {
         #[clap(subcommand)]
         cmd: Option<WasmFeatureSet>,
     },
+
     /// Run wasm-pack tests
     WasmPack {
         #[clap(subcommand)]
         cmd: Option<WasmFeatureSet>,
     },
+
     /// Run tests for the different crypto crate features
     TestCrypto,
+
+    /// Check that bindings can be generated
+    Bindings,
+
     /// Check that the examples compile
     Examples,
 }
@@ -59,7 +70,6 @@ enum FeatureSet {
     Markdown,
     Socks,
     SsoLogin,
-    ExperimentalTimeline,
 }
 
 #[derive(Subcommand, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,7 +90,7 @@ enum WasmFeatureSet {
 
 impl CiArgs {
     pub fn run(self) -> Result<()> {
-        let _p = pushd(&workspace_root()?)?;
+        let _p = pushd(workspace::root_path()?)?;
 
         match self.cmd {
             Some(cmd) => match cmd {
@@ -93,6 +103,7 @@ impl CiArgs {
                 CiCommand::Wasm { cmd } => run_wasm_checks(cmd),
                 CiCommand::WasmPack { cmd } => run_wasm_pack_tests(cmd),
                 CiCommand::TestCrypto => run_crypto_tests(),
+                CiCommand::Bindings => check_bindings(),
                 CiCommand::Examples => check_examples(),
             },
             None => {
@@ -110,6 +121,34 @@ impl CiArgs {
             }
         }
     }
+}
+
+fn check_bindings() -> Result<()> {
+    cmd!("rustup run stable cargo build -p matrix-sdk-crypto-ffi -p matrix-sdk-ffi").run()?;
+    cmd!(
+        "
+        rustup run stable cargo run -p uniffi-bindgen -- generate
+            --language kotlin
+            --language swift
+            --lib-file target/debug/libmatrix_sdk_ffi.a
+            --out-dir target/generated-bindings
+            bindings/matrix-sdk-ffi/src/api.udl
+        "
+    )
+    .run()?;
+    cmd!(
+        "
+        rustup run stable cargo run -p uniffi-bindgen -- generate
+            --language kotlin
+            --language swift
+            --lib-file target/debug/libmatrix_sdk_crypto_ffi.a
+            --out-dir target/generated-bindings
+            bindings/matrix-sdk-crypto-ffi/src/olm.udl
+        "
+    )
+    .run()?;
+
+    Ok(())
 }
 
 fn check_examples() -> Result<()> {
@@ -134,7 +173,8 @@ fn check_clippy() -> Result<()> {
     cmd!(
         "rustup run nightly cargo clippy --workspace --all-targets
             --exclude matrix-sdk-crypto --exclude xtask
-            --no-default-features --features native-tls,warp
+            --no-default-features
+            --features native-tls,experimental-sliding-sync,sso-login,experimental-timeline
             -- -D warnings"
     )
     .run()?;
@@ -163,7 +203,6 @@ fn run_feature_tests(cmd: Option<FeatureSet>) -> Result<()> {
         (FeatureSet::Markdown, "--features markdown"),
         (FeatureSet::Socks, "--features socks"),
         (FeatureSet::SsoLogin, "--features sso-login"),
-        (FeatureSet::ExperimentalTimeline, "--features experimental-timeline"),
     ]);
 
     let run = |arg_set: &str| {
@@ -196,7 +235,22 @@ fn run_crypto_tests() -> Result<()> {
     .run()?;
     cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --features=backups_v1").run()?;
     cmd!("rustup run stable cargo test --doc -p matrix-sdk-crypto --features=backups_v1").run()?;
+    cmd!(
+        "rustup run stable cargo clippy -p matrix-sdk-crypto --features=experimental-algorithms -- -D warnings"
+    )
+    .run()?;
+    cmd!(
+        "rustup run stable cargo nextest run -p matrix-sdk-crypto --features=experimental-algorithms"
+    ).run()?;
+    cmd!(
+        "rustup run stable cargo test --doc -p matrix-sdk-crypto --features=experimental-algorithms"
+    )
+    .run()?;
+
     cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto-ffi").run()?;
+
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-sqlite --features crypto-store")
+        .run()?;
 
     Ok(())
 }
@@ -220,18 +274,18 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
         (WasmFeatureSet::MatrixSdkQrcode, "-p matrix-sdk-qrcode"),
         (
             WasmFeatureSet::MatrixSdkNoDefault,
-            "-p matrix-sdk --no-default-features --features rustls-tls",
+            "-p matrix-sdk --no-default-features --features js,rustls-tls",
         ),
-        (WasmFeatureSet::MatrixSdkBase, "-p matrix-sdk-base"),
-        (WasmFeatureSet::MatrixSdkCommon, "-p matrix-sdk-common"),
+        (WasmFeatureSet::MatrixSdkBase, "-p matrix-sdk-base --features js"),
+        (WasmFeatureSet::MatrixSdkCommon, "-p matrix-sdk-common --features js"),
         (WasmFeatureSet::MatrixSdkCryptoJs, "-p matrix-sdk-crypto-js"),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStoresNoCrypto,
-            "-p matrix-sdk --no-default-features --features indexeddb,rustls-tls",
+            "-p matrix-sdk --no-default-features --features js,indexeddb,rustls-tls",
         ),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStores,
-            "-p matrix-sdk --no-default-features --features indexeddb,e2e-encryption,rustls-tls",
+            "-p matrix-sdk --no-default-features --features js,indexeddb,e2e-encryption,rustls-tls",
         ),
         (WasmFeatureSet::IndexeddbNoCrypto, "-p matrix-sdk-indexeddb --no-default-features "),
         (
@@ -288,20 +342,20 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
         (WasmFeatureSet::MatrixSdkQrcode, ("matrix-sdk-qrcode", "")),
         (
             WasmFeatureSet::MatrixSdkNoDefault,
-            ("matrix-sdk", "--no-default-features --features rustls-tls --lib"),
+            ("matrix-sdk", "--no-default-features --features js,rustls-tls --lib"),
         ),
-        (WasmFeatureSet::MatrixSdkBase, ("matrix-sdk-base", "")),
-        (WasmFeatureSet::MatrixSdkCommon, ("matrix-sdk-common", "")),
+        (WasmFeatureSet::MatrixSdkBase, ("matrix-sdk-base", "--features js")),
+        (WasmFeatureSet::MatrixSdkCommon, ("matrix-sdk-common", "--features js")),
         (WasmFeatureSet::MatrixSdkCryptoJs, ("matrix-sdk-crypto-js", "")),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStoresNoCrypto,
-            ("matrix-sdk", "--no-default-features --features indexeddb,rustls-tls --lib"),
+            ("matrix-sdk", "--no-default-features --features js,indexeddb,rustls-tls --lib"),
         ),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStores,
             (
                 "matrix-sdk",
-                "--no-default-features --features indexeddb,e2e-encryption,rustls-tls --lib",
+                "--no-default-features --features js,indexeddb,e2e-encryption,rustls-tls --lib",
             ),
         ),
         (WasmFeatureSet::IndexeddbNoCrypto, ("matrix-sdk-indexeddb", "--no-default-features")),
@@ -351,15 +405,4 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn workspace_root() -> Result<PathBuf> {
-    #[derive(Deserialize)]
-    struct Metadata {
-        workspace_root: PathBuf,
-    }
-
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let metadata_json = cmd!("{cargo} metadata --no-deps --format-version 1").read()?;
-    Ok(serde_json::from_str::<Metadata>(&metadata_json)?.workspace_root)
 }

@@ -17,15 +17,7 @@ use std::{
     sync::{Arc, RwLock as SyncRwLock},
 };
 
-#[cfg(feature = "experimental-timeline")]
-use dashmap::DashSet;
-#[cfg(feature = "experimental-timeline")]
-use futures_channel::mpsc;
-#[cfg(feature = "experimental-timeline")]
-use futures_core::stream::Stream;
 use futures_util::stream::{self, StreamExt};
-#[cfg(feature = "experimental-timeline")]
-use matrix_sdk_common::locks::Mutex;
 use ruma::{
     api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
     events::{
@@ -37,7 +29,7 @@ use ruma::{
         },
         tag::Tags,
         AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent,
-        RoomAccountDataEventType, StateEventType,
+        RoomAccountDataEventType,
     },
     room::RoomType as CreateRoomType,
     EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedUserId, RoomAliasId, RoomId,
@@ -48,14 +40,9 @@ use tracing::debug;
 
 use super::{BaseRoomInfo, DisplayName, RoomMember};
 use crate::{
-    deserialized_responses::UnreadNotificationsCount,
-    store::{Result as StoreResult, StateStore},
+    store::{Result as StoreResult, StateStore, StateStoreExt},
+    sync::UnreadNotificationsCount,
     MinimalStateEvent,
-};
-#[cfg(feature = "experimental-timeline")]
-use crate::{
-    deserialized_responses::{SyncRoomEvent, TimelineSlice},
-    timeline_stream::{TimelineStreamBackward, TimelineStreamError, TimelineStreamForward},
 };
 
 /// The underlying room data structure collecting state for joined, left and
@@ -66,10 +53,6 @@ pub struct Room {
     own_user_id: Arc<UserId>,
     inner: Arc<SyncRwLock<RoomInfo>>,
     store: Arc<dyn StateStore>,
-    #[cfg(feature = "experimental-timeline")]
-    forward_timeline_streams: Arc<Mutex<Vec<mpsc::Sender<TimelineSlice>>>>,
-    #[cfg(feature = "experimental-timeline")]
-    backward_timeline_streams: Arc<Mutex<Vec<mpsc::Sender<TimelineSlice>>>>,
 }
 
 /// The room summary containing member counts and members that should be used to
@@ -118,10 +101,6 @@ impl Room {
             room_id: room_info.room_id.clone(),
             store,
             inner: Arc::new(SyncRwLock::new(room_info)),
-            #[cfg(feature = "experimental-timeline")]
-            forward_timeline_streams: Default::default(),
-            #[cfg(feature = "experimental-timeline")]
-            backward_timeline_streams: Default::default(),
         }
     }
 
@@ -150,7 +129,7 @@ impl Room {
         self.inner.read().unwrap().notification_counts
     }
 
-    /// Check if the room has it's members fully synced.
+    /// Check if the room has its members fully synced.
     ///
     /// Members might be missing if lazy member loading was enabled for the
     /// sync.
@@ -158,6 +137,27 @@ impl Room {
     /// Returns true if no members are missing, false otherwise.
     pub fn are_members_synced(&self) -> bool {
         self.inner.read().unwrap().members_synced
+    }
+
+    /// Check if the room states have been synced
+    ///
+    /// States might be missing if we have only seen the room_id of this Room
+    /// so far, for example as the response for a `create_room` request without
+    /// being synced yet.
+    ///
+    /// Returns true if the state is fully synced, false otherwise.
+    pub fn is_state_fully_synced(&self) -> bool {
+        self.inner.read().unwrap().sync_info == SyncInfo::FullySynced
+    }
+
+    /// Check if the room has its encryption event synced.
+    ///
+    /// The encryption event can be missing when the room hasn't appeared in
+    /// sync yet.
+    ///
+    /// Returns true if the encryption state is synced, false otherwise.
+    pub fn is_encryption_state_synced(&self) -> bool {
+        self.inner.read().unwrap().encryption_state_synced
     }
 
     /// Get the `prev_batch` token that was received from the last sync. May be
@@ -426,12 +426,10 @@ impl Room {
     /// return a `RoomMember` that can be in a joined, invited, left, banned
     /// state.
     pub async fn get_member(&self, user_id: &UserId) -> StoreResult<Option<RoomMember>> {
-        let member_event =
-            if let Some(m) = self.store.get_member_event(self.room_id(), user_id).await? {
-                m
-            } else {
-                return Ok(None);
-            };
+        let Some(raw_event) = self.store.get_member_event(self.room_id(), user_id).await? else {
+            return Ok(None);
+        };
+        let member_event = raw_event.deserialize()?;
 
         let presence =
             self.store.get_presence_event(user_id).await?.and_then(|e| e.deserialize().ok());
@@ -440,18 +438,11 @@ impl Room {
         let is_room_creator =
             self.inner.read().unwrap().creator().map(|c| c == user_id).unwrap_or(false);
 
-        let power =
-            self.store
-                .get_state_event(self.room_id(), StateEventType::RoomPowerLevels, "")
-                .await?
-                .and_then(|e| e.deserialize().ok())
-                .and_then(|e| {
-                    if let AnySyncStateEvent::RoomPowerLevels(e) = e {
-                        Some(e)
-                    } else {
-                        None
-                    }
-                });
+        let power = self
+            .store
+            .get_state_event_static(self.room_id())
+            .await?
+            .and_then(|e| e.deserialize().ok());
 
         let ambiguous = self
             .store
@@ -508,130 +499,6 @@ impl Room {
     ) -> StoreResult<Vec<(OwnedUserId, Receipt)>> {
         self.store.get_event_room_receipt_events(self.room_id(), ReceiptType::Read, event_id).await
     }
-
-    /// Get two stream into the timeline.
-    /// First one is forward in time and the second one is backward in time.
-    #[cfg(feature = "experimental-timeline")]
-    pub async fn timeline(
-        &self,
-    ) -> StoreResult<(
-        impl Stream<Item = SyncRoomEvent>,
-        impl Stream<Item = Result<SyncRoomEvent, TimelineStreamError>>,
-    )> {
-        // We need to hold the lock while we create the stream so that we don't lose new
-        // sync responses
-        let mut forward_timeline_streams = self.forward_timeline_streams.lock().await;
-        let mut backward_timeline_streams = self.backward_timeline_streams.lock().await;
-        let sync_token = self.store.get_sync_token().await?;
-        let event_ids = Arc::new(DashSet::new());
-
-        let (backward_stream, backward_sender) = if let Some((stored_events, end_token)) =
-            self.store.room_timeline(&self.room_id).await?
-        {
-            TimelineStreamBackward::new(event_ids.clone(), end_token, Some(stored_events))
-        } else {
-            TimelineStreamBackward::new(
-                event_ids.clone(),
-                Some(sync_token.clone().expect("Sync token exists")),
-                None,
-            )
-        };
-
-        backward_timeline_streams.push(backward_sender);
-
-        let (forward_stream, forward_sender) = TimelineStreamForward::new(event_ids);
-        forward_timeline_streams.push(forward_sender);
-
-        Ok((forward_stream, backward_stream))
-    }
-
-    /// Create a stream that returns all events of the room's timeline forward
-    /// in time.
-    ///
-    /// If you need also a backward stream you should use
-    /// [`timeline`][`crate::Room::timeline`]
-    #[cfg(feature = "experimental-timeline")]
-    pub async fn timeline_forward(&self) -> StoreResult<impl Stream<Item = SyncRoomEvent>> {
-        let mut forward_timeline_streams = self.forward_timeline_streams.lock().await;
-        let event_ids = Arc::new(DashSet::new());
-
-        let (forward_stream, forward_sender) = TimelineStreamForward::new(event_ids);
-        forward_timeline_streams.push(forward_sender);
-
-        Ok(forward_stream)
-    }
-
-    /// Create a stream that returns all events of the room's timeline backward
-    /// in time.
-    ///
-    /// If you need also a forward stream you should use
-    /// [`timeline`][`crate::Room::timeline`]
-    #[cfg(feature = "experimental-timeline")]
-    pub async fn timeline_backward(
-        &self,
-    ) -> StoreResult<impl Stream<Item = Result<SyncRoomEvent, TimelineStreamError>>> {
-        let mut backward_timeline_streams = self.backward_timeline_streams.lock().await;
-        let sync_token = self.store.get_sync_token().await?;
-        let event_ids = Arc::new(DashSet::new());
-
-        let (backward_stream, backward_sender) = if let Some((stored_events, end_token)) =
-            self.store.room_timeline(&self.room_id).await?
-        {
-            TimelineStreamBackward::new(event_ids.clone(), end_token, Some(stored_events))
-        } else {
-            TimelineStreamBackward::new(event_ids.clone(), Some(sync_token.clone().unwrap()), None)
-        };
-
-        backward_timeline_streams.push(backward_sender);
-
-        Ok(backward_stream)
-    }
-
-    /// Add a new timeline slice to the timeline streams.
-    #[cfg(feature = "experimental-timeline")]
-    pub async fn add_timeline_slice(&self, timeline: &TimelineSlice) {
-        use tracing::warn;
-
-        if timeline.sync {
-            let mut streams = self.forward_timeline_streams.lock().await;
-            let mut remaining_streams = Vec::with_capacity(streams.len());
-            while let Some(mut forward) = streams.pop() {
-                if !forward.is_closed() {
-                    if let Err(error) = forward.try_send(timeline.clone()) {
-                        if error.is_full() {
-                            warn!(
-                                room_id = %self.room_id(),
-                                "Dropping timeline slice because the limit of the buffer for the \
-                                 forward stream is reached"
-                            );
-                        }
-                    } else {
-                        remaining_streams.push(forward);
-                    }
-                }
-            }
-            *streams = remaining_streams;
-        } else {
-            let mut streams = self.backward_timeline_streams.lock().await;
-            let mut remaining_streams = Vec::with_capacity(streams.len());
-            while let Some(mut backward) = streams.pop() {
-                if !backward.is_closed() {
-                    if let Err(error) = backward.try_send(timeline.clone()) {
-                        if error.is_full() {
-                            warn!(
-                                room_id = %self.room_id(),
-                                "Dropping timeline slice because the limit of the buffer for the \
-                                 backward stream is reached"
-                            );
-                        }
-                    } else {
-                        remaining_streams.push(backward);
-                    }
-                }
-            }
-            *streams = remaining_streams;
-        }
-    }
 }
 
 /// The underlying pure data structure for joined and left rooms.
@@ -651,9 +518,50 @@ pub struct RoomInfo {
     pub(crate) members_synced: bool,
     /// The prev batch of this room we received during the last sync.
     pub(crate) last_prev_batch: Option<String>,
+    /// How much we know about this room.
+    #[serde(default = "SyncInfo::complete")] // see fn docs for why we use this default
+    pub(crate) sync_info: SyncInfo,
+    /// Whether or not the encryption info was been synced.
+    #[serde(default = "encryption_state_default")] // see fn docs for why we use this default
+    pub(crate) encryption_state_synced: bool,
     /// Base room info which holds some basic event contents important for the
     /// room state.
     pub(crate) base_info: BaseRoomInfo,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum SyncInfo {
+    /// We only know the room exists and whether it is in invite / joined / left
+    /// state.
+    ///
+    /// This is the case when we have a limited sync or only seen the room
+    /// because of a request we've done, like a room creation event.
+    NoState,
+
+    /// Some states have been synced, but they might have been filtered or is
+    /// stale, as it is from a room we've left.
+    PartiallySynced,
+
+    /// We have all the latest state events.
+    FullySynced,
+}
+
+impl SyncInfo {
+    // The sync_info field introduced a new field in the database schema, but to
+    // avoid a database migration, we let serde assume that if the room is in
+    // the database, yet the field isn't, we have synced it before this field
+    // was introduced - which was a a full sync.
+    fn complete() -> Self {
+        SyncInfo::FullySynced
+    }
+}
+
+// The encryption_state_synced field introduced a new field in the database
+// schema, but to avoid a database migration, we let serde assume that if
+// the room is in the database, yet the field isn't, we have synced it
+// before this field was introduced - which was a a full sync.
+fn encryption_state_default() -> bool {
+    true
 }
 
 impl RoomInfo {
@@ -666,33 +574,60 @@ impl RoomInfo {
             summary: Default::default(),
             members_synced: false,
             last_prev_batch: None,
+            sync_info: SyncInfo::NoState,
+            encryption_state_synced: false,
             base_info: BaseRoomInfo::new(),
         }
     }
 
-    /// Mark this Room as joined
+    /// Mark this Room as joined.
     pub fn mark_as_joined(&mut self) {
         self.room_type = RoomType::Joined;
     }
 
-    /// Mark this Room as left
+    /// Mark this Room as left.
     pub fn mark_as_left(&mut self) {
         self.room_type = RoomType::Left;
     }
 
-    /// Mark this Room as invited
+    /// Mark this Room as invited.
     pub fn mark_as_invited(&mut self) {
         self.room_type = RoomType::Invited;
     }
 
-    /// Mark this Room as having all the members synced
+    /// Mark this Room as having all the members synced.
     pub fn mark_members_synced(&mut self) {
         self.members_synced = true;
     }
 
-    /// Mark this Room still missing member information
+    /// Mark this Room still missing member information.
     pub fn mark_members_missing(&mut self) {
         self.members_synced = false;
+    }
+
+    /// Mark this Room still missing some state information.
+    pub fn mark_state_partially_synced(&mut self) {
+        self.sync_info = SyncInfo::PartiallySynced;
+    }
+
+    /// Mark this Room still having all state synced.
+    pub fn mark_state_fully_synced(&mut self) {
+        self.sync_info = SyncInfo::FullySynced;
+    }
+
+    /// Mark this Room still having no state synced.
+    pub fn mark_state_not_synced(&mut self) {
+        self.sync_info = SyncInfo::NoState;
+    }
+
+    /// Mark this Room as having the encryption state synced.
+    pub fn mark_encryption_state_synced(&mut self) {
+        self.encryption_state_synced = true;
+    }
+
+    /// Mark this Room still missing encryption state information.
+    pub fn mark_encryption_state_missing(&mut self) {
+        self.encryption_state_synced = false;
     }
 
     /// Set the `prev_batch`-token.
@@ -707,9 +642,14 @@ impl RoomInfo {
         }
     }
 
-    /// Whether this is an encrypted Room
+    /// Returns whether this is an encrypted Room.
     pub fn is_encrypted(&self) -> bool {
         self.base_info.encryption.is_some()
+    }
+
+    /// Set the encryption event content in this room.
+    pub fn set_encryption_event(&mut self, event: Option<RoomEncryptionEventContent>) {
+        self.base_info.encryption = event;
     }
 
     /// Handle the given state event.
@@ -847,21 +787,21 @@ mod test {
     use std::sync::Arc;
 
     use assign::assign;
+    use matrix_sdk_test::async_test;
     use ruma::{
-        event_id,
-        events::{
-            room::{
-                canonical_alias::RoomCanonicalAliasEventContent,
-                member::{
-                    MembershipState, OriginalSyncRoomMemberEvent, RoomMemberEventContent,
-                    StrippedRoomMemberEvent, SyncRoomMemberEvent,
-                },
-                name::RoomNameEventContent,
+        events::room::{
+            canonical_alias::RoomCanonicalAliasEventContent,
+            member::{
+                MembershipState, RoomMemberEventContent, StrippedRoomMemberEvent,
+                SyncRoomMemberEvent,
             },
-            StateUnsigned,
+            name::RoomNameEventContent,
         },
-        room_alias_id, room_id, user_id, MilliSecondsSinceUnixEpoch,
+        room_alias_id, room_id,
+        serde::Raw,
+        user_id,
     };
+    use serde_json::json;
 
     use super::*;
     use crate::{
@@ -877,32 +817,36 @@ mod test {
         (store.clone(), Room::new(user_id, store, room_id, room_type))
     }
 
-    fn make_stripped_member_event(user_id: &UserId, name: &str) -> StrippedRoomMemberEvent {
-        StrippedRoomMemberEvent {
-            content: assign!(RoomMemberEventContent::new(MembershipState::Join), {
+    fn make_stripped_member_event(user_id: &UserId, name: &str) -> Raw<StrippedRoomMemberEvent> {
+        let ev_json = json!({
+            "type": "m.room.member",
+            "content": assign!(RoomMemberEventContent::new(MembershipState::Join), {
                 displayname: Some(name.to_owned())
             }),
-            sender: user_id.to_owned(),
-            state_key: user_id.to_owned(),
-        }
+            "sender": user_id,
+            "state_key": user_id,
+        });
+
+        Raw::new(&ev_json).unwrap().cast()
     }
 
-    fn make_member_event(user_id: &UserId, name: &str) -> SyncRoomMemberEvent {
-        SyncRoomMemberEvent::Original(OriginalSyncRoomMemberEvent {
-            content: assign!(RoomMemberEventContent::new(MembershipState::Join), {
+    fn make_member_event(user_id: &UserId, name: &str) -> Raw<SyncRoomMemberEvent> {
+        let ev_json = json!({
+            "type": "m.room.member",
+            "content": assign!(RoomMemberEventContent::new(MembershipState::Join), {
                 displayname: Some(name.to_owned())
             }),
-            sender: user_id.to_owned(),
-            state_key: user_id.to_owned(),
-            event_id: event_id!("$h29iv0s1:example.com").to_owned(),
-            origin_server_ts: MilliSecondsSinceUnixEpoch(208u32.into()),
-            unsigned: StateUnsigned::default(),
-        })
+            "sender": user_id,
+            "state_key": user_id,
+            "event_id": "$h29iv0s1:example.com",
+            "origin_server_ts": 208,
+        });
+
+        Raw::new(&ev_json).unwrap().cast()
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn test_display_name_default() {
-        let _ = env_logger::try_init();
         let (_, room) = make_room(RoomType::Joined);
         assert_eq!(room.display_name().await.unwrap(), DisplayName::Empty);
 
@@ -938,9 +882,8 @@ mod test {
         assert_eq!(room.display_name().await.unwrap(), DisplayName::Named("Test Room".to_owned()));
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn test_display_name_dm_invited() {
-        let _ = env_logger::try_init();
         let (store, room) = make_room(RoomType::Invited);
         let room_id = room_id!("!test:localhost");
         let matthew = user_id!("@matthew:example.org");
@@ -950,8 +893,12 @@ mod test {
             heroes: vec![me.to_string(), matthew.to_string()],
         });
 
-        changes.add_stripped_member(room_id, make_stripped_member_event(matthew, "Matthew"));
-        changes.add_stripped_member(room_id, make_stripped_member_event(me, "Me"));
+        changes.add_stripped_member(
+            room_id,
+            matthew,
+            make_stripped_member_event(matthew, "Matthew"),
+        );
+        changes.add_stripped_member(room_id, me, make_stripped_member_event(me, "Me"));
         store.save_changes(&changes).await.unwrap();
 
         room.inner.write().unwrap().update_summary(&summary);
@@ -961,17 +908,20 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn test_display_name_dm_invited_no_heroes() {
-        let _ = env_logger::try_init();
         let (store, room) = make_room(RoomType::Invited);
         let room_id = room_id!("!test:localhost");
         let matthew = user_id!("@matthew:example.org");
         let me = user_id!("@me:example.org");
         let mut changes = StateChanges::new("".to_owned());
 
-        changes.add_stripped_member(room_id, make_stripped_member_event(matthew, "Matthew"));
-        changes.add_stripped_member(room_id, make_stripped_member_event(me, "Me"));
+        changes.add_stripped_member(
+            room_id,
+            matthew,
+            make_stripped_member_event(matthew, "Matthew"),
+        );
+        changes.add_stripped_member(room_id, me, make_stripped_member_event(me, "Me"));
         store.save_changes(&changes).await.unwrap();
 
         assert_eq!(
@@ -980,9 +930,8 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn test_display_name_dm_joined() {
-        let _ = env_logger::try_init();
         let (store, room) = make_room(RoomType::Joined);
         let room_id = room_id!("!test:localhost");
         let matthew = user_id!("@matthew:example.org");
@@ -1012,9 +961,8 @@ mod test {
         );
     }
 
-    #[tokio::test]
+    #[async_test]
     async fn test_display_name_dm_joined_no_heroes() {
-        let _ = env_logger::try_init();
         let (store, room) = make_room(RoomType::Joined);
         let room_id = room_id!("!test:localhost");
         let matthew = user_id!("@matthew:example.org");
@@ -1038,9 +986,9 @@ mod test {
             DisplayName::Calculated("Matthew".to_owned())
         );
     }
-    #[tokio::test]
+
+    #[async_test]
     async fn test_display_name_dm_alone() {
-        let _ = env_logger::try_init();
         let (store, room) = make_room(RoomType::Joined);
         let room_id = room_id!("!test:localhost");
         let matthew = user_id!("@matthew:example.org");
