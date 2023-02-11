@@ -36,18 +36,12 @@ jobs:
 
       - name: Install rust stable toolchain
         if: steps.xtask-cache.outputs.cache-hit != 'true'
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build
         if: steps.xtask-cache.outputs.cache-hit != 'true'
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: -p xtask
+        run: |
+          cargo build -p xtask
 
   test-matrix-sdk-features:
     name: 🐧 [m], ${{ matrix.name }}
@@ -73,14 +67,10 @@ jobs:
         uses: actions/checkout@v1
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -92,10 +82,8 @@ jobs:
           key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci test-features ${{ matrix.name }}
+        run: |
+          cargo run -p xtask -- ci test-features ${{ matrix.name }}
 
   test-matrix-sdk-examples:
     name: 🐧 [m]-examples
@@ -108,14 +96,10 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -127,10 +111,8 @@ jobs:
           key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci examples
+        run: |
+          cargo run -p xtask -- ci examples
 
   test-matrix-sdk-crypto:
     name: 🐧 [m]-crypto
@@ -143,14 +125,10 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -162,10 +140,8 @@ jobs:
           key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci test-crypto
+        run: |
+          cargo run -p xtask -- ci test-crypto
 
   test-all-crates:
     name: ${{ matrix.name }}
@@ -197,30 +173,33 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Can't use `${{ matrix.* }}` inside uses
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
+        if: matrix.rust == 'stable'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust
+        if: matrix.rust == 'beta'
+        uses: dtolnay/rust-toolchain@beta
+
+      - name: Install Rust
+        if: matrix.rust == 'nightly'
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: nextest
-          args: run --workspace --exclude matrix-sdk-integration-testing --exclude sliding-sync-integration-test
+        run: |
+          cargo nextest run --workspace \
+            --exclude matrix-sdk-integration-testing --exclude sliding-sync-integration-test
 
       - name: Test documentation
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --doc
+        run: |
+          cargo test --doc
 
   test-wasm:
     name: 🕸️ ${{ matrix.name }}
@@ -265,13 +244,10 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown
           components: clippy
-          profile: minimal
-          override: true
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
@@ -279,7 +255,7 @@ jobs:
           version: v0.10.3
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -291,16 +267,12 @@ jobs:
           key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Rust Check
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci wasm ${{ matrix.cmd }}
+        run: |
+          cargo run -p xtask -- ci wasm ${{ matrix.cmd }}
 
       - name: Wasm-Pack test
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci wasm-pack ${{ matrix.cmd }}
+        run: |
+          cargo run -p xtask -- ci wasm-pack ${{ matrix.cmd }}
 
   test-appservice:
     name: ${{ matrix.os-name }} [m]-appservice
@@ -323,14 +295,10 @@ jobs:
         uses: actions/checkout@v1
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -342,10 +310,8 @@ jobs:
           key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Run checks
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci test-appservice
+        run: |
+          cargo run -p xtask -- ci test-appservice
 
   formatting:
     name: Check Formatting
@@ -357,18 +323,13 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
           components: rustfmt
-          profile: minimal
-          override: true
 
       - name: Cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: -- --check
+        run: |
+          cargo fmt -- --check
 
   typos:
     name: Spell Check with Typos
@@ -398,15 +359,12 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly
           components: clippy
-          profile: minimal
-          override: true
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Get xtask
         uses: actions/cache@v3
@@ -415,10 +373,8 @@ jobs:
           key: xtask-${{ hashFiles('xtask/**') }}
 
       - name: Clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p xtask -- ci clippy
+        run: |
+          cargo run -p xtask -- ci clippy
 
   integration-tests:
     name: Integration test
@@ -431,14 +387,10 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -454,10 +406,8 @@ jobs:
           disableRateLimiting: true
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: nextest
-          args: run -p matrix-sdk-integration-testing
+        run: |
+          cargo nextest run -p matrix-sdk-integration-testing
 
 
   sliding-sync-integration-tests:
@@ -493,14 +443,10 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Load cache
-        uses: Swatinem/rust-cache@v1
+        uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -526,7 +472,5 @@ jobs:
           options: '-e "SYNCV3_SERVER=http://locahost:8228" -e "SYNCV3_SECRET=SUPER_CI_SECRET" -e "SYNCV3_BINDADDR=:8118" -e "SYNCV3_DB=user=postgres password=postgres dbname=syncv3 sslmode=disable host=postgres" -p 8118:8118'
 
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: nextest
-          args: run -p sliding-sync-integration-tests
+        run: |
+          cargo nextest run -p sliding-sync-integration-tests
