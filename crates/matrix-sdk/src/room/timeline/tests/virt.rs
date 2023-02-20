@@ -1,88 +1,74 @@
 use assert_matches::assert_matches;
 use chrono::{Datelike, Local, TimeZone};
-use futures_signals::signal_vec::VecDiff;
+use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk_test::async_test;
 use ruma::{
     event_id,
     events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
 };
-use serde_json::json;
 
 use super::{TestTimeline, ALICE, BOB};
-use crate::room::timeline::VirtualTimelineItem;
+use crate::room::timeline::{TimelineItem, VirtualTimelineItem};
 
 #[async_test]
 async fn day_divider() {
     let timeline = TestTimeline::new();
-    let mut stream = timeline.stream();
+    let mut stream = timeline.subscribe().await;
 
     timeline
-        .handle_live_custom_event(json!({
-            "content": {
-                "msgtype": "m.text",
-                "body": "This is a first message on the first day"
-            },
-            "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
-            "origin_server_ts": 1669897395000u64,
-            "sender": "@alice:example.org",
-            "type": "m.room.message",
-        }))
+        .handle_live_message_event(
+            *ALICE,
+            RoomMessageEventContent::text_plain("This is a first message on the first day"),
+        )
         .await;
 
-    let day_divider = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let day_divider =
+        assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     let ts = assert_matches!(
         day_divider.as_virtual().unwrap(),
         VirtualTimelineItem::DayDivider(ts) => *ts
     );
     let date = Local.timestamp_millis_opt(ts.0.into()).single().unwrap();
-    assert_eq!(date.year(), 2022);
-    assert_eq!(date.month(), 12);
+    assert_eq!(date.year(), 1970);
+    assert_eq!(date.month(), 1);
     assert_eq!(date.day(), 1);
 
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     item.as_event().unwrap();
 
     timeline
-        .handle_live_custom_event(json!({
-            "content": {
-                "msgtype": "m.text",
-                "body": "This is a second message on the first day"
-            },
-            "event_id": "$feG0HA0FAZ37wP8kXlNkxx3I",
-            "origin_server_ts": 1669906604000u64,
-            "sender": "@alice:example.org",
-            "type": "m.room.message",
-        }))
+        .handle_live_message_event(
+            *ALICE,
+            RoomMessageEventContent::text_plain("This is a second message on the first day"),
+        )
         .await;
 
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     item.as_event().unwrap();
 
+    // Timestamps start at unix epoch, advance to one day later
+    timeline.set_next_ts(24 * 60 * 60 * 1000);
+
     timeline
-        .handle_live_custom_event(json!({
-            "content": {
-                "msgtype": "m.text",
-                "body": "This is a first message on the next day"
-            },
-            "event_id": "$geG0HA0FAZ37wP8kXlNkxx3I",
-            "origin_server_ts": 1669992963000u64,
-            "sender": "@alice:example.org",
-            "type": "m.room.message",
-        }))
+        .handle_live_message_event(
+            *ALICE,
+            RoomMessageEventContent::text_plain("This is a first message on the next day"),
+        )
         .await;
 
-    let day_divider = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let day_divider =
+        assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     let ts = assert_matches!(
         day_divider.as_virtual().unwrap(),
         VirtualTimelineItem::DayDivider(ts) => *ts
     );
     let date = Local.timestamp_millis_opt(ts.0.into()).single().unwrap();
-    assert_eq!(date.year(), 2022);
-    assert_eq!(date.month(), 12);
+    assert_eq!(date.year(), 1970);
+    assert_eq!(date.month(), 1);
     assert_eq!(date.day(), 2);
 
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     item.as_event().unwrap();
 
     let _ = timeline
@@ -93,33 +79,39 @@ async fn day_divider() {
 
     // The other events are in the past so a local event always creates a new day
     // divider.
-    let day_divider = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let day_divider =
+        assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     assert_matches!(day_divider.as_virtual().unwrap(), VirtualTimelineItem::DayDivider { .. });
 
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     item.as_event().unwrap();
 }
 
 #[async_test]
 async fn update_read_marker() {
     let timeline = TestTimeline::new();
-    let mut stream = timeline.stream();
+    let mut stream = timeline.subscribe().await;
 
     timeline.handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("A")).await;
-    let _day_divider = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let _day_divider =
+        assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     let event_id = item.as_event().unwrap().event_id().unwrap().to_owned();
 
     timeline.inner.set_fully_read_event(event_id).await;
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item =
+        assert_matches!(stream.next().await, Some(VectorDiff::Insert { index: 2, value }) => value);
     assert_matches!(item.as_virtual(), Some(VirtualTimelineItem::ReadMarker));
 
     timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("B")).await;
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     let event_id = item.as_event().unwrap().event_id().unwrap().to_owned();
 
     timeline.inner.set_fully_read_event(event_id.clone()).await;
-    assert_matches!(stream.next().await, Some(VecDiff::Move { old_index: 2, new_index: 3 }));
+    assert_matches!(stream.next().await, Some(VectorDiff::Remove { index: 2 }));
+    let marker =
+        assert_matches!(stream.next().await, Some(VectorDiff::Insert { index: 3, value }) => value);
+    assert_matches!(*marker, TimelineItem::Virtual(VirtualTimelineItem::ReadMarker));
 
     // Nothing should happen if the fully read event is set back to the same event
     // as before.
@@ -133,9 +125,12 @@ async fn update_read_marker() {
     timeline.inner.set_fully_read_event(event_id).await;
 
     timeline.handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("C")).await;
-    let item = assert_matches!(stream.next().await, Some(VecDiff::Push { value }) => value);
+    let item = assert_matches!(stream.next().await, Some(VectorDiff::PushBack { value }) => value);
     let event_id = item.as_event().unwrap().event_id().unwrap().to_owned();
 
     timeline.inner.set_fully_read_event(event_id).await;
-    assert_matches!(stream.next().await, Some(VecDiff::Move { old_index: 3, new_index: 4 }));
+    assert_matches!(stream.next().await, Some(VectorDiff::Remove { index: 3 }));
+    let marker =
+        assert_matches!(stream.next().await, Some(VectorDiff::Insert { index: 4, value }) => value);
+    assert_matches!(*marker, TimelineItem::Virtual(VirtualTimelineItem::ReadMarker));
 }
