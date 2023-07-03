@@ -9,12 +9,13 @@ use matrix_sdk::{
     Client as MatrixClient, ClientBuilder as MatrixClientBuilder,
 };
 use sanitize_filename_reader_friendly::sanitize;
+use url::Url;
 use zeroize::Zeroizing;
 
-use super::{client::Client, ClientState, RUNTIME};
-use crate::helpers::unwrap_or_clone_arc;
+use super::{client::Client, RUNTIME};
+use crate::{error::ClientError, helpers::unwrap_or_clone_arc};
 
-#[derive(Clone)]
+#[derive(Clone, uniffi::Object)]
 pub struct ClientBuilder {
     base_path: Option<String>,
     username: Option<String>,
@@ -24,11 +25,18 @@ pub struct ClientBuilder {
     passphrase: Zeroizing<Option<String>>,
     user_agent: Option<String>,
     sliding_sync_proxy: Option<String>,
+    proxy: Option<String>,
+    disable_ssl_verification: bool,
     inner: MatrixClientBuilder,
 }
 
 #[uniffi::export]
 impl ClientBuilder {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
     pub fn base_path(self: Arc<Self>, path: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.base_path = Some(path);
@@ -76,24 +84,26 @@ impl ClientBuilder {
         builder.sliding_sync_proxy = sliding_sync_proxy;
         Arc::new(builder)
     }
+
+    pub fn proxy(self: Arc<Self>, url: String) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.proxy = Some(url);
+        Arc::new(builder)
+    }
+
+    pub fn disable_ssl_verification(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_ssl_verification = true;
+        Arc::new(builder)
+    }
+
+    pub fn build(self: Arc<Self>) -> Result<Arc<Client>, ClientError> {
+        Ok(self.build_inner()?)
+    }
 }
 
 impl ClientBuilder {
-    pub fn new() -> Self {
-        Self {
-            base_path: None,
-            username: None,
-            server_name: None,
-            homeserver_url: None,
-            server_versions: None,
-            passphrase: Zeroizing::new(None),
-            user_agent: None,
-            sliding_sync_proxy: None,
-            inner: MatrixClient::builder(),
-        }
-    }
-
-    pub fn build(self: Arc<Self>) -> anyhow::Result<Arc<Client>> {
+    pub(crate) fn build_inner(self: Arc<Self>) -> anyhow::Result<Arc<Client>> {
         let builder = unwrap_or_clone_arc(self);
         let mut inner_builder = builder.inner;
 
@@ -102,7 +112,7 @@ impl ClientBuilder {
             let data_path = PathBuf::from(base_path).join(sanitize(username));
             fs::create_dir_all(&data_path)?;
 
-            inner_builder = inner_builder.sled_store(data_path, builder.passphrase.as_deref());
+            inner_builder = inner_builder.sqlite_store(&data_path, builder.passphrase.as_deref());
         }
 
         // Determine server either from URL, server name or user ID.
@@ -120,6 +130,14 @@ impl ClientBuilder {
             ));
         }
 
+        if let Some(proxy) = builder.proxy {
+            inner_builder = inner_builder.proxy(proxy);
+        }
+
+        if builder.disable_ssl_verification {
+            inner_builder = inner_builder.disable_ssl_verification();
+        }
+
         if let Some(user_agent) = builder.user_agent {
             inner_builder = inner_builder.user_agent(user_agent);
         }
@@ -133,17 +151,45 @@ impl ClientBuilder {
             );
         }
 
-        RUNTIME.block_on(async move {
-            let client = inner_builder.build().await?;
-            let c = Client::new(client, ClientState::default());
-            c.set_sliding_sync_proxy(builder.sliding_sync_proxy);
-            Ok(Arc::new(c))
-        })
+        let sdk_client = RUNTIME.block_on(async move { inner_builder.build().await })?;
+
+        // At this point, `sdk_client` might contain a `sliding_sync_proxy` that has
+        // been configured by the homeserver (if it's a `ServerName` and the
+        // `.well-known` file is filled as expected).
+        //
+        // If `builder.sliding_sync_proxy` contains `Some(_)`, it means one wants to
+        // overwrite this value. It would be an error to call
+        // `sdk_client.set_sliding_sync_proxy()` with `None`, as it would erase the
+        // `sliding_sync_proxy` if any, and it's not the intended behavior.
+        //
+        // So let's call `sdk_client.set_sliding_sync_proxy()` if and only if there is
+        // `Some(_)` value in `builder.sliding_sync_proxy`. That's really important: It
+        // might not break an existing app session, but it is likely to break a new
+        // session, which not immediate to detect if there is no test.
+        if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
+            sdk_client.set_sliding_sync_proxy(Some(Url::parse(&sliding_sync_proxy)?));
+        }
+
+        let client = Client::new(sdk_client);
+
+        Ok(Arc::new(client))
     }
 }
 
 impl Default for ClientBuilder {
     fn default() -> Self {
-        Self::new()
+        Self {
+            base_path: None,
+            username: None,
+            server_name: None,
+            homeserver_url: None,
+            server_versions: None,
+            passphrase: Zeroizing::new(None),
+            user_agent: None,
+            sliding_sync_proxy: None,
+            proxy: None,
+            disable_ssl_verification: false,
+            inner: MatrixClient::builder(),
+        }
     }
 }

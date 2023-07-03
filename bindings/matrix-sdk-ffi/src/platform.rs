@@ -98,7 +98,13 @@ pub fn create_otlp_tracer(
 fn setup_tracing_helper(configuration: String, colors: bool) {
     tracing_subscriber::registry()
         .with(EnvFilter::new(configuration))
-        .with(fmt::layer().with_ansi(colors).with_writer(io::stderr))
+        .with(
+            fmt::layer()
+                .with_file(true)
+                .with_line_number(true)
+                .with_ansi(colors)
+                .with_writer(io::stderr),
+        )
         .init();
 }
 
@@ -111,12 +117,18 @@ fn setup_otlp_tracing_helper(
     password: String,
     otlp_endpoint: String,
 ) -> anyhow::Result<()> {
-    let otlp_tracer = super::create_otlp_tracer(user, password, otlp_endpoint, client_name)?;
+    let otlp_tracer = create_otlp_tracer(user, password, otlp_endpoint, client_name)?;
     let otlp_layer = tracing_opentelemetry::layer().with_tracer(otlp_tracer);
 
     tracing_subscriber::registry()
         .with(EnvFilter::new(configuration))
-        .with(fmt::layer().with_ansi(colors).with_writer(io::stderr))
+        .with(
+            fmt::layer()
+                .with_file(true)
+                .with_line_number(true)
+                .with_ansi(colors)
+                .with_writer(io::stderr),
+        )
         .with(otlp_layer)
         .init();
 

@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use matrix_sdk::{self, config::SyncSettings, ruma::OwnedRoomId, Client};
+use matrix_sdk_ui::timeline::RoomExt;
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -32,8 +33,10 @@ struct Cli {
 }
 
 async fn login(cli: Cli) -> Result<Client> {
-    let mut builder =
-        Client::builder().homeserver_url(cli.homeserver).sled_store("./", Some("some password"));
+    // Note that when encryption is enabled, you should use a persistent store to be
+    // able to restore the session with a working encryption setup.
+    // See the `persist_session` example.
+    let mut builder = Client::builder().homeserver_url(cli.homeserver);
 
     if let Some(proxy) = cli.proxy {
         builder = builder.proxy(proxy);
@@ -42,6 +45,7 @@ async fn login(cli: Cli) -> Result<Client> {
     let client = builder.build().await?;
 
     client
+        .matrix_auth()
         .login_username(&cli.user_name, &cli.password)
         .initial_device_display_name("rust-sdk")
         .await?;

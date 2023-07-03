@@ -28,11 +28,11 @@ use std::{
     sync::Arc,
 };
 
-use matrix_sdk_common::locks::RwLock;
 use ruma::{
     api::client::backup::RoomKeyBackup, serde::Raw, DeviceId, DeviceKeyAlgorithm, OwnedDeviceId,
     OwnedRoomId, OwnedTransactionId, TransactionId,
 };
+use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
@@ -44,8 +44,7 @@ use crate::{
 
 mod keys;
 
-pub use keys::{DecodeError, MegolmV1BackupKey};
-pub use olm_rs::errors::OlmPkDecryptionError;
+pub use keys::{DecodeError, DecryptionError, MegolmV1BackupKey};
 
 /// A state machine that handles backing up room keys.
 ///
@@ -161,7 +160,7 @@ impl BackupMachine {
 
     /// Are we able to back up room keys to the server?
     pub async fn enabled(&self) -> bool {
-        self.backup_key.read().await.as_ref().map(|b| b.backup_version().is_some()).unwrap_or(false)
+        self.backup_key.read().await.as_ref().is_some_and(|b| b.backup_version().is_some())
     }
 
     /// Check if our own device has signed the given signed JSON payload.

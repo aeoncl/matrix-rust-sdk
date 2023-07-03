@@ -74,8 +74,10 @@ impl ToDeviceRequest {
     /// * `recipient_device` - The device that should receive this to-device
     /// event, or all devices.
     ///
+    /// * `event_type` - The type of the event content that is getting sent out.
+    ///
     /// * `content` - The content of the to-device event.
-    pub(crate) fn new(
+    pub fn new(
         recipient: &UserId,
         recipient_device: impl Into<DeviceIdOrAllDevices>,
         event_type: &str,
@@ -91,11 +93,11 @@ impl ToDeviceRequest {
     pub(crate) fn for_recipients(
         recipient: &UserId,
         recipient_devices: Vec<OwnedDeviceId>,
-        content: AnyToDeviceEventContent,
+        content: &AnyToDeviceEventContent,
         txn_id: OwnedTransactionId,
     ) -> Self {
         let event_type = content.event_type();
-        let raw_content = Raw::new(&content).expect("Failed to serialize to-device event");
+        let raw_content = Raw::new(content).expect("Failed to serialize to-device event");
 
         if recipient_devices.is_empty() {
             Self::new(
@@ -132,11 +134,11 @@ impl ToDeviceRequest {
     pub(crate) fn with_id(
         recipient: &UserId,
         recipient_device: impl Into<DeviceIdOrAllDevices>,
-        content: AnyToDeviceEventContent,
+        content: &AnyToDeviceEventContent,
         txn_id: OwnedTransactionId,
     ) -> Self {
         let event_type = content.event_type();
-        let raw_content = Raw::new(&content).expect("Failed to serialize to-device event");
+        let raw_content = Raw::new(content).expect("Failed to serialize to-device event");
 
         let user_messages = iter::once((recipient_device.into(), raw_content)).collect();
         let messages = iter::once((recipient.to_owned(), user_messages)).collect();
@@ -192,7 +194,9 @@ pub struct KeysQueryRequest {
 }
 
 impl KeysQueryRequest {
-    pub(crate) fn new(device_keys: BTreeMap<OwnedUserId, Vec<OwnedDeviceId>>) -> Self {
+    pub(crate) fn new(users: impl Iterator<Item = OwnedUserId>) -> Self {
+        let device_keys = users.map(|u| (u, Vec::new())).collect();
+
         Self { timeout: None, device_keys, token: None }
     }
 }

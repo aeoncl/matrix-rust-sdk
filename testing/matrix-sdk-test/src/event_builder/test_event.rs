@@ -18,6 +18,7 @@ pub enum TimelineTestEvent {
     HistoryVisibility,
     JoinRules,
     Member,
+    MemberBan,
     MemberInvite,
     MemberNameChange,
     MessageEdit,
@@ -47,6 +48,7 @@ impl TimelineTestEvent {
             Self::HistoryVisibility => test_json::sync_events::HISTORY_VISIBILITY.to_owned(),
             Self::JoinRules => test_json::sync_events::JOIN_RULES.to_owned(),
             Self::Member => test_json::sync_events::MEMBER.to_owned(),
+            Self::MemberBan => test_json::sync_events::MEMBER_BAN.to_owned(),
             Self::MemberInvite => test_json::sync_events::MEMBER_INVITE.to_owned(),
             Self::MemberNameChange => test_json::sync_events::MEMBER_NAME_CHANGE.to_owned(),
             Self::MessageEdit => test_json::sync_events::MESSAGE_EDIT.to_owned(),
@@ -81,7 +83,10 @@ pub enum StateTestEvent {
     HistoryVisibility,
     JoinRules,
     Member,
+    MemberAdditional,
+    MemberBan,
     MemberInvite,
+    MemberLeave,
     MemberNameChange,
     PowerLevels,
     RedactedInvalid,
@@ -103,7 +108,10 @@ impl StateTestEvent {
             Self::HistoryVisibility => test_json::sync_events::HISTORY_VISIBILITY.to_owned(),
             Self::JoinRules => test_json::sync_events::JOIN_RULES.to_owned(),
             Self::Member => test_json::sync_events::MEMBER.to_owned(),
+            Self::MemberAdditional => test_json::sync_events::MEMBER_ADDITIONAL.to_owned(),
+            Self::MemberBan => test_json::sync_events::MEMBER_BAN.to_owned(),
             Self::MemberInvite => test_json::sync_events::MEMBER_INVITE.to_owned(),
+            Self::MemberLeave => test_json::sync_events::MEMBER_LEAVE.to_owned(),
             Self::MemberNameChange => test_json::sync_events::MEMBER_NAME_CHANGE.to_owned(),
             Self::PowerLevels => test_json::sync_events::POWER_LEVELS.to_owned(),
             Self::RedactedInvalid => test_json::sync_events::REDACTED_INVALID.to_owned(),
@@ -213,6 +221,7 @@ impl PresenceTestEvent {
 
 /// Test events that can be added to the global account data.
 pub enum GlobalAccountDataTestEvent {
+    Direct,
     PushRules,
     Tags,
     Custom(JsonValue),
@@ -222,6 +231,7 @@ impl GlobalAccountDataTestEvent {
     /// Get the JSON representation of this test event.
     pub fn into_json_value(self) -> JsonValue {
         match self {
+            Self::Direct => test_json::sync_events::DIRECT.to_owned(),
             Self::PushRules => test_json::sync_events::PUSH_RULES.to_owned(),
             Self::Tags => test_json::sync_events::TAG.to_owned(),
             Self::Custom(json) => json,

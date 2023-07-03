@@ -32,8 +32,6 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedTransactionId, OwnedUserId, TransactionId, UserId,
 };
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use tracing::error;
 
 use crate::{
     requests::{OutgoingRequest, ToDeviceRequest},
@@ -44,7 +42,8 @@ use crate::{
 };
 
 /// An error describing why a key share request won't be honored.
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[cfg(feature = "automatic-room-key-forwarding")]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum KeyForwardDecision {
     /// The key request is from a device that we don't own, we're only sharing
     /// sessions that we know the requesting device already was supposed to get.
@@ -165,7 +164,7 @@ impl GossipRequest {
                 ToDeviceRequest::with_id(
                     &self.request_recipient,
                     DeviceIdOrAllDevices::AllDevices,
-                    content,
+                    &content,
                     self.request_id.clone(),
                 )
             }
@@ -196,7 +195,7 @@ impl GossipRequest {
         let request = ToDeviceRequest::with_id(
             &self.request_recipient,
             DeviceIdOrAllDevices::AllDevices,
-            content,
+            &content,
             TransactionId::new(),
         );
 
@@ -302,7 +301,7 @@ impl WaitQueue {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "automatic-room-key-forwarding"))]
     fn is_empty(&self) -> bool {
         self.requests_ids_waiting.is_empty() && self.requests_waiting_for_session.is_empty()
     }

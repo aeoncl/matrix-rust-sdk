@@ -77,11 +77,13 @@ impl From<RustSasState> for SasState {
 }
 
 /// Enum representing the different verification flows we support.
+#[derive(uniffi::Object)]
 pub struct Verification {
     pub(crate) inner: InnerVerification,
     pub(crate) runtime: Handle,
 }
 
+#[uniffi::export]
 impl Verification {
     /// Try to represent the `Verification` as an `Sas` verification object,
     /// returns `None` if the verification is not a `Sas` verification.
@@ -105,11 +107,13 @@ impl Verification {
 }
 
 /// The `m.sas.v1` verification flow.
+#[derive(uniffi::Object)]
 pub struct Sas {
     pub(crate) inner: InnerSas,
     pub(crate) runtime: Handle,
 }
 
+#[uniffi::export]
 impl Sas {
     /// Get the user id of the other side.
     pub fn other_user_id(&self) -> String {
@@ -170,7 +174,7 @@ impl Sas {
     /// list of cancel codes can be found in the [spec]
     ///
     /// [spec]: https://spec.matrix.org/unstable/client-server-api/#mkeyverificationcancel
-    pub fn cancel(&self, cancel_code: &str) -> Option<OutgoingVerificationRequest> {
+    pub fn cancel(&self, cancel_code: String) -> Option<OutgoingVerificationRequest> {
         self.inner.cancel_with_code(cancel_code.into()).map(|r| r.into())
     }
 
@@ -248,7 +252,9 @@ impl Sas {
     pub fn state(&self) -> SasState {
         self.inner.state().into()
     }
+}
 
+impl Sas {
     async fn changes_listener(
         mut stream: impl Stream<Item = RustSasState> + std::marker::Unpin,
         listener: Box<dyn SasListener>,
@@ -315,11 +321,13 @@ impl From<QrVerificationState> for QrCodeState {
 
 /// The `m.qr_code.scan.v1`, `m.qr_code.show.v1`, and `m.reciprocate.v1`
 /// verification flow.
+#[derive(uniffi::Object)]
 pub struct QrCode {
     pub(crate) inner: InnerQr,
     pub(crate) runtime: Handle,
 }
 
+#[uniffi::export]
 impl QrCode {
     /// Get the user id of the other side.
     pub fn other_user_id(&self) -> String {
@@ -386,7 +394,7 @@ impl QrCode {
     /// list of cancel codes can be found in the [spec]
     ///
     /// [spec]: https://spec.matrix.org/unstable/client-server-api/#mkeyverificationcancel
-    pub fn cancel(&self, cancel_code: &str) -> Option<OutgoingVerificationRequest> {
+    pub fn cancel(&self, cancel_code: String) -> Option<OutgoingVerificationRequest> {
         self.inner.cancel_with_code(cancel_code.into()).map(|r| r.into())
     }
 
@@ -424,7 +432,9 @@ impl QrCode {
     pub fn state(&self) -> QrCodeState {
         self.inner.state().into()
     }
+}
 
+impl QrCode {
     async fn changes_listener(
         mut stream: impl Stream<Item = QrVerificationState> + std::marker::Unpin,
         listener: Box<dyn QrCodeListener>,
@@ -468,6 +478,7 @@ impl From<RustCancelInfo> for CancelInfo {
 }
 
 /// A result type for starting SAS verifications.
+#[derive(uniffi::Record)]
 pub struct StartSasResult {
     /// The SAS verification object that got created.
     pub sas: Arc<Sas>,
@@ -477,6 +488,7 @@ pub struct StartSasResult {
 }
 
 /// A result type for scanning QR codes.
+#[derive(uniffi::Record)]
 pub struct ScanResult {
     /// The QR code verification object that got created.
     pub qr: Arc<QrCode>,
@@ -486,6 +498,7 @@ pub struct ScanResult {
 }
 
 /// A result type for requesting verifications.
+#[derive(uniffi::Record)]
 pub struct RequestVerificationResult {
     /// The verification request object that got created.
     pub verification: Arc<VerificationRequest>,
@@ -495,6 +508,7 @@ pub struct RequestVerificationResult {
 }
 
 /// A result type for confirming verifications.
+#[derive(uniffi::Record)]
 pub struct ConfirmVerificationResult {
     /// The requests that needs to be sent out to notify the other side that we
     /// confirmed the verification.
@@ -536,33 +550,15 @@ pub enum VerificationRequestState {
     },
 }
 
-impl From<RustVerificationRequestState> for VerificationRequestState {
-    fn from(value: RustVerificationRequestState) -> Self {
-        match value {
-            // The clients do not need to distinguish `Created` and `Requested` state
-            RustVerificationRequestState::Created { .. } => Self::Requested,
-            RustVerificationRequestState::Requested { .. } => Self::Requested,
-            RustVerificationRequestState::Ready {
-                their_methods,
-                our_methods,
-                other_device_id: _,
-            } => Self::Ready {
-                their_methods: their_methods.iter().map(|m| m.to_string()).collect(),
-                our_methods: our_methods.iter().map(|m| m.to_string()).collect(),
-            },
-            RustVerificationRequestState::Done => Self::Done,
-            RustVerificationRequestState::Cancelled(c) => Self::Cancelled { cancel_info: c.into() },
-        }
-    }
-}
-
 /// The verificatoin request object which then can transition into some concrete
 /// verification method
+#[derive(uniffi::Object)]
 pub struct VerificationRequest {
     pub(crate) inner: InnerVerificationRequest,
     pub(crate) runtime: Handle,
 }
 
+#[uniffi::export]
 impl VerificationRequest {
     /// The id of the other user that is participating in this verification
     /// request.
@@ -709,7 +705,7 @@ impl VerificationRequest {
     ///
     /// * `data` - The data that was extracted from the scanned QR code as an
     /// base64 encoded string, without padding.
-    pub fn scan_qr_code(&self, data: &str) -> Option<ScanResult> {
+    pub fn scan_qr_code(&self, data: String) -> Option<ScanResult> {
         let data = STANDARD_NO_PAD.decode(data).ok()?;
         let data = QrVerificationData::from_bytes(data).ok()?;
 
@@ -731,15 +727,57 @@ impl VerificationRequest {
     pub fn set_changes_listener(&self, listener: Box<dyn VerificationRequestListener>) {
         let stream = self.inner.changes();
 
-        self.runtime.spawn(Self::changes_listener(stream, listener));
+        self.runtime.spawn(Self::changes_listener(self.inner.to_owned(), stream, listener));
     }
 
     /// Get the current state of the verification request.
     pub fn state(&self) -> VerificationRequestState {
-        self.inner.state().into()
+        Self::convert_verification_request(&self.inner, self.inner.state())
+    }
+}
+
+impl VerificationRequest {
+    fn convert_verification_request(
+        request: &InnerVerificationRequest,
+        value: RustVerificationRequestState,
+    ) -> VerificationRequestState {
+        match value {
+            // The clients do not need to distinguish `Created` and `Requested` state
+            RustVerificationRequestState::Created { .. } => VerificationRequestState::Requested,
+            RustVerificationRequestState::Requested { .. } => VerificationRequestState::Requested,
+            RustVerificationRequestState::Ready {
+                their_methods,
+                our_methods,
+                other_device_id: _,
+            } => VerificationRequestState::Ready {
+                their_methods: their_methods.iter().map(|m| m.to_string()).collect(),
+                our_methods: our_methods.iter().map(|m| m.to_string()).collect(),
+            },
+            RustVerificationRequestState::Done => VerificationRequestState::Done,
+            RustVerificationRequestState::Transitioned { .. } => {
+                let their_methods = request
+                    .their_supported_methods()
+                    .expect("The transitioned state should know the other side's methods")
+                    .into_iter()
+                    .map(|m| m.to_string())
+                    .collect();
+                let our_methods = request
+                    .our_supported_methods()
+                    .expect("The transitioned state should know our own supported methods")
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect();
+                VerificationRequestState::Ready { their_methods, our_methods }
+            }
+
+            RustVerificationRequestState::Cancelled(c) => {
+                VerificationRequestState::Cancelled { cancel_info: c.into() }
+            }
+        }
     }
 
     async fn changes_listener(
+        request: InnerVerificationRequest,
         mut stream: impl Stream<Item = RustVerificationRequestState> + std::marker::Unpin,
         listener: Box<dyn VerificationRequestListener>,
     ) {
@@ -753,7 +791,9 @@ impl VerificationRequest {
                     | RustVerificationRequestState::Cancelled { .. }
             );
 
-            listener.on_change(state.into());
+            let state = Self::convert_verification_request(&request, state);
+
+            listener.on_change(state);
 
             if should_break {
                 break;

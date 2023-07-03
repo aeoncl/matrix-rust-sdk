@@ -3,19 +3,24 @@
 #[cfg(feature = "qrcode")]
 use std::fmt;
 
+use futures_util::StreamExt;
 #[cfg(feature = "qrcode")]
 use js_sys::Uint8ClampedArray;
-use js_sys::{Array, JsString, Promise};
+use js_sys::{Array, Function, JsString, Promise};
+use matrix_sdk_crypto::VerificationRequestState;
 use ruma::events::key::verification::{
     cancel::CancelCode as RumaCancelCode, VerificationMethod as RumaVerificationMethod,
 };
+use tracing::warn;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     future::future_to_promise,
     identifiers::{DeviceId, RoomId, UserId},
     impl_from_to_inner,
     js::try_array_to_vec,
+    machine::promise_result_to_future,
     requests,
 };
 
@@ -179,32 +184,32 @@ impl Sas {
     }
 
     /// Does this verification flow support displaying emoji for the
-    /// short authentication string.
+    /// short authentication string?
     #[wasm_bindgen(js_name = "supportsEmoji")]
     pub fn supports_emoji(&self) -> bool {
         self.inner.supports_emoji()
     }
 
-    /// Did this verification flow start from a verification request.
+    /// Did this verification flow start from a verification request?
     #[wasm_bindgen(js_name = "startedFromRequest")]
     pub fn started_from_request(&self) -> bool {
         self.inner.started_from_request()
     }
 
-    /// Is this a verification that is veryfying one of our own
-    /// devices.
+    /// Is this a verification that is verifying one of our own
+    /// devices?
     #[wasm_bindgen(js_name = "isSelfVerification")]
     pub fn is_self_verification(&self) -> bool {
         self.inner.is_self_verification()
     }
 
-    /// Have we confirmed that the short auth string matches.
+    /// Have we confirmed that the short auth string matches?
     #[wasm_bindgen(js_name = "haveWeConfirmed")]
     pub fn have_we_confirmed(&self) -> bool {
         self.inner.have_we_confirmed()
     }
 
-    /// Has the verification been accepted by both parties.
+    /// Has the verification been accepted by both parties?
     #[wasm_bindgen(js_name = "hasBeenAccepted")]
     pub fn has_been_accepted(&self) -> bool {
         self.inner.has_been_accepted()
@@ -217,7 +222,8 @@ impl Sas {
         self.inner.cancel_info().map(Into::into)
     }
 
-    /// Did we initiate the verification flow.
+    /// True if we initiated the verification flow (ie, we sent the
+    /// `m.key.verification.request`).
     #[wasm_bindgen(js_name = "weStarted")]
     pub fn we_started(&self) -> bool {
         self.inner.we_started()
@@ -225,9 +231,9 @@ impl Sas {
 
     /// Accept the SAS verification.
     ///
-    /// This does nothing if the verification was already accepted,
-    /// otherwise it returns an `AcceptEventContent` that needs to be
-    /// sent out.
+    /// This does nothing (and returns `undefined`) if the verification was
+    /// already accepted, otherwise it returns an `OutgoingRequest`
+    /// that needs to be sent out.
     pub fn accept(&self) -> Result<JsValue, JsError> {
         self.inner
             .accept()
@@ -243,8 +249,9 @@ impl Sas {
     /// This confirms that the short auth strings match on both sides.
     ///
     /// Does nothing if we’re not in a state where we can confirm the
-    /// short auth string, otherwise returns a `MacEventContent` that
-    /// needs to be sent to the server.
+    /// short auth string.
+    ///
+    /// Returns a `Promise` for an array of `OutgoingRequest`s.
     pub fn confirm(&self) -> Promise {
         let me = self.inner.clone();
 
@@ -256,21 +263,21 @@ impl Sas {
                 .map(JsValue::try_from)
                 .collect::<Result<Array, _>>()?;
 
-            let tuple = Array::new();
-            tuple.set(0, outgoing_verification_requests.into());
-            tuple.set(
-                1,
-                signature_upload_request
-                    .map(|request| requests::SignatureUploadRequest::try_from(&request))
-                    .transpose()?
-                    .into(),
-            );
+            // if a signature upload request was returned, push it onto the end of the array
+            // of OutgoingRequests we just built.
+            if let Some(sig_rq) = signature_upload_request {
+                outgoing_verification_requests
+                    .push(&requests::SignatureUploadRequest::try_from(&sig_rq)?.into());
+            }
 
-            Ok(tuple)
+            Ok(outgoing_verification_requests)
         })
     }
 
     /// Cancel the verification.
+    ///
+    /// Returns either an `OutgoingRequest` which should be sent out, or
+    /// `undefined` if the verification is already cancelled.
     pub fn cancel(&self) -> Result<JsValue, JsError> {
         self.inner
             .cancel()
@@ -284,6 +291,9 @@ impl Sas {
     /// Cancel the verification.
     ///
     /// This cancels the verification with given code.
+    ///
+    /// Returns either an `OutgoingRequest` which should be sent out, or
+    /// `undefined` if the verification is already cancelled.
     #[wasm_bindgen(js_name = "cancelWithCode")]
     pub fn cancel_with_code(&self, code: CancelCode) -> Result<JsValue, JsError> {
         self.inner
@@ -295,25 +305,25 @@ impl Sas {
             .map_err(Into::into)
     }
 
-    /// Has the SAS verification flow timed out.
+    /// Has the SAS verification flow timed out?
     #[wasm_bindgen(js_name = "timedOut")]
     pub fn timed_out(&self) -> bool {
         self.inner.timed_out()
     }
 
-    /// Are we in a state where we can show the short auth string.
+    /// Are we in a state where we can show the short auth string?
     #[wasm_bindgen(js_name = "canBePresented")]
     pub fn can_be_presented(&self) -> bool {
         self.inner.can_be_presented()
     }
 
-    /// Is the SAS flow done.
+    /// Is the SAS flow done?
     #[wasm_bindgen(js_name = "isDone")]
     pub fn is_done(&self) -> bool {
         self.inner.is_done()
     }
 
-    /// Is the SAS flow canceled.
+    /// Is the SAS flow cancelled?
     #[wasm_bindgen(js_name = "isCancelled")]
     pub fn is_cancelled(&self) -> bool {
         self.inner.is_cancelled()
@@ -322,7 +332,7 @@ impl Sas {
     /// Get the emoji version of the short auth string.
     ///
     /// Returns `undefined` if we can't yet present the short auth string,
-    /// otherwise seven tuples containing the emoji and description.
+    /// otherwise an array of seven `Emoji` objects.
     pub fn emoji(&self) -> Option<Array> {
         Some(
             self.inner
@@ -361,6 +371,21 @@ impl Sas {
 
         Some(out)
     }
+
+    /// Register a callback which will be called whenever there is an update to
+    /// the request.
+    ///
+    /// The `callback` is called with no parameters.
+    #[wasm_bindgen(js_name = "registerChangesCallback")]
+    pub fn register_changes_callback(&self, callback: Function) {
+        let stream = self.inner.changes();
+
+        // fire up a promise chain which will call `callback` on each result from the
+        // stream
+        spawn_local(async move {
+            stream.for_each(|_| send_change_info_to_callback(&callback)).await;
+        });
+    }
 }
 
 /// QR code based verification.
@@ -387,7 +412,7 @@ impl Qr {
         self.inner.has_been_scanned()
     }
 
-    /// Has the scanning of the QR code been confirmed by us.
+    /// Has the scanning of the QR code been confirmed by us?
     #[wasm_bindgen(js_name = "hasBeenConfirmed")]
     pub fn has_been_confirmed(&self) -> bool {
         self.inner.has_been_confirmed()
@@ -412,7 +437,7 @@ impl Qr {
         self.inner.other_device_id().to_owned().into()
     }
 
-    /// Did we initiate the verification request.
+    /// Did we initiate the verification request?
     #[wasm_bindgen(js_name = "weStarted")]
     pub fn we_started(&self) -> bool {
         self.inner.we_started()
@@ -425,26 +450,26 @@ impl Qr {
         self.inner.cancel_info().map(Into::into)
     }
 
-    /// Has the verification flow completed.
+    /// Has the verification flow completed?
     #[wasm_bindgen(js_name = "isDone")]
     pub fn is_done(&self) -> bool {
         self.inner.is_done()
     }
 
-    /// Has the verification flow been cancelled.
+    /// Has the verification flow been cancelled?
     #[wasm_bindgen(js_name = "isCancelled")]
     pub fn is_cancelled(&self) -> bool {
         self.inner.is_cancelled()
     }
 
-    /// Is this a verification that is veryfying one of our own devices.
+    /// Is this a verification that is verifying one of our own devices?
     #[wasm_bindgen(js_name = "isSelfVerification")]
     pub fn is_self_verification(&self) -> bool {
         self.inner.is_self_verification()
     }
 
     /// Have we successfully scanned the QR code and are able to send
-    /// a reciprocation event.
+    /// a reciprocation event?
     pub fn reciprocated(&self) -> bool {
         self.inner.reciprocated()
     }
@@ -471,6 +496,8 @@ impl Qr {
     ///
     /// The `to_bytes` method can be used to instead output the raw
     /// bytes that should be encoded as a QR code.
+    ///
+    /// Returns a `QrCode`.
     #[wasm_bindgen(js_name = "toQrCode")]
     pub fn to_qr_code(&self) -> Result<QrCode, JsError> {
         Ok(self.inner.to_qr_code().map(Into::into)?)
@@ -507,6 +534,9 @@ impl Qr {
     }
 
     /// Confirm that the other side has scanned our QR code.
+    ///
+    /// Returns either an `OutgoingRequest` which should be sent out, or
+    /// `undefined` if the verification is already confirmed.
     #[wasm_bindgen(js_name = "confirmScanning")]
     pub fn confirm_scanning(&self) -> Result<JsValue, JsError> {
         self.inner
@@ -519,6 +549,9 @@ impl Qr {
     }
 
     /// Cancel the verification flow.
+    ///
+    /// Returns either an `OutgoingRequest` which should be sent out, or
+    /// `undefined` if the verification is already cancelled.
     pub fn cancel(&self) -> Result<JsValue, JsError> {
         self.inner
             .cancel()
@@ -532,6 +565,9 @@ impl Qr {
     /// Cancel the verification.
     ///
     /// This cancels the verification with given code.
+    ///
+    /// Returns either an `OutgoingRequest` which should be sent out, or
+    /// `undefined` if the verification is already cancelled.
     #[wasm_bindgen(js_name = "cancelWithCode")]
     pub fn cancel_with_code(&self, code: CancelCode) -> Result<JsValue, JsError> {
         self.inner
@@ -541,6 +577,21 @@ impl Qr {
             .transpose()
             .map(JsValue::from)
             .map_err(Into::into)
+    }
+
+    /// Register a callback which will be called whenever there is an update to
+    /// the request
+    ///
+    /// The `callback` is called with no parameters.
+    #[wasm_bindgen(js_name = "registerChangesCallback")]
+    pub fn register_changes_callback(&self, callback: Function) {
+        let stream = self.inner.changes();
+
+        // fire up a promise chain which will call `callback` on each result from the
+        // stream
+        spawn_local(async move {
+            stream.for_each(|_| send_change_info_to_callback(&callback)).await;
+        });
     }
 }
 
@@ -837,22 +888,31 @@ impl VerificationRequest {
         self.inner.cancel_info().map(Into::into)
     }
 
-    /// Has the verification request been answered by another device.
+    /// Has the verification request been answered by another device?
     #[wasm_bindgen(js_name = "isPassive")]
     pub fn is_passive(&self) -> bool {
         self.inner.is_passive()
     }
 
-    /// Is the verification request ready to start a verification flow.
+    /// Is the verification request ready to start a verification flow?
     #[wasm_bindgen(js_name = "isReady")]
     pub fn is_ready(&self) -> bool {
         self.inner.is_ready()
     }
 
-    /// Has the verification flow timed out.
+    /// Has the verification flow timed out?
     #[wasm_bindgen(js_name = "timedOut")]
     pub fn timed_out(&self) -> bool {
         self.inner.timed_out()
+    }
+
+    /// The number of milliseconds remaining before this verification flow times
+    /// out.
+    ///
+    /// Returns zero if the time has already passed.
+    #[wasm_bindgen(js_name = "timeRemainingMillis")]
+    pub fn time_remaining_millis(&self) -> f64 {
+        self.inner.time_remaining().as_millis() as f64
     }
 
     /// Get the supported verification methods of the other side.
@@ -891,34 +951,72 @@ impl VerificationRequest {
             .transpose()
     }
 
-    /// Get the unique ID of this verification request
+    /// Get the unique ID of this verification request.
     #[wasm_bindgen(getter, js_name = "flowId")]
     pub fn flow_id(&self) -> String {
         self.inner.flow_id().as_str().to_owned()
     }
 
-    /// Is this a verification that is veryfying one of our own
-    /// devices.
+    /// Is this a verification that is verifying one of our own
+    /// devices?
     #[wasm_bindgen(js_name = "isSelfVerification")]
     pub fn is_self_verification(&self) -> bool {
         self.inner.is_self_verification()
     }
 
-    /// Did we initiate the verification request.
+    /// Did we initiate the verification request?
     #[wasm_bindgen(js_name = "weStarted")]
     pub fn we_started(&self) -> bool {
         self.inner.we_started()
     }
 
     /// Has the verification flow that was started with this request
-    /// finished.
+    /// finished?
     #[wasm_bindgen(js_name = "isDone")]
     pub fn is_done(&self) -> bool {
         self.inner.is_done()
     }
 
+    /// Get the current phase of this request.
+    ///
+    /// Returns a `VerificationRequestPhase`.
+    pub fn phase(&self) -> VerificationRequestPhase {
+        self.inner.state().into()
+    }
+
+    /// If this request has transitioned into a concrete verification
+    /// flow (and not yet been completed or cancelled), returns a `Verification`
+    /// object.
+    ///
+    /// Returns: a `Sas`, a `Qr`, or `undefined`.
+    #[wasm_bindgen(js_name = "getVerification")]
+    pub fn get_verification(&self) -> JsValue {
+        let result: Option<JsValue> =
+            if let VerificationRequestState::Transitioned { verification } = self.inner.state() {
+                Verification(verification).try_into().ok()
+            } else {
+                None
+            };
+        result.into()
+    }
+
+    /// Register a callback which will be called whenever there is an update to
+    /// the request.
+    ///
+    /// The `callback` is called with no parameters.
+    #[wasm_bindgen(js_name = "registerChangesCallback")]
+    pub fn register_changes_callback(&self, callback: Function) {
+        let stream = self.inner.changes();
+
+        // fire up a promise chain which will call `callback` on each result from the
+        // stream
+        spawn_local(async move {
+            stream.for_each(|_| send_change_info_to_callback(&callback)).await;
+        });
+    }
+
     /// Has the verification flow that was started with this request
-    /// been cancelled.
+    /// been cancelled?
     #[wasm_bindgen(js_name = "isCancelled")]
     pub fn is_cancelled(&self) -> bool {
         self.inner.is_cancelled()
@@ -984,6 +1082,8 @@ impl VerificationRequest {
     }
 
     /// Transition from this verification request into a SAS verification flow.
+    ///
+    /// Returns `Promise<[Sas, RoomMessageRequest|ToDeviceRequest] | undefined>`
     #[wasm_bindgen(js_name = "startSas")]
     pub fn start_sas(&self) -> Promise {
         let me = self.inner.clone();
@@ -1068,5 +1168,54 @@ impl TryFrom<OutgoingVerificationRequest> for JsValue {
                 JsValue::from(requests::RoomMessageRequest::try_from((request_id, &request))?)
             }
         })
+    }
+}
+
+/// List of VerificationRequestState phases
+#[wasm_bindgen]
+#[derive(Debug, Clone)]
+pub enum VerificationRequestPhase {
+    /// The verification request has been newly created by us.
+    Created = 0,
+
+    /// The verification request was received from the other party.
+    Requested = 1,
+
+    /// The verification request is ready to start a verification flow.
+    Ready = 2,
+
+    /// The verification request has transitioned into a concrete verification
+    /// flow. For example it transitioned into the emoji based SAS
+    /// verification.
+    Transitioned = 3,
+
+    /// The verification flow that was started with this request has finished.
+    Done = 4,
+
+    /// The verification process has been cancelled.
+    Cancelled = 5,
+}
+
+impl From<VerificationRequestState> for VerificationRequestPhase {
+    fn from(value: VerificationRequestState) -> Self {
+        use matrix_sdk_crypto::VerificationRequestState::*;
+        match value {
+            Created { .. } => Self::Created,
+            Requested { .. } => Self::Requested,
+            Transitioned { .. } => Self::Transitioned,
+            Ready { .. } => Self::Ready,
+            Done => Self::Done,
+            Cancelled(_) => Self::Cancelled,
+        }
+    }
+}
+
+// helper for register_changes_callback: calls the javascript callback
+async fn send_change_info_to_callback(callback: &Function) {
+    match promise_result_to_future(callback.call0(&JsValue::NULL)).await {
+        Ok(_) => (),
+        Err(e) => {
+            warn!("Error calling changes callback: {:?}", e);
+        }
     }
 }

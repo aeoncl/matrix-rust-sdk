@@ -15,15 +15,17 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
-use matrix_sdk_common::{locks::Mutex, AsyncTraitDeps};
+use matrix_sdk_common::AsyncTraitDeps;
 use ruma::{DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId};
+use tokio::sync::Mutex;
 
-use super::{BackupKeys, Changes, CryptoStoreError, Result, RoomKeyCounts};
+use super::{BackupKeys, Changes, CryptoStoreError, Result, RoomKeyCounts, RoomSettings};
 use crate::{
     olm::{
         InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
         Session,
     },
+    types::events::room_key_withheld::RoomKeyWithheldEvent,
     GossipRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
     TrackedUser,
 };
@@ -79,6 +81,17 @@ pub trait CryptoStore: AsyncTraitDeps {
         room_id: &RoomId,
         session_id: &str,
     ) -> Result<Option<InboundGroupSession>, Self::Error>;
+
+    /// Get withheld info for this key.
+    /// Allows to know if the session was not sent on purpose.
+    /// This only returns withheld info sent by the owner of the group session,
+    /// not the one you can get from a response to a key request from
+    /// another of your device.
+    async fn get_withheld_info(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<Option<RoomKeyWithheldEvent>, Self::Error>;
 
     /// Get all the inbound group sessions we have stored.
     async fn get_inbound_group_sessions(&self) -> Result<Vec<InboundGroupSession>, Self::Error>;
@@ -186,6 +199,68 @@ pub trait CryptoStore: AsyncTraitDeps {
         &self,
         request_id: &TransactionId,
     ) -> Result<(), Self::Error>;
+
+    /// Get the room settings, such as the encryption algorithm or whether to
+    /// encrypt only for trusted devices.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room id of the room
+    async fn get_room_settings(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<RoomSettings>, Self::Error>;
+
+    /// Get arbitrary data from the store
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to fetch data for
+    async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Put arbitrary data into the store
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert data into
+    ///
+    /// * `value` - The value to insert
+    async fn set_custom_value(&self, key: &str, value: Vec<u8>) -> Result<(), Self::Error>;
+
+    /// Insert a custom value only if it's missing from the database.
+    ///
+    /// In other words, doesn't do an upsert (insert or update).
+    ///
+    /// Guaranteed to be atomic.
+    async fn insert_custom_value_if_missing(
+        &self,
+        key: &str,
+        new: Vec<u8>,
+    ) -> Result<bool, Self::Error>;
+
+    /// Removes a custom value from the store.
+    ///
+    /// Returns a boolean indicating whether the value was actually present in
+    /// the store.
+    async fn remove_custom_value(&self, key: &str) -> Result<bool, Self::Error>;
+
+    /// Try to take a leased lock.
+    ///
+    /// This attempts to take a lock for the given lease duration.
+    ///
+    /// - If we already had the lease, this will extend the lease.
+    /// - If we didn't, but the previous lease has expired, we will acquire the
+    ///   lock.
+    /// - If there was no previous lease, we will acquire the lock.
+    /// - Otherwise, we don't get the lock.
+    ///
+    /// Returns whether taking the lock succeeded.
+    async fn try_take_leased_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> Result<bool, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -311,6 +386,47 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
 
     async fn delete_outgoing_secret_requests(&self, request_id: &TransactionId) -> Result<()> {
         self.0.delete_outgoing_secret_requests(request_id).await.map_err(Into::into)
+    }
+
+    async fn get_withheld_info(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<Option<RoomKeyWithheldEvent>, Self::Error> {
+        self.0.get_withheld_info(room_id, session_id).await.map_err(Into::into)
+    }
+
+    async fn get_room_settings(&self, room_id: &RoomId) -> Result<Option<RoomSettings>> {
+        self.0.get_room_settings(room_id).await.map_err(Into::into)
+    }
+
+    async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.get_custom_value(key).await.map_err(Into::into)
+    }
+
+    async fn set_custom_value(&self, key: &str, value: Vec<u8>) -> Result<(), Self::Error> {
+        self.0.set_custom_value(key, value).await.map_err(Into::into)
+    }
+
+    async fn insert_custom_value_if_missing(
+        &self,
+        key: &str,
+        new: Vec<u8>,
+    ) -> Result<bool, Self::Error> {
+        self.0.insert_custom_value_if_missing(key, new).await.map_err(Into::into)
+    }
+
+    async fn remove_custom_value(&self, key: &str) -> Result<bool, Self::Error> {
+        self.0.remove_custom_value(key).await.map_err(Into::into)
+    }
+
+    async fn try_take_leased_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> Result<bool, Self::Error> {
+        self.0.try_take_leased_lock(lease_duration_ms, key, holder).await.map_err(Into::into)
     }
 }
 

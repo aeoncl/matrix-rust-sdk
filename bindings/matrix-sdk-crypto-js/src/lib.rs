@@ -17,9 +17,6 @@
 #![warn(missing_docs, missing_debug_implementations)]
 // triggered by wasm_bindgen code
 #![allow(clippy::drop_non_drop)]
-// Triggers false positives.
-// See <https://github.com/rust-lang/rust-clippy/issues/10319>.
-#![allow(clippy::extra_unused_type_parameters)]
 
 pub mod attachment;
 pub mod device;
@@ -41,7 +38,29 @@ pub mod types;
 pub mod verification;
 pub mod vodozemac;
 
+use js_sys::JsString;
 use wasm_bindgen::prelude::*;
+
+/// Object containing the versions of the Rust libraries we are using.
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Debug)]
+pub struct Versions {
+    /// The version of the vodozemac crate.
+    #[wasm_bindgen(readonly)]
+    pub vodozemac: JsString,
+    /// The version of the matrix-sdk-crypto crate.
+    #[wasm_bindgen(readonly)]
+    pub matrix_sdk_crypto: JsString,
+}
+
+/// Get the versions of the Rust libraries we are using.
+#[wasm_bindgen(js_name = "getVersions")]
+pub fn get_versions() -> Versions {
+    Versions {
+        vodozemac: matrix_sdk_crypto::vodozemac::VERSION.into(),
+        matrix_sdk_crypto: matrix_sdk_crypto::VERSION.into(),
+    }
+}
 
 /// Run some stuff when the Wasm module is instantiated.
 ///

@@ -1,10 +1,13 @@
+#![allow(clippy::assign_op_pattern)] // triggered by bitflags! usage
+
 mod members;
 mod normal;
 
 use std::{collections::HashSet, fmt};
 
+use bitflags::bitflags;
 pub use members::RoomMember;
-pub use normal::{Room, RoomInfo, RoomType};
+pub use normal::{Room, RoomInfo, RoomState, RoomStateFilter};
 use ruma::{
     assign,
     events::{
@@ -13,9 +16,9 @@ use ruma::{
             create::RoomCreateEventContent, encryption::RoomEncryptionEventContent,
             guest_access::RoomGuestAccessEventContent,
             history_visibility::RoomHistoryVisibilityEventContent,
-            join_rules::RoomJoinRulesEventContent, name::RoomNameEventContent,
-            redaction::OriginalSyncRoomRedactionEvent, tombstone::RoomTombstoneEventContent,
-            topic::RoomTopicEventContent,
+            join_rules::RoomJoinRulesEventContent, member::MembershipState,
+            name::RoomNameEventContent, redaction::OriginalSyncRoomRedactionEvent,
+            tombstone::RoomTombstoneEventContent, topic::RoomTopicEventContent,
         },
         AnyStrippedStateEvent, AnySyncStateEvent, RedactContent, RedactedStateEventContent,
         StaticStateEventContent, SyncStateEvent,
@@ -246,7 +249,7 @@ where
     C::Redacted: RedactedStateEventContent,
 {
     fn has_event_id(&self, ev_id: &EventId) -> bool {
-        self.as_ref().and_then(|ev| ev.event_id()).map_or(false, |id| id == ev_id)
+        self.as_ref().is_some_and(|ev| ev.event_id() == Some(ev_id))
     }
 }
 
@@ -304,6 +307,72 @@ fn calculate_room_name(
         }
     } else {
         DisplayName::Calculated(names)
+    }
+}
+
+bitflags! {
+    /// Room membership filter as a bitset.
+    ///
+    /// Note that [`RoomMemberships::empty()`] doesn't filter the results and
+    /// [`RoomMemberships::all()`] filters out unknown memberships.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct RoomMemberships: u16 {
+        /// The member joined the room.
+        const JOIN    = 0b00000001;
+        /// The member was invited to the room.
+        const INVITE  = 0b00000010;
+        /// The member requested to join the room.
+        const KNOCK   = 0b00000100;
+        /// The member left the room.
+        const LEAVE   = 0b00001000;
+        /// The member was banned.
+        const BAN     = 0b00010000;
+
+        /// The member is active in the room (i.e. joined or invited).
+        const ACTIVE = Self::JOIN.bits() | Self::INVITE.bits();
+    }
+}
+
+impl RoomMemberships {
+    /// Whether the given membership matches this `RoomMemberships`.
+    pub fn matches(&self, membership: &MembershipState) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+
+        let membership = match membership {
+            MembershipState::Ban => Self::BAN,
+            MembershipState::Invite => Self::INVITE,
+            MembershipState::Join => Self::JOIN,
+            MembershipState::Knock => Self::KNOCK,
+            MembershipState::Leave => Self::LEAVE,
+            _ => return false,
+        };
+
+        self.contains(membership)
+    }
+
+    /// Get this `RoomMemberships` as a list of matching [`MembershipState`]s.
+    pub fn as_vec(&self) -> Vec<MembershipState> {
+        let mut memberships = Vec::new();
+
+        if self.contains(Self::JOIN) {
+            memberships.push(MembershipState::Join);
+        }
+        if self.contains(Self::INVITE) {
+            memberships.push(MembershipState::Invite);
+        }
+        if self.contains(Self::KNOCK) {
+            memberships.push(MembershipState::Knock);
+        }
+        if self.contains(Self::LEAVE) {
+            memberships.push(MembershipState::Leave);
+        }
+        if self.contains(Self::BAN) {
+            memberships.push(MembershipState::Ban);
+        }
+
+        memberships
     }
 }
 

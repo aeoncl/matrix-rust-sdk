@@ -76,18 +76,18 @@ pub enum KeyExportError {
 /// * `passphrase` - The passphrase that was used to encrypt the exported keys.
 ///
 /// # Examples
+///
 /// ```no_run
 /// # use std::io::Cursor;
 /// # use matrix_sdk_crypto::{OlmMachine, decrypt_room_key_export};
 /// # use ruma::{device_id, user_id};
-/// # use futures::executor::block_on;
 /// # let alice = user_id!("@alice:example.org");
-/// # block_on(async {
+/// # async {
 /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
 /// # let export = Cursor::new("".to_owned());
 /// let exported_keys = decrypt_room_key_export(export, "1234").unwrap();
 /// machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
-/// # });
+/// # };
 /// ```
 pub fn decrypt_room_key_export(
     mut input: impl Read,
@@ -134,17 +134,17 @@ pub fn decrypt_room_key_export(
 /// encrypt the exported keys securely.
 ///
 /// # Examples
+///
 /// ```no_run
 /// # use matrix_sdk_crypto::{OlmMachine, encrypt_room_key_export};
 /// # use ruma::{device_id, user_id, room_id};
-/// # use futures::executor::block_on;
 /// # let alice = user_id!("@alice:example.org");
-/// # block_on(async {
+/// # async {
 /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
 /// let room_id = room_id!("!test:localhost");
 /// let exported_keys = machine.export_room_keys(|s| s.room_id() == room_id).await.unwrap();
 /// let encrypted_export = encrypt_room_key_export(&exported_keys, "1234", 1);
-/// # });
+/// # };
 /// ```
 pub fn encrypt_room_key_export(
     keys: &[ExportedRoomKey],
@@ -330,7 +330,7 @@ mod tests {
 
     #[async_test]
     async fn test_session_encrypt() {
-        let (machine, _) = get_prepared_machine().await;
+        let (machine, _) = get_prepared_machine(false).await;
         let room_id = room_id!("!test:localhost");
 
         machine.create_outbound_group_session_with_defaults(room_id).await.unwrap();
@@ -353,7 +353,7 @@ mod tests {
 
     #[async_test]
     async fn test_importing_better_session() -> OlmResult<()> {
-        let (machine, _) = get_prepared_machine().await;
+        let (machine, _) = get_prepared_machine(false).await;
         let room_id = room_id!("!test:localhost");
         let session = machine.create_inbound_session(room_id).await?;
 

@@ -28,8 +28,11 @@ use base64::{
 };
 use matrix_sdk_common::instant::Instant;
 
-const STANDARD_NO_PAD: GeneralPurpose =
-    GeneralPurpose::new(&alphabet::STANDARD, general_purpose::NO_PAD);
+const STANDARD_NO_PAD: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    general_purpose::NO_PAD
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+);
 
 /// Decode the input as base64 with no padding.
 pub fn decode(input: impl AsRef<[u8]>) -> Result<Vec<u8>, DecodeError> {
@@ -110,12 +113,17 @@ where
         Duration::from_secs(delay)
     }
 
+    /// Add a single item to the cache.
+    pub fn insert(&self, item: T) {
+        self.extend([item]);
+    }
+
     /// Extend the cache with the given iterator of items.
     ///
     /// Items that are already part of the cache, whether they are expired or
     /// not, will have their TTL extended using an exponential backoff
     /// algorithm.
-    pub fn extend(&self, iterator: impl Iterator<Item = T>) {
+    pub fn extend(&self, iterator: impl IntoIterator<Item = T>) {
         let mut lock = self.inner.write().unwrap();
 
         let now = Instant::now();

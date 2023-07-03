@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    collections::HashMap,
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -25,7 +26,7 @@ use ruma::{
     events::{
         key::verification::VerificationMethod, room::message::KeyVerificationRequestEventContent,
     },
-    EventId, OwnedDeviceId, RoomId, UserId,
+    DeviceId, EventId, OwnedDeviceId, OwnedUserId, RoomId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tracing::error;
@@ -161,14 +162,10 @@ impl OwnUserIdentity {
         &self,
         methods: Option<Vec<VerificationMethod>>,
     ) -> Result<(VerificationRequest, OutgoingVerificationRequest), CryptoStoreError> {
-        let devices: Vec<OwnedDeviceId> = self
-            .verification_machine
-            .store
-            .get_user_devices(self.user_id())
-            .await?
-            .into_keys()
-            .filter(|d| &**d != self.verification_machine.own_device_id())
-            .collect();
+        let all_devices = self.verification_machine.store.get_user_devices(self.user_id()).await?;
+        let devices = self
+            .inner
+            .filter_devices_to_request(all_devices, self.verification_machine.own_device_id());
 
         Ok(self
             .verification_machine
@@ -203,10 +200,7 @@ impl Deref for UserIdentity {
 impl UserIdentity {
     /// Is this user identity verified.
     pub fn is_verified(&self) -> bool {
-        self.own_identity
-            .as_ref()
-            .map(|o| o.is_identity_signed(&self.inner).is_ok())
-            .unwrap_or(false)
+        self.own_identity.as_ref().is_some_and(|o| o.is_identity_signed(&self.inner).is_ok())
     }
 
     /// Manually verify this user.
@@ -363,7 +357,7 @@ impl PartialEq for ReadOnlyUserIdentities {
 /// signatures can be checked with this identity.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReadOnlyUserIdentity {
-    user_id: Arc<UserId>,
+    user_id: OwnedUserId,
     pub(crate) master_key: MasterPubkey,
     self_signing_key: SelfSigningPubkey,
 }
@@ -464,7 +458,7 @@ impl ReadOnlyUserIdentity {
 /// the identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadOnlyOwnUserIdentity {
-    user_id: Arc<UserId>,
+    user_id: OwnedUserId,
     master_key: MasterPubkey,
     self_signing_key: SelfSigningPubkey,
     user_signing_key: UserSigningPubkey,
@@ -622,6 +616,20 @@ impl ReadOnlyOwnUserIdentity {
 
         Ok(())
     }
+
+    fn filter_devices_to_request(
+        &self,
+        devices: HashMap<OwnedDeviceId, ReadOnlyDevice>,
+        own_device_id: &DeviceId,
+    ) -> Vec<OwnedDeviceId> {
+        devices
+            .into_iter()
+            .filter_map(|(device_id, device)| {
+                (device_id != own_device_id && self.is_device_signed(&device).is_ok())
+                    .then_some(device_id)
+            })
+            .collect()
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -699,13 +707,13 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use assert_matches::assert_matches;
-    use matrix_sdk_common::locks::Mutex;
     use matrix_sdk_test::async_test;
-    use ruma::user_id;
+    use ruma::{device_id, user_id};
     use serde_json::{json, Value};
+    use tokio::sync::Mutex;
 
     use super::{
         testing::{device, get_other_identity, get_own_identity},
@@ -873,6 +881,29 @@ pub(crate) mod tests {
         assert_matches!(
             serde_json::from_value::<UserSigningPubkey>(user_signing_key_json.clone()),
             Err(_)
+        );
+    }
+
+    #[test]
+    fn filter_devices_to_request() {
+        let response = own_key_query();
+        let identity = get_own_identity();
+        let (first, second) = device(&response);
+
+        let second_device_id = second.device_id().to_owned();
+        let unknown_device_id = device_id!("UNKNOWN");
+
+        let devices = HashMap::from([
+            (first.device_id().to_owned(), first),
+            (second.device_id().to_owned(), second),
+        ]);
+
+        // Own device and devices not verified are filtered out.
+        assert_eq!(identity.filter_devices_to_request(devices.clone(), &second_device_id).len(), 0);
+        // Signed devices that are not our own are kept.
+        assert_eq!(
+            identity.filter_devices_to_request(devices, unknown_device_id),
+            [second_device_id]
         );
     }
 }

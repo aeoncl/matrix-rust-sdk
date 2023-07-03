@@ -14,86 +14,84 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "experimental-sliding-sync")]
+use std::sync::RwLock as StdRwLock;
 use std::{
+    collections::{btree_map, BTreeMap},
     fmt::{self, Debug},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
-#[cfg(target_arch = "wasm32")]
-use async_once_cell::OnceCell;
 use dashmap::DashMap;
-use futures_core::stream::Stream;
-use futures_signals::signal::Signal;
+use eyeball::{shared::Observable as SharedObservable, unique::Observable, Subscriber};
+use futures_core::Stream;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::store::locks::CryptoStoreLock;
 use matrix_sdk_base::{
-    BaseClient, RoomType, SendOutsideWasm, Session, SessionMeta, SessionTokens, StateStore,
+    store::{DynStateStore, StateStoreExt}, BaseClient, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     SyncOutsideWasm, deserialized_responses::RawMemberEvent,
 };
-use matrix_sdk_common::{
-    instant::Instant,
-    locks::{Mutex, RwLock, RwLockReadGuard},
-};
+use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "appservice")]
 use ruma::TransactionId;
 use ruma::{
     api::{
         client::{
-            account::{register, whoami},
-            device::{delete_devices, get_devices, update_device},
+            account::whoami,
             alias::get_alias,
+            device::{delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
+                discover_homeserver::AuthenticationServerInfo,
                 get_capabilities::{self, Capabilities},
                 get_supported_versions,
             },
             error::ErrorKind,
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             membership::{join_room_by_id, join_room_by_id_or_alias},
-            push::get_notifications::v3::Notification,
+            profile::get_profile,
+            push::{get_notifications::v3::Notification, set_pusher, Pusher},
             room::create_room,
-            session::{
-                get_login_types, login, logout, refresh_token, sso_login, sso_login_with_provider,
-            },
+            session::login::v3::DiscoveryInfo,
             sync::sync_events,
-            uiaa::{AuthData, UserIdentifier},
+            uiaa,
+            user_directory::search_users,
         },
         error::FromHttpResponseError,
-        MatrixVersion, OutgoingRequest, SendAccessToken,
+        MatrixVersion, OutgoingRequest,
     },
     assign, DeviceId, OwnedDeviceId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
     RoomOrAliasId, ServerName, UInt, UserId, events::{GlobalAccountDataEvent, direct::DirectEventContent, GlobalAccountDataEventType, SyncStateEvent, room::member::{RoomMemberEventContent, MembershipState}},
 };
 use serde::de::DeserializeOwned;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::OnceCell;
-#[cfg(feature = "e2e-encryption")]
-use tracing::error;
-use tracing::{debug, field::display, info, instrument, trace, Instrument, Span};
+use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
+use tracing::{debug, error, instrument, trace, Instrument, Span};
 use url::Url;
 
 #[cfg(feature = "e2e-encryption")]
 use crate::encryption::Encryption;
 use crate::{
+    authentication::AuthData,
     config::RequestConfig,
     error::{HttpError, HttpResult},
     event_handler::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
     },
     http_client::HttpClient,
+    matrix_auth::MatrixAuth,
     room,
-    sync::SyncResponse,
-    Account, Error, Media, RefreshTokenError, Result, RumaApiError,
+    sync::{RoomUpdate, SyncResponse},
+    Account, AuthApi, AuthSession, Error, Media, RefreshTokenError, Result, TransmissionProgress,
 };
 
 mod builder;
-mod login_builder;
+mod futures;
 
-#[cfg(feature = "sso-login")]
-pub use self::login_builder::SsoLoginBuilder;
 pub use self::{
     builder::{ClientBuildError, ClientBuilder},
-    login_builder::LoginBuilder,
+    futures::SendRequest,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -122,23 +120,29 @@ pub enum LoopCtrl {
     Break,
 }
 
+/// Wrapper struct for ErrorKind::UnknownToken
+#[derive(Debug, Clone)]
+pub struct UnknownToken {
+    /// Whether or not the session was soft logged out
+    pub soft_logout: bool,
+}
+
 /// An async/await enabled Matrix client.
 ///
 /// All of the state is held in an `Arc` so the `Client` can be cloned freely.
 #[derive(Clone)]
 pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
-    pub(crate) root_span: Span,
 }
 
 pub(crate) struct ClientInner {
     /// The URL of the homeserver to connect to.
     homeserver: RwLock<Url>,
-    /// The OIDC Provider that is trusted by the homeserver.
-    authentication_issuer: Option<RwLock<Url>>,
+    /// The authentication server info discovered from the homeserver.
+    authentication_server_info: Option<AuthenticationServerInfo>,
     /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
-    sliding_sync_proxy: Option<RwLock<Url>>,
+    sliding_sync_proxy: StdRwLock<Option<Url>>,
     /// The underlying HTTP client.
     http_client: HttpClient,
     /// User session data.
@@ -148,11 +152,11 @@ pub(crate) struct ClientInner {
     /// Locks making sure we only have one group session sharing request in
     /// flight per room.
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) group_session_locks: DashMap<OwnedRoomId, Arc<Mutex<()>>>,
+    pub(crate) group_session_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
     /// Lock making sure we're only doing one key claim request at a time.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) key_claim_lock: Mutex<()>,
-    pub(crate) members_request_locks: DashMap<OwnedRoomId, Arc<Mutex<()>>>,
+    pub(crate) members_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
     /// Locks for requests on the encryption state of rooms.
     pub(crate) encryption_state_request_locks: DashMap<OwnedRoomId, Arc<Mutex<()>>>,
     pub(crate) typing_notice_times: DashMap<OwnedRoomId, Instant>,
@@ -160,10 +164,12 @@ pub(crate) struct ClientInner {
     pub(crate) event_handlers: EventHandlerStore,
     /// Notification handlers. See `register_notification_handler`.
     notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
+    pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
+    pub(crate) sync_gap_broadcast_txs: StdMutex<BTreeMap<OwnedRoomId, Observable<()>>>,
     /// Whether the client should operate in application service style mode.
     /// This is low-level functionality. For an high-level API check the
     /// `matrix_sdk_appservice` crate.
-    appservice_mode: bool,
+    pub(crate) appservice_mode: bool,
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
     respect_login_well_known: bool,
@@ -171,13 +177,21 @@ pub(crate) struct ClientInner {
     /// `M_UNKNOWN_TOKEN` error is encountered.
     handle_refresh_tokens: bool,
     /// Lock making sure we're only doing one token refresh at a time.
-    refresh_token_lock: Mutex<Result<(), RefreshTokenError>>,
+    pub(crate) refresh_token_lock: Mutex<Result<(), RefreshTokenError>>,
     /// An event that can be listened on to wait for a successful sync. The
     /// event will only be fired if a sync loop is running. Can be used for
     /// synchronization, e.g. if we send out a request to create a room, we can
     /// wait for the sync to get the data to fetch a room object from the state
     /// store.
     pub(crate) sync_beat: event_listener::Event,
+    /// Client API UnknownToken error publisher. Allows the subscriber logout
+    /// the user when any request fails because of an invalid access token
+    pub(crate) unknown_token_error_sender: broadcast::Sender<UnknownToken>,
+    /// Authentication data to keep in memory.
+    pub(crate) auth_data: OnceCell<AuthData>,
+
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) cross_process_crypto_store_lock: OnceCell<CryptoStoreLock>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -199,6 +213,12 @@ impl Client {
             .build()
             .await
             .map_err(ClientBuildError::assert_valid_builder_args)
+    }
+
+    /// Returns a subscriber that publishes an event every time the ignore user
+    /// list changes.
+    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<()> {
+        self.inner.base_client.subscribe_to_ignore_user_list_changes()
     }
 
     /// Create a new [`ClientBuilder`].
@@ -225,12 +245,12 @@ impl Client {
     /// This method should be used to check what features are supported by the
     /// homeserver.
     ///
-    /// # Example
+    /// # Examples
+    ///
     /// ```no_run
-    /// # use futures::executor::block_on;
     /// # use matrix_sdk::Client;
     /// # use url::Url;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://example.com")?;
     /// let client = Client::new(homeserver).await?;
     ///
@@ -239,8 +259,7 @@ impl Client {
     /// if capabilities.change_password.enabled {
     ///     // Change password
     /// }
-    ///
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn get_capabilities(&self) -> HttpResult<Capabilities> {
         let res = self.send(get_capabilities::v3::Request::new(), None).await?;
@@ -314,21 +333,62 @@ impl Client {
         self.inner.homeserver.read().await.clone()
     }
 
-    /// The OIDC Provider that is trusted by the homeserver.
-    pub async fn authentication_issuer(&self) -> Option<Url> {
-        let server = self.inner.authentication_issuer.as_ref()?;
-        Some(server.read().await.clone())
+    /// The authentication server info discovered from the homeserver.
+    ///
+    /// This will only be set if the homeserver supports authenticating via
+    /// OpenID Connect ([MSC3861]) and this `Client` was constructed using
+    /// auto-discovery by setting the homeserver with
+    /// [`ClientBuilder::server_name()`].
+    ///
+    /// [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
+    pub fn authentication_server_info(&self) -> Option<&AuthenticationServerInfo> {
+        self.inner.authentication_server_info.as_ref()
     }
 
     /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
-    pub async fn sliding_sync_proxy(&self) -> Option<Url> {
-        let server = self.inner.sliding_sync_proxy.as_ref()?;
-        Some(server.read().await.clone())
+    pub fn sliding_sync_proxy(&self) -> Option<Url> {
+        let server = self.inner.sliding_sync_proxy.read().unwrap();
+        Some(server.as_ref()?.clone())
     }
 
-    fn session_meta(&self) -> Option<&SessionMeta> {
+    /// Force to set the sliding sync proxy URL.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn set_sliding_sync_proxy(&self, sliding_sync_proxy: Option<Url>) {
+        let mut lock = self.inner.sliding_sync_proxy.write().unwrap();
+        *lock = sliding_sync_proxy;
+    }
+
+    /// Get the Matrix user session meta information.
+    ///
+    /// If the client is currently logged in, this will return a
+    /// [`SessionMeta`] object which contains the user ID and device ID.
+    /// Otherwise it returns `None`.
+    pub fn session_meta(&self) -> Option<&SessionMeta> {
         self.base_client().session_meta()
+    }
+
+    /// Performs a search for users.
+    /// The search is performed case-insensitively on user IDs and display names
+    ///
+    /// # Arguments
+    ///
+    /// * `search_term` - The search term for the search
+    /// * `limit` - The maximum number of results to return. Defaults to 10.
+    ///
+    /// [user directory]: https://spec.matrix.org/v1.6/client-server-api/#user-directory
+    pub async fn search_users(
+        &self,
+        search_term: &str,
+        limit: u64,
+    ) -> HttpResult<search_users::v3::Response> {
+        let mut request = search_users::v3::Request::new(search_term.to_owned());
+
+        if let Some(limit) = UInt::new(limit) {
+            request.limit = limit;
+        }
+
+        self.send(request, None).await
     }
 
     /// Get the user id of the current owner of the client.
@@ -341,156 +401,21 @@ impl Client {
         self.session_meta().map(|s| s.device_id.as_ref())
     }
 
-    /// Get the current access token and optional refresh token for this
-    /// session.
+    /// Get the current access token for this session, regardless of the
+    /// authentication API used to log in.
     ///
     /// Will be `None` if the client has not been logged in.
-    ///
-    /// After login, the tokens should only change if support for [refreshing
-    /// access tokens] has been enabled.
-    ///
-    /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
-    pub fn session_tokens(&self) -> Option<SessionTokens> {
-        self.base_client().session_tokens().get_cloned()
-    }
-
-    /// Get the current access token for this session.
-    ///
-    /// Will be `None` if the client has not been logged in.
-    ///
-    /// After login, this token should only change if support for [refreshing
-    /// access tokens] has been enabled.
-    ///
-    /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
     pub fn access_token(&self) -> Option<String> {
-        self.session_tokens().map(|tokens| tokens.access_token)
+        Some(self.inner.auth_data.get()?.access_token())
     }
 
-    /// Get the current refresh token for this session.
+    /// Access the authentication API used to log in this client.
     ///
-    /// Will be `None` if the client has not been logged in, or if the access
-    /// token doesn't expire.
-    ///
-    /// After login, this token should only change if support for [refreshing
-    /// access tokens] has been enabled.
-    ///
-    /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
-    pub fn refresh_token(&self) -> Option<String> {
-        self.session_tokens().and_then(|tokens| tokens.refresh_token)
-    }
-
-    /// [`Signal`] to get notified when the current access token and optional
-    /// refresh token for this session change.
-    ///
-    /// This can be used with [`Client::session()`] to persist the [`Session`]
-    /// when the tokens change.
-    ///
-    /// After login, the tokens should only change if support for [refreshing
-    /// access tokens] has been enabled.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use futures_signals::signal::SignalExt;
-    /// use matrix_sdk::Client;
-    /// # use matrix_sdk::Session;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
-    /// # fn persist_session(_: Option<Session>) {};
-    ///
-    /// let homeserver = "http://example.com";
-    /// let client = Client::builder()
-    ///     .homeserver_url(homeserver)
-    ///     .handle_refresh_tokens()
-    ///     .build()
-    ///     .await?;
-    ///
-    /// let response = client
-    ///     .login_username("user", "wordpass")
-    ///     .initial_device_display_name("My App")
-    ///     .request_refresh_token()
-    ///     .send()
-    ///     .await?;
-    ///
-    /// persist_session(client.session());
-    ///
-    /// // Handle when at least one of the tokens changed.
-    /// let future = client.session_tokens_changed_signal().for_each(move |_| {
-    ///     let client = client.clone();
-    ///     async move {
-    ///         persist_session(client.session());
-    ///     }
-    /// });
-    ///
-    /// tokio::spawn(future);
-    ///
-    /// # anyhow::Ok(()) });
-    /// ```
-    ///
-    /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
-    pub fn session_tokens_changed_signal(&self) -> impl Signal<Item = ()> {
-        self.base_client().session_tokens().signal_ref(|_| ())
-    }
-
-    /// Get the current access token and optional refresh token for this
-    /// session as a [`Signal`].
-    ///
-    /// This can be used to watch changes of the tokens by calling methods like
-    /// `for_each()` or `to_stream()`.
-    ///
-    /// The value will be `None` if the client has not been logged in.
-    ///
-    /// After login, the tokens should only change if support for [refreshing
-    /// access tokens] has been enabled.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use futures::StreamExt;
-    /// use futures_signals::signal::SignalExt;
-    /// use matrix_sdk::Client;
-    /// # use matrix_sdk::Session;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
-    /// # fn persist_session(_: &Session) {};
-    ///
-    /// let homeserver = "http://example.com";
-    /// let client = Client::builder()
-    ///     .homeserver_url(homeserver)
-    ///     .handle_refresh_tokens()
-    ///     .build()
-    ///     .await?;
-    ///
-    /// client
-    ///     .login_username("user", "wordpass")
-    ///     .initial_device_display_name("My App")
-    ///     .request_refresh_token()
-    ///     .send()
-    ///     .await?;
-    ///
-    /// let mut session = client.session().expect("Client should be logged in");
-    /// persist_session(&session);
-    ///
-    /// // Handle when at least one of the tokens changed.
-    /// let mut tokens_stream = client.session_tokens_signal().to_stream();
-    /// loop {
-    ///     if let Some(tokens) = tokens_stream.next().await.flatten() {
-    ///         session.access_token = tokens.access_token;
-    ///
-    ///         if let Some(refresh_token) = tokens.refresh_token {
-    ///             session.refresh_token = Some(refresh_token);
-    ///         }
-    ///
-    ///         persist_session(&session);
-    ///     }
-    /// }
-    ///
-    /// # anyhow::Ok(()) });
-    /// ```
-    ///
-    /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
-    pub fn session_tokens_signal(&self) -> impl Signal<Item = Option<SessionTokens>> {
-        self.base_client().session_tokens().signal_cloned()
+    /// Will be `None` if the client has not been logged in.
+    pub fn auth_api(&self) -> Option<AuthApi> {
+        match self.inner.auth_data.get()? {
+            AuthData::Matrix(_) => Some(AuthApi::Matrix(self.matrix_auth())),
+        }
     }
 
     /// Get the whole session info of this client.
@@ -499,13 +424,20 @@ impl Client {
     ///
     /// Can be used with [`Client::restore_session`] to restore a previously
     /// logged-in session.
-    pub fn session(&self) -> Option<Session> {
-        self.base_client().session()
+    pub fn session(&self) -> Option<AuthSession> {
+        match self.auth_api()? {
+            AuthApi::Matrix(api) => api.session().map(Into::into),
+        }
     }
 
     /// Get a reference to the state store.
-    pub fn store(&self) -> &dyn StateStore {
+    pub fn store(&self) -> &DynStateStore {
         self.base_client().store()
+    }
+
+    /// Access the native Matrix authentication API with this client.
+    pub fn matrix_auth(&self) -> MatrixAuth {
+        MatrixAuth::new(self.clone())
     }
 
     /// Get the account of the current owner of the client.
@@ -555,7 +487,6 @@ impl Client {
     /// # Examples
     ///
     /// ```
-    /// # use futures::executor::block_on;
     /// # use url::Url;
     /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// use matrix_sdk::{
@@ -568,20 +499,21 @@ impl Client {
     ///             push_rules::PushRulesEvent,
     ///             room::{message::SyncRoomMessageEvent, topic::SyncRoomTopicEvent},
     ///         },
+    ///         push::Action,
     ///         Int, MilliSecondsSinceUnixEpoch,
     ///     },
     ///     Client,
     /// };
     /// use serde::{Deserialize, Serialize};
     ///
-    /// # block_on(async {
+    /// # futures_executor::block_on(async {
     /// # let client = matrix_sdk::Client::builder()
     /// #     .homeserver_url(homeserver)
     /// #     .server_versions([ruma::api::MatrixVersion::V1_0])
     /// #     .build()
     /// #     .await
     /// #     .unwrap();
-    ///
+    /// #
     /// client.add_event_handler(
     ///     |ev: SyncRoomMessageEvent, room: Room, client: Client| async move {
     ///         // Common usage: Room event plus room and client.
@@ -592,6 +524,16 @@ impl Client {
     ///         async move {
     ///             // An `Option<EncryptionInfo>` parameter lets you distinguish between
     ///             // unencrypted events and events that were decrypted by the SDK.
+    ///         }
+    ///     },
+    /// );
+    /// client.add_event_handler(
+    ///     |ev: SyncRoomMessageEvent, room: Room, push_actions: Vec<Action>| {
+    ///         async move {
+    ///             // A `Vec<Action>` parameter allows you to know which push actions
+    ///             // are applicable for an event. For example, an event with
+    ///             // `Action::SetTweak(Tweak::Highlight(true))` should be highlighted
+    ///             // in the timeline.
     ///         }
     ///     },
     /// );
@@ -701,7 +643,6 @@ impl Client {
     /// # Examples
     ///
     /// ```
-    /// # use futures::executor::block_on;
     /// # use url::Url;
     /// # use tokio::sync::mpsc;
     /// #
@@ -712,7 +653,7 @@ impl Client {
     ///     ruma::events::room::member::SyncRoomMemberEvent, Client,
     /// };
     /// #
-    /// # block_on(async {
+    /// # futures_executor::block_on(async {
     /// # let client = matrix_sdk::Client::builder()
     /// #     .homeserver_url(homeserver)
     /// #     .server_versions([ruma::api::MatrixVersion::V1_0])
@@ -751,10 +692,9 @@ impl Client {
     /// If a value of the same type has been added before, it will be
     /// overwritten.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```
-    /// # use futures::executor::block_on;
     /// use matrix_sdk::{
     ///     event_handler::Ctx, room::Room,
     ///     ruma::events::room::message::SyncRoomMessageEvent,
@@ -763,7 +703,7 @@ impl Client {
     /// # struct SomeType;
     /// # fn obtain_gui_handle() -> SomeType { SomeType }
     /// # let homeserver = url::Url::parse("http://localhost:8080").unwrap();
-    /// # block_on(async {
+    /// # futures_executor::block_on(async {
     /// # let client = matrix_sdk::Client::builder()
     /// #     .homeserver_url(homeserver)
     /// #     .server_versions([ruma::api::MatrixVersion::V1_0])
@@ -811,6 +751,21 @@ impl Client {
         self
     }
 
+    /// Subscribe to all updates for the room with the given ID.
+    ///
+    /// The returned receiver will receive a new message for each sync response
+    /// that contains updates for that room.
+    pub fn subscribe_to_room_updates(&self, room_id: &RoomId) -> broadcast::Receiver<RoomUpdate> {
+        match self.inner.room_update_channels.lock().unwrap().entry(room_id.to_owned()) {
+            btree_map::Entry::Vacant(entry) => {
+                let (tx, rx) = broadcast::channel(8);
+                entry.insert(tx);
+                rx
+            }
+            btree_map::Entry::Occupied(entry) => entry.get().subscribe(),
+        }
+    }
+
     pub(crate) async fn notification_handlers(
         &self,
     ) -> RwLockReadGuard<'_, Vec<NotificationHandlerFn>> {
@@ -828,10 +783,19 @@ impl Client {
             .collect()
     }
 
+    /// Get all the rooms the client knows about, filtered by room state.
+    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<room::Room> {
+        self.base_client()
+            .get_rooms_filtered(filter)
+            .into_iter()
+            .map(|room| room::Common::new(self.clone(), room).into())
+            .collect()
+    }
+
     /// Returns the joined rooms this client knows about.
     pub fn joined_rooms(&self) -> Vec<room::Joined> {
         self.base_client()
-            .get_rooms()
+            .get_rooms_filtered(RoomStateFilter::JOINED)
             .into_iter()
             .filter_map(|room| room::Joined::new(self, room))
             .collect()
@@ -840,7 +804,7 @@ impl Client {
     /// Returns the invited rooms this client knows about.
     pub fn invited_rooms(&self) -> Vec<room::Invited> {
         self.base_client()
-            .get_stripped_rooms()
+            .get_rooms_filtered(RoomStateFilter::INVITED)
             .into_iter()
             .filter_map(|room| room::Invited::new(self, room))
             .collect()
@@ -849,7 +813,7 @@ impl Client {
     /// Returns the left rooms this client knows about.
     pub fn left_rooms(&self) -> Vec<room::Left> {
         self.base_client()
-            .get_rooms()
+            .get_rooms_filtered(RoomStateFilter::LEFT)
             .into_iter()
             .filter_map(|room| room::Left::new(self, room))
             .collect()
@@ -907,542 +871,59 @@ impl Client {
         self.send(request, None).await
     }
 
-    /// Gets the homeserver’s supported login types.
-    ///
-    /// This should be the first step when trying to login so you can call the
-    /// appropriate method for the next step.
-    pub async fn get_login_types(&self) -> HttpResult<get_login_types::v3::Response> {
-        let request = get_login_types::v3::Request::new();
-        self.send(request, None).await
-    }
-
-    /// Get the URL to use to login via Single Sign-On.
-    ///
-    /// Returns a URL that should be opened in a web browser to let the user
-    /// login.
-    ///
-    /// After a successful login, the loginToken received at the redirect URL
-    /// should be used to login with [`login_with_token`].
+    /// Update the homeserver from the login response well-known if needed.
     ///
     /// # Arguments
     ///
-    /// * `redirect_url` - The URL that will receive a `loginToken` after a
-    ///   successful SSO login.
-    ///
-    /// * `idp_id` - The optional ID of the identity provider to login with.
-    ///
-    /// [`login_with_token`]: #method.login_with_token
-    pub async fn get_sso_login_url(
+    /// * `login_well_known` - The `well_known` field from a successful login
+    ///   response.
+    pub(crate) async fn maybe_update_login_well_known(
         &self,
-        redirect_url: &str,
-        idp_id: Option<&str>,
-    ) -> Result<String> {
-        let homeserver = self.homeserver().await;
-        let server_versions = self.server_versions().await?;
-
-        let request = if let Some(id) = idp_id {
-            sso_login_with_provider::v3::Request::new(id.to_owned(), redirect_url.to_owned())
-                .try_into_http_request::<Vec<u8>>(
-                    homeserver.as_str(),
-                    SendAccessToken::None,
-                    server_versions,
-                )
-        } else {
-            sso_login::v3::Request::new(redirect_url.to_owned()).try_into_http_request::<Vec<u8>>(
-                homeserver.as_str(),
-                SendAccessToken::None,
-                server_versions,
-            )
-        };
-
-        match request {
-            Ok(req) => Ok(req.uri().to_string()),
-            Err(err) => Err(Error::from(HttpError::from(err))),
-        }
-    }
-
-    /// Login to the server with a username and password.
-    ///
-    /// This can be used for the first login as well as for subsequent logins,
-    /// note that if the device ID isn't provided a new device will be created.
-    ///
-    /// If this isn't the first login, a device ID should be provided through
-    /// [`LoginBuilder::device_id`] to restore the correct stores.
-    ///
-    /// Alternatively the [`restore_session`] method can be used to restore a
-    /// logged-in client without the password.
-    ///
-    /// # Arguments
-    ///
-    /// * `user` - The user ID or user ID localpart of the user that should be
-    ///   logged into the homeserver.
-    ///
-    /// * `password` - The password of the user.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use futures::executor::block_on;
-    /// # use url::Url;
-    /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
-    /// use matrix_sdk::Client;
-    ///
-    /// let client = Client::new(homeserver).await?;
-    /// let user = "example";
-    ///
-    /// let response = client
-    ///     .login_username(user, "wordpass")
-    ///     .initial_device_display_name("My bot")
-    ///     .await?;
-    ///
-    /// println!(
-    ///     "Logged in as {user}, got device_id {} and access_token {}",
-    ///     response.device_id, response.access_token,
-    /// );
-    /// # anyhow::Ok(()) });
-    /// ```
-    ///
-    /// [`restore_session`]: #method.restore_session
-    pub fn login_username(&self, id: impl AsRef<str>, password: &str) -> LoginBuilder {
-        self.login_identifier(UserIdentifier::UserIdOrLocalpart(id.as_ref().to_owned()), password)
-    }
-
-    /// Login to the server with a user identifier and password.
-    ///
-    /// This is more general form of [`login_username`][Self::login_username]
-    /// that also accepts third-party identifiers instead of just the user ID or
-    /// its localpart.
-    pub fn login_identifier(&self, id: UserIdentifier, password: &str) -> LoginBuilder {
-        LoginBuilder::new_password(self.clone(), id, password.to_owned())
-    }
-
-    /// Login to the server with a token.
-    ///
-    /// This token is usually received in the SSO flow after following the URL
-    /// provided by [`get_sso_login_url`], note that this is not the access
-    /// token of a session.
-    ///
-    /// This should only be used for the first login.
-    ///
-    /// The [`restore_session`] method should be used to restore a logged-in
-    /// client after the first login.
-    ///
-    /// A device ID should be provided through [`LoginBuilder::device_id`] to
-    /// restore the correct stores, if the device ID isn't provided a new
-    /// device will be created.
-    ///
-    /// # Arguments
-    ///
-    /// * `token` - A login token.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use matrix_sdk::Client;
-    /// # use matrix_sdk::ruma::{assign, DeviceId};
-    /// # use futures::executor::block_on;
-    /// # use url::Url;
-    /// # let homeserver = Url::parse("https://example.com").unwrap();
-    /// # let redirect_url = "http://localhost:1234";
-    /// # let login_token = "token";
-    /// # block_on(async {
-    /// let client = Client::new(homeserver).await.unwrap();
-    /// let sso_url = client.get_sso_login_url(redirect_url, None);
-    ///
-    /// // Let the user authenticate at the SSO URL
-    /// // Receive the loginToken param at redirect_url
-    ///
-    /// let response = client
-    ///     .login_token(login_token)
-    ///     .initial_device_display_name("My app")
-    ///     .await
-    ///     .unwrap();
-    ///
-    /// println!(
-    ///     "Logged in as {}, got device_id {} and access_token {}",
-    ///     response.user_id, response.device_id, response.access_token,
-    /// );
-    /// # })
-    /// ```
-    ///
-    /// [`get_sso_login_url`]: #method.get_sso_login_url
-    /// [`restore_session`]: #method.restore_session
-    pub fn login_token(&self, token: &str) -> LoginBuilder {
-        LoginBuilder::new_token(self.clone(), token.to_owned())
-    }
-
-    /// Login to the server via Single Sign-On.
-    ///
-    /// This takes care of the whole SSO flow:
-    ///   * Spawn a local http server
-    ///   * Provide a callback to open the SSO login URL in a web browser
-    ///   * Wait for the local http server to get the loginToken
-    ///   * Call [`login_token`]
-    ///
-    /// If cancellation is needed the method should be wrapped in a cancellable
-    /// task. **Note** that users with root access to the system have the
-    /// ability to snoop in on the data/token that is passed to the local
-    /// HTTP server that will be spawned.
-    ///
-    /// If you need more control over the SSO login process, you should use
-    /// [`get_sso_login_url`] and [`login_token`] directly.
-    ///
-    /// This should only be used for the first login.
-    ///
-    /// The [`restore_session`] method should be used to restore a logged-in
-    /// client after the first login.
-    ///
-    /// # Arguments
-    ///
-    /// * `use_sso_login_url` - A callback that will receive the SSO Login URL.
-    ///   It should usually be used to open the SSO URL in a browser and must
-    ///   return `Ok(())` if the URL was successfully opened. If it returns
-    ///   `Err`, the error will be forwarded.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use matrix_sdk::Client;
-    /// # use futures::executor::block_on;
-    /// # use url::Url;
-    /// # let homeserver = Url::parse("https://example.com").unwrap();
-    /// # block_on(async {
-    /// let client = Client::new(homeserver).await.unwrap();
-    ///
-    /// let response = client
-    ///     .login_sso(|sso_url| async move {
-    ///         // Open sso_url
-    ///         Ok(())
-    ///     })
-    ///     .initial_device_display_name("My app")
-    ///     .await
-    ///     .unwrap();
-    ///
-    /// println!(
-    ///     "Logged in as {}, got device_id {} and access_token {}",
-    ///     response.user_id, response.device_id, response.access_token
-    /// );
-    /// # })
-    /// ```
-    ///
-    /// [`get_sso_login_url`]: #method.get_sso_login_url
-    /// [`login_token`]: #method.login_token
-    /// [`restore_session`]: #method.restore_session
-    #[cfg(feature = "sso-login")]
-    pub fn login_sso<F, Fut>(&self, use_sso_login_url: F) -> SsoLoginBuilder<F>
-    where
-        F: FnOnce(String) -> Fut + Send,
-        Fut: Future<Output = Result<()>> + Send,
-    {
-        SsoLoginBuilder::new(self.clone(), use_sso_login_url)
-    }
-
-    /// Receive a login response and update the homeserver and the base client
-    /// if needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `response` - A successful login response.
-    async fn receive_login_response(&self, response: &login::v3::Response) -> Result<()> {
+        login_well_known: Option<&DiscoveryInfo>,
+    ) {
         if self.inner.respect_login_well_known {
-            if let Some(well_known) = &response.well_known {
+            if let Some(well_known) = login_well_known {
                 if let Ok(homeserver) = Url::parse(&well_known.homeserver.base_url) {
                     self.set_homeserver(homeserver).await;
                 }
             }
         }
-
-        self.root_span
-            .record("user_id", display(&response.user_id))
-            .record("device_id", display(&response.device_id));
-
-        #[cfg(feature = "e2e-encryption")]
-        if let Some(key) = self.encryption().ed25519_key().await {
-            self.root_span.record("ed25519_key", key);
-        }
-
-        self.inner.base_client.receive_login_response(response).await?;
-
-        Ok(())
     }
 
-    /// Restore a previously logged in session.
+    /// Restore a session previously logged-in using one of the available
+    /// authentication APIs.
     ///
-    /// This can be used to restore the client to a logged in state, loading all
-    /// the stored state and encryption keys.
+    /// See the documentation of the corresponding authentication API's
+    /// `restore_session` method for more information.
     ///
-    /// Alternatively, if the whole session isn't stored the [`login`] method
-    /// can be used with a device ID.
+    /// # Panics
     ///
-    /// # Arguments
-    ///
-    /// * `session` - A session that the user already has from a
-    /// previous login call.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use matrix_sdk::{
-    ///     ruma::{device_id, user_id},
-    ///     Client, Session,
-    /// };
-    /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
-    ///
-    /// let homeserver = Url::parse("http://example.com")?;
-    /// let client = Client::new(homeserver).await?;
-    ///
-    /// let session = Session {
-    ///     access_token: "My-Token".to_owned(),
-    ///     refresh_token: None,
-    ///     user_id: user_id!("@example:localhost").to_owned(),
-    ///     device_id: device_id!("MYDEVICEID").to_owned(),
-    /// };
-    ///
-    /// client.restore_session(session).await?;
-    /// # anyhow::Ok(()) });
-    /// ```
-    ///
-    /// The `Session` object can also be created from the response the
-    /// [`LoginBuilder::send()`] method returns:
-    ///
-    /// ```no_run
-    /// use matrix_sdk::{Client, Session};
-    /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
-    ///
-    /// let homeserver = Url::parse("http://example.com")?;
-    /// let client = Client::new(homeserver).await?;
-    ///
-    /// let session: Session =
-    ///     client.login_username("example", "my-password").send().await?.into();
-    ///
-    /// // Persist the `Session` so it can later be used to restore the login.
-    /// client.restore_session(session).await?;
-    /// # anyhow::Ok(()) });
-    /// ```
-    ///
-    /// [`login`]: #method.login
-    #[instrument(skip_all, parent = &self.root_span)]
-    pub async fn restore_session(&self, session: Session) -> Result<()> {
-        debug!("Restoring session");
-
-        let (meta, tokens) = session.into_parts();
-
-        self.root_span
-            .record("user_id", display(&meta.user_id))
-            .record("device_id", display(&meta.device_id));
-
-        self.base_client().set_session_tokens(tokens);
-        self.base_client().set_session_meta(meta).await?;
-
-        #[cfg(feature = "e2e-encryption")]
-        if let Some(key) = self.encryption().ed25519_key().await {
-            self.root_span.record("ed25519_key", key);
-        }
-
-        debug!("Done restoring session");
-
-        Ok(())
-    }
-
-    /// Refresh the access token.
-    ///
-    /// When support for [refreshing access tokens] is activated on both the
-    /// homeserver and the client, access tokens have an expiration date and
-    /// need to be refreshed periodically. To activate support for refresh
-    /// tokens in the [`Client`], it needs to be done at login with the
-    /// [`LoginBuilder::request_refresh_token()`] method, or during account
-    /// registration.
-    ///
-    /// This method doesn't need to be called if
-    /// [`ClientBuilder::handle_refresh_tokens()`] is called during construction
-    /// of the `Client`. Otherwise, it should be called once when a refresh
-    /// token is available and an [`UnknownToken`] error is received.
-    /// If this call fails with another [`UnknownToken`] error, it means that
-    /// the session needs to be logged in again.
-    ///
-    /// It can also be called at any time when a refresh token is available, it
-    /// will invalidate the previous access token.
-    ///
-    /// The new tokens in the response will be used by the `Client` and should
-    /// be persisted to be able to [restore the session]. The response will
-    /// always contain an access token that replaces the previous one. It
-    /// can also contain a refresh token, in which case it will also replace
-    /// the previous one.
-    ///
-    /// This method is protected behind a lock, so calling this method several
-    /// times at once will only call the endpoint once and all subsequent calls
-    /// will wait for the result of the first call. The first call will
-    /// return `Ok(Some(response))` or the [`HttpError`] returned by the
-    /// endpoint, while the others will return `Ok(None)` if the token was
-    /// refreshed by the first call or a [`RefreshTokenError`] error, if it
-    /// failed.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use matrix_sdk::{Client, Error, Session};
-    /// use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
-    /// # fn get_credentials() -> (&'static str, &'static str) { ("", "") };
-    /// # fn persist_session(_: Option<Session>) {};
-    ///
-    /// let homeserver = Url::parse("http://example.com")?;
-    /// let client = Client::new(homeserver).await?;
-    ///
-    /// let (user, password) = get_credentials();
-    /// let response = client
-    ///     .login_username(user, password)
-    ///     .initial_device_display_name("My App")
-    ///     .request_refresh_token()
-    ///     .send()
-    ///     .await?;
-    ///
-    /// persist_session(client.session());
-    ///
-    /// // Handle when an `M_UNKNOWN_TOKEN` error is encountered.
-    /// async fn on_unknown_token_err(client: &Client) -> Result<(), Error> {
-    ///     if client.refresh_token().is_some()
-    ///         && client.refresh_access_token().await.is_ok()
-    ///     {
-    ///         persist_session(client.session());
-    ///         return Ok(());
-    ///     }
-    ///
-    ///     let (user, password) = get_credentials();
-    ///     client
-    ///         .login_username(user, password)
-    ///         .request_refresh_token()
-    ///         .send()
-    ///         .await?;
-    ///
-    ///     persist_session(client.session());
-    ///
-    ///     Ok(())
-    /// }
-    ///
-    /// # anyhow::Ok(()) });
-    /// ```
-    ///
-    /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
-    /// [`UnknownToken`]: ruma::api::client::error::ErrorKind::UnknownToken
-    /// [restore the session]: Client::restore_session
-    pub async fn refresh_access_token(&self) -> HttpResult<Option<refresh_token::v3::Response>> {
-        #[cfg(not(target_arch = "wasm32"))]
-        let lock = self.inner.refresh_token_lock.try_lock().ok();
-        #[cfg(target_arch = "wasm32")]
-        let lock = self.inner.refresh_token_lock.try_lock();
-
-        if let Some(mut guard) = lock {
-            let Some(mut session_tokens) = self.session_tokens() else {
-                *guard = Err(RefreshTokenError::RefreshTokenRequired);
-                return Err(RefreshTokenError::RefreshTokenRequired.into());
-            };
-
-            let refresh_token = session_tokens
-                .refresh_token
-                .clone()
-                .ok_or(RefreshTokenError::RefreshTokenRequired)?;
-            let request = refresh_token::v3::Request::new(refresh_token);
-
-            let res = self
-                .inner
-                .http_client
-                .send(
-                    request,
-                    None,
-                    self.homeserver().await.to_string(),
-                    self.access_token().as_deref(),
-                    self.user_id(),
-                    self.server_versions().await?,
-                )
-                .await;
-
-            match res {
-                Ok(res) => {
-                    *guard = Ok(());
-
-                    session_tokens.update_with_refresh_response(&res);
-
-                    self.base_client().set_session_tokens(session_tokens);
-
-                    // TODO: Let ffi client to know that tokens have changed
-
-                    Ok(Some(res))
-                }
-                Err(error) => {
-                    *guard = match error.as_ruma_api_error() {
-                        Some(RumaApiError::ClientApi(api_error)) => {
-                            Err(RefreshTokenError::ClientApi(api_error.to_owned()))
-                        }
-                        _ => Err(RefreshTokenError::UnableToRefreshToken),
-                    };
-
-                    Err(error)
-                }
-            }
-        } else {
-            match *self.inner.refresh_token_lock.lock().await {
-                Ok(_) => Ok(None),
-                Err(_) => Err(RefreshTokenError::UnableToRefreshToken.into()),
-            }
+    /// Panics if a session was already restored or logged in.
+    #[instrument(skip_all)]
+    pub async fn restore_session(&self, session: impl Into<AuthSession>) -> Result<()> {
+        let session = session.into();
+        match session {
+            AuthSession::Matrix(s) => self.matrix_auth().restore_session(s).await,
         }
     }
 
-    /// Register a user to the server.
+    /// Refresh the access token using the authentication API used to log into
+    /// this session.
     ///
-    /// # Arguments
-    ///
-    /// * `registration` - The easiest way to create this request is using the
-    ///   [`register::v3::Request`] itself.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use matrix_sdk::Client;
-    /// # use matrix_sdk::ruma::{
-    /// #     api::client::{
-    /// #         account::register::{v3::Request as RegistrationRequest, RegistrationKind},
-    /// #         uiaa,
-    /// #     },
-    /// #     DeviceId,
-    /// # };
-    /// # use futures::executor::block_on;
-    /// # use url::Url;
-    /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
-    ///
-    /// let mut request = RegistrationRequest::new();
-    /// request.username = Some("user".to_owned());
-    /// request.password = Some("password".to_owned());
-    /// request.auth = Some(uiaa::AuthData::FallbackAcknowledgement(
-    ///     uiaa::FallbackAcknowledgement::new("foobar".to_owned()),
-    /// ));
-    ///
-    /// let client = Client::new(homeserver).await.unwrap();
-    /// client.register(request).await;
-    /// # })
-    /// ```
-    #[instrument(skip_all, parent = &self.root_span)]
-    pub async fn register(
-        &self,
-        request: register::v3::Request,
-    ) -> HttpResult<register::v3::Response> {
-        let homeserver = self.homeserver().await;
-        info!("Registering to {homeserver}");
-
-        let config = if self.inner.appservice_mode {
-            Some(RequestConfig::short_retry().force_auth())
-        } else {
-            None
+    /// See the documentation of the authentication API's `refresh_access_token`
+    /// method for more information.
+    pub async fn refresh_access_token(&self) -> HttpResult<()> {
+        let Some(auth_api) = self.auth_api() else {
+            return Err(RefreshTokenError::RefreshTokenRequired.into());
         };
 
-        self.send(request, config).await
+        match auth_api {
+            AuthApi::Matrix(a) => {
+                a.refresh_access_token().await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Get or upload a sync filter.
@@ -1470,9 +951,8 @@ impl Client {
     /// #        sync::sync_events::v3::Filter,
     /// #    }
     /// # };
-    /// # use futures::executor::block_on;
     /// # use url::Url;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let mut filter = FilterDefinition::default();
@@ -1490,8 +970,8 @@ impl Client {
     ///     .filter(Filter::FilterId(filter_id));
     ///
     /// let response = client.sync_once(sync_settings).await.unwrap();
-    /// # });
-    #[instrument(skip(self, definition), parent = &self.root_span)]
+    /// # };
+    #[instrument(skip(self, definition))]
     pub async fn get_or_upload_filter(
         &self,
         filter_name: &str,
@@ -1571,13 +1051,11 @@ impl Client {
     /// # let limit = Some(10);
     /// # let since = Some("since token");
     /// # let server = Some("servername.com".try_into().unwrap());
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
-    ///
+    /// # async {
     /// let mut client = Client::new(homeserver).await.unwrap();
     ///
     /// client.public_rooms(limit, since, server).await;
-    /// # });
+    /// # };
     /// ```
     #[cfg_attr(not(target_arch = "wasm32"), deny(clippy::future_not_send))]
     pub async fn public_rooms(
@@ -1596,46 +1074,78 @@ impl Client {
         self.send(request, None).await
     }
 
-    /// Create a room using the `RoomBuilder` and send the request.
+    /// Create a room with the given parameters.
     ///
-    /// Sends a request to `/_matrix/client/r0/createRoom`, returns a
-    /// `create_room::Response`, this is an empty response.
+    /// Sends a request to `/_matrix/client/r0/createRoom`, returns the created
+    /// room as a [`room::Joined`] object.
     ///
-    /// # Arguments
+    /// If you want to create a direct message with one specific user, you can
+    /// use [`create_dm`][Self::create_dm], which is more convenient than
+    /// assembling the [`create_room::v3::Request`] yourself.
     ///
-    /// * `room` - The easiest way to create this request is using the
-    /// `create_room::Request` itself.
+    /// If the `is_direct` field of the request is set to `true` and at least
+    /// one user is invited, the room will be automatically added to the direct
+    /// rooms in the account data.
     ///
     /// # Examples
+    ///
     /// ```no_run
     /// use matrix_sdk::Client;
+    ///
     /// # use matrix_sdk::ruma::api::client::room::{
     /// #     create_room::v3::Request as CreateRoomRequest,
     /// #     Visibility,
     /// # };
     /// # use url::Url;
-    ///
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// #
+    /// # async {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
     /// assert!(client.create_room(request).await.is_ok());
-    /// # });
+    /// # };
     /// ```
-    pub async fn create_room(&self, request: create_room::v3::Request) -> HttpResult<room::Joined> {
+    pub async fn create_room(&self, request: create_room::v3::Request) -> Result<room::Joined> {
+        let invite = request.invite.clone();
+        let is_direct_room = request.is_direct;
         let response = self.send(request, None).await?;
 
         let base_room =
-            self.base_client().get_or_create_room(&response.room_id, RoomType::Joined).await;
-        Ok(room::Joined::new(self, base_room).unwrap())
+            self.base_client().get_or_create_room(&response.room_id, RoomState::Joined).await;
+
+        let joined_room = room::Joined::new(self, base_room).unwrap();
+
+        if is_direct_room && !invite.is_empty() {
+            if let Err(error) =
+                self.account().mark_as_dm(joined_room.room_id(), invite.as_slice()).await
+            {
+                // FIXME: Retry in the background
+                error!("Failed to mark room as DM: {error}");
+            }
+        }
+
+        Ok(joined_room)
+    }
+
+    /// Create a DM room.
+    ///
+    /// Convenience shorthand for [`create_room`][Self::create_room] with the
+    /// given user being invited, the room marked `is_direct` and both the
+    /// creator and invitee getting the default maximum power level.
+    pub async fn create_dm(&self, user_id: &UserId) -> Result<room::Joined> {
+        self.create_room(assign!(create_room::v3::Request::new(), {
+            invite: vec![user_id.to_owned()],
+            is_direct: true,
+            preset: Some(create_room::v3::RoomPreset::TrustedPrivateChat),
+        }))
+        .await
     }
 
     pub async fn find_or_create_dm_room(&self, user_id: &UserId) -> Result<room::Joined>  {
         if let Some(found) = self.find_dm_room(user_id).await? {
             return Ok(found);
         }
-        return self.create_dm_room(user_id.to_owned()).await;
+        return self.create_dm(user_id).await;
     }
 
     pub async fn find_dm_room(&self, user_id: &UserId) -> Result<Option<room::Joined>> {
@@ -1691,8 +1201,7 @@ impl Client {
     /// ```no_run
     /// # use url::Url;
     /// # use matrix_sdk::Client;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://example.com")?;
     /// use matrix_sdk::ruma::{
     ///     api::client::directory::get_public_rooms_filtered, directory::Filter,
@@ -1707,9 +1216,9 @@ impl Client {
     /// let response = client.public_rooms_filtered(request).await?;
     ///
     /// for room in response.chunk {
-    ///     println!("Found room {:?}", room);
+    ///     println!("Found room {room:?}");
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn public_rooms_filtered(
         &self,
@@ -1733,13 +1242,12 @@ impl Client {
     /// * `timeout` - An optional request timeout setting, this overrides the
     /// default request setting if one was set.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # use matrix_sdk::{Client, config::SyncSettings};
-    /// # use futures::executor::block_on;
     /// # use url::Url;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
     /// use matrix_sdk::ruma::{api::client::profile, user_id};
@@ -1755,42 +1263,18 @@ impl Client {
     ///
     /// // Check the corresponding Response struct to find out what types are
     /// // returned
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
-    pub async fn send<Request>(
+    pub fn send<Request>(
         &self,
         request: Request,
         config: Option<RequestConfig>,
-    ) -> HttpResult<Request::IncomingResponse>
+    ) -> SendRequest<Request>
     where
         Request: OutgoingRequest + Clone + Debug,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
-        let res = self.send_inner(request.clone(), config, None).await;
-
-        // If this is an `M_UNKNOWN_TOKEN` error and refresh token handling is active,
-        // try to refresh the token and retry the request.
-        if self.inner.handle_refresh_tokens {
-            if let Err(Some(ErrorKind::UnknownToken { .. })) =
-                res.as_ref().map_err(HttpError::client_api_error_kind)
-            {
-                if let Err(refresh_error) = self.refresh_access_token().await {
-                    match &refresh_error {
-                        HttpError::RefreshToken(RefreshTokenError::RefreshTokenRequired) => {
-                            // Refreshing access tokens is not supported by
-                            // this `Session`, ignore.
-                        }
-                        _ => {
-                            return Err(refresh_error);
-                        }
-                    }
-                } else {
-                    return self.send_inner(request, config, None).await;
-                }
-            }
-        }
-
-        res
+        SendRequest { client: self.clone(), request, config, send_progress: Default::default() }
     }
 
     #[cfg(feature = "experimental-sliding-sync")]
@@ -1800,13 +1284,19 @@ impl Client {
         &self,
         request: Request,
         config: Option<RequestConfig>,
-        homeserver: Option<String>,
+        sliding_sync_proxy: Option<String>,
     ) -> HttpResult<Request::IncomingResponse>
     where
         Request: OutgoingRequest + Clone + Debug,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
-        let res = self.send_inner(request.clone(), config, homeserver.clone()).await;
+        let res = Box::pin(self.send_inner(
+            request.clone(),
+            config,
+            sliding_sync_proxy.clone(),
+            Default::default(),
+        ))
+        .await;
 
         // If this is an `M_UNKNOWN_TOKEN` error and refresh token handling is active,
         // try to refresh the token and retry the request.
@@ -1825,7 +1315,13 @@ impl Client {
                         }
                     }
                 } else {
-                    return self.send_inner(request, config, homeserver).await;
+                    return Box::pin(self.send_inner(
+                        request,
+                        config,
+                        sliding_sync_proxy,
+                        Default::default(),
+                    ))
+                    .await;
                 }
             }
         }
@@ -1833,11 +1329,12 @@ impl Client {
         res
     }
 
-    async fn send_inner<Request>(
+    pub(crate) async fn send_inner<Request>(
         &self,
         request: Request,
         config: Option<RequestConfig>,
         homeserver: Option<String>,
+        send_progress: SharedObservable<TransmissionProgress>,
     ) -> HttpResult<Request::IncomingResponse>
     where
         Request: OutgoingRequest + Debug,
@@ -1848,7 +1345,8 @@ impl Client {
             None => self.homeserver().await.to_string(),
         };
 
-        self.inner
+        let response = self
+            .inner
             .http_client
             .send(
                 request,
@@ -1857,8 +1355,22 @@ impl Client {
                 self.access_token().as_deref(),
                 self.user_id(),
                 self.server_versions().await?,
+                send_progress,
             )
-            .await
+            .await;
+
+        if let Err(http_error) = &response {
+            if let Some(ErrorKind::UnknownToken { soft_logout }) =
+                http_error.client_api_error_kind()
+            {
+                _ = self
+                    .inner
+                    .unknown_token_error_sender
+                    .send(UnknownToken { soft_logout: *soft_logout });
+            }
+        }
+
+        response
     }
 
     async fn request_server_versions(&self) -> HttpResult<Box<[MatrixVersion]>> {
@@ -1872,6 +1384,7 @@ impl Client {
                 None,
                 None,
                 &[MatrixVersion::V1_0],
+                Default::default(),
             )
             .await?
             .known_versions()
@@ -1885,11 +1398,6 @@ impl Client {
     }
 
     pub(crate) async fn server_versions(&self) -> HttpResult<&[MatrixVersion]> {
-        #[cfg(target_arch = "wasm32")]
-        let server_versions =
-            self.inner.server_versions.get_or_try_init(self.request_server_versions()).await?;
-
-        #[cfg(not(target_arch = "wasm32"))]
         let server_versions =
             self.inner.server_versions.get_or_try_init(|| self.request_server_versions()).await?;
 
@@ -1902,9 +1410,8 @@ impl Client {
     ///
     /// ```no_run
     /// # use matrix_sdk::{Client, config::SyncSettings};
-    /// # use futures::executor::block_on;
     /// # use url::Url;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
     /// let response = client.devices().await?;
@@ -1916,7 +1423,7 @@ impl Client {
     ///         device.display_name.as_deref().unwrap_or("")
     ///     );
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn devices(&self) -> HttpResult<get_devices::v3::Response> {
         let request = get_devices::v3::Request::new();
@@ -1942,11 +1449,10 @@ impl Client {
     /// #    ruma::{api::client::uiaa, device_id},
     /// #    Client, Error, config::SyncSettings,
     /// # };
-    /// # use futures::executor::block_on;
     /// # use serde_json::json;
     /// # use url::Url;
     /// # use std::collections::BTreeMap;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
     /// let devices = &[device_id!("DEVICEID").to_owned()];
@@ -1964,11 +1470,11 @@ impl Client {
     ///             .await?;
     ///     }
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     pub async fn delete_devices(
         &self,
         devices: &[OwnedDeviceId],
-        auth_data: Option<AuthData>,
+        auth_data: Option<uiaa::AuthData>,
     ) -> HttpResult<delete_devices::v3::Response> {
         let mut request = delete_devices::v3::Request::new(devices.to_owned());
         request.auth = auth_data;
@@ -1976,37 +1482,22 @@ impl Client {
         self.send(request, None).await
     }
 
-    /// Update the given device from the server.
+    /// Change the display name of a device owned by the current user.
+    ///
+    /// Returns a `update_device::Response` which specifies the result
+    /// of the operation.
     ///
     /// # Arguments
     ///
-    /// * `device` - The device id of the device that should be updated on the
-    /// server.
-    ///
-    /// * `display_name` - The display name of the device
-    ///
-    /// ```no_run
-    /// # use matrix_sdk::{
-    /// #    ruma::{api::client::uiaa, device_id},
-    /// #    Client, Error, config::SyncSettings,
-    /// # };
-    /// # use futures::executor::block_on;
-    /// # use serde_json::json;
-    /// # use url::Url;
-    /// # use std::collections::BTreeMap;
-    /// # block_on(async {
-    /// # let homeserver = Url::parse("http://localhost:8080")?;
-    /// # let mut client = Client::new(homeserver).await?;
-    /// let device_id = device_id!("DEVICEID").to_owned();
-    ///
-    /// if let Err(e) = client.update_device(device_id, String::from("AwesomeDevice")).await {
-    ///     
-    /// }
-    /// # anyhow::Ok(()) });
-    pub async fn update_device(&self, device: OwnedDeviceId, display_name: String) -> HttpResult<update_device::v3::Response> {
-        let mut request = update_device::v3::Request::new(device);
-        request.display_name = Some(display_name);
-
+    /// * `device_id` - The ID of the device to change the display name of.
+    /// * `display_name` - The new display name to set.
+    pub async fn rename_device(
+        &self,
+        device_id: &DeviceId,
+        display_name: &str,
+    ) -> HttpResult<update_device::v3::Response> {
+        let mut request = update_device::v3::Request::new(device_id.to_owned());
+        request.display_name = Some(display_name.to_owned());
         self.send(request, None).await
     }
 
@@ -2064,8 +1555,7 @@ impl Client {
     ///
     /// ```no_run
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let username = "";
     /// # let password = "";
@@ -2075,7 +1565,7 @@ impl Client {
     /// };
     ///
     /// let client = Client::new(homeserver).await?;
-    /// client.login_username(username, password).send().await?;
+    /// client.matrix_auth().login_username(username, password).send().await?;
     ///
     /// // Sync once so we receive the client state and old messages.
     /// client.sync_once(SyncSettings::default()).await?;
@@ -2089,7 +1579,7 @@ impl Client {
     /// // Now keep on syncing forever. `sync()` will use the stored sync token
     /// // from our `sync_once()` call automatically.
     /// client.sync(SyncSettings::default()).await;
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     ///
     /// [`sync`]: #method.sync
@@ -2121,7 +1611,7 @@ impl Client {
         }
 
         let request = assign!(sync_events::v3::Request::new(), {
-            filter: sync_settings.filter,
+            filter: sync_settings.filter.map(|f| *f),
             since: sync_settings.token,
             full_state: sync_settings.full_state,
             set_presence: sync_settings.set_presence,
@@ -2178,8 +1668,7 @@ impl Client {
     ///
     /// ```no_run
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let username = "";
     /// # let password = "";
@@ -2189,7 +1678,7 @@ impl Client {
     /// };
     ///
     /// let client = Client::new(homeserver).await?;
-    /// client.login_username(&username, &password).send().await?;
+    /// client.matrix_auth().login_username(&username, &password).send().await?;
     ///
     /// // Register our handler so we start responding once we receive a new
     /// // event.
@@ -2200,7 +1689,7 @@ impl Client {
     /// // Now keep on syncing forever. `sync()` will use the latest sync token
     /// // automatically.
     /// client.sync(SyncSettings::default()).await?;
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     ///
     /// [argument docs]: #method.sync_once
@@ -2239,8 +1728,7 @@ impl Client {
     /// # use std::time::Duration;
     /// # use matrix_sdk::{Client, config::SyncSettings, LoopCtrl};
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// # let mut client = Client::new(homeserver).await.unwrap();
     ///
@@ -2264,9 +1752,9 @@ impl Client {
     ///         LoopCtrl::Continue
     ///     })
     ///     .await;
-    /// })
+    /// };
     /// ```
-    #[instrument(skip_all, parent = &self.root_span)]
+    #[instrument(skip_all)]
     pub async fn sync_with_callback<C>(
         &self,
         sync_settings: crate::config::SyncSettings,
@@ -2291,12 +1779,12 @@ impl Client {
     ///
     /// * `callback` - A callback that will be called every time after a
     ///   response has been received, failure or not. The callback returns a
-    ///   `Result<LoopCtrl, Error>, too. When returning `Ok(LoopCtrl::Continue)`
-    ///   the sync will continue, if the callback returns `Ok(LoopCtrl::Break)`
-    ///   the sync will be stopped and the function returns `Ok(())`. In case
-    ///   the callback can't handle the `Error` or has a different malfunction,
-    ///   it can return an `Err(Error)`, which results in the sync ending and
-    ///   the `Err(Error)` being returned.
+    ///   `Result<LoopCtrl, Error>`, too. When returning
+    ///   `Ok(LoopCtrl::Continue)` the sync will continue, if the callback
+    ///   returns `Ok(LoopCtrl::Break)` the sync will be stopped and the
+    ///   function returns `Ok(())`. In case the callback can't handle the
+    ///   `Error` or has a different malfunction, it can return an `Err(Error)`,
+    ///   which results in the sync ending and the `Err(Error)` being returned.
     ///
     /// # Return
     /// The sync runs until an error occurs that the callback can't handle or
@@ -2319,11 +1807,10 @@ impl Client {
     /// # use std::time::Duration;
     /// # use matrix_sdk::{Client, config::SyncSettings, LoopCtrl};
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// # let mut client = Client::new(homeserver).await.unwrap();
-    ///
+    /// #
     /// use tokio::sync::mpsc::channel;
     ///
     /// let (tx, rx) = channel(100);
@@ -2345,7 +1832,7 @@ impl Client {
     ///         Ok(LoopCtrl::Continue)
     ///     })
     ///     .await;
-    /// })
+    /// };
     /// ```
     #[instrument(skip(self, callback))]
     pub async fn sync_with_result_callback<C>(
@@ -2395,16 +1882,15 @@ impl Client {
     ///
     /// ```no_run
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let username = "";
     /// # let password = "";
-    /// use futures::StreamExt;
+    /// use futures_util::StreamExt;
     /// use matrix_sdk::{config::SyncSettings, Client};
     ///
     /// let client = Client::new(homeserver).await?;
-    /// client.login_username(&username, &password).send().await?;
+    /// client.matrix_auth().login_username(&username, &password).send().await?;
     ///
     /// let mut sync_stream =
     ///     Box::pin(client.sync_stream(SyncSettings::default()).await);
@@ -2419,9 +1905,10 @@ impl Client {
     ///     }
     /// }
     ///
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
-    #[instrument(skip(self), parent = &self.root_span)]
+    #[allow(unknown_lints, clippy::let_with_type_underscore)] // triggered by instrument macro
+    #[instrument(skip(self))]
     pub async fn sync_stream(
         &self,
         mut sync_settings: crate::config::SyncSettings,
@@ -2455,10 +1942,36 @@ impl Client {
         self.send(request, None).await
     }
 
-    /// Log out the current user
-    pub async fn logout(&self) -> HttpResult<logout::v3::Response> {
-        let request = logout::v3::Request::new();
+    /// Subscribes a new receiver to client UnknownToken errors
+    pub fn subscribe_to_unknown_token_errors(&self) -> broadcast::Receiver<UnknownToken> {
+        let broadcast = &self.inner.unknown_token_error_sender;
+        broadcast.subscribe()
+    }
+
+    /// Sets a given pusher
+    pub async fn set_pusher(&self, pusher: Pusher) -> HttpResult<set_pusher::v3::Response> {
+        let request = set_pusher::v3::Request::post(pusher);
         self.send(request, None).await
+    }
+
+    /// Subscribe to sync gaps for the given room.
+    ///
+    /// This method is meant to be removed in favor of making event handlers
+    /// more general in the future.
+    pub fn subscribe_sync_gap(&self, room_id: &RoomId) -> Subscriber<()> {
+        let mut lock = self.inner.sync_gap_broadcast_txs.lock().unwrap();
+        let observable = lock.entry(room_id.to_owned()).or_default();
+        Observable::subscribe(observable)
+    }
+
+    /// Get the profile for a given user id
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` the matrix id this function downloads the profile for
+    pub async fn get_profile(&self, user_id: &UserId) -> Result<get_profile::v3::Response> {
+        let request = get_profile::v3::Request::new(user_id.to_owned());
+        Ok(self.send(request, Some(RequestConfig::short_retry())).await?)
     }
 }
 
@@ -2474,7 +1987,7 @@ pub(crate) mod tests {
     use ruma::{events::ignored_user_list::IgnoredUserListEventContent, UserId};
     use url::Url;
     use wiremock::{
-        matchers::{header, method, path},
+        matchers::{body_json, header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -2596,7 +2109,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        client.login_username("example", "wordpass").send().await.unwrap_err();
+        client.matrix_auth().login_username("example", "wordpass").send().await.unwrap_err();
     }
 
     #[async_test]
@@ -2619,7 +2132,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        client.login_username("example", "wordpass").send().await.unwrap_err();
+        client.matrix_auth().login_username("example", "wordpass").send().await.unwrap_err();
     }
 
     #[async_test]
@@ -2634,7 +2147,7 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        client.login_username("example", "wordpass").send().await.unwrap_err();
+        client.matrix_auth().login_username("example", "wordpass").send().await.unwrap_err();
     }
 
     #[async_test]
@@ -2660,5 +2173,29 @@ pub(crate) mod tests {
         let homeserver = Url::parse("http://example.com/").unwrap();
         client.set_homeserver(homeserver.clone()).await;
         assert_eq!(client.homeserver().await, homeserver);
+    }
+
+    #[async_test]
+    async fn search_user_request() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        Mock::given(method("POST"))
+            .and(path("_matrix/client/r0/user_directory/search"))
+            .and(body_json(&*test_json::search_users::SEARCH_USERS_REQUEST))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&*test_json::search_users::SEARCH_USERS_RESPONSE),
+            )
+            .mount(&server)
+            .await;
+
+        let response = client.search_users("test", 50).await.unwrap();
+        let result = response.results.first().unwrap();
+        assert_eq!(result.user_id.to_string(), "@test:example.me");
+        assert_eq!(result.display_name.clone().unwrap(), "Test");
+        assert_eq!(result.avatar_url.clone().unwrap().to_string(), "mxc://example.me/someid");
+        assert_eq!(response.results.len(), 1);
+        assert!(!response.limited);
     }
 }

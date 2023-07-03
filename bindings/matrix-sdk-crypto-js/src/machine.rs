@@ -1,11 +1,14 @@
 //! The crypto specific Olm objects.
 
-use std::{collections::BTreeMap, ops::Deref};
+use std::{collections::BTreeMap, ops::Deref, time::Duration};
 
+use futures_util::StreamExt;
 use js_sys::{Array, Function, Map, Promise, Set};
 use ruma::{serde::Raw, DeviceKeyAlgorithm, OwnedTransactionId, UInt};
 use serde_json::{json, Value as JsonValue};
+use tracing::warn;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use crate::{
     device, encryption,
@@ -15,7 +18,9 @@ use crate::{
     olm, requests,
     requests::{OutgoingRequest, ToDeviceRequest},
     responses::{self, response_from_string},
-    store, sync_events, types, verification, vodozemac,
+    store,
+    store::RoomKeyInfo,
+    sync_events, types, verification, vodozemac,
 };
 
 /// State machine implementation of the Olm/Megolm encryption protocol
@@ -217,7 +222,7 @@ impl OlmMachine {
         to_device_events: &str,
         changed_devices: &sync_events::DeviceLists,
         one_time_key_counts: &Map,
-        unused_fallback_keys: &Set,
+        unused_fallback_keys: Option<Set>,
     ) -> Result<Promise, JsError> {
         let to_device_events = serde_json::from_str(to_device_events)?;
         let changed_devices = changed_devices.inner.clone();
@@ -234,13 +239,18 @@ impl OlmMachine {
                 Some((key, value))
             })
             .collect();
-        let unused_fallback_keys: Option<Vec<DeviceKeyAlgorithm>> = Some(
-            unused_fallback_keys
-                .values()
-                .into_iter()
-                .filter_map(|js_value| Some(DeviceKeyAlgorithm::from(js_value.ok()?.as_string()?)))
-                .collect(),
-        );
+
+        // Convert the unused_fallback_keys JS Set to a `Vec<DeviceKeyAlgorithm>`
+        let unused_fallback_keys: Option<Vec<DeviceKeyAlgorithm>> =
+            unused_fallback_keys.map(|fallback_keys| {
+                fallback_keys
+                    .values()
+                    .into_iter()
+                    .filter_map(|js_value| {
+                        Some(DeviceKeyAlgorithm::from(js_value.ok()?.as_string()?))
+                    })
+                    .collect()
+            });
 
         let me = self.inner.clone();
 
@@ -387,11 +397,11 @@ impl OlmMachine {
 
     /// Export all the private cross signing keys we have.
     ///
-    /// The export will contain the seed for the ed25519 keys as a
-    /// unpadded base64 encoded string.
+    /// The export will contain the seeds for the ed25519 keys as
+    /// unpadded base64 encoded strings.
     ///
-    /// This method returns None if we don’t have any private cross
-    /// signing keys.
+    /// Returns `null` if we don’t have any private cross signing keys;
+    /// otherwise returns a `CrossSigningKeyExport`.
     #[wasm_bindgen(js_name = "exportCrossSigningKeys")]
     pub fn export_cross_signing_keys(&self) -> Promise {
         let me = self.inner.clone();
@@ -403,12 +413,22 @@ impl OlmMachine {
 
     /// Import our private cross signing keys.
     ///
-    /// The export needs to contain the seed for the ed25519 keys as
-    /// an unpadded base64 encoded string.
+    /// The keys should be provided as unpadded-base64-encoded strings.
+    ///
+    /// Returns a `CrossSigningStatus`.
     #[wasm_bindgen(js_name = "importCrossSigningKeys")]
-    pub fn import_cross_signing_keys(&self, export: store::CrossSigningKeyExport) -> Promise {
+    pub fn import_cross_signing_keys(
+        &self,
+        master_key: Option<String>,
+        self_signing_key: Option<String>,
+        user_signing_key: Option<String>,
+    ) -> Promise {
         let me = self.inner.clone();
-        let export = export.inner;
+        let export = matrix_sdk_crypto::store::CrossSigningKeyExport {
+            master_key,
+            self_signing_key,
+            user_signing_key,
+        };
 
         future_to_promise(async move {
             Ok(me.import_cross_signing_keys(export).await.map(olm::CrossSigningStatus::from)?)
@@ -423,6 +443,8 @@ impl OlmMachine {
     /// between all the devices.
     ///
     /// Uploading these keys will require user interactive auth.
+    ///
+    /// Returns an `Array` of `OutgoingRequest`s
     #[wasm_bindgen(js_name = "bootstrapCrossSigning")]
     pub fn bootstrap_cross_signing(&self, reset: bool) -> Promise {
         let me = self.inner.clone();
@@ -446,13 +468,21 @@ impl OlmMachine {
     }
 
     /// Get the cross signing user identity of a user.
+    ///
+    /// Returns a promise for an `OwnUserIdentity`, a `UserIdentity`, or
+    /// `undefined`.
     #[wasm_bindgen(js_name = "getIdentity")]
     pub fn get_identity(&self, user_id: &identifiers::UserId) -> Promise {
         let me = self.inner.clone();
         let user_id = user_id.inner.clone();
 
         future_to_promise(async move {
-            Ok(me.get_identity(user_id.as_ref(), None).await?.map(identities::UserIdentities::from))
+            // wait for up to a second for any in-flight device list requests to complete.
+            // The reason for this isn't so much to avoid races, but to make testing easier.
+            Ok(me
+                .get_identity(user_id.as_ref(), Some(Duration::from_secs(1)))
+                .await?
+                .map(identities::UserIdentities::from))
         })
     }
 
@@ -577,7 +607,10 @@ impl OlmMachine {
         let me = self.inner.clone();
 
         future_to_promise::<_, device::UserDevices>(async move {
-            Ok(me.get_user_devices(&user_id, None).await.map(Into::into)?)
+            // wait for up to a second for any in-flight device list requests to complete.
+            // The reason for this isn't so much to avoid races (some level of raciness is
+            // inevitable for this method) but to make testing easier.
+            Ok(me.get_user_devices(&user_id, Some(Duration::from_secs(1))).await.map(Into::into)?)
         })
     }
 
@@ -768,6 +801,25 @@ impl OlmMachine {
         )?)?)
     }
 
+    /// Register a callback which will be called whenever there is an update to
+    /// a room key.
+    ///
+    /// `callback` should be a function that takes a single argument (an array
+    /// of {@link RoomKeyInfo}) and returns a Promise.
+    #[wasm_bindgen(js_name = "registerRoomKeyUpdatedCallback")]
+    pub async fn register_room_key_updated_callback(&self, callback: Function) {
+        let stream = self.inner.store().room_keys_received_stream();
+
+        // fire up a promise chain which will call `cb` on each result from the stream
+        spawn_local(async move {
+            // take a reference to `callback` (which we then pass into the closure), to stop
+            // the callback being moved into the closure (which would mean we could only
+            // call the closure once)
+            let callback_ref = &callback;
+            stream.for_each(move |item| send_room_key_info_to_callback(callback_ref, item)).await;
+        });
+    }
+
     /// Shut down the `OlmMachine`.
     ///
     /// The `OlmMachine` cannot be used after this method has been called.
@@ -775,4 +827,44 @@ impl OlmMachine {
     /// All associated resources will be closed too, like IndexedDB
     /// connections.
     pub fn close(self) {}
+}
+
+// helper for register_room_key_received_callback: wraps the key info
+// into our own RoomKeyInfo struct, and passes it into the javascript
+// function
+async fn send_room_key_info_to_callback(
+    callback: &Function,
+    room_key_info: Vec<matrix_sdk_crypto::store::RoomKeyInfo>,
+) {
+    let rki: Array = room_key_info.into_iter().map(RoomKeyInfo::from).map(JsValue::from).collect();
+    match promise_result_to_future(callback.call1(&JsValue::NULL, &rki)).await {
+        Ok(_) => (),
+        Err(e) => {
+            warn!("Error calling room-key-received callback: {:?}", e);
+        }
+    }
+}
+
+/// Given a result from a javascript function which returns a Promise (or throws
+/// an exception before returning one), convert the result to a rust Future
+/// which completes with the result of the promise
+pub(crate) async fn promise_result_to_future(
+    res: Result<JsValue, JsValue>,
+) -> Result<JsValue, JsValue> {
+    match res {
+        Ok(retval) => {
+            if !retval.has_type::<Promise>() {
+                panic!("not a promise");
+            }
+            let prom: Promise = retval.dyn_into().map_err(|v| {
+                JsError::new(&format!("function returned a non-Promise value {v:?}"))
+            })?;
+            JsFuture::from(prom).await
+        }
+        Err(e) => {
+            // the function threw an exception before it returned the promise. We can just
+            // return the error as an error result.
+            Err(e)
+        }
+    }
 }

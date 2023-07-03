@@ -1,12 +1,40 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use anyhow::bail;
 use extension_trait::extension_trait;
 use eyeball_im::VectorDiff;
-use matrix_sdk::room::timeline::{Profile, TimelineDetails};
-pub use matrix_sdk::ruma::events::room::{message::RoomMessageEventContent, MediaSource};
+use matrix_sdk::{
+    attachment::{BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseThumbnailInfo, BaseVideoInfo},
+    ruma::events::{
+        location::AssetType as RumaAssetType,
+        room::{
+            message::{
+                AudioInfo as RumaAudioInfo,
+                AudioMessageEventContent as RumaAudioMessageEventContent,
+                EmoteMessageEventContent as RumaEmoteMessageEventContent, FileInfo as RumaFileInfo,
+                FileMessageEventContent as RumaFileMessageEventContent,
+                FormattedBody as RumaFormattedBody,
+                ImageMessageEventContent as RumaImageMessageEventContent,
+                LocationMessageEventContent as RumaLocationMessageEventContent,
+                MessageType as RumaMessageType,
+                NoticeMessageEventContent as RumaNoticeMessageEventContent,
+                RoomMessageEventContent, TextMessageEventContent as RumaTextMessageEventContent,
+                VideoInfo as RumaVideoInfo,
+                VideoMessageEventContent as RumaVideoMessageEventContent,
+            },
+            ImageInfo as RumaImageInfo, MediaSource, ThumbnailInfo as RumaThumbnailInfo,
+        },
+    },
+};
+use matrix_sdk_ui::timeline::{Profile, TimelineDetails};
+use ruma::{assign, UInt};
 use tracing::warn;
 
-use crate::helpers::unwrap_or_clone_arc;
+use crate::{
+    error::{ClientError, TimelineError},
+    helpers::unwrap_or_clone_arc,
+    room::AssetType,
+};
 
 #[uniffi::export]
 pub fn media_source_from_url(url: String) -> Arc<MediaSource> {
@@ -14,15 +42,21 @@ pub fn media_source_from_url(url: String) -> Arc<MediaSource> {
 }
 
 #[uniffi::export]
+pub fn message_event_content_new(msgtype: MessageType) -> Arc<RoomMessageEventContent> {
+    Arc::new(RoomMessageEventContent::new(msgtype.into()))
+}
+
+#[uniffi::export]
 pub fn message_event_content_from_markdown(md: String) -> Arc<RoomMessageEventContent> {
     Arc::new(RoomMessageEventContent::text_markdown(md))
 }
 
+#[uniffi::export(callback_interface)]
 pub trait TimelineListener: Sync + Send {
     fn on_update(&self, diff: Arc<TimelineDiff>);
 }
 
-#[derive(Clone)]
+#[derive(Clone, uniffi::Object)]
 pub enum TimelineDiff {
     Append { values: Vec<Arc<TimelineItem>> },
     Clear,
@@ -37,7 +71,7 @@ pub enum TimelineDiff {
 }
 
 impl TimelineDiff {
-    pub(crate) fn new(inner: VectorDiff<Arc<matrix_sdk::room::timeline::TimelineItem>>) -> Self {
+    pub(crate) fn new(inner: VectorDiff<Arc<matrix_sdk_ui::timeline::TimelineItem>>) -> Self {
         match inner {
             VectorDiff::Append { values } => {
                 Self::Append { values: values.into_iter().map(TimelineItem::from_arc).collect() }
@@ -155,11 +189,6 @@ pub struct SetData {
     pub item: Arc<TimelineItem>,
 }
 
-pub struct MoveData {
-    pub old_index: u32,
-    pub new_index: u32,
-}
-
 #[derive(Clone, Copy, uniffi::Enum)]
 pub enum TimelineChange {
     Append,
@@ -175,11 +204,11 @@ pub enum TimelineChange {
 }
 
 #[repr(transparent)]
-#[derive(Clone)]
-pub struct TimelineItem(matrix_sdk::room::timeline::TimelineItem);
+#[derive(Clone, uniffi::Object)]
+pub struct TimelineItem(pub(crate) matrix_sdk_ui::timeline::TimelineItem);
 
 impl TimelineItem {
-    pub(crate) fn from_arc(arc: Arc<matrix_sdk::room::timeline::TimelineItem>) -> Arc<Self> {
+    pub(crate) fn from_arc(arc: Arc<matrix_sdk_ui::timeline::TimelineItem>) -> Arc<Self> {
         // SAFETY: This is valid because Self is a repr(transparent) wrapper
         //         around the other Timeline type.
         unsafe { Arc::from_raw(Arc::into_raw(arc) as _) }
@@ -189,14 +218,14 @@ impl TimelineItem {
 #[uniffi::export]
 impl TimelineItem {
     pub fn as_event(self: Arc<Self>) -> Option<Arc<EventTimelineItem>> {
-        use matrix_sdk::room::timeline::TimelineItem as Item;
+        use matrix_sdk_ui::timeline::TimelineItem as Item;
         unwrap_or_clone_arc_into_variant!(self, .0, Item::Event(evt) => {
             Arc::new(EventTimelineItem(evt))
         })
     }
 
     pub fn as_virtual(self: Arc<Self>) -> Option<VirtualTimelineItem> {
-        use matrix_sdk::room::timeline::{TimelineItem as Item, VirtualTimelineItem as VItem};
+        use matrix_sdk_ui::timeline::{TimelineItem as Item, VirtualTimelineItem as VItem};
         match &self.0 {
             Item::Virtual(VItem::DayDivider(ts)) => {
                 Some(VirtualTimelineItem::DayDivider { ts: ts.0.into() })
@@ -217,45 +246,49 @@ impl TimelineItem {
 #[derive(Clone, uniffi::Enum)]
 pub enum EventSendState {
     /// The local event has not been sent yet.
-    NotSendYet,
+    NotSentYet,
     /// The local event has been sent to the server, but unsuccessfully: The
     /// sending has failed.
     SendingFailed { error: String },
+    /// Sending has been cancelled because an earlier event in the
+    /// message-sending queue failed.
+    Cancelled,
     /// The local event has been sent successfully to the server.
     Sent { event_id: String },
 }
 
-impl From<&matrix_sdk::room::timeline::EventSendState> for EventSendState {
-    fn from(value: &matrix_sdk::room::timeline::EventSendState) -> Self {
-        use matrix_sdk::room::timeline::EventSendState::*;
+impl From<&matrix_sdk_ui::timeline::EventSendState> for EventSendState {
+    fn from(value: &matrix_sdk_ui::timeline::EventSendState) -> Self {
+        use matrix_sdk_ui::timeline::EventSendState::*;
 
         match value {
-            NotSentYet => Self::NotSendYet,
+            NotSentYet => Self::NotSentYet,
             SendingFailed { error } => Self::SendingFailed { error: error.to_string() },
+            Cancelled => Self::Cancelled,
             Sent { event_id } => Self::Sent { event_id: event_id.to_string() },
         }
     }
 }
 
 #[derive(uniffi::Object)]
-pub struct EventTimelineItem(pub(crate) matrix_sdk::room::timeline::EventTimelineItem);
+pub struct EventTimelineItem(pub(crate) matrix_sdk_ui::timeline::EventTimelineItem);
 
 #[uniffi::export]
 impl EventTimelineItem {
     pub fn is_local(&self) -> bool {
-        use matrix_sdk::room::timeline::EventTimelineItem::*;
-
-        matches!(self.0, Local(_))
+        self.0.is_local_echo()
     }
 
     pub fn is_remote(&self) -> bool {
-        use matrix_sdk::room::timeline::EventTimelineItem::*;
-
-        matches!(self.0, Remote(_))
+        !self.0.is_local_echo()
     }
 
     pub fn unique_identifier(&self) -> String {
         self.0.unique_identifier()
+    }
+
+    pub fn transaction_id(&self) -> Option<String> {
+        self.0.transaction_id().map(ToString::to_string)
     }
 
     pub fn event_id(&self) -> Option<String> {
@@ -266,7 +299,7 @@ impl EventTimelineItem {
         self.0.sender().to_string()
     }
 
-    pub fn sender_profile(&self) -> ProfileTimelineDetails {
+    pub fn sender_profile(&self) -> ProfileDetails {
         self.0.sender_profile().into()
     }
 
@@ -286,51 +319,62 @@ impl EventTimelineItem {
         self.0.timestamp().0.into()
     }
 
-    pub fn reactions(&self) -> Option<Vec<Reaction>> {
-        use matrix_sdk::room::timeline::EventTimelineItem::*;
-
-        match &self.0 {
-            Local(_) => None,
-            Remote(remote_event_item) => Some(
-                remote_event_item
-                    .reactions()
-                    .iter()
-                    .map(|(k, v)| Reaction {
-                        key: k.to_owned(),
-                        count: v.len().try_into().unwrap(),
-                    })
-                    .collect(),
-            ),
-        }
+    pub fn reactions(&self) -> Vec<Reaction> {
+        self.0
+            .reactions()
+            .iter()
+            .map(|(k, v)| Reaction {
+                key: k.to_owned(),
+                count: v.len().try_into().unwrap(),
+                senders: v.senders().map(ToString::to_string).collect(),
+            })
+            .collect()
     }
 
-    pub fn raw(&self) -> Option<String> {
-        self.0.raw().map(|r| r.json().get().to_owned())
+    pub fn debug_info(&self) -> EventTimelineItemDebugInfo {
+        EventTimelineItemDebugInfo {
+            model: format!("{:#?}", self.0),
+            original_json: self.0.original_json().map(|raw| raw.json().get().to_owned()),
+            latest_edit_json: self.0.latest_edit_json().map(|raw| raw.json().get().to_owned()),
+        }
     }
 
     pub fn local_send_state(&self) -> Option<EventSendState> {
-        use matrix_sdk::room::timeline::EventTimelineItem::*;
-
-        match &self.0 {
-            Local(local_event) => Some((&local_event.send_state).into()),
-            Remote(_) => None,
-        }
+        self.0.send_state().map(Into::into)
     }
 
-    pub fn fmt_debug(&self) -> String {
-        format!("{:#?}", self.0)
+    pub fn read_receipts(&self) -> HashMap<String, Receipt> {
+        self.0.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect()
     }
 }
 
+#[derive(uniffi::Record)]
+pub struct Receipt {
+    pub timestamp: Option<u64>,
+}
+
+impl From<ruma::events::receipt::Receipt> for Receipt {
+    fn from(value: ruma::events::receipt::Receipt) -> Self {
+        Receipt { timestamp: value.ts.map(|ts| ts.0.into()) }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct EventTimelineItemDebugInfo {
+    model: String,
+    original_json: Option<String>,
+    latest_edit_json: Option<String>,
+}
+
 #[derive(uniffi::Enum)]
-pub enum ProfileTimelineDetails {
+pub enum ProfileDetails {
     Unavailable,
     Pending,
     Ready { display_name: Option<String>, display_name_ambiguous: bool, avatar_url: Option<String> },
     Error { message: String },
 }
 
-impl From<&TimelineDetails<Profile>> for ProfileTimelineDetails {
+impl From<&TimelineDetails<Profile>> for ProfileDetails {
     fn from(details: &TimelineDetails<Profile>) -> Self {
         match details {
             TimelineDetails::Unavailable => Self::Unavailable,
@@ -346,12 +390,12 @@ impl From<&TimelineDetails<Profile>> for ProfileTimelineDetails {
 }
 
 #[derive(Clone, uniffi::Object)]
-pub struct TimelineItemContent(matrix_sdk::room::timeline::TimelineItemContent);
+pub struct TimelineItemContent(matrix_sdk_ui::timeline::TimelineItemContent);
 
 #[uniffi::export]
 impl TimelineItemContent {
     pub fn kind(&self) -> TimelineItemContentKind {
-        use matrix_sdk::room::timeline::TimelineItemContent as Content;
+        use matrix_sdk_ui::timeline::TimelineItemContent as Content;
 
         match &self.0 {
             Content::Message(_) => TimelineItemContentKind::Message,
@@ -413,7 +457,7 @@ impl TimelineItemContent {
     }
 
     pub fn as_message(self: Arc<Self>) -> Option<Arc<Message>> {
-        use matrix_sdk::room::timeline::TimelineItemContent as Content;
+        use matrix_sdk_ui::timeline::TimelineItemContent as Content;
         unwrap_or_clone_arc_into_variant!(self, .0, Content::Message(msg) => Arc::new(Message(msg)))
     }
 }
@@ -456,70 +500,20 @@ pub enum TimelineItemContentKind {
 }
 
 #[derive(Clone, uniffi::Object)]
-pub struct Message(matrix_sdk::room::timeline::Message);
+pub struct Message(matrix_sdk_ui::timeline::Message);
 
 #[uniffi::export]
 impl Message {
     pub fn msgtype(&self) -> Option<MessageType> {
-        use matrix_sdk::ruma::events::room::message::MessageType as MTy;
-        match self.0.msgtype() {
-            MTy::Emote(c) => Some(MessageType::Emote {
-                content: EmoteMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                },
-            }),
-            MTy::Image(c) => Some(MessageType::Image {
-                content: ImageMessageContent {
-                    body: c.body.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
-                },
-            }),
-            MTy::Audio(c) => Some(MessageType::Audio {
-                content: AudioMessageContent {
-                    body: c.body.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
-                },
-            }),
-            MTy::Video(c) => Some(MessageType::Video {
-                content: VideoMessageContent {
-                    body: c.body.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
-                },
-            }),
-            MTy::File(c) => Some(MessageType::File {
-                content: FileMessageContent {
-                    body: c.body.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
-                },
-            }),
-            MTy::Notice(c) => Some(MessageType::Notice {
-                content: NoticeMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                },
-            }),
-            MTy::Text(c) => Some(MessageType::Text {
-                content: TextMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                },
-            }),
-            _ => None,
-        }
+        self.0.msgtype().clone().try_into().ok()
     }
 
     pub fn body(&self) -> String {
         self.0.msgtype().body().to_owned()
     }
 
-    // This event ID string will be replaced by something more useful later.
-    pub fn in_reply_to(&self) -> Option<String> {
-        self.0.in_reply_to().map(|r| r.event_id.to_string())
+    pub fn in_reply_to(&self) -> Option<InReplyToDetails> {
+        self.0.in_reply_to().map(InReplyToDetails::from)
     }
 
     pub fn is_edited(&self) -> bool {
@@ -536,6 +530,124 @@ pub enum MessageType {
     File { content: FileMessageContent },
     Notice { content: NoticeMessageContent },
     Text { content: TextMessageContent },
+    Location { content: LocationContent },
+}
+
+impl From<MessageType> for RumaMessageType {
+    fn from(value: MessageType) -> Self {
+        match value {
+            MessageType::Emote { content } => {
+                Self::Emote(assign!(RumaEmoteMessageEventContent::plain(content.body), {
+                    formatted: content.formatted.map(Into::into),
+                }))
+            }
+            MessageType::Image { content } => Self::Image(
+                RumaImageMessageEventContent::new(content.body, (*content.source).clone())
+                    .info(content.info.map(Into::into).map(Box::new)),
+            ),
+            MessageType::Audio { content } => Self::Audio(
+                RumaAudioMessageEventContent::new(content.body, (*content.source).clone())
+                    .info(content.info.map(Into::into).map(Box::new)),
+            ),
+            MessageType::Video { content } => Self::Video(
+                RumaVideoMessageEventContent::new(content.body, (*content.source).clone())
+                    .info(content.info.map(Into::into).map(Box::new)),
+            ),
+            MessageType::File { content } => Self::File(
+                RumaFileMessageEventContent::new(content.body, (*content.source).clone())
+                    .filename(content.filename)
+                    .info(content.info.map(Into::into).map(Box::new)),
+            ),
+            MessageType::Notice { content } => {
+                Self::Notice(assign!(RumaNoticeMessageEventContent::plain(content.body), {
+                    formatted: content.formatted.map(Into::into),
+                }))
+            }
+            MessageType::Text { content } => {
+                Self::Text(assign!(RumaTextMessageEventContent::plain(content.body), {
+                    formatted: content.formatted.map(Into::into),
+                }))
+            }
+            MessageType::Location { content } => {
+                Self::Location(RumaLocationMessageEventContent::new(content.body, content.geo_uri))
+            }
+        }
+    }
+}
+
+impl TryFrom<RumaMessageType> for MessageType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: RumaMessageType) -> anyhow::Result<Self> {
+        let message_type = match value {
+            RumaMessageType::Emote(c) => MessageType::Emote {
+                content: EmoteMessageContent {
+                    body: c.body.clone(),
+                    formatted: c.formatted.as_ref().map(Into::into),
+                },
+            },
+            RumaMessageType::Image(c) => MessageType::Image {
+                content: ImageMessageContent {
+                    body: c.body.clone(),
+                    source: Arc::new(c.source.clone()),
+                    info: c.info.as_deref().map(Into::into),
+                },
+            },
+            RumaMessageType::Audio(c) => MessageType::Audio {
+                content: AudioMessageContent {
+                    body: c.body.clone(),
+                    source: Arc::new(c.source.clone()),
+                    info: c.info.as_deref().map(Into::into),
+                },
+            },
+            RumaMessageType::Video(c) => MessageType::Video {
+                content: VideoMessageContent {
+                    body: c.body.clone(),
+                    source: Arc::new(c.source.clone()),
+                    info: c.info.as_deref().map(Into::into),
+                },
+            },
+            RumaMessageType::File(c) => MessageType::File {
+                content: FileMessageContent {
+                    body: c.body.clone(),
+                    filename: c.filename.clone(),
+                    source: Arc::new(c.source.clone()),
+                    info: c.info.as_deref().map(Into::into),
+                },
+            },
+            RumaMessageType::Notice(c) => MessageType::Notice {
+                content: NoticeMessageContent {
+                    body: c.body.clone(),
+                    formatted: c.formatted.as_ref().map(Into::into),
+                },
+            },
+            RumaMessageType::Text(c) => MessageType::Text {
+                content: TextMessageContent {
+                    body: c.body.clone(),
+                    formatted: c.formatted.as_ref().map(Into::into),
+                },
+            },
+            RumaMessageType::Location(c) => {
+                let (description, zoom_level) =
+                    c.location.map(|loc| (loc.description, loc.zoom_level)).unwrap_or((None, None));
+                MessageType::Location {
+                    content: LocationContent {
+                        body: c.body,
+                        geo_uri: c.geo_uri,
+                        description,
+                        zoom_level: zoom_level.and_then(|z| z.get().try_into().ok()),
+                        asset: c.asset.and_then(|a| match a.type_ {
+                            RumaAssetType::Self_ => Some(AssetType::Sender),
+                            RumaAssetType::Pin => Some(AssetType::Pin),
+                            _ => None,
+                        }),
+                    },
+                }
+            }
+            _ => bail!("Unsupported type"),
+        };
+        Ok(message_type)
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -568,6 +680,7 @@ pub struct VideoMessageContent {
 #[derive(Clone, uniffi::Record)]
 pub struct FileMessageContent {
     pub body: String,
+    pub filename: Option<String>,
     pub source: Arc<MediaSource>,
     pub info: Option<FileInfo>,
 }
@@ -583,17 +696,73 @@ pub struct ImageInfo {
     pub blurhash: Option<String>,
 }
 
+impl From<ImageInfo> for RumaImageInfo {
+    fn from(value: ImageInfo) -> Self {
+        assign!(RumaImageInfo::new(), {
+            height: value.height.map(u64_to_uint),
+            width: value.width.map(u64_to_uint),
+            mimetype: value.mimetype,
+            size: value.size.map(u64_to_uint),
+            thumbnail_info: value.thumbnail_info.map(Into::into).map(Box::new),
+            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone()),
+            blurhash: value.blurhash,
+        })
+    }
+}
+
+impl TryFrom<&ImageInfo> for BaseImageInfo {
+    type Error = TimelineError;
+
+    fn try_from(value: &ImageInfo) -> Result<Self, TimelineError> {
+        let height = UInt::try_from(value.height.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let width = UInt::try_from(value.width.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let size = UInt::try_from(value.size.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let blurhash = value.blurhash.clone().ok_or(TimelineError::MissingMediaInfoField)?;
+
+        Ok(BaseImageInfo {
+            height: Some(height),
+            width: Some(width),
+            size: Some(size),
+            blurhash: Some(blurhash),
+        })
+    }
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct AudioInfo {
-    // FIXME: duration should be a std::time::Duration once the UniFFI proc-macro API adds support
-    // for that
-    pub duration: Option<u64>,
+    pub duration: Option<Duration>,
     pub size: Option<u64>,
+    pub mimetype: Option<String>,
+}
+
+impl From<AudioInfo> for RumaAudioInfo {
+    fn from(value: AudioInfo) -> Self {
+        assign!(RumaAudioInfo::new(), {
+            duration: value.duration,
+            size: value.size.map(u64_to_uint),
+            mimetype: value.mimetype,
+        })
+    }
+}
+
+impl TryFrom<&AudioInfo> for BaseAudioInfo {
+    type Error = TimelineError;
+
+    fn try_from(value: &AudioInfo) -> Result<Self, TimelineError> {
+        let duration = value.duration.ok_or(TimelineError::MissingMediaInfoField)?;
+        let size = UInt::try_from(value.size.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+
+        Ok(BaseAudioInfo { duration: Some(duration), size: Some(size) })
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
 pub struct VideoInfo {
-    pub duration: Option<u64>,
+    pub duration: Option<Duration>,
     pub height: Option<u64>,
     pub width: Option<u64>,
     pub mimetype: Option<String>,
@@ -601,6 +770,44 @@ pub struct VideoInfo {
     pub thumbnail_info: Option<ThumbnailInfo>,
     pub thumbnail_source: Option<Arc<MediaSource>>,
     pub blurhash: Option<String>,
+}
+
+impl From<VideoInfo> for RumaVideoInfo {
+    fn from(value: VideoInfo) -> Self {
+        assign!(RumaVideoInfo::new(), {
+            duration: value.duration,
+            height: value.height.map(u64_to_uint),
+            width: value.width.map(u64_to_uint),
+            mimetype: value.mimetype,
+            size: value.size.map(u64_to_uint),
+            thumbnail_info: value.thumbnail_info.map(Into::into).map(Box::new),
+            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone()),
+            blurhash: value.blurhash,
+        })
+    }
+}
+
+impl TryFrom<&VideoInfo> for BaseVideoInfo {
+    type Error = TimelineError;
+
+    fn try_from(value: &VideoInfo) -> Result<Self, TimelineError> {
+        let duration = value.duration.ok_or(TimelineError::MissingMediaInfoField)?;
+        let height = UInt::try_from(value.height.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let width = UInt::try_from(value.width.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let size = UInt::try_from(value.size.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let blurhash = value.blurhash.clone().ok_or(TimelineError::MissingMediaInfoField)?;
+
+        Ok(BaseVideoInfo {
+            duration: Some(duration),
+            height: Some(height),
+            width: Some(width),
+            size: Some(size),
+            blurhash: Some(blurhash),
+        })
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -611,12 +818,60 @@ pub struct FileInfo {
     pub thumbnail_source: Option<Arc<MediaSource>>,
 }
 
+impl From<FileInfo> for RumaFileInfo {
+    fn from(value: FileInfo) -> Self {
+        assign!(RumaFileInfo::new(), {
+            mimetype: value.mimetype,
+            size: value.size.map(u64_to_uint),
+            thumbnail_info: value.thumbnail_info.map(Into::into).map(Box::new),
+            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone()),
+        })
+    }
+}
+
+impl TryFrom<&FileInfo> for BaseFileInfo {
+    type Error = TimelineError;
+
+    fn try_from(value: &FileInfo) -> Result<Self, TimelineError> {
+        let size = UInt::try_from(value.size.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+
+        Ok(BaseFileInfo { size: Some(size) })
+    }
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct ThumbnailInfo {
     pub height: Option<u64>,
     pub width: Option<u64>,
     pub mimetype: Option<String>,
     pub size: Option<u64>,
+}
+
+impl From<ThumbnailInfo> for RumaThumbnailInfo {
+    fn from(value: ThumbnailInfo) -> Self {
+        assign!(RumaThumbnailInfo::new(), {
+            height: value.height.map(u64_to_uint),
+            width: value.width.map(u64_to_uint),
+            mimetype: value.mimetype,
+            size: value.size.map(u64_to_uint),
+        })
+    }
+}
+
+impl TryFrom<&ThumbnailInfo> for BaseThumbnailInfo {
+    type Error = TimelineError;
+
+    fn try_from(value: &ThumbnailInfo) -> Result<Self, TimelineError> {
+        let height = UInt::try_from(value.height.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let width = UInt::try_from(value.width.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+        let size = UInt::try_from(value.size.ok_or(TimelineError::MissingMediaInfoField)?)
+            .map_err(|_| TimelineError::InvalidMediaInfoField)?;
+
+        Ok(BaseThumbnailInfo { height: Some(height), width: Some(width), size: Some(size) })
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -632,27 +887,48 @@ pub struct TextMessageContent {
 }
 
 #[derive(Clone, uniffi::Record)]
+pub struct LocationContent {
+    pub body: String,
+    pub geo_uri: String,
+    pub description: Option<String>,
+    pub zoom_level: Option<u8>,
+    pub asset: Option<AssetType>,
+}
+
+#[derive(Clone, uniffi::Record)]
 pub struct FormattedBody {
     pub format: MessageFormat,
     pub body: String,
 }
 
-impl From<&matrix_sdk::ruma::events::room::message::FormattedBody> for FormattedBody {
-    fn from(f: &matrix_sdk::ruma::events::room::message::FormattedBody) -> Self {
+impl From<FormattedBody> for RumaFormattedBody {
+    fn from(f: FormattedBody) -> Self {
+        Self {
+            format: match f.format {
+                MessageFormat::Html => matrix_sdk::ruma::events::room::message::MessageFormat::Html,
+                MessageFormat::Unknown { format } => format.into(),
+            },
+            body: f.body,
+        }
+    }
+}
+
+impl From<&RumaFormattedBody> for FormattedBody {
+    fn from(f: &RumaFormattedBody) -> Self {
         Self {
             format: match &f.format {
                 matrix_sdk::ruma::events::room::message::MessageFormat::Html => MessageFormat::Html,
-                _ => MessageFormat::Unknown,
+                _ => MessageFormat::Unknown { format: f.format.to_string() },
             },
             body: f.body.clone(),
         }
     }
 }
 
-#[derive(Clone, Copy, uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum MessageFormat {
     Html,
-    Unknown,
+    Unknown { format: String },
 }
 
 impl From<&matrix_sdk::ruma::events::room::ImageInfo> for ImageInfo {
@@ -676,17 +952,18 @@ impl From<&matrix_sdk::ruma::events::room::ImageInfo> for ImageInfo {
     }
 }
 
-impl From<&matrix_sdk::ruma::events::room::message::AudioInfo> for AudioInfo {
-    fn from(info: &matrix_sdk::ruma::events::room::message::AudioInfo) -> Self {
+impl From<&RumaAudioInfo> for AudioInfo {
+    fn from(info: &RumaAudioInfo) -> Self {
         Self {
-            duration: info.duration.map(|d| d.as_millis() as u64),
+            duration: info.duration,
             size: info.size.map(Into::into),
+            mimetype: info.mimetype.clone(),
         }
     }
 }
 
-impl From<&matrix_sdk::ruma::events::room::message::VideoInfo> for VideoInfo {
-    fn from(info: &matrix_sdk::ruma::events::room::message::VideoInfo) -> Self {
+impl From<&RumaVideoInfo> for VideoInfo {
+    fn from(info: &RumaVideoInfo) -> Self {
         let thumbnail_info = info.thumbnail_info.as_ref().map(|info| ThumbnailInfo {
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
@@ -695,7 +972,7 @@ impl From<&matrix_sdk::ruma::events::room::message::VideoInfo> for VideoInfo {
         });
 
         Self {
-            duration: info.duration.map(|d| d.as_secs()),
+            duration: info.duration,
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
             mimetype: info.mimetype.clone(),
@@ -707,8 +984,8 @@ impl From<&matrix_sdk::ruma::events::room::message::VideoInfo> for VideoInfo {
     }
 }
 
-impl From<&matrix_sdk::ruma::events::room::message::FileInfo> for FileInfo {
-    fn from(info: &matrix_sdk::ruma::events::room::message::FileInfo) -> Self {
+impl From<&RumaFileInfo> for FileInfo {
+    fn from(info: &RumaFileInfo) -> Self {
         let thumbnail_info = info.thumbnail_info.as_ref().map(|info| ThumbnailInfo {
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
@@ -723,6 +1000,47 @@ impl From<&matrix_sdk::ruma::events::room::message::FileInfo> for FileInfo {
             thumbnail_source: info.thumbnail_source.clone().map(Arc::new),
         }
     }
+}
+
+fn u64_to_uint(u: u64) -> UInt {
+    UInt::new(u).unwrap_or_else(|| {
+        warn!("u64 -> UInt conversion overflowed, falling back to UInt::MAX");
+        UInt::MAX
+    })
+}
+
+#[derive(uniffi::Record)]
+pub struct InReplyToDetails {
+    event_id: String,
+    event: RepliedToEventDetails,
+}
+
+impl From<&matrix_sdk_ui::timeline::InReplyToDetails> for InReplyToDetails {
+    fn from(inner: &matrix_sdk_ui::timeline::InReplyToDetails) -> Self {
+        let event_id = inner.event_id.to_string();
+        let event = match &inner.event {
+            TimelineDetails::Unavailable => RepliedToEventDetails::Unavailable,
+            TimelineDetails::Pending => RepliedToEventDetails::Pending,
+            TimelineDetails::Ready(event) => RepliedToEventDetails::Ready {
+                message: Arc::new(Message(event.message().to_owned())),
+                sender: event.sender().to_string(),
+                sender_profile: event.sender_profile().into(),
+            },
+            TimelineDetails::Error(err) => {
+                RepliedToEventDetails::Error { message: err.to_string() }
+            }
+        };
+
+        Self { event_id, event }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum RepliedToEventDetails {
+    Unavailable,
+    Pending,
+    Ready { message: Arc<Message>, sender: String, sender_profile: ProfileDetails },
+    Error { message: String },
 }
 
 #[derive(Clone, uniffi::Enum)]
@@ -741,8 +1059,8 @@ pub enum EncryptedMessage {
 }
 
 impl EncryptedMessage {
-    fn new(msg: &matrix_sdk::room::timeline::EncryptedMessage) -> Self {
-        use matrix_sdk::room::timeline::EncryptedMessage as Message;
+    fn new(msg: &matrix_sdk_ui::timeline::EncryptedMessage) -> Self {
+        use matrix_sdk_ui::timeline::EncryptedMessage as Message;
 
         match msg {
             Message::OlmV1Curve25519AesSha2 { sender_key } => {
@@ -762,7 +1080,7 @@ impl EncryptedMessage {
 pub struct Reaction {
     pub key: String,
     pub count: u64,
-    // TODO: Also expose senders
+    pub senders: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -796,6 +1114,15 @@ pub enum VirtualTimelineItem {
 
 #[extension_trait]
 pub impl MediaSourceExt for MediaSource {
+    fn from_json(json: String) -> Result<MediaSource, ClientError> {
+        let res = serde_json::from_str(&json)?;
+        Ok(res)
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("Media source should always be serializable ")
+    }
+
     fn url(&self) -> String {
         match self {
             MediaSource::Plain(url) => url.to_string(),
@@ -825,9 +1152,9 @@ pub enum MembershipChange {
     NotImplemented,
 }
 
-impl From<matrix_sdk::room::timeline::MembershipChange> for MembershipChange {
-    fn from(membership_change: matrix_sdk::room::timeline::MembershipChange) -> Self {
-        use matrix_sdk::room::timeline::MembershipChange as Change;
+impl From<matrix_sdk_ui::timeline::MembershipChange> for MembershipChange {
+    fn from(membership_change: matrix_sdk_ui::timeline::MembershipChange) -> Self {
+        use matrix_sdk_ui::timeline::MembershipChange as Change;
         match membership_change {
             Change::None => Self::None,
             Change::Error => Self::Error,
@@ -875,12 +1202,11 @@ pub enum OtherState {
     Custom { event_type: String },
 }
 
-impl From<&matrix_sdk::room::timeline::AnyOtherFullStateEventContent> for OtherState {
-    fn from(content: &matrix_sdk::room::timeline::AnyOtherFullStateEventContent) -> Self {
-        use matrix_sdk::{
-            room::timeline::AnyOtherFullStateEventContent as Content,
-            ruma::events::FullStateEventContent as FullContent,
-        };
+impl From<&matrix_sdk_ui::timeline::AnyOtherFullStateEventContent> for OtherState {
+    fn from(content: &matrix_sdk_ui::timeline::AnyOtherFullStateEventContent) -> Self {
+        use matrix_sdk::ruma::events::FullStateEventContent as FullContent;
+        use matrix_sdk_ui::timeline::AnyOtherFullStateEventContent as Content;
+
         match content {
             Content::PolicyRuleRoom(_) => Self::PolicyRuleRoom,
             Content::PolicyRuleServer(_) => Self::PolicyRuleServer,

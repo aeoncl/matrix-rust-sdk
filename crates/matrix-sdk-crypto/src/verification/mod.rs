@@ -24,7 +24,6 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use event_enums::OutgoingContent;
 pub use machine::VerificationMachine;
-use matrix_sdk_common::locks::Mutex;
 #[cfg(feature = "qrcode")]
 pub use qrcode::{QrVerification, QrVerificationState, ScanError};
 pub use requests::{VerificationRequest, VerificationRequestState};
@@ -46,6 +45,7 @@ use ruma::{
     UserId,
 };
 pub use sas::{AcceptSettings, AcceptedProtocols, EmojiShortAuthString, Sas, SasState};
+use tokio::sync::Mutex;
 use tracing::{error, info, trace, warn};
 
 use crate::{
@@ -648,9 +648,9 @@ impl IdentitiesBeingVerified {
             if self
                 .identity_being_verified
                 .as_ref()
-                .map_or(false, |i| i.master_key() == identity.master_key())
+                .is_some_and(|i| i.master_key() == identity.master_key())
             {
-                if verified_identities.map_or(false, |i| i.contains(&identity)) {
+                if verified_identities.is_some_and(|i| i.contains(&identity)) {
                     trace!(
                         user_id = self.other_user_id().as_str(),
                         "Marking the user identity of as verified."
@@ -719,7 +719,7 @@ impl IdentitiesBeingVerified {
             return Ok(None);
         }
 
-        if verified_devices.map_or(false, |v| v.contains(&device)) {
+        if verified_devices.is_some_and(|v| v.contains(&device)) {
             trace!(
                 user_id = device.user_id().as_str(),
                 device_id = device.device_id().as_str(),
@@ -812,8 +812,8 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod test {
-    use matrix_sdk_common::locks::Mutex;
     use ruma::{device_id, user_id, DeviceId, UserId};
+    use tokio::sync::Mutex;
 
     use super::VerificationStore;
     use crate::{

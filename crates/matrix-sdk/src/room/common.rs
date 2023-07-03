@@ -1,11 +1,14 @@
-use std::{borrow::Borrow, collections::BTreeMap, ops::Deref, sync::Arc};
+use std::{borrow::Borrow, collections::BTreeMap, fmt, ops::Deref, sync::Arc};
 
 use matrix_sdk_base::{
-    deserialized_responses::{MembersResponse, TimelineEvent},
+    deserialized_responses::{
+        MembersResponse, RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
+        TimelineEvent,
+    },
     store::StateStoreExt,
-    StateChanges,
+    RoomMemberships, StateChanges,
 };
-use matrix_sdk_common::locks::Mutex;
+use matrix_sdk_common::debug::DebugStructExt;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
     room::encrypted::OriginalSyncRoomEncryptedEvent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
@@ -31,27 +34,29 @@ use ruma::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
             encryption::RoomEncryptionEventContent, history_visibility::HistoryVisibility,
-            server_acl::RoomServerAclEventContent, MediaSource,
+            power_levels::RoomPowerLevelsEventContent, server_acl::RoomServerAclEventContent,
+            MediaSource,
         },
         tag::{TagInfo, TagName},
-        AnyRoomAccountDataEvent, AnyStateEvent, AnySyncStateEvent, EmptyStateKey, RedactContent,
+        AnyRoomAccountDataEvent, AnyStateEvent, EmptyStateKey, RedactContent,
         RedactedStateEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
         RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
-        SyncStateEvent,
     },
+    push::{Action, PushConditionRoomCtx},
     serde::Raw,
     uint, EventId, MatrixToUri, MatrixUri, OwnedEventId, OwnedServerName, OwnedUserId, RoomId,
     UInt, UserId,
 };
 use serde::de::DeserializeOwned;
+use tokio::sync::{broadcast, Mutex};
+use tracing::{debug, instrument};
 
-#[cfg(feature = "experimental-timeline")]
-use super::timeline::Timeline;
 use super::Joined;
 use crate::{
     event_handler::{EventHandler, EventHandlerHandle, SyncEvent},
     media::{MediaFormat, MediaRequest},
-    room::{Left, RoomMember, RoomType},
+    room::{Left, RoomMember, RoomState},
+    sync::RoomUpdate,
     BaseRoom, Client, Error, HttpError, HttpResult, Result,
 };
 
@@ -145,24 +150,24 @@ impl Common {
     ///
     /// * `format` - The desired format of the avatar.
     ///
-    /// # Example
+    /// # Examples
+    ///
     /// ```no_run
-    /// # use futures::executor::block_on;
     /// # use matrix_sdk::Client;
     /// # use matrix_sdk::ruma::room_id;
     /// # use matrix_sdk::media::MediaFormat;
     /// # use url::Url;
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
+    /// # async {
     /// # let user = "example";
     /// let client = Client::new(homeserver).await.unwrap();
-    /// client.login_username(user, "password").send().await.unwrap();
+    /// client.matrix_auth().login_username(user, "password").send().await.unwrap();
     /// let room_id = room_id!("!roomid:example.com");
     /// let room = client.get_joined_room(&room_id).unwrap();
     /// if let Some(avatar) = room.avatar(MediaFormat::File).await.unwrap() {
     ///     std::fs::write("avatar.png", avatar);
     /// }
-    /// # })
+    /// # };
     /// ```
     pub async fn avatar(&self, format: MediaFormat) -> Result<Option<Vec<u8>>> {
         let Some(url) = self.avatar_url() else { return Ok(None) };
@@ -179,6 +184,7 @@ impl Common {
     /// undecrypted.
     ///
     /// # Examples
+    ///
     /// ```no_run
     /// use matrix_sdk::{room::MessagesOptions, Client};
     /// # use matrix_sdk::ruma::{
@@ -188,16 +194,16 @@ impl Common {
     /// # use url::Url;
     ///
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// let options =
     ///     MessagesOptions::backward().from("t47429-4392820_219380_26003_2265");
     ///
     /// let mut client = Client::new(homeserver).await.unwrap();
     /// let room = client.get_joined_room(room_id!("!roomid:example.com")).unwrap();
     /// assert!(room.messages(options).await.is_ok());
-    /// # });
+    /// # };
     /// ```
+    #[instrument(skip_all, fields(room_id = ?self.inner.room_id(), ?options))]
     pub async fn messages(&self, options: MessagesOptions) -> Result<Messages> {
         let room_id = self.inner.room_id();
         let request = options.into_request(room_id);
@@ -208,41 +214,45 @@ impl Common {
             start: http_response.start,
             end: http_response.end,
             #[cfg(not(feature = "e2e-encryption"))]
-            chunk: http_response
-                .chunk
-                .into_iter()
-                .map(|event| TimelineEvent { event, encryption_info: None })
-                .collect(),
+            chunk: http_response.chunk.into_iter().map(TimelineEvent::new).collect(),
             #[cfg(feature = "e2e-encryption")]
             chunk: Vec::with_capacity(http_response.chunk.len()),
             state: http_response.state,
         };
 
         #[cfg(feature = "e2e-encryption")]
-        if let Some(machine) = self.client.olm_machine() {
-            for event in http_response.chunk {
-                let decrypted_event = if let Ok(AnySyncTimelineEvent::MessageLike(
-                    AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(_)),
-                )) = event.deserialize_as::<AnySyncTimelineEvent>()
-                {
-                    if let Ok(event) = machine.decrypt_room_event(event.cast_ref(), room_id).await {
-                        event
+        {
+            let machine = self.client.olm_machine().await;
+            if let Some(machine) = machine.as_ref() {
+                for event in http_response.chunk {
+                    let decrypted_event = if let Ok(AnySyncTimelineEvent::MessageLike(
+                        AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(_)),
+                    )) = event.deserialize_as::<AnySyncTimelineEvent>()
+                    {
+                        if let Ok(event) =
+                            machine.decrypt_room_event(event.cast_ref(), room_id).await
+                        {
+                            event
+                        } else {
+                            TimelineEvent::new(event)
+                        }
                     } else {
-                        TimelineEvent { event, encryption_info: None }
-                    }
-                } else {
-                    TimelineEvent { event, encryption_info: None }
-                };
+                        TimelineEvent::new(event)
+                    };
 
-                response.chunk.push(decrypted_event);
+                    response.chunk.push(decrypted_event);
+                }
+            } else {
+                response.chunk.extend(http_response.chunk.into_iter().map(TimelineEvent::new));
             }
-        } else {
-            response.chunk.extend(
-                http_response
-                    .chunk
-                    .into_iter()
-                    .map(|event| TimelineEvent { event, encryption_info: None }),
-            );
+        }
+
+        if let Some(push_context) = self.push_context().await? {
+            let push_rules = self.client().account().push_rules().await?;
+
+            for event in &mut response.chunk {
+                event.push_actions = push_rules.get_actions(&event.event, &push_context).to_owned();
+            }
         }
 
         Ok(response)
@@ -265,14 +275,12 @@ impl Common {
         self.client.add_room_event_handler(self.room_id(), handler)
     }
 
-    /// Get a [`Timeline`] for this room.
+    /// Subscribe to all updates for this room.
     ///
-    /// This offers a higher-level API than event handlers, in treating things
-    /// like edits and reactions as updates of existing items rather than new
-    /// independent events.
-    #[cfg(feature = "experimental-timeline")]
-    pub async fn timeline(&self) -> Timeline {
-        Timeline::builder(self).track_fully_read().build().await
+    /// The returned receiver will receive a new message for each sync response
+    /// that contains updates for this room.
+    pub fn subscribe_to_updates(&self) -> broadcast::Receiver<RoomUpdate> {
+        self.client.subscribe_to_room_updates(self.room_id())
     }
 
     /// Fetch the event with the given `EventId` in this room.
@@ -282,47 +290,46 @@ impl Common {
         let event = self.client.send(request, None).await?.event;
 
         #[cfg(feature = "e2e-encryption")]
+        if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+            SyncMessageLikeEvent::Original(_),
+        ))) = event.deserialize_as::<AnySyncTimelineEvent>()
         {
-            if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-                SyncMessageLikeEvent::Original(_),
-            ))) = event.deserialize_as::<AnySyncTimelineEvent>()
-            {
-                if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
-                    return Ok(event);
-                }
+            if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
+                return Ok(event);
             }
-            Ok(TimelineEvent { event, encryption_info: None })
         }
 
-        #[cfg(not(feature = "e2e-encryption"))]
-        Ok(TimelineEvent { event, encryption_info: None })
+        let push_actions = self.event_push_actions(&event).await?;
+
+        Ok(TimelineEvent { event, encryption_info: None, push_actions })
     }
 
     pub(crate) async fn request_members(&self) -> Result<Option<MembersResponse>> {
-        if let Some(mutex) =
-            self.client.inner.members_request_locks.get(self.inner.room_id()).map(|m| m.clone())
-        {
+        let mut map = self.client.inner.members_request_locks.lock().await;
+
+        if let Some(mutex) = map.get(self.inner.room_id()).cloned() {
             // If a member request is already going on, await the release of
             // the lock.
+            drop(map);
             _ = mutex.lock().await;
 
             Ok(None)
         } else {
             let mutex = Arc::new(Mutex::new(()));
-            self.client
-                .inner
-                .members_request_locks
-                .insert(self.inner.room_id().to_owned(), mutex.clone());
+            map.insert(self.inner.room_id().to_owned(), mutex.clone());
 
             let _guard = mutex.lock().await;
+            drop(map);
 
             let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
             let response = self.client.send(request, None).await?;
 
-            let response =
-                self.client.base_client().receive_members(self.inner.room_id(), &response).await?;
+            let response = Box::pin(
+                self.client.base_client().receive_members(self.inner.room_id(), &response),
+            )
+            .await?;
 
-            self.client.inner.members_request_locks.remove(self.inner.room_id());
+            self.client.inner.members_request_locks.lock().await.remove(self.inner.room_id());
 
             Ok(Some(response))
         }
@@ -392,20 +399,8 @@ impl Common {
         }
     }
 
-    pub(crate) async fn ensure_members(&self) -> Result<()> {
-        if !self.are_events_visible() {
-            return Ok(());
-        }
-
-        if !self.are_members_synced() {
-            self.request_members().await?;
-        }
-
-        Ok(())
-    }
-
     fn are_events_visible(&self) -> bool {
-        if let RoomType::Invited = self.inner.room_type() {
+        if let RoomState::Invited = self.inner.state() {
             return matches!(
                 self.inner.history_visibility(),
                 HistoryVisibility::WorldReadable | HistoryVisibility::Invited
@@ -418,9 +413,18 @@ impl Common {
     /// Sync the member list with the server.
     ///
     /// This method will de-duplicate requests if it is called multiple times in
-    /// quick succession, in that case the return value will be `None`.
+    /// quick succession, in that case the return value will be `None`. This
+    /// method does nothing if the members are already synced.
     pub async fn sync_members(&self) -> Result<Option<MembersResponse>> {
-        self.request_members().await
+        if !self.are_events_visible() {
+            return Ok(None);
+        }
+
+        if !self.are_members_synced() {
+            self.request_members().await
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get active members for this room, includes invited, joined members.
@@ -431,9 +435,10 @@ impl Common {
     ///
     /// Use [active_members_no_sync()](#method.active_members_no_sync) if you
     /// want a method that doesn't do any requests.
+    #[deprecated = "Use members with RoomMemberships::ACTIVE instead"]
     pub async fn active_members(&self) -> Result<Vec<RoomMember>> {
-        self.ensure_members().await?;
-        self.active_members_no_sync().await
+        self.sync_members().await?;
+        self.members_no_sync(RoomMemberships::ACTIVE).await
     }
 
     /// Get active members for this room, includes invited, joined members.
@@ -444,14 +449,9 @@ impl Common {
     ///
     /// Use [active_members()](#method.active_members) if you want to ensure to
     /// always get the full member list.
+    #[deprecated = "Use members_no_sync with RoomMemberships::ACTIVE instead"]
     pub async fn active_members_no_sync(&self) -> Result<Vec<RoomMember>> {
-        Ok(self
-            .inner
-            .active_members()
-            .await?
-            .into_iter()
-            .map(|member| RoomMember::new(self.client.clone(), member))
-            .collect())
+        self.members_no_sync(RoomMemberships::ACTIVE).await
     }
 
     /// Get all the joined members of this room.
@@ -462,9 +462,10 @@ impl Common {
     ///
     /// Use [joined_members_no_sync()](#method.joined_members_no_sync) if you
     /// want a method that doesn't do any requests.
+    #[deprecated = "Use members with RoomMemberships::JOIN instead"]
     pub async fn joined_members(&self) -> Result<Vec<RoomMember>> {
-        self.ensure_members().await?;
-        self.joined_members_no_sync().await
+        self.sync_members().await?;
+        self.members_no_sync(RoomMemberships::JOIN).await
     }
 
     /// Get all the joined members of this room.
@@ -475,14 +476,9 @@ impl Common {
     ///
     /// Use [joined_members()](#method.joined_members) if you want to ensure to
     /// always get the full member list.
+    #[deprecated = "Use members_no_sync with RoomMemberships::JOIN instead"]
     pub async fn joined_members_no_sync(&self) -> Result<Vec<RoomMember>> {
-        Ok(self
-            .inner
-            .joined_members()
-            .await?
-            .into_iter()
-            .map(|member| RoomMember::new(self.client.clone(), member))
-            .collect())
+        self.members_no_sync(RoomMemberships::JOIN).await
     }
 
     /// Get a specific member of this room.
@@ -499,7 +495,7 @@ impl Common {
     /// * `user_id` - The ID of the user that should be fetched out of the
     /// store.
     pub async fn get_member(&self, user_id: &UserId) -> Result<Option<RoomMember>> {
-        self.ensure_members().await?;
+        self.sync_members().await?;
         self.get_member_no_sync(user_id).await
     }
 
@@ -524,8 +520,7 @@ impl Common {
             .map(|member| RoomMember::new(self.client.clone(), member)))
     }
 
-    /// Get all members for this room, includes invited, joined and left
-    /// members.
+    /// Get members for this room, with the given memberships.
     ///
     /// *Note*: This method will fetch the members from the homeserver if the
     /// member list isn't synchronized due to member lazy loading. Because of
@@ -533,13 +528,12 @@ impl Common {
     ///
     /// Use [members_no_sync()](#method.members_no_sync) if you want a
     /// method that doesn't do any requests.
-    pub async fn members(&self) -> Result<Vec<RoomMember>> {
-        self.ensure_members().await?;
-        self.members_no_sync().await
+    pub async fn members(&self, memberships: RoomMemberships) -> Result<Vec<RoomMember>> {
+        self.sync_members().await?;
+        self.members_no_sync(memberships).await
     }
 
-    /// Get all members for this room, includes invited, joined and left
-    /// members.
+    /// Get members for this room, with the given memberships.
     ///
     /// *Note*: This method will not fetch the members from the homeserver if
     /// the member list isn't synchronized due to member lazy loading. Thus,
@@ -547,10 +541,10 @@ impl Common {
     ///
     /// Use [members()](#method.members) if you want to ensure to always get
     /// the full member list.
-    pub async fn members_no_sync(&self) -> Result<Vec<RoomMember>> {
+    pub async fn members_no_sync(&self, memberships: RoomMemberships) -> Result<Vec<RoomMember>> {
         Ok(self
             .inner
-            .members()
+            .members(memberships)
             .await?
             .into_iter()
             .map(|member| RoomMember::new(self.client.clone(), member))
@@ -561,27 +555,27 @@ impl Common {
     pub async fn get_state_events(
         &self,
         event_type: StateEventType,
-    ) -> Result<Vec<Raw<AnySyncStateEvent>>> {
+    ) -> Result<Vec<RawAnySyncOrStrippedState>> {
         self.client.store().get_state_events(self.room_id(), event_type).await.map_err(Into::into)
     }
 
     /// Get all state events of a given statically-known type in this room.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # async {
     /// # let room: matrix_sdk::room::Common = todo!();
     /// use matrix_sdk::ruma::{
-    ///     events::room::member::SyncRoomMemberEvent, serde::Raw,
+    ///     events::room::member::RoomMemberEventContent, serde::Raw,
     /// };
     ///
-    /// let room_members: Vec<Raw<SyncRoomMemberEvent>> =
-    ///     room.get_state_events_static().await?;
+    /// let room_members =
+    ///     room.get_state_events_static::<RoomMemberEventContent>().await?;
     /// # anyhow::Ok(())
     /// # };
     /// ```
-    pub async fn get_state_events_static<C>(&self) -> Result<Vec<Raw<SyncStateEvent<C>>>>
+    pub async fn get_state_events_static<C>(&self) -> Result<Vec<RawSyncOrStrippedState<C>>>
     where
         C: StaticEventContent + StaticStateEventContent + RedactContent,
         C::Redacted: RedactedStateEventContent,
@@ -589,12 +583,60 @@ impl Common {
         Ok(self.client.store().get_state_events_static(self.room_id()).await?)
     }
 
+    /// Get the state events of a given type with the given state keys in this
+    /// room.
+    pub async fn get_state_events_for_keys(
+        &self,
+        event_type: StateEventType,
+        state_keys: &[&str],
+    ) -> Result<Vec<RawAnySyncOrStrippedState>> {
+        self.client
+            .store()
+            .get_state_events_for_keys(self.room_id(), event_type, state_keys)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get the state events of a given statically-known type with the given
+    /// state keys in this room.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async {
+    /// # let room: matrix_sdk::room::Common = todo!();
+    /// # let user_ids: &[matrix_sdk::ruma::OwnedUserId] = &[];
+    /// use matrix_sdk::ruma::events::room::member::RoomMemberEventContent;
+    ///
+    /// let room_members = room
+    ///     .get_state_events_for_keys_static::<RoomMemberEventContent, _, _>(
+    ///         user_ids,
+    ///     )
+    ///     .await?;
+    /// # anyhow::Ok(())
+    /// # };
+    /// ```
+    pub async fn get_state_events_for_keys_static<'a, C, K, I>(
+        &self,
+        state_keys: I,
+    ) -> Result<Vec<RawSyncOrStrippedState<C>>>
+    where
+        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C::StateKey: Borrow<K>,
+        C::Redacted: RedactedStateEventContent,
+        K: AsRef<str> + Sized + Sync + 'a,
+        I: IntoIterator<Item = &'a K> + Send,
+        I::IntoIter: Send,
+    {
+        Ok(self.client.store().get_state_events_for_keys_static(self.room_id(), state_keys).await?)
+    }
+
     /// Get a specific state event in this room.
     pub async fn get_state_event(
         &self,
         event_type: StateEventType,
         state_key: &str,
-    ) -> Result<Option<Raw<AnySyncStateEvent>>> {
+    ) -> Result<Option<RawAnySyncOrStrippedState>> {
         self.client
             .store()
             .get_state_event(self.room_id(), event_type, state_key)
@@ -605,22 +647,22 @@ impl Common {
     /// Get a specific state event of statically-known type with an empty state
     /// key in this room.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # async {
     /// # let room: matrix_sdk::room::Common = todo!();
-    /// use matrix_sdk::ruma::events::room::power_levels::SyncRoomPowerLevelsEvent;
+    /// use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevelsEventContent;
     ///
-    /// let power_levels: SyncRoomPowerLevelsEvent = room
-    ///     .get_state_event_static()
+    /// let power_levels = room
+    ///     .get_state_event_static::<RoomPowerLevelsEventContent>()
     ///     .await?
     ///     .expect("every room has a power_levels event")
     ///     .deserialize()?;
     /// # anyhow::Ok(())
     /// # };
     /// ```
-    pub async fn get_state_event_static<C>(&self) -> Result<Option<Raw<SyncStateEvent<C>>>>
+    pub async fn get_state_event_static<C>(&self) -> Result<Option<RawSyncOrStrippedState<C>>>
     where
         C: StaticEventContent + StaticStateEventContent<StateKey = EmptyStateKey> + RedactContent,
         C::Redacted: RedactedStateEventContent,
@@ -630,17 +672,19 @@ impl Common {
 
     /// Get a specific state event of statically-known type in this room.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # async {
     /// # let room: matrix_sdk::room::Common = todo!();
     /// use matrix_sdk::ruma::{
-    ///     events::room::member::SyncRoomMemberEvent, serde::Raw, user_id,
+    ///     events::room::member::RoomMemberEventContent, serde::Raw, user_id,
     /// };
     ///
-    /// let member_event: Option<Raw<SyncRoomMemberEvent>> = room
-    ///     .get_state_event_static_for_key(user_id!("@alice:example.org"))
+    /// let member_event = room
+    ///     .get_state_event_static_for_key::<RoomMemberEventContent, _>(user_id!(
+    ///         "@alice:example.org"
+    ///     ))
     ///     .await?;
     /// # anyhow::Ok(())
     /// # };
@@ -648,7 +692,7 @@ impl Common {
     pub async fn get_state_event_static_for_key<C, K>(
         &self,
         state_key: &K,
-    ) -> Result<Option<Raw<SyncStateEvent<C>>>>
+    ) -> Result<Option<RawSyncOrStrippedState<C>>>
     where
         C: StaticEventContent + StaticStateEventContent + RedactContent,
         C::StateKey: Borrow<K>,
@@ -672,7 +716,7 @@ impl Common {
 
     /// Get account data of statically-known type in this room.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # async {
@@ -701,7 +745,8 @@ impl Common {
     /// Returns true if all devices in the room are verified, otherwise false.
     #[cfg(feature = "e2e-encryption")]
     pub async fn contains_only_verified_devices(&self) -> Result<bool> {
-        let user_ids = self.client.store().get_user_ids(self.room_id()).await?;
+        let user_ids =
+            self.client.store().get_user_ids(self.room_id(), RoomMemberships::empty()).await?;
 
         for user_id in user_ids {
             let devices = self.client.encryption().get_user_devices(&user_id).await?;
@@ -725,12 +770,12 @@ impl Common {
     /// * `tag_info` - Information about the tag, generally containing the
     ///   `order` parameter.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # use std::str::FromStr;
     /// # use ruma::events::tag::{TagInfo, TagName, UserTagName};
-    /// # futures::executor::block_on(async {
+    /// # async {
     /// # let homeserver = url::Url::parse("http://localhost:8080")?;
     /// # let mut client = matrix_sdk::Client::new(homeserver).await?;
     /// # let room_id = matrix_sdk::ruma::room_id!("!test:localhost");
@@ -743,7 +788,7 @@ impl Common {
     ///
     ///     room.set_tag(TagName::User(user_tag), tag_info).await?;
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn set_tag(
         &self,
@@ -800,7 +845,9 @@ impl Common {
         let this_room_id = self.inner.room_id();
 
         if is_direct {
-            let room_members = self.active_members().await?;
+            let mut room_members = self.members(RoomMemberships::ACTIVE).await?;
+            room_members.retain(|member| member.user_id() != self.own_user_id());
+
             for member in room_members {
                 let entry = content.entry(member.user_id().to_owned()).or_default();
                 if !entry.iter().any(|room_id| room_id == this_room_id) {
@@ -833,8 +880,14 @@ impl Common {
         &self,
         event: &Raw<OriginalSyncRoomEncryptedEvent>,
     ) -> Result<TimelineEvent> {
-        if let Some(machine) = self.client.olm_machine() {
-            Ok(machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await?)
+        let machine = self.client.olm_machine().await;
+        if let Some(machine) = machine.as_ref() {
+            let mut event =
+                machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await?;
+
+            event.push_actions = self.event_push_actions(&event.event).await?;
+
+            Ok(event)
         } else {
             Err(Error::NoOlmMachine)
         }
@@ -853,13 +906,16 @@ impl Common {
             .get_state_event_static::<RoomServerAclEventContent>()
             .await?
             .and_then(|ev| ev.deserialize().ok());
-        let acl = acl_ev.as_ref().and_then(|ev| ev.as_original()).map(|ev| &ev.content);
+        let acl = acl_ev.as_ref().and_then(|ev| match ev {
+            SyncOrStrippedState::Sync(ev) => ev.as_original().map(|ev| &ev.content),
+            SyncOrStrippedState::Stripped(ev) => Some(&ev.content),
+        });
 
         // Filter out server names that:
         // - Are blocked due to server ACLs
         // - Are IP addresses
         let members: Vec<_> = self
-            .joined_members_no_sync()
+            .members_no_sync(RoomMemberships::JOIN)
             .await?
             .into_iter()
             .filter(|member| {
@@ -1017,6 +1073,58 @@ impl Common {
     ) -> Result<Vec<(OwnedUserId, Receipt)>> {
         self.inner.event_receipts(receipt_type, thread, event_id).await.map_err(Into::into)
     }
+
+    /// Get the push context for this room.
+    ///
+    /// Returns `None` if some data couldn't be found. This should only happen
+    /// in brand new rooms, while we process its state.
+    pub async fn push_context(&self) -> Result<Option<PushConditionRoomCtx>> {
+        let room_id = self.room_id();
+        let user_id = self.own_user_id();
+        let room_info = self.clone_info();
+        let member_count = room_info.active_members_count();
+
+        let user_display_name = if let Some(member) = self.get_member_no_sync(user_id).await? {
+            member.name().to_owned()
+        } else {
+            return Ok(None);
+        };
+
+        let room_power_levels = if let Some(event) = self
+            .get_state_event_static::<RoomPowerLevelsEventContent>()
+            .await?
+            .and_then(|e| e.deserialize().ok())
+        {
+            event.power_levels()
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(PushConditionRoomCtx {
+            user_id: user_id.to_owned(),
+            room_id: room_id.to_owned(),
+            member_count: UInt::new(member_count).unwrap_or(UInt::MAX),
+            user_display_name,
+            users_power_levels: room_power_levels.users,
+            default_power_level: room_power_levels.users_default,
+            notification_power_levels: room_power_levels.notifications,
+        }))
+    }
+
+    /// Get the push actions for the given event with the current room state.
+    ///
+    /// Note that it is possible that no push action is returned because the
+    /// current room state does not have all the required state events.
+    pub async fn event_push_actions<T>(&self, event: &Raw<T>) -> Result<Vec<Action>> {
+        let Some(push_context) = self.push_context().await? else {
+            debug!("Could not aggregate push context");
+            return Ok(Vec::default());
+        };
+
+        let push_rules = self.client().account().push_rules().await?;
+
+        Ok(push_rules.get_actions(event, &push_context).to_owned())
+    }
 }
 
 /// Options for [`messages`][Common::messages].
@@ -1024,7 +1132,6 @@ impl Common {
 /// See that method and
 /// <https://spec.matrix.org/v1.3/client-server-api/#get_matrixclientv3roomsroomidmessages>
 /// for details.
-#[derive(Debug)]
 #[non_exhaustive]
 pub struct MessagesOptions {
     /// The token to start returning events from.
@@ -1098,5 +1205,18 @@ impl MessagesOptions {
             limit: self.limit,
             filter: self.filter,
         })
+    }
+}
+
+impl fmt::Debug for MessagesOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { from, to, dir, limit, filter } = self;
+
+        let mut s = f.debug_struct("MessagesOptions");
+        s.maybe_field("from", from).maybe_field("to", to).field("dir", dir).field("limit", limit);
+        if !filter.is_empty() {
+            s.field("filter", filter);
+        }
+        s.finish()
     }
 }

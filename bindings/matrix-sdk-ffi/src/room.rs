@@ -1,29 +1,47 @@
-use std::{
-    convert::TryFrom,
-    sync::{Arc, RwLock},
-};
+use std::{convert::TryFrom, fs, sync::Arc};
 
-use anyhow::{bail, Context, Result};
-use futures_util::StreamExt;
+use anyhow::{anyhow, bail, Context, Result};
+use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
-    room::{timeline::Timeline, Receipts, Room as SdkRoom},
+    attachment::{
+        AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+        BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
+    },
+    room::{Receipts, Room as SdkRoom},
     ruma::{
         api::client::{receipt::create_receipt::v3::ReceiptType, room::report_content},
         events::{
-            reaction::ReactionEventContent,
+            location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
             receipt::ReceiptThread,
             relation::{Annotation, Replacement},
             room::message::{
-                ForwardThread, MessageType, Relation, RoomMessageEvent, RoomMessageEventContent,
+                ForwardThread, LocationMessageEventContent, MessageType, Relation,
+                RoomMessageEvent, RoomMessageEventContent,
             },
         },
         EventId, UserId,
     },
+    RoomMemberships,
 };
-use tracing::error;
+use matrix_sdk_ui::timeline::{RoomExt, Timeline};
+use mime::Mime;
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::{AbortHandle, JoinHandle},
+};
+use tracing::{error, info};
 
 use super::RUNTIME;
-use crate::{TimelineDiff, TimelineItem, TimelineListener};
+use crate::{
+    client::ProgressWatcher,
+    error::{ClientError, RoomError},
+    room_member::RoomMember,
+    timeline::{
+        AudioInfo, FileInfo, ImageInfo, ThumbnailInfo, TimelineDiff, TimelineItem,
+        TimelineListener, VideoInfo,
+    },
+    TaskHandle,
+};
 
 #[derive(uniffi::Enum)]
 pub enum Membership {
@@ -34,108 +52,83 @@ pub enum Membership {
 
 pub(crate) type TimelineLock = Arc<RwLock<Option<Arc<Timeline>>>>;
 
+#[derive(uniffi::Object)]
 pub struct Room {
-    room: SdkRoom,
+    inner: SdkRoom,
     timeline: TimelineLock,
 }
 
-#[derive(Clone, uniffi::Enum)]
-pub enum MembershipState {
-    /// The user is banned.
-    Ban,
+impl Room {
+    pub(crate) fn new(inner: SdkRoom) -> Self {
+        Room { inner, timeline: Default::default() }
+    }
 
-    /// The user has been invited.
-    Invite,
-
-    /// The user has joined.
-    Join,
-
-    /// The user has requested to join.
-    Knock,
-
-    /// The user has left.
-    Leave,
-}
-
-#[derive(uniffi::Object)]
-pub struct RoomMember {
-    pub user_id: String,
-    pub display_name: Option<String>,
-    pub avatar_url: Option<String>,
-    pub membership: MembershipState,
-    pub is_name_ambiguous: bool,
-    pub power_level: i64,
-    pub normalized_power_level: i64,
-}
-
-impl From<matrix_sdk::ruma::events::room::member::MembershipState> for MembershipState {
-    fn from(m: matrix_sdk::ruma::events::room::member::MembershipState) -> Self {
-        match m {
-            matrix_sdk::ruma::events::room::member::MembershipState::Ban => MembershipState::Ban,
-            matrix_sdk::ruma::events::room::member::MembershipState::Invite => {
-                MembershipState::Invite
-            }
-            matrix_sdk::ruma::events::room::member::MembershipState::Join => MembershipState::Join,
-            matrix_sdk::ruma::events::room::member::MembershipState::Knock => {
-                MembershipState::Knock
-            }
-            matrix_sdk::ruma::events::room::member::MembershipState::Leave => {
-                MembershipState::Leave
-            }
-            _ => todo!(
-                "Handle Custom case: https://github.com/matrix-org/matrix-rust-sdk/issues/1254"
-            ),
-        }
+    pub(crate) fn with_timeline(inner: SdkRoom, timeline: TimelineLock) -> Self {
+        Room { inner, timeline }
     }
 }
 
 #[uniffi::export]
 impl Room {
     pub fn id(&self) -> String {
-        self.room.room_id().to_string()
+        self.inner.room_id().to_string()
     }
 
     pub fn name(&self) -> Option<String> {
-        self.room.name()
+        self.inner.name()
     }
 
     pub fn topic(&self) -> Option<String> {
-        self.room.topic()
+        self.inner.topic()
     }
 
     pub fn avatar_url(&self) -> Option<String> {
-        self.room.avatar_url().map(|m| m.to_string())
+        self.inner.avatar_url().map(|m| m.to_string())
     }
 
     pub fn is_direct(&self) -> bool {
-        self.room.is_direct()
+        RUNTIME.block_on(async move { self.inner.is_direct().await.unwrap_or(false) })
     }
 
     pub fn is_public(&self) -> bool {
-        self.room.is_public()
+        self.inner.is_public()
     }
 
     pub fn is_space(&self) -> bool {
-        self.room.is_space()
+        self.inner.is_space()
     }
 
     pub fn is_tombstoned(&self) -> bool {
-        self.room.is_tombstoned()
+        self.inner.is_tombstoned()
     }
 
     pub fn canonical_alias(&self) -> Option<String> {
-        self.room.canonical_alias().map(|a| a.to_string())
+        self.inner.canonical_alias().map(|a| a.to_string())
     }
 
     pub fn alternative_aliases(&self) -> Vec<String> {
-        self.room.alt_aliases().iter().map(|a| a.to_string()).collect()
+        self.inner.alt_aliases().iter().map(|a| a.to_string()).collect()
     }
 
     pub fn membership(&self) -> Membership {
-        match &self.room {
+        match &self.inner {
             SdkRoom::Invited(_) => Membership::Invited,
             SdkRoom::Joined(_) => Membership::Joined,
             SdkRoom::Left(_) => Membership::Left,
+        }
+    }
+
+    pub fn inviter(&self) -> Option<Arc<RoomMember>> {
+        match &self.inner {
+            SdkRoom::Invited(i) => RUNTIME.block_on(async move {
+                i.invite_details()
+                    .await
+                    .ok()
+                    .and_then(|a| a.inviter)
+                    .map(|m| Arc::new(RoomMember::new(m)))
+            }),
+            SdkRoom::Joined(_) => None,
+            SdkRoom::Left(_) => None,
         }
     }
 
@@ -144,11 +137,13 @@ impl Room {
     /// Timeline items cached in memory as well as timeline listeners are
     /// dropped.
     pub fn remove_timeline(&self) {
-        *self.timeline.write().unwrap() = None;
+        RUNTIME.block_on(async {
+            *self.timeline.write().await = None;
+        });
     }
 
     pub fn retry_decryption(&self, session_ids: Vec<String>) {
-        let timeline = match &*self.timeline.read().unwrap() {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
             Some(t) => Arc::clone(t),
             None => {
                 error!("Timeline not set up, can't retry decryption");
@@ -162,7 +157,7 @@ impl Room {
     }
 
     pub fn fetch_members(&self) {
-        let timeline = match &*self.timeline.read().unwrap() {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
             Some(t) => Arc::clone(t),
             None => {
                 error!("Timeline not set up, can't fetch members");
@@ -174,119 +169,118 @@ impl Room {
             timeline.fetch_members().await;
         });
     }
-}
 
-impl Room {
-    pub fn new(room: SdkRoom) -> Self {
-        Room { room, timeline: Default::default() }
-    }
-    pub fn with_timeline(room: SdkRoom, timeline: TimelineLock) -> Self {
-        Room { room, timeline }
-    }
-
-    pub fn display_name(&self) -> Result<String> {
-        let r = self.room.clone();
+    pub fn display_name(&self) -> Result<String, ClientError> {
+        let r = self.inner.clone();
         RUNTIME.block_on(async move { Ok(r.display_name().await?.to_string()) })
     }
 
-    pub fn is_encrypted(&self) -> Result<bool> {
-        let room = self.room.clone();
+    pub fn is_encrypted(&self) -> Result<bool, ClientError> {
+        let room = self.inner.clone();
         RUNTIME.block_on(async move {
             let is_encrypted = room.is_encrypted().await?;
             Ok(is_encrypted)
         })
     }
 
-    pub fn members(&self) -> Result<Vec<RoomMember>> {
-        let room = self.room.clone();
+    pub fn members(&self) -> Result<Vec<Arc<RoomMember>>, ClientError> {
+        let room = self.inner.clone();
         RUNTIME.block_on(async move {
             let members = room
-                .members()
+                .members(RoomMemberships::empty())
                 .await?
                 .iter()
-                .map(|m| RoomMember {
-                    user_id: m.user_id().to_string(),
-                    display_name: m.display_name().map(|d| d.to_owned()),
-                    avatar_url: m.avatar_url().map(|a| a.to_string()),
-                    membership: m.membership().to_owned().into(),
-                    is_name_ambiguous: m.name_ambiguous(),
-                    power_level: m.power_level(),
-                    normalized_power_level: m.normalized_power_level(),
-                })
+                .map(|m| Arc::new(RoomMember::new(m.clone())))
                 .collect();
             Ok(members)
         })
     }
 
-    pub fn member_avatar_url(&self, user_id: String) -> Result<Option<String>> {
-        let room = self.room.clone();
+    pub fn member(&self, user_id: String) -> Result<Arc<RoomMember>, ClientError> {
+        let room = self.inner.clone();
         let user_id = user_id;
         RUNTIME.block_on(async move {
-            let user_id = <&UserId>::try_from(&*user_id).context("Invalid user id.")?;
-            let member = room.get_member(user_id).await?.context("No user found")?;
+            let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+            let member = room.get_member(&user_id).await?.context("No user found")?;
+            Ok(Arc::new(RoomMember::new(member)))
+        })
+    }
+
+    pub fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
+        let room = self.inner.clone();
+        let user_id = user_id;
+        RUNTIME.block_on(async move {
+            let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+            let member = room.get_member(&user_id).await?.context("No user found")?;
             let avatar_url_string = member.avatar_url().map(|m| m.to_string());
             Ok(avatar_url_string)
         })
     }
 
-    pub fn member_display_name(&self, user_id: String) -> Result<Option<String>> {
-        let room = self.room.clone();
+    pub fn member_display_name(&self, user_id: String) -> Result<Option<String>, ClientError> {
+        let room = self.inner.clone();
         let user_id = user_id;
         RUNTIME.block_on(async move {
-            let user_id = <&UserId>::try_from(&*user_id).context("Invalid user id.")?;
-            let member = room.get_member(user_id).await?.context("No user found")?;
+            let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+            let member = room.get_member(&user_id).await?.context("No user found")?;
             let avatar_url_string = member.display_name().map(|m| m.to_owned());
             Ok(avatar_url_string)
         })
     }
 
-    pub fn add_timeline_listener(
+    pub async fn add_timeline_listener(
         &self,
         listener: Box<dyn TimelineListener>,
-    ) -> Vec<Arc<TimelineItem>> {
+    ) -> RoomTimelineListenerResult {
         let timeline = self
             .timeline
             .write()
-            .unwrap()
+            .await
             .get_or_insert_with(|| {
-                let room = self.room.clone();
-                let timeline = RUNTIME.block_on(async move { room.timeline().await });
+                let room = self.inner.clone();
+                #[allow(unknown_lints, clippy::redundant_async_block)] // false positive
+                let timeline = RUNTIME.block_on(room.timeline());
                 Arc::new(timeline)
             })
             .clone();
 
-        RUNTIME.block_on(async move {
-            let (timeline_items, timeline_stream) = timeline.subscribe().await;
+        let (timeline_items, timeline_stream) = timeline.subscribe().await;
 
-            let listener: Arc<dyn TimelineListener> = listener.into();
-            RUNTIME.spawn(timeline_stream.for_each(move |diff| {
-                let listener = listener.clone();
-                let fut = RUNTIME
-                    .spawn_blocking(move || listener.on_update(Arc::new(TimelineDiff::new(diff))));
+        let timeline_stream = TaskHandle::new(RUNTIME.spawn(async move {
+            pin_mut!(timeline_stream);
 
-                async move {
-                    if let Err(e) = fut.await {
-                        error!("Timeline listener error: {e}");
-                    }
-                }
-            }));
+            while let Some(diff) = timeline_stream.next().await {
+                listener.on_update(Arc::new(TimelineDiff::new(diff)));
+            }
+        }));
 
-            timeline_items.into_iter().map(TimelineItem::from_arc).collect()
-        })
-    }
-
-    pub fn paginate_backwards(&self, opts: PaginationOptions) -> Result<()> {
-        if let Some(timeline) = &*self.timeline.read().unwrap() {
-            RUNTIME.block_on(async move { Ok(timeline.paginate_backwards(opts.into()).await?) })
-        } else {
-            bail!("No timeline listeners registered, can't paginate");
+        RoomTimelineListenerResult {
+            items: timeline_items.into_iter().map(TimelineItem::from_arc).collect(),
+            items_stream: Arc::new(timeline_stream),
         }
     }
 
-    pub fn send_read_receipt(&self, event_id: String) -> Result<()> {
-        let room = match &self.room {
+    /// Loads older messages into the timeline.
+    ///
+    /// Raises an exception if there are no timeline listeners.
+    pub fn paginate_backwards(&self, opts: PaginationOptions) -> Result<(), ClientError> {
+        RUNTIME.block_on(async move {
+            if let Some(timeline) = &*self.timeline.read().await {
+                Ok(timeline.paginate_backwards(opts.into()).await?)
+            } else {
+                Err(anyhow!("No timeline listeners registered, can't paginate").into())
+            }
+        })
+    }
+
+    pub fn send_read_receipt(&self, event_id: String) -> Result<(), ClientError> {
+        let room = match &self.inner {
             SdkRoom::Joined(j) => j.clone(),
-            _ => bail!("Can't send read receipts to room that isn't in joined state"),
+            _ => {
+                return Err(
+                    anyhow!("Can't send read receipts to room that isn't in joined state").into()
+                )
+            }
         };
 
         let event_id = EventId::parse(event_id)?;
@@ -302,10 +296,14 @@ impl Room {
         &self,
         fully_read_event_id: String,
         read_receipt_event_id: Option<String>,
-    ) -> Result<()> {
-        let room = match &self.room {
+    ) -> Result<(), ClientError> {
+        let room = match &self.inner {
             SdkRoom::Joined(j) => j.clone(),
-            _ => bail!("Can't send read markers to room that isn't in joined state"),
+            _ => {
+                return Err(
+                    anyhow!("Can't send read markers to room that isn't in joined state").into()
+                )
+            }
         };
 
         let fully_read =
@@ -324,7 +322,7 @@ impl Room {
     }
 
     pub fn send(&self, msg: Arc<RoomMessageEventContent>, txn_id: Option<String>) {
-        let timeline = match &*self.timeline.read().unwrap() {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
             Some(t) => Arc::clone(t),
             None => {
                 error!("Timeline not set up, can't send message");
@@ -342,15 +340,15 @@ impl Room {
         msg: String,
         in_reply_to_event_id: String,
         txn_id: Option<String>,
-    ) -> Result<()> {
-        let room = match &self.room {
+    ) -> Result<(), ClientError> {
+        let room = match &self.inner {
             SdkRoom::Joined(j) => j.clone(),
-            _ => bail!("Can't send to a room that isn't in joined state"),
+            _ => return Err(anyhow!("Can't send to a room that isn't in joined state").into()),
         };
 
-        let timeline = match &*self.timeline.read().unwrap() {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
             Some(t) => Arc::clone(t),
-            None => bail!("Timeline not set up, can't send message"),
+            None => return Err(anyhow!("Timeline not set up, can't send message").into()),
         };
 
         let event_id: &EventId =
@@ -384,15 +382,15 @@ impl Room {
         new_msg: String,
         original_event_id: String,
         txn_id: Option<String>,
-    ) -> Result<()> {
-        let room = match &self.room {
+    ) -> Result<(), ClientError> {
+        let room = match &self.inner {
             SdkRoom::Joined(j) => j.clone(),
-            _ => bail!("Can't send to a room that isn't in joined state"),
+            _ => return Err(anyhow!("Can't send to a room that isn't in joined state").into()),
         };
 
-        let timeline = match &*self.timeline.read().unwrap() {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
             Some(t) => Arc::clone(t),
-            None => bail!("Timeline not set up, can't send message"),
+            None => return Err(anyhow!("Timeline not set up, can't send message").into()),
         };
 
         let event_id: &EventId =
@@ -406,8 +404,8 @@ impl Room {
                 .deserialize_as::<RoomMessageEvent>()
                 .context("Couldn't deserialise event")?;
 
-            if self.own_user_id() != event_content.sender() {
-                bail!("Can't edit an event not sent by own user")
+            if self.inner.own_user_id() != event_content.sender() {
+                bail!("Can't edit an event not sent by own user");
             }
 
             let replacement = Replacement::new(
@@ -441,10 +439,10 @@ impl Room {
         event_id: String,
         reason: Option<String>,
         txn_id: Option<String>,
-    ) -> Result<()> {
-        let room = match &self.room {
+    ) -> Result<(), ClientError> {
+        let room = match &self.inner {
             SdkRoom::Joined(j) => j.clone(),
-            _ => bail!("Can't redact in a room that isn't in joined state"),
+            _ => return Err(anyhow!("Can't redact in a room that isn't in joined state").into()),
         };
 
         RUNTIME.block_on(async move {
@@ -454,17 +452,29 @@ impl Room {
         })
     }
 
-    pub fn send_reaction(&self, event_id: String, key: String) -> Result<()> {
-        let room = match &self.room {
-            SdkRoom::Joined(j) => j.clone(),
-            _ => bail!("Can't send reaction in a room that isn't in joined state"),
+    pub fn toggle_reaction(&self, event_id: String, key: String) -> Result<(), ClientError> {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
+            Some(t) => Arc::clone(t),
+            None => return Err(anyhow!("Timeline not set up, can't send message").into()),
         };
 
         RUNTIME.block_on(async move {
             let event_id = EventId::parse(event_id)?;
-            room.send(ReactionEventContent::new(Annotation::new(event_id, key)), None).await?;
+            timeline.toggle_reaction(&Annotation::new(event_id, key)).await?;
             Ok(())
         })
+    }
+
+    pub fn active_members_count(&self) -> u64 {
+        self.inner.active_members_count()
+    }
+
+    pub fn invited_members_count(&self) -> u64 {
+        self.inner.invited_members_count()
+    }
+
+    pub fn joined_members_count(&self) -> u64 {
+        self.inner.joined_members_count()
     }
 
     /// Reports an event from the room.
@@ -482,15 +492,15 @@ impl Room {
         event_id: String,
         score: Option<i32>,
         reason: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<(), ClientError> {
         let int_score = score.map(|value| value.into());
         RUNTIME.block_on(async move {
             let event_id = EventId::parse(event_id)?;
-            self.room
+            self.inner
                 .client()
                 .send(
                     report_content::v3::Request::new(
-                        self.room_id().into(),
+                        self.inner.room_id().into(),
                         event_id,
                         int_score,
                         reason,
@@ -501,29 +511,495 @@ impl Room {
             Ok(())
         })
     }
-}
 
-impl std::ops::Deref for Room {
-    type Target = SdkRoom;
+    /// Ignores a user.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_id` - The ID of the user to ignore.
+    pub fn ignore_user(&self, user_id: String) -> Result<(), ClientError> {
+        RUNTIME.block_on(async move {
+            let user_id = UserId::parse(user_id)?;
+            self.inner.client().account().ignore_user(&user_id).await?;
+            Ok(())
+        })
+    }
 
-    fn deref(&self) -> &SdkRoom {
-        &self.room
+    /// Leaves the joined room.
+    ///
+    /// Will throw an error if used on an room that isn't in a joined state
+    pub fn leave(&self) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Joined(j) => j.clone(),
+            _ => return Err(anyhow!("Can't leave a room that isn't in joined state").into()),
+        };
+
+        RUNTIME.block_on(async move {
+            room.leave().await?;
+            Ok(())
+        })
+    }
+
+    /// Rejects the invitation for the invited room.
+    ///
+    /// Will throw an error if used on an room that isn't in an invited state
+    pub fn reject_invitation(&self) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Invited(i) => i.clone(),
+            _ => {
+                return Err(anyhow!(
+                    "Can't reject an invite for a room that isn't in invited state"
+                )
+                .into())
+            }
+        };
+
+        RUNTIME.block_on(async move {
+            room.reject_invitation().await?;
+            Ok(())
+        })
+    }
+
+    /// Accepts the invitation for the invited room.
+    ///
+    /// Will throw an error if used on an room that isn't in an invited state
+    pub fn accept_invitation(&self) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Invited(i) => i.clone(),
+            _ => {
+                return Err(anyhow!(
+                    "Can't accept an invite for a room that isn't in invited state"
+                )
+                .into())
+            }
+        };
+
+        RUNTIME.block_on(async move {
+            room.accept_invitation().await?;
+            Ok(())
+        })
+    }
+
+    /// Sets a new name to the room.
+    pub fn set_name(&self, name: Option<String>) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Joined(j) => j.clone(),
+            _ => {
+                return Err(anyhow!("Can't set a name in a room that isn't in joined state").into())
+            }
+        };
+
+        RUNTIME.block_on(async move {
+            room.set_name(name).await?;
+            Ok(())
+        })
+    }
+
+    /// Sets a new topic in the room.
+    pub fn set_topic(&self, topic: String) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Joined(j) => j.clone(),
+            _ => {
+                return Err(anyhow!("Can't set a topic in a room that isn't in joined state").into())
+            }
+        };
+
+        RUNTIME.block_on(async move {
+            room.set_room_topic(&topic).await?;
+            Ok(())
+        })
+    }
+
+    /// Upload and set the room's avatar.
+    ///
+    /// This will upload the data produced by the reader to the homeserver's
+    /// content repository, and set the room's avatar to the MXC URI for the
+    /// uploaded file.
+    ///
+    /// # Arguments
+    ///
+    /// * `mime_type` - The mime description of the avatar, for example
+    ///   image/jpeg
+    /// * `data` - The raw data that will be uploaded to the homeserver's
+    ///   content repository
+    pub fn upload_avatar(&self, mime_type: String, data: Vec<u8>) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Joined(j) => j.clone(),
+            _ => {
+                return Err(
+                    anyhow!("Can't set a avatar in a room that isn't in joined state").into()
+                )
+            }
+        };
+
+        RUNTIME.block_on(async move {
+            let mime: Mime = mime_type.parse()?;
+            // TODO: We could add an FFI ImageInfo struct in the future
+            room.upload_avatar(&mime, data, None).await?;
+            Ok(())
+        })
+    }
+
+    /// Removes the current room avatar
+    pub fn remove_avatar(&self) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Joined(j) => j.clone(),
+            _ => {
+                return Err(
+                    anyhow!("Can't remove a avatar in a room that isn't in joined state").into()
+                )
+            }
+        };
+
+        RUNTIME.block_on(async move {
+            room.remove_avatar().await?;
+            Ok(())
+        })
+    }
+
+    pub fn invite_user_by_id(&self, user_id: String) -> Result<(), ClientError> {
+        let room = match &self.inner {
+            SdkRoom::Joined(joined_room) => joined_room.clone(),
+            _ => return Err(anyhow!("Can't invite user to room that isn't in joined state").into()),
+        };
+
+        RUNTIME.block_on(async move {
+            let user = <&UserId>::try_from(user_id.as_str())
+                .context("Could not create user from string")?;
+            room.invite_user_by_id(user).await?;
+            Ok(())
+        })
+    }
+
+    pub fn fetch_details_for_event(&self, event_id: String) -> Result<(), ClientError> {
+        let timeline = RUNTIME
+            .block_on(self.timeline.read())
+            .as_ref()
+            .context("Timeline not set up, can't fetch event details")?
+            .clone();
+
+        RUNTIME.block_on(async move {
+            let event_id = <&EventId>::try_from(event_id.as_str())?;
+            timeline.fetch_details_for_event(event_id).await.context("Fetching event details")?;
+            Ok(())
+        })
+    }
+
+    pub fn send_image(
+        self: Arc<Self>,
+        url: String,
+        thumbnail_url: String,
+        image_info: ImageInfo,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Arc<SendAttachmentJoinHandle> {
+        SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+            let mime_str =
+                image_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+            let mime_type =
+                mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+            let base_image_info = BaseImageInfo::try_from(&image_info)
+                .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            let attachment_info = AttachmentInfo::Image(base_image_info);
+
+            let attachment_config = match image_info.thumbnail_info {
+                Some(thumbnail_image_info) => {
+                    let thumbnail =
+                        self.build_thumbnail_info(thumbnail_url, thumbnail_image_info)?;
+                    AttachmentConfig::with_thumbnail(thumbnail).info(attachment_info)
+                }
+                None => AttachmentConfig::new().info(attachment_info),
+            };
+
+            self.send_attachment(url, mime_type, attachment_config, progress_watcher).await
+        }))
+    }
+
+    pub fn send_video(
+        self: Arc<Self>,
+        url: String,
+        thumbnail_url: String,
+        video_info: VideoInfo,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Arc<SendAttachmentJoinHandle> {
+        SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+            let mime_str =
+                video_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+            let mime_type =
+                mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+            let base_video_info: BaseVideoInfo = BaseVideoInfo::try_from(&video_info)
+                .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            let attachment_info = AttachmentInfo::Video(base_video_info);
+
+            let attachment_config = match video_info.thumbnail_info {
+                Some(thumbnail_image_info) => {
+                    let thumbnail =
+                        self.build_thumbnail_info(thumbnail_url, thumbnail_image_info)?;
+                    AttachmentConfig::with_thumbnail(thumbnail).info(attachment_info)
+                }
+                None => AttachmentConfig::new().info(attachment_info),
+            };
+
+            self.send_attachment(url, mime_type, attachment_config, progress_watcher).await
+        }))
+    }
+
+    pub fn send_audio(
+        self: Arc<Self>,
+        url: String,
+        audio_info: AudioInfo,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Arc<SendAttachmentJoinHandle> {
+        SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+            let mime_str =
+                audio_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+            let mime_type =
+                mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+            let base_audio_info: BaseAudioInfo = BaseAudioInfo::try_from(&audio_info)
+                .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            let attachment_info = AttachmentInfo::Audio(base_audio_info);
+            let attachment_config = AttachmentConfig::new().info(attachment_info);
+
+            self.send_attachment(url, mime_type, attachment_config, progress_watcher).await
+        }))
+    }
+
+    pub fn send_file(
+        self: Arc<Self>,
+        url: String,
+        file_info: FileInfo,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Arc<SendAttachmentJoinHandle> {
+        SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+            let mime_str =
+                file_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+            let mime_type =
+                mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+            let base_file_info: BaseFileInfo =
+                BaseFileInfo::try_from(&file_info).map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            let attachment_info = AttachmentInfo::File(base_file_info);
+            let attachment_config = AttachmentConfig::new().info(attachment_info);
+
+            self.send_attachment(url, mime_type, attachment_config, progress_watcher).await
+        }))
+    }
+
+    pub fn retry_send(&self, txn_id: String) {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
+            Some(t) => Arc::clone(t),
+            None => {
+                error!("Timeline not set up, can't retry sending message");
+                return;
+            }
+        };
+
+        RUNTIME.spawn(async move {
+            if let Err(e) = timeline.retry_send(txn_id.as_str().into()).await {
+                error!(txn_id, "Failed to retry sending: {e}");
+            }
+        });
+    }
+
+    pub fn send_location(
+        &self,
+        body: String,
+        geo_uri: String,
+        description: Option<String>,
+        zoom_level: Option<u8>,
+        asset_type: Option<AssetType>,
+        txn_id: Option<String>,
+    ) {
+        let mut location_event_message_content =
+            LocationMessageEventContent::new(body, geo_uri.clone());
+
+        if let Some(asset_type) = asset_type {
+            location_event_message_content =
+                location_event_message_content.with_asset_type(RumaAssetType::from(asset_type));
+        }
+
+        let mut location_content = LocationContent::new(geo_uri);
+        location_content.description = description;
+        location_content.zoom_level = zoom_level.and_then(ZoomLevel::new);
+        location_event_message_content.location = Some(location_content);
+
+        let room_message_event_content =
+            RoomMessageEventContent::new(MessageType::Location(location_event_message_content));
+        self.send(Arc::new(room_message_event_content), txn_id)
+    }
+
+    pub fn cancel_send(&self, txn_id: String) {
+        let timeline = match &*RUNTIME.block_on(self.timeline.read()) {
+            Some(t) => Arc::clone(t),
+            None => {
+                error!("Timeline not set up, can't retry sending message");
+                return;
+            }
+        };
+
+        RUNTIME.spawn(async move {
+            if !timeline.cancel_send(txn_id.as_str().into()).await {
+                info!(txn_id, "Failed to discard local echo: Not found");
+            }
+        });
+    }
+
+    pub fn get_timeline_event_content_by_event_id(
+        &self,
+        event_id: String,
+    ) -> Result<Arc<RoomMessageEventContent>, ClientError> {
+        RUNTIME.block_on(async move {
+            let timeline = self
+                .timeline
+                .read()
+                .await
+                .clone()
+                .context("Timeline not set up, can't get event content")?;
+
+            let event_id = EventId::parse(event_id)?;
+
+            let item = timeline
+                .item_by_event_id(&event_id)
+                .await
+                .context("Item with given event ID not found")?;
+
+            let msgtype = item
+                .content()
+                .as_message()
+                .context("Item with given event ID is not a message")?
+                .msgtype()
+                .to_owned();
+
+            Ok(Arc::new(RoomMessageEventContent::new(msgtype)))
+        })
     }
 }
 
-pub enum PaginationOptions {
-    SingleRequest { event_limit: u16 },
-    UntilNumItems { event_limit: u16, items: u16 },
+impl Room {
+    fn build_thumbnail_info(
+        &self,
+        thumbnail_url: String,
+        thumbnail_info: ThumbnailInfo,
+    ) -> Result<Thumbnail, RoomError> {
+        let thumbnail_data =
+            fs::read(thumbnail_url).map_err(|_| RoomError::InvalidThumbnailData)?;
+
+        let base_thumbnail_info = BaseThumbnailInfo::try_from(&thumbnail_info)
+            .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+        let mime_str =
+            thumbnail_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+        let mime_type =
+            mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+        Ok(Thumbnail {
+            data: thumbnail_data,
+            content_type: mime_type,
+            info: Some(base_thumbnail_info),
+        })
+    }
+
+    async fn send_attachment(
+        &self,
+        url: String,
+        mime_type: Mime,
+        attachment_config: AttachmentConfig,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Result<(), RoomError> {
+        let timeline_guard = self.timeline.read().await;
+        let timeline = timeline_guard.as_ref().ok_or(RoomError::TimelineUnavailable)?;
+
+        let request = timeline.send_attachment(url, mime_type, attachment_config);
+        if let Some(progress_watcher) = progress_watcher {
+            let mut subscriber = request.subscribe_to_send_progress();
+            RUNTIME.spawn(async move {
+                while let Some(progress) = subscriber.next().await {
+                    progress_watcher.transmission_progress(progress.into());
+                }
+            });
+        }
+        request.await.map_err(|_| RoomError::FailedSendingAttachment)?;
+        Ok(())
+    }
 }
 
-impl From<PaginationOptions> for matrix_sdk::room::timeline::PaginationOptions<'static> {
+#[derive(uniffi::Object)]
+pub struct SendAttachmentJoinHandle {
+    join_hdl: Mutex<JoinHandle<Result<(), RoomError>>>,
+    abort_hdl: AbortHandle,
+}
+
+impl SendAttachmentJoinHandle {
+    fn new(join_hdl: JoinHandle<Result<(), RoomError>>) -> Arc<Self> {
+        let abort_hdl = join_hdl.abort_handle();
+        let join_hdl = Mutex::new(join_hdl);
+        Arc::new(Self { join_hdl, abort_hdl })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl SendAttachmentJoinHandle {
+    pub async fn join(&self) -> Result<(), RoomError> {
+        (&mut *self.join_hdl.lock().await).await.unwrap()
+    }
+}
+
+#[uniffi::export]
+impl SendAttachmentJoinHandle {
+    pub fn cancel(&self) {
+        self.abort_hdl.abort();
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct RoomTimelineListenerResult {
+    pub items: Vec<Arc<TimelineItem>>,
+    pub items_stream: Arc<TaskHandle>,
+}
+
+#[derive(uniffi::Enum)]
+pub enum PaginationOptions {
+    SingleRequest { event_limit: u16, wait_for_token: bool },
+    UntilNumItems { event_limit: u16, items: u16, wait_for_token: bool },
+}
+
+impl From<PaginationOptions> for matrix_sdk_ui::timeline::PaginationOptions<'static> {
     fn from(value: PaginationOptions) -> Self {
-        use matrix_sdk::room::timeline::PaginationOptions as Opts;
-        match value {
-            PaginationOptions::SingleRequest { event_limit } => Opts::single_request(event_limit),
-            PaginationOptions::UntilNumItems { event_limit, items } => {
-                Opts::until_num_items(event_limit, items)
+        use matrix_sdk_ui::timeline::PaginationOptions as Opts;
+        let (wait_for_token, mut opts) = match value {
+            PaginationOptions::SingleRequest { event_limit, wait_for_token } => {
+                (wait_for_token, Opts::single_request(event_limit))
             }
+            PaginationOptions::UntilNumItems { event_limit, items, wait_for_token } => {
+                (wait_for_token, Opts::until_num_items(event_limit, items))
+            }
+        };
+
+        if wait_for_token {
+            opts = opts.wait_for_token();
+        }
+
+        opts
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum AssetType {
+    Sender,
+    Pin,
+}
+
+impl From<AssetType> for RumaAssetType {
+    fn from(value: AssetType) -> Self {
+        match value {
+            AssetType::Sender => Self::Self_,
+            AssetType::Pin => Self::Pin,
         }
     }
 }

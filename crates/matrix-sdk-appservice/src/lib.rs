@@ -293,7 +293,7 @@ impl AppService {
     ///
     /// See [GET /_matrix/app/v1/users/{userId}](https://matrix.org/docs/spec/application_service/r0.1.2#get-matrix-app-v1-users-userid).
     ///
-    /// # Example
+    /// # Examples
     /// ```no_run
     /// # use matrix_sdk_appservice::AppService;
     /// # fn run(appservice: AppService) {
@@ -314,7 +314,7 @@ impl AppService {
     ///
     /// See [GET /_matrix/app/v1/rooms/{roomAlias}](https://matrix.org/docs/spec/application_service/r0.1.2#get-matrix-app-v1-rooms-roomalias).
     ///
-    /// # Example
+    /// # Examples
     /// ```no_run
     /// # use matrix_sdk_appservice::AppService;
     /// # fn run(appservice: AppService) {
@@ -352,7 +352,7 @@ impl AppService {
         });
 
         let client = self.user(None).await?;
-        client.register(request).await?;
+        client.matrix_auth().register(request).await?;
         self.set_user_registered(localpart).await?;
 
         Ok(())
@@ -376,8 +376,7 @@ impl AppService {
         let client = self.user(None).await?;
         let key = [USER_KEY, localpart.as_ref().as_bytes()].concat();
         let store = client.store().get_custom_value(&key).await?;
-        let registered =
-            store.and_then(|vec| vec.first().copied()).map_or(false, |b| b == u8::from(true));
+        let registered = store.is_some_and(|vec| vec.first().copied() == Some(u8::from(true)));
         Ok(registered)
     }
 
@@ -550,7 +549,7 @@ mod tests {
     use matrix_sdk::{
         config::RequestConfig,
         ruma::{api::appservice::Registration, events::room::member::OriginalSyncRoomMemberEvent},
-        Client,
+        Client, RoomMemberships,
     };
     use matrix_sdk_test::{appservice::TransactionBuilder, async_test, TimelineTestEvent};
     use ruma::{
@@ -888,7 +887,7 @@ mod tests {
             .await?
             .get_room(room_id)
             .expect("Expected room to be available")
-            .members_no_sync()
+            .members_no_sync(RoomMemberships::empty())
             .await?;
 
         assert_eq!(members[0].display_name().unwrap(), "changed");

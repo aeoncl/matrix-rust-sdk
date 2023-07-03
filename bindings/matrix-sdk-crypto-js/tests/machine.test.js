@@ -7,7 +7,6 @@ const {
     EncryptionSettings,
     EventId,
     InboundGroupSession,
-    KeysClaimRequest,
     KeysQueryRequest,
     KeysUploadRequest,
     MaybeSignature,
@@ -16,15 +15,28 @@ const {
     RequestType,
     RoomId,
     RoomMessageRequest,
+    ShieldColor,
     SignatureUploadRequest,
     ToDeviceRequest,
     UserId,
     UserIdentity,
     VerificationRequest,
     VerificationState,
+    Versions,
+    getVersions,
 } = require("../pkg/matrix_sdk_crypto_js");
 const { addMachineToMachine } = require("./helper");
 require("fake-indexeddb/auto");
+
+describe("Versions", () => {
+    test("can find out the crate versions", async () => {
+        const versions = getVersions();
+
+        expect(versions).toBeInstanceOf(Versions);
+        expect(versions.vodozemac).toBeDefined();
+        expect(versions.matrix_sdk_crypto).toBeDefined();
+    });
+});
 
 describe(OlmMachine.name, () => {
     test("can be instantiated with the async initializer", async () => {
@@ -51,7 +63,7 @@ describe(OlmMachine.name, () => {
         expect(databases).toHaveLength(2);
         expect(databases).toStrictEqual([
             { name: `${store_name}::matrix-sdk-crypto-meta`, version: 1 },
-            { name: `${store_name}::matrix-sdk-crypto`, version: 1 },
+            { name: `${store_name}::matrix-sdk-crypto`, version: 3 },
         ]);
 
         // Creating a new Olm machine, with the stored state.
@@ -142,7 +154,7 @@ describe(OlmMachine.name, () => {
         expect(databases).toHaveLength(2);
         expect(databases).toStrictEqual([
             { name: `${store_name}::matrix-sdk-crypto-meta`, version: 1 },
-            { name: `${store_name}::matrix-sdk-crypto`, version: 1 },
+            { name: `${store_name}::matrix-sdk-crypto`, version: 3 },
         ]);
 
         // Let's force to close the `OlmMachine`.
@@ -203,6 +215,19 @@ describe(OlmMachine.name, () => {
 
         const receiveSyncChanges = JSON.parse(
             await m.receiveSyncChanges(toDeviceEvents, changedDevices, oneTimeKeyCounts, unusedFallbackKeys),
+        );
+
+        expect(receiveSyncChanges).toEqual([]);
+    });
+
+    test("can receive sync changes with unusedFallbackKeys as undefined", async () => {
+        const m = await machine();
+        const toDeviceEvents = JSON.stringify([]);
+        const changedDevices = new DeviceLists();
+        const oneTimeKeyCounts = new Map();
+
+        const receiveSyncChanges = JSON.parse(
+            await m.receiveSyncChanges(toDeviceEvents, changedDevices, oneTimeKeyCounts, undefined),
         );
 
         expect(receiveSyncChanges).toEqual([]);
@@ -497,7 +522,8 @@ describe(OlmMachine.name, () => {
             expect(decrypted.senderCurve25519Key).toBeDefined();
             expect(decrypted.senderClaimedEd25519Key).toBeDefined();
             expect(decrypted.forwardingCurve25519KeyChain).toHaveLength(0);
-            expect(decrypted.verificationState).toStrictEqual(VerificationState.Trusted);
+            expect(decrypted.shieldState(true).color).toStrictEqual(ShieldColor.Red);
+            expect(decrypted.shieldState(false).color).toStrictEqual(ShieldColor.Red);
         });
     });
 
@@ -575,6 +601,27 @@ describe(OlmMachine.name, () => {
         const identity = await m.getIdentity(user);
 
         expect(identity).toBeInstanceOf(OwnUserIdentity);
+        const masterKey = JSON.parse(identity.masterKey);
+        const selfSigningKey = JSON.parse(identity.selfSigningKey);
+        const userSigningKey = JSON.parse(identity.userSigningKey);
+
+        const masterObjKeys = Object.keys(masterKey.keys);
+        const keyFromMasterKey = masterKey.keys[masterObjKeys[0]];
+
+        // self signing key exists
+        expect(Object.keys(selfSigningKey.keys).length).toBe(1);
+        // self signing key is different from the master key
+        expect(selfSigningKey.keys[keyFromMasterKey]).not.toBeDefined();
+
+        const selfSigningObjKeys = Object.keys(selfSigningKey.keys);
+        const keyFromSelfSigningKey = masterKey.keys[selfSigningObjKeys[0]];
+
+        // user signing key exists
+        expect(Object.keys(userSigningKey.keys).length).toBe(1);
+        // user signing key is different from the master key
+        expect(userSigningKey.keys[keyFromMasterKey]).not.toBeDefined();
+        // user signing key is different from the self signing key
+        expect(userSigningKey.keys[keyFromSelfSigningKey]).not.toBeDefined();
 
         const signatureUploadRequest = await identity.verify();
         expect(signatureUploadRequest).toBeInstanceOf(SignatureUploadRequest);
@@ -589,15 +636,15 @@ describe(OlmMachine.name, () => {
     });
 
     describe("can export/import room keys", () => {
-        let m;
         let exportedRoomKeys;
 
         test("can export room keys", async () => {
-            m = await machine();
+            let m = await machine();
             await m.shareRoomKey(room, [new UserId("@bob:example.org")], new EncryptionSettings());
 
             exportedRoomKeys = await m.exportRoomKeys((session) => {
                 expect(session).toBeInstanceOf(InboundGroupSession);
+                expect(session.senderKey.toBase64()).toEqual(m.identityKeys.curve25519.toBase64());
                 expect(session.roomId.toString()).toStrictEqual(room.toString());
                 expect(session.sessionId).toBeDefined();
                 expect(session.hasBeenImported()).toStrictEqual(false);
@@ -651,6 +698,7 @@ describe(OlmMachine.name, () => {
                 expect(total).toStrictEqual(1n);
             };
 
+            let m = await machine();
             const result = JSON.parse(await m.importRoomKeys(exportedRoomKeys, progressListener));
 
             expect(result).toMatchObject({
@@ -658,6 +706,18 @@ describe(OlmMachine.name, () => {
                 total_count: expect.any(Number),
                 keys: expect.any(Object),
             });
+        });
+
+        test("importing room keys calls RoomKeyUpdatedCallback", async () => {
+            const callback = jest.fn();
+            callback.mockImplementation(() => Promise.resolve(undefined));
+            let m = await machine();
+            m.registerRoomKeyUpdatedCallback(callback);
+            await m.importRoomKeys(exportedRoomKeys, (_, _1) => {});
+            expect(callback).toHaveBeenCalledTimes(1);
+            let keyInfoList = callback.mock.calls[0][0];
+            expect(keyInfoList.length).toEqual(1);
+            expect(keyInfoList[0].roomId.toString()).toStrictEqual(room.toString());
         });
     });
 
@@ -834,7 +894,7 @@ describe(OlmMachine.name, () => {
                 "method": "m.sas.v1",
                 "key_agreement_protocols": [expect.any(String)],
                 "hashes": [expect.any(String)],
-                "message_authentication_codes": [expect.any(String), expect.any(String)],
+                "message_authentication_codes": [expect.any(String), expect.any(String), expect.any(String)],
                 "short_authentication_string": ["decimal", "emoji"],
                 "m.relates_to": {
                     rel_type: "m.reference",

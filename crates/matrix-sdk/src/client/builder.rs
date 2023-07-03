@@ -13,43 +13,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "experimental-sliding-sync")]
+use std::sync::RwLock as StdRwLock;
 use std::{fmt, sync::Arc};
 
-#[cfg(target_arch = "wasm32")]
-use async_once_cell::OnceCell;
-use matrix_sdk_base::{
-    locks::{Mutex, RwLock},
-    store::StoreConfig,
-    BaseClient,
-};
+use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use ruma::{
     api::{client::discovery::discover_homeserver, error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
 };
 use thiserror::Error;
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::OnceCell;
-use tracing::{
-    debug,
-    field::{self, debug},
-    instrument, span, Level, Span,
-};
+use tokio::sync::{broadcast, Mutex, OnceCell, RwLock};
+use tracing::{debug, field::debug, instrument, Span};
 use url::Url;
 
 use super::{Client, ClientInner};
-use crate::{
-    config::RequestConfig,
-    error::RumaApiError,
-    http_client::{HttpClient, HttpSend, HttpSettings},
-    HttpError,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::http_client::HttpSettings;
+use crate::{config::RequestConfig, error::RumaApiError, http_client::HttpClient, HttpError};
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
 ///
 /// When setting the `StateStore` it is up to the user to open/connect
 /// the storage backend before client creation.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```
 /// use matrix_sdk::Client;
@@ -79,7 +67,7 @@ use crate::{
 ///     .user_agent("MyApp/v3.0");
 ///
 /// let client_builder =
-///     Client::builder().http_client(Arc::new(reqwest_builder.build()?));
+///     Client::builder().http_client(reqwest_builder.build()?);
 /// # anyhow::Ok(())
 /// ```
 #[must_use]
@@ -93,19 +81,10 @@ pub struct ClientBuilder {
     appservice_mode: bool,
     server_versions: Option<Box<[MatrixVersion]>>,
     handle_refresh_tokens: bool,
-    root_span: Span,
 }
 
 impl ClientBuilder {
     pub(crate) fn new() -> Self {
-        let root_span = span!(
-            Level::INFO,
-            "matrix-sdk",
-            user_id = field::Empty,
-            device_id = field::Empty,
-            ed25519_key = field::Empty
-        );
-
         Self {
             homeserver_cfg: None,
             http_cfg: None,
@@ -115,7 +94,6 @@ impl ClientBuilder {
             appservice_mode: false,
             server_versions: None,
             handle_refresh_tokens: false,
-            root_span,
         }
     }
 
@@ -139,19 +117,19 @@ impl ClientBuilder {
         self
     }
 
-    /// Set up the store configuration for a sled store.
+    /// Set up the store configuration for a SQLite store.
     ///
     /// This is the same as
-    /// <code>.[store_config](Self::store_config)([matrix_sdk_sled]::[make_store_config](matrix_sdk_sled::make_store_config)(path, passphrase)?)</code>.
+    /// <code>.[store_config](Self::store_config)([matrix_sdk_sqlite]::[make_store_config](matrix_sdk_sqlite::make_store_config)(path, passphrase)?)</code>.
     /// except it delegates the actual store config creation to when
     /// `.build().await` is called.
-    #[cfg(feature = "sled")]
-    pub fn sled_store(
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite_store(
         mut self,
         path: impl AsRef<std::path::Path>,
         passphrase: Option<&str>,
     ) -> Self {
-        self.store_config = BuilderStoreConfig::Sled {
+        self.store_config = BuilderStoreConfig::Sqlite {
             path: path.as_ref().to_owned(),
             passphrase: passphrase.map(ToOwned::to_owned),
         };
@@ -182,7 +160,7 @@ impl ClientBuilder {
     ///
     /// * `store_config` - The configuration of the store.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```
     /// # use matrix_sdk_base::store::MemoryStore;
@@ -218,16 +196,12 @@ impl ClientBuilder {
     ///
     /// * `proxy` - The HTTP URL of the proxy.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```
-    /// # futures::executor::block_on(async {
+    /// ```no_run
     /// use matrix_sdk::Client;
     ///
     /// let client_config = Client::builder().proxy("http://localhost:8080");
-    ///
-    /// # anyhow::Ok(())
-    /// # });
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
     pub fn proxy(mut self, proxy: impl AsRef<str>) -> Self {
@@ -249,15 +223,13 @@ impl ClientBuilder {
         self
     }
 
-    /// Specify an HTTP client to handle sending requests and receiving
-    /// responses.
+    /// Specify a [`reqwest::Client`] instance to handle sending requests and
+    /// receiving responses.
     ///
-    /// Any type that implements the `HttpSend` trait can be used to send /
-    /// receive `http` types.
-    ///
-    /// This method is mutually exclusive with
-    /// [`user_agent()`][Self::user_agent],
-    pub fn http_client(mut self, client: Arc<dyn HttpSend>) -> Self {
+    /// This method is mutually exclusive with [`proxy()`][Self::proxy],
+    /// [`disable_ssl_verification`][Self::disable_ssl_verification] and
+    /// [`user_agent()`][Self::user_agent].
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_cfg = Some(HttpConfig::Custom(client));
         self
     }
@@ -318,8 +290,8 @@ impl ClientBuilder {
     ///   is encountered, it means that the user needs to be logged in again.
     ///
     /// * The access token and refresh token need to be watched for changes,
-    ///   using [`Client::session_tokens_signal()`] for example, to be able to
-    ///   [restore the session] later.
+    ///   using the authentication API's `session_tokens_stream()` for example,
+    ///   to be able to [restore the session] later.
     ///
     /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
     /// [`UnknownToken`]: ruma::api::client::error::ErrorKind::UnknownToken
@@ -341,31 +313,28 @@ impl ClientBuilder {
     ///   server discovery request is made which can fail; if you didn't set
     ///   [`server_versions(false)`][Self::server_versions], that amounts to
     ///   another request that can fail
-    #[instrument(skip_all, parent = &self.root_span, target = "matrix_sdk::client", fields(homeserver))]
+    #[instrument(skip_all, target = "matrix_sdk::client", fields(homeserver))]
     pub async fn build(self) -> Result<Client, ClientBuildError> {
         debug!("Starting to build the Client");
 
         let homeserver_cfg = self.homeserver_cfg.ok_or(ClientBuildError::MissingHomeserver)?;
         Span::current().record("homeserver", debug(&homeserver_cfg));
 
+        #[cfg_attr(target_arch = "wasm32", allow(clippy::infallible_destructuring_match))]
         let inner_http_client = match self.http_cfg.unwrap_or_default() {
-            #[allow(unused_mut)]
+            #[cfg(not(target_arch = "wasm32"))]
             HttpConfig::Settings(mut settings) => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    settings.timeout = self.request_config.timeout;
-                }
-
-                Arc::new(settings.make_client()?)
+                settings.timeout = self.request_config.timeout;
+                settings.make_client()?
             }
             HttpConfig::Custom(c) => c,
         };
 
         #[allow(clippy::infallible_destructuring_match)]
         let store_config = match self.store_config {
-            #[cfg(feature = "sled")]
-            BuilderStoreConfig::Sled { path, passphrase } => {
-                matrix_sdk_sled::make_store_config(&path, passphrase.as_deref()).await?
+            #[cfg(feature = "sqlite")]
+            BuilderStoreConfig::Sqlite { path, passphrase } => {
+                matrix_sdk_sqlite::make_store_config(&path, passphrase.as_deref()).await?
             }
             #[cfg(feature = "indexeddb")]
             BuilderStoreConfig::IndexedDb { name, passphrase } => {
@@ -377,7 +346,7 @@ impl ClientBuilder {
         let base_client = BaseClient::with_store_config(store_config);
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
-        let mut authentication_issuer: Option<Url> = None;
+        let mut authentication_server_info = None;
         #[cfg(feature = "experimental-sliding-sync")]
         let mut sliding_sync_proxy: Option<Url> = None;
         let homeserver = match homeserver_cfg {
@@ -394,6 +363,7 @@ impl ClientBuilder {
                         None,
                         None,
                         &[MatrixVersion::V1_0],
+                        Default::default(),
                     )
                     .await
                     .map_err(|e| match e {
@@ -401,29 +371,30 @@ impl ClientBuilder {
                         err => ClientBuildError::Http(err),
                     })?;
 
-                if let Some(issuer) = well_known.authentication.map(|auth| auth.issuer) {
-                    authentication_issuer = Url::parse(&issuer).ok();
-                }
+                authentication_server_info = well_known.authentication;
+
                 #[cfg(feature = "experimental-sliding-sync")]
                 if let Some(proxy) = well_known.sliding_sync_proxy.map(|p| p.url) {
                     sliding_sync_proxy = Url::parse(&proxy).ok();
                 }
-                debug!(homserver_url = well_known.homeserver.base_url, "Discovered the homeserver");
+                debug!(
+                    homeserver_url = well_known.homeserver.base_url,
+                    "Discovered the homeserver"
+                );
 
                 well_known.homeserver.base_url
             }
         };
 
         let homeserver = RwLock::new(Url::parse(&homeserver)?);
-        let authentication_issuer = authentication_issuer.map(RwLock::new);
-        #[cfg(feature = "experimental-sliding-sync")]
-        let sliding_sync_proxy = sliding_sync_proxy.map(RwLock::new);
+
+        let (unknown_token_error_sender, _) = broadcast::channel(1);
 
         let inner = Arc::new(ClientInner {
             homeserver,
-            authentication_issuer,
+            authentication_server_info,
             #[cfg(feature = "experimental-sliding-sync")]
-            sliding_sync_proxy,
+            sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
             http_client,
             base_client,
             server_versions: OnceCell::new_with(self.server_versions),
@@ -436,22 +407,22 @@ impl ClientBuilder {
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
+            room_update_channels: Default::default(),
+            sync_gap_broadcast_txs: Default::default(),
             appservice_mode: self.appservice_mode,
             respect_login_well_known: self.respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             handle_refresh_tokens: self.handle_refresh_tokens,
             refresh_token_lock: Mutex::new(Ok(())),
+            unknown_token_error_sender,
+            auth_data: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
+            cross_process_crypto_store_lock: OnceCell::new(),
         });
 
         debug!("Done building the Client");
 
-        // We drop the root span here so it gets pushed to the subscribers, i.e. it gets
-        // only uploaded to a OpenTelemetry collector if the span gets dropped.
-        // We still want it around so other methods that get called by this
-        // client instance are connected to it, so we clone.
-        drop(self.root_span.clone());
-
-        Ok(Client { inner, root_span: self.root_span })
+        Ok(Client { inner })
     }
 }
 
@@ -473,8 +444,9 @@ enum HomeserverConfig {
 
 #[derive(Clone, Debug)]
 enum HttpConfig {
+    #[cfg(not(target_arch = "wasm32"))]
     Settings(HttpSettings),
-    Custom(Arc<dyn HttpSend>),
+    Custom(reqwest::Client),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -495,14 +467,18 @@ impl HttpConfig {
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        Self::Settings(HttpSettings::default())
+        #[cfg(not(target_arch = "wasm32"))]
+        return Self::Settings(HttpSettings::default());
+
+        #[cfg(target_arch = "wasm32")]
+        return Self::Custom(reqwest::Client::new());
     }
 }
 
 #[derive(Clone)]
 enum BuilderStoreConfig {
-    #[cfg(feature = "sled")]
-    Sled {
+    #[cfg(feature = "sqlite")]
+    Sqlite {
         path: std::path::PathBuf,
         passphrase: Option<String>,
     },
@@ -519,9 +495,9 @@ impl fmt::Debug for BuilderStoreConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[allow(clippy::infallible_destructuring_match)]
         match self {
-            #[cfg(feature = "sled")]
-            Self::Sled { path, .. } => {
-                f.debug_struct("Sled").field("path", path).finish_non_exhaustive()
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite { path, .. } => {
+                f.debug_struct("Sqlite").field("path", path).finish_non_exhaustive()
             }
             #[cfg(feature = "indexeddb")]
             Self::IndexedDb { name, .. } => {
@@ -556,10 +532,10 @@ pub enum ClientBuildError {
     #[error(transparent)]
     IndexeddbStore(#[from] matrix_sdk_indexeddb::OpenStoreError),
 
-    /// Error opening the sled store.
-    #[cfg(feature = "sled")]
+    /// Error opening the sqlite store.
+    #[cfg(feature = "sqlite")]
     #[error(transparent)]
-    SledStore(#[from] matrix_sdk_sled::OpenStoreError),
+    SqliteStore(#[from] matrix_sdk_sqlite::OpenStoreError),
 }
 
 impl ClientBuildError {

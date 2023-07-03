@@ -1,7 +1,12 @@
 // The http mocking library is not supported for wasm32
 #![cfg(not(target_arch = "wasm32"))]
 
-use matrix_sdk::{config::RequestConfig, Client, ClientBuilder, Session};
+use matrix_sdk::{
+    config::{RequestConfig, SyncSettings},
+    matrix_auth::{Session, SessionTokens},
+    Client, ClientBuilder,
+};
+use matrix_sdk_base::SessionMeta;
 use matrix_sdk_test::test_json;
 use ruma::{api::MatrixVersion, device_id, user_id};
 use serde::Serialize;
@@ -11,6 +16,7 @@ use wiremock::{
 };
 
 mod client;
+mod matrix_auth;
 mod refresh_token;
 mod room;
 
@@ -40,13 +46,25 @@ async fn no_retry_test_client() -> (Client, MockServer) {
 
 async fn logged_in_client() -> (Client, MockServer) {
     let session = Session {
-        access_token: "1234".to_owned(),
-        refresh_token: None,
-        user_id: user_id!("@example:localhost").to_owned(),
-        device_id: device_id!("DEVICEID").to_owned(),
+        meta: SessionMeta {
+            user_id: user_id!("@example:localhost").to_owned(),
+            device_id: device_id!("DEVICEID").to_owned(),
+        },
+        tokens: SessionTokens { access_token: "1234".to_owned(), refresh_token: None },
     };
     let (client, server) = no_retry_test_client().await;
     client.restore_session(session).await.unwrap();
+
+    (client, server)
+}
+
+async fn synced_client() -> (Client, MockServer) {
+    let (client, server) = logged_in_client().await;
+    mock_sync(&server, &*test_json::SYNC, None).await;
+
+    let sync_settings = SyncSettings::new();
+
+    let _response = client.sync_once(sync_settings).await.unwrap();
 
     (client, server)
 }

@@ -4,6 +4,7 @@ use js_sys::{Array, Map, Promise};
 use wasm_bindgen::prelude::*;
 
 use crate::{
+    encryption::EncryptionAlgorithm,
     future::future_to_promise,
     identifiers::{self, DeviceId, UserId},
     impl_from_to_inner,
@@ -23,6 +24,9 @@ impl_from_to_inner!(matrix_sdk_crypto::Device => Device);
 #[wasm_bindgen]
 impl Device {
     /// Request an interactive verification with this device.
+    ///
+    /// Returns a Promise for a 2-element array `[VerificationRequest,
+    /// ToDeviceRequest]`.
     #[wasm_bindgen(js_name = "requestVerification")]
     pub fn request_verification(&self, methods: Option<Array>) -> Result<Promise, JsError> {
         let methods =
@@ -61,6 +65,12 @@ impl Device {
     #[wasm_bindgen(js_name = "isCrossSigningTrusted")]
     pub fn is_cross_signing_trusted(&self) -> bool {
         self.inner.is_cross_signing_trusted()
+    }
+
+    /// Is this device cross-signed by its owner?
+    #[wasm_bindgen(js_name = "isCrossSignedByOwner")]
+    pub fn is_cross_signed_by_owner(&self) -> bool {
+        self.inner.is_cross_signed_by_owner()
     }
 
     /// Set the local trust state of the device to the given state.
@@ -135,6 +145,19 @@ impl Device {
         map
     }
 
+    /// Get the list of algorithms this device supports.
+    ///
+    /// Returns `Array<EncryptionAlgorithm>`.
+    #[wasm_bindgen(getter)]
+    pub fn algorithms(&self) -> Array {
+        self.inner
+            .algorithms()
+            .iter()
+            .map(|alg| EncryptionAlgorithm::from(alg.clone()))
+            .map(JsValue::from)
+            .collect()
+    }
+
     /// Get a map containing all the device signatures.
     #[wasm_bindgen(getter)]
     pub fn signatures(&self) -> types::Signatures {
@@ -165,6 +188,13 @@ impl Device {
     #[wasm_bindgen(js_name = "isDeleted")]
     pub fn is_deleted(&self) -> bool {
         self.inner.is_deleted()
+    }
+
+    /// Timestamp representing the first time this device has been seen (in
+    /// milliseconds).
+    #[wasm_bindgen(js_name = "firstTimeSeen")]
+    pub fn first_time_seen(&self) -> u64 {
+        self.inner.first_time_seen_ts().0.into()
     }
 }
 

@@ -3,25 +3,42 @@
 macro_rules! cryptostore_integration_tests {
     () => {
         mod cryptostore_integration_tests {
-            use std::collections::HashMap;
+            use std::collections::{BTreeMap, HashMap};
 
+            use assert_matches::assert_matches;
             use matrix_sdk_test::async_test;
             use ruma::{
-                device_id, encryption::SignedKey, room_id, serde::Base64, user_id, DeviceId,
-                TransactionId, UserId,
+                device_id,
+                encryption::SignedKey,
+                room_id,
+                serde::{Base64, Raw},
+                to_device::DeviceIdOrAllDevices,
+                user_id, DeviceId, JsOption, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
             };
+            use serde_json::value::to_raw_value;
             use $crate::{
                 olm::{
                     Curve25519PublicKey, InboundGroupSession, OlmMessageHash,
                     PrivateCrossSigningIdentity, ReadOnlyAccount, Session,
                 },
                 store::{
-                    Changes, CryptoStore, DeviceChanges, GossipRequest, IdentityChanges,
-                    RecoveryKey,
+                    Changes, CryptoStore, DeviceChanges,
+                    GossipRequest, IdentityChanges, RecoveryKey, RoomSettings,
                 },
                 testing::{get_device, get_other_identity, get_own_identity},
-                types::events::room_key_request::MegolmV1AesSha2Content,
-                ReadOnlyDevice, SecretInfo, TrackedUser,
+                types::{
+                    events::{
+                        dummy::DummyEventContent,
+                        room_key_request::MegolmV1AesSha2Content,
+                        room_key_withheld::{
+                            CommonWithheldCodeContent, MegolmV1AesSha2WithheldContent,
+                            RoomKeyWithheldContent, WithheldCode,
+                        },
+                        ToDeviceEvent,
+                    },
+                    EventEncryptionAlgorithm,
+                },
+                ReadOnlyDevice, SecretInfo, ToDeviceRequest, TrackedUser,
             };
 
             use super::get_store;
@@ -42,7 +59,7 @@ macro_rules! cryptostore_integration_tests {
                 device_id!("BOBDEVICE")
             }
 
-            async fn get_loaded_store(name: &str) -> (ReadOnlyAccount, impl CryptoStore) {
+            pub async fn get_loaded_store(name: &str) -> (ReadOnlyAccount, impl CryptoStore) {
                 let store = get_store(name, None).await;
                 let account = get_account();
                 store.save_account(account.clone()).await.expect("Can't save account");
@@ -205,6 +222,16 @@ macro_rules! cryptostore_integration_tests {
                 assert!(store.get_outbound_group_session(&room_id).await.unwrap().is_none());
 
                 let (session, _) = account.create_group_session_pair_with_defaults(&room_id).await;
+
+                let user_id = user_id!("@example:localhost");
+                let request = ToDeviceRequest::new(
+                    user_id,
+                    DeviceIdOrAllDevices::AllDevices,
+                    "m.dummy",
+                    Raw::from_json(to_raw_value(&DummyEventContent::new()).unwrap()),
+                );
+
+                session.add_request(TransactionId::new(), request.into(), Default::default());
 
                 let changes = Changes {
                     outbound_group_sessions: vec![session.clone()],
@@ -615,36 +642,288 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn recovery_key_saving() {
-                let (account, store) = get_loaded_store("recovery_key_saving").await;
+            async fn withheld_info_storage() {
+                let (account, store) = get_loaded_store("withheld_info_storage").await;
 
-                let recovery_key = RecoveryKey::new().expect("Can't create new recovery key");
-                let encoded_key = recovery_key.to_base64();
+                let mut info_list: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+
+                let user_id = account.user_id().to_owned();
+                let room_id = room_id!("!DwLygpkclUAfQNnfva:example.com");
+                let session_id_1 = "GBnDxGP9i3IkPsz3/ihNr6P7qjIXxSRVWZ1MYmSn09w";
+                let session_id_2 = "IDLtnNCH2kIr3xIf1B7JFkGpQmTjyMca2jww+X6zeOE";
+
+                let content = RoomKeyWithheldContent::MegolmV1AesSha2(
+                    MegolmV1AesSha2WithheldContent::Unverified(
+                        CommonWithheldCodeContent::new(
+                            room_id.to_owned(),
+                            session_id_1.into(),
+                            Curve25519PublicKey::from_base64(
+                                "9n7mdWKOjr9c4NTlG6zV8dbFtNK79q9vZADoh7nMUwA",
+                            )
+                            .unwrap(),
+                            "DEVICEID".into(),
+                        )
+                        .into(),
+                    ),
+                );
+                let event = ToDeviceEvent::new(user_id.to_owned(), content);
+                info_list
+                    .entry(room_id.to_owned())
+                    .or_default()
+                    .insert(session_id_1.to_owned(), event);
+
+                let content = RoomKeyWithheldContent::MegolmV1AesSha2(
+                    MegolmV1AesSha2WithheldContent::BlackListed(
+                        CommonWithheldCodeContent::new(
+                            room_id.to_owned(),
+                            session_id_2.into(),
+                            Curve25519PublicKey::from_base64(
+                                "9n7mdWKOjr9c4NTlG6zV8dbFtNK79q9vZADoh7nMUwA",
+                            )
+                            .unwrap(),
+                            "DEVICEID".into(),
+                        )
+                        .into(),
+                    ),
+                );
+                let event = ToDeviceEvent::new(user_id.to_owned(), content);
+                info_list
+                    .entry(room_id.to_owned())
+                    .or_default()
+                    .insert(session_id_2.to_owned(), event);
+
+                let changes = Changes { withheld_session_info: info_list, ..Default::default() };
+                store.save_changes(changes).await.unwrap();
+
+                let is_withheld = store.get_withheld_info(room_id, session_id_1).await.unwrap();
+
+                assert_matches!(
+                    is_withheld, Some(event)
+                    if event.content.algorithm() == EventEncryptionAlgorithm::MegolmV1AesSha2 &&
+                    event.content.withheld_code() == WithheldCode::Unverified
+                );
+
+                let is_withheld = store.get_withheld_info(room_id, session_id_2).await.unwrap();
+
+                assert_matches!(
+                    is_withheld, Some(event)
+                    if event.content.algorithm() == EventEncryptionAlgorithm::MegolmV1AesSha2 &&
+                    event.content.withheld_code() == WithheldCode::Blacklisted
+                );
+
+                let other_room_id = room_id!("!nQRyiRFuyUhXeaQfiR:example.com");
+
+                let is_withheld =
+                    store.get_withheld_info(other_room_id, session_id_2).await.unwrap();
+
+                assert!(is_withheld.is_none());
+            }
+
+            #[async_test]
+            async fn room_settings_saving() {
+                let (account, store) = get_loaded_store("room_settings_saving").await;
+
+                let room_1 = room_id!("!test_1:localhost");
+                let settings_1 = RoomSettings {
+                    algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2,
+                    only_allow_trusted_devices: true,
+                };
+
+                let room_2 = room_id!("!test_2:localhost");
+                let settings_2 = RoomSettings {
+                    algorithm: EventEncryptionAlgorithm::OlmV1Curve25519AesSha2,
+                    only_allow_trusted_devices: false,
+                };
+
+                let room_3 = room_id!("!test_3:localhost");
 
                 let changes = Changes {
-                    recovery_key: Some(recovery_key),
-                    backup_version: Some("1".to_owned()),
+                    room_settings: HashMap::from([
+                        (room_1.into(), settings_1.clone()),
+                        (room_2.into(), settings_2.clone()),
+                    ]),
                     ..Default::default()
                 };
 
                 store.save_changes(changes).await.unwrap();
 
-                let loded_backup = store.load_backup_keys().await.unwrap();
+                let loaded_settings_1 = store.get_room_settings(room_1).await.unwrap();
+                assert_eq!(Some(settings_1), loaded_settings_1);
 
-                assert_eq!(
-                    encoded_key,
-                    loded_backup
-                        .recovery_key
-                        .expect("The recovery key wasn't loaded from the store")
-                        .to_base64(),
-                    "The loaded key matches to the one we stored"
-                );
+                let loaded_settings_2 = store.get_room_settings(room_2).await.unwrap();
+                assert_eq!(Some(settings_2), loaded_settings_2);
 
-                assert_eq!(
-                    Some("1"),
-                    loded_backup.backup_version.as_deref(),
-                    "The loaded version matches to the one we stored"
-                );
+                let loaded_settings_3 = store.get_room_settings(room_3).await.unwrap();
+                assert_eq!(None, loaded_settings_3);
+            }
+
+            #[async_test]
+            async fn custom_value_saving() {
+                let (account, store) = get_loaded_store("custom_value_saving").await;
+                store.set_custom_value("A", "Hello".as_bytes().to_vec()).await.unwrap();
+
+                let loaded_1 = store.get_custom_value("A").await.unwrap();
+                assert_eq!(Some("Hello".as_bytes().to_vec()), loaded_1);
+
+                let loaded_2 = store.get_custom_value("B").await.unwrap();
+                assert_eq!(None, loaded_2);
+            }
+
+            #[async_test]
+            async fn test_custom_value_insert_if_missing_remove() {
+                let (_account, store) = get_loaded_store("custom_value_insert_if_missing").await;
+
+                let val = "Hello".as_bytes().to_vec();
+
+                // Removing while the value wasn't present doesn't remove anything.
+                let removed = store.remove_custom_value("A").await.unwrap();
+                assert!(!removed);
+
+                // Inserting while the value wasn't present does something.
+                let inserted = store.insert_custom_value_if_missing("A", val.clone()).await.unwrap();
+                assert!(inserted);
+
+                let loaded = store.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, Some(val.clone()));
+
+                // Inserting while the value was present does nothing.
+                let inserted = store.insert_custom_value_if_missing("A", val.clone()).await.unwrap();
+                assert!(!inserted);
+
+                // …even if we try hard.
+                let inserted = store.insert_custom_value_if_missing("A", val.clone()).await.unwrap();
+                assert!(!inserted);
+
+                // Removing while the value was present does something.
+                let removed = store.remove_custom_value("A").await.unwrap();
+                assert!(removed);
+
+                let loaded = store.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, None);
+
+                // …only the first time.
+                let removed = store.remove_custom_value("A").await.unwrap();
+                assert!(!removed);
+            }
+
+            #[async_test]
+            async fn test_custom_value_multiple_stores() {
+                // Hey, have you heard about my second, mimic store?
+                let val1 = "Hello".as_bytes().to_vec();
+                let (_account, store1) = get_loaded_store("custom_value_multiple_stores").await;
+                let (_account, store2) = get_loaded_store("custom_value_multiple_stores").await;
+
+                // Store1 inserts...
+                let inserted = store1.insert_custom_value_if_missing("A", val1.clone()).await.unwrap();
+                assert!(inserted);
+
+                // Store2 can't!
+                let val2 = "Goodbye".as_bytes().to_vec();
+                let inserted = store2.insert_custom_value_if_missing("A", val2.clone()).await.unwrap();
+                assert!(!inserted);
+
+                // But when reading, both stores must agree.
+                let loaded = store1.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, Some(val1.clone()));
+
+                let loaded = store2.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, Some(val1.clone()));
+
+                // Clean up.
+                let removed = store1.remove_custom_value("A").await.unwrap();
+                assert!(removed);
+
+                let loaded = store1.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, None);
+
+                let loaded = store2.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, None);
+
+                // Now store2 can write, store1 can't, they agree on reading etc.
+                let inserted = store2.insert_custom_value_if_missing("A", val2.clone()).await.unwrap();
+                assert!(inserted);
+
+                let inserted = store1.insert_custom_value_if_missing("A", val1.clone()).await.unwrap();
+                assert!(!inserted);
+
+                let loaded = store1.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, Some(val2.clone()));
+
+                let loaded = store2.get_custom_value("A").await.unwrap();
+                assert_eq!(loaded, Some(val2.clone()));
+            }
+        }
+    };
+}
+
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! cryptostore_integration_tests_time {
+    () => {
+        mod cryptostore_integration_tests_time {
+            use std::time::Duration;
+
+            use matrix_sdk_test::async_test;
+            use $crate::store::CryptoStore as _;
+
+            use super::cryptostore_integration_tests::*;
+
+            #[async_test]
+            async fn test_lease_locks() {
+                let (_account, store) = get_loaded_store("lease_locks").await;
+
+                let acquired0 = store.try_take_leased_lock(0, "key", "alice").await.unwrap();
+                assert!(acquired0);
+
+                // Should extend the lease automatically (same holder).
+                let acquired2 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
+                assert!(acquired2);
+
+                // Should extend the lease automatically (same holder + time is ok).
+                let acquired3 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
+                assert!(acquired3);
+
+                // Another attempt at taking the lock should fail, because it's taken.
+                let acquired4 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(!acquired4);
+
+                // Even if we insist.
+                let acquired5 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(!acquired5);
+
+                // That's a nice test we got here, go take a little nap.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Still too early.
+                let acquired55 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(!acquired55);
+
+                // Ok you can take another nap then.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                // At some point, we do get the lock.
+                let acquired6 = store.try_take_leased_lock(0, "key", "bob").await.unwrap();
+                assert!(acquired6);
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // The other gets it almost immediately too.
+                let acquired7 = store.try_take_leased_lock(0, "key", "alice").await.unwrap();
+                assert!(acquired7);
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // But when we take a longer lease...
+                let acquired8 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(acquired8);
+
+                // It blocks the other user.
+                let acquired9 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
+                assert!(!acquired9);
+
+                // We can hold onto our lease.
+                let acquired10 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(acquired10);
             }
         }
     };

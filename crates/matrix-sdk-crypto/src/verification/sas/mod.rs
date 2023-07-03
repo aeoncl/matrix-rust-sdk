@@ -18,8 +18,8 @@ mod sas_state;
 
 use std::sync::Arc;
 
+use eyeball::shared::{Observable as SharedObservable, ObservableWriteGuard};
 use futures_core::Stream;
-use futures_signals::signal::{Mutable, SignalExt};
 use futures_util::StreamExt;
 use inner_sas::InnerSas;
 use ruma::{
@@ -49,7 +49,7 @@ use crate::{
 /// Short authentication string object.
 #[derive(Clone, Debug)]
 pub struct Sas {
-    inner: Arc<Mutable<InnerSas>>,
+    inner: SharedObservable<InnerSas>,
     account: ReadOnlyAccount,
     identities_being_verified: IdentitiesBeingVerified,
     flow_id: Arc<FlowId>,
@@ -268,12 +268,12 @@ impl Sas {
     /// Does this verification flow support displaying emoji for the short
     /// authentication string.
     pub fn supports_emoji(&self) -> bool {
-        self.inner.lock_ref().supports_emoji()
+        self.inner.read().supports_emoji()
     }
 
     /// Did this verification flow start from a verification request.
     pub fn started_from_request(&self) -> bool {
-        self.inner.lock_ref().started_from_request()
+        self.inner.read().started_from_request()
     }
 
     /// Is this a verification that is veryfying one of our own devices.
@@ -283,18 +283,18 @@ impl Sas {
 
     /// Have we confirmed that the short auth string matches.
     pub fn have_we_confirmed(&self) -> bool {
-        self.inner.lock_ref().have_we_confirmed()
+        self.inner.read().have_we_confirmed()
     }
 
     /// Has the verification been accepted by both parties.
     pub fn has_been_accepted(&self) -> bool {
-        self.inner.lock_ref().has_been_accepted()
+        self.inner.read().has_been_accepted()
     }
 
     /// Get info about the cancellation if the verification flow has been
     /// cancelled.
     pub fn cancel_info(&self) -> Option<CancelInfo> {
-        if let InnerSas::Cancelled(c) = &*self.inner.lock_ref() {
+        if let InnerSas::Cancelled(c) = &*self.inner.read() {
             Some(c.state.as_ref().clone().into())
         } else {
             None
@@ -309,7 +309,9 @@ impl Sas {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn set_creation_time(&self, time: matrix_sdk_common::instant::Instant) {
-        self.inner.lock_mut().set_creation_time(time)
+        self.inner.update(|inner| {
+            inner.set_creation_time(time);
+        });
     }
 
     fn start_helper(
@@ -317,6 +319,7 @@ impl Sas {
         identities: IdentitiesBeingVerified,
         we_started: bool,
         request_handle: Option<RequestHandle>,
+        short_auth_strings: Option<Vec<ShortAuthenticationString>>,
     ) -> (Sas, OutgoingContent) {
         let (inner, content) = InnerSas::start(
             identities.store.account.clone(),
@@ -325,13 +328,14 @@ impl Sas {
             identities.identity_being_verified.clone(),
             flow_id.clone(),
             request_handle.is_some(),
+            short_auth_strings,
         );
 
         let account = identities.store.account.clone();
 
         (
             Sas {
-                inner: Arc::new(Mutable::new(inner)),
+                inner: SharedObservable::new(inner),
                 account,
                 identities_being_verified: identities,
                 flow_id: flow_id.into(),
@@ -357,10 +361,11 @@ impl Sas {
         transaction_id: OwnedTransactionId,
         we_started: bool,
         request_handle: Option<RequestHandle>,
+        short_auth_strings: Option<Vec<ShortAuthenticationString>>,
     ) -> (Sas, OutgoingContent) {
         let flow_id = FlowId::ToDevice(transaction_id);
 
-        Self::start_helper(flow_id, identities, we_started, request_handle)
+        Self::start_helper(flow_id, identities, we_started, request_handle, short_auth_strings)
     }
 
     /// Start a new SAS auth flow with the given device inside the given room.
@@ -382,7 +387,7 @@ impl Sas {
         request_handle: RequestHandle,
     ) -> (Sas, OutgoingContent) {
         let flow_id = FlowId::InRoom(room_id, flow_id);
-        Self::start_helper(flow_id, identities, we_started, Some(request_handle))
+        Self::start_helper(flow_id, identities, we_started, Some(request_handle), None)
     }
 
     /// Create a new Sas object from a m.key.verification.start request.
@@ -415,7 +420,7 @@ impl Sas {
         let account = identities.store.account.clone();
 
         Ok(Sas {
-            inner: Arc::new(Mutable::new(inner)),
+            inner: SharedObservable::new(inner),
             account,
             identities_being_verified: identities,
             flow_id: flow_id.into(),
@@ -429,7 +434,15 @@ impl Sas {
     /// This does nothing if the verification was already accepted, otherwise it
     /// returns an `AcceptEventContent` that needs to be sent out.
     pub fn accept(&self) -> Option<OutgoingVerificationRequest> {
-        self.accept_with_settings(Default::default())
+        match self.state() {
+            SasState::Started { protocols } => {
+                let settings =
+                    AcceptSettings { allowed_methods: protocols.short_authentication_string };
+
+                self.accept_with_settings(settings)
+            }
+            _ => None,
+        }
     }
 
     /// Accept the SAS verification customizing the accept method.
@@ -445,17 +458,17 @@ impl Sas {
         let old_state = self.state_debug();
 
         let request = {
-            let mut guard = self.inner.lock_mut();
+            let mut guard = self.inner.write();
             let sas: InnerSas = (*guard).clone();
             let methods = settings.allowed_methods;
 
             if let Some((sas, content)) = sas.accept(methods) {
-                *guard = sas;
+                ObservableWriteGuard::set(&mut guard, sas);
 
                 Some(match content {
                     OwnedAcceptContent::ToDevice(c) => {
                         let content = AnyToDeviceEventContent::KeyVerificationAccept(c);
-                        self.content_to_request(content).into()
+                        self.content_to_request(&content).into()
                     }
                     OwnedAcceptContent::Room(room_id, content) => RoomMessageRequest {
                         room_id,
@@ -493,19 +506,19 @@ impl Sas {
     ) -> Result<(Vec<OutgoingVerificationRequest>, Option<SignatureUploadRequest>), CryptoStoreError>
     {
         let (contents, done) = {
-            let mut guard = self.inner.lock_mut();
+            let mut guard = self.inner.write();
 
             let sas: InnerSas = (*guard).clone();
             let (sas, contents) = sas.confirm();
 
-            *guard = sas;
+            ObservableWriteGuard::set(&mut guard, sas);
             (contents, guard.is_done())
         };
 
         let mac_requests = contents
             .into_iter()
             .map(|c| match c {
-                OutgoingContent::ToDevice(c) => self.content_to_request(c).into(),
+                OutgoingContent::ToDevice(c) => self.content_to_request(&c).into(),
                 OutgoingContent::Room(r, c) => {
                     RoomMessageRequest { room_id: r, txn_id: TransactionId::new(), content: c }
                         .into()
@@ -565,7 +578,7 @@ impl Sas {
     /// [`cancel()`]: #method.cancel
     pub fn cancel_with_code(&self, code: CancelCode) -> Option<OutgoingVerificationRequest> {
         let content = {
-            let mut guard = self.inner.lock_mut();
+            let mut guard = self.inner.write();
 
             if let Some(request) = &self.request_handle {
                 request.cancel_with_code(&code);
@@ -573,13 +586,13 @@ impl Sas {
 
             let sas: InnerSas = (*guard).clone();
             let (sas, content) = sas.cancel(true, code);
-            *guard = sas;
+            ObservableWriteGuard::set(&mut guard, sas);
 
             content.map(|c| match c {
                 OutgoingContent::Room(room_id, content) => {
                     RoomMessageRequest { room_id, txn_id: TransactionId::new(), content }.into()
                 }
-                OutgoingContent::ToDevice(c) => self.content_to_request(c).into(),
+                OutgoingContent::ToDevice(c) => self.content_to_request(&c).into(),
             })
         };
 
@@ -598,22 +611,22 @@ impl Sas {
 
     /// Has the SAS verification flow timed out.
     pub fn timed_out(&self) -> bool {
-        self.inner.lock_ref().timed_out()
+        self.inner.read().timed_out()
     }
 
     /// Are we in a state where we can show the short auth string.
     pub fn can_be_presented(&self) -> bool {
-        self.inner.lock_ref().can_be_presented()
+        self.inner.read().can_be_presented()
     }
 
     /// Is the SAS flow done.
     pub fn is_done(&self) -> bool {
-        self.inner.lock_ref().is_done()
+        self.inner.read().is_done()
     }
 
     /// Is the SAS flow canceled.
     pub fn is_cancelled(&self) -> bool {
-        self.inner.lock_ref().is_cancelled()
+        self.inner.read().is_cancelled()
     }
 
     /// Get the emoji version of the short auth string.
@@ -621,7 +634,7 @@ impl Sas {
     /// Returns None if we can't yet present the short auth string, otherwise
     /// seven tuples containing the emoji and description.
     pub fn emoji(&self) -> Option<[Emoji; 7]> {
-        self.inner.lock_ref().emoji()
+        self.inner.read().emoji()
     }
 
     /// Get the index of the emoji representing the short auth string
@@ -631,7 +644,7 @@ impl Sas {
     /// converted to an emoji using the
     /// [relevant spec entry](https://spec.matrix.org/unstable/client-server-api/#sas-method-emoji).
     pub fn emoji_index(&self) -> Option<[u8; 7]> {
-        self.inner.lock_ref().emoji_index()
+        self.inner.read().emoji_index()
     }
 
     /// Get the decimal version of the short auth string.
@@ -640,7 +653,7 @@ impl Sas {
     /// tuple containing three 4-digit integers that represent the short auth
     /// string.
     pub fn decimals(&self) -> Option<(u16, u16, u16)> {
-        self.inner.lock_ref().decimals()
+        self.inner.read().decimals()
     }
 
     /// Listen for changes in the SAS verification process.
@@ -685,15 +698,15 @@ impl Sas {
     ///                │  Done │
     ///                └───────┘
     /// ```
-    /// # Example
+    ///
+    /// # Examples
     ///
     /// ```no_run
-    /// use futures::stream::{Stream, StreamExt};
+    /// use futures_util::{Stream, StreamExt};
     /// use matrix_sdk_crypto::{Sas, SasState};
     ///
-    /// # futures::executor::block_on(async {
+    /// # async {
     /// # let sas: Sas = unimplemented!();
-    ///
     /// let mut stream = sas.changes();
     ///
     /// while let Some(state) = stream.next().await {
@@ -729,19 +742,19 @@ impl Sas {
     ///         | SasState::Confirmed => (),
     ///     }
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub fn changes(&self) -> impl Stream<Item = SasState> {
-        self.inner.signal_cloned().to_stream().map(|s| (&s).into())
+        self.inner.subscribe().map(|s| (&s).into())
     }
 
     /// Get the current state of the verification process.
     pub fn state(&self) -> SasState {
-        (&*self.inner.lock_ref()).into()
+        (&*self.inner.read()).into()
     }
 
     fn state_debug(&self) -> State {
-        (&*self.inner.lock_ref()).into()
+        (&*self.inner.read()).into()
     }
 
     pub(crate) fn receive_any_event(
@@ -752,11 +765,11 @@ impl Sas {
         let old_state = self.state_debug();
 
         let content = {
-            let mut guard = self.inner.lock_mut();
+            let mut guard = self.inner.write();
             let sas: InnerSas = (*guard).clone();
             let (sas, content) = sas.receive_any_event(sender, content);
 
-            *guard = sas;
+            ObservableWriteGuard::set(&mut guard, sas);
 
             content
         };
@@ -776,12 +789,12 @@ impl Sas {
         let old_state = self.state_debug();
 
         {
-            let mut guard = self.inner.lock_mut();
+            let mut guard = self.inner.write();
 
             let sas: InnerSas = (*guard).clone();
 
             if let Some(sas) = sas.mark_request_as_sent(request_id) {
-                *guard = sas;
+                ObservableWriteGuard::set(&mut guard, sas);
             } else {
                 error!(
                     flow_id = self.flow_id().as_str(),
@@ -803,14 +816,14 @@ impl Sas {
     }
 
     pub(crate) fn verified_devices(&self) -> Option<Arc<[ReadOnlyDevice]>> {
-        self.inner.lock_ref().verified_devices()
+        self.inner.read().verified_devices()
     }
 
     pub(crate) fn verified_identities(&self) -> Option<Arc<[ReadOnlyUserIdentities]>> {
-        self.inner.lock_ref().verified_identities()
+        self.inner.read().verified_identities()
     }
 
-    pub(crate) fn content_to_request(&self, content: AnyToDeviceEventContent) -> ToDeviceRequest {
+    pub(crate) fn content_to_request(&self, content: &AnyToDeviceEventContent) -> ToDeviceRequest {
         ToDeviceRequest::with_id(
             self.other_user_id(),
             self.other_device_id().to_owned(),
@@ -852,9 +865,13 @@ impl AcceptSettings {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use matrix_sdk_common::locks::Mutex;
     use matrix_sdk_test::async_test;
-    use ruma::{device_id, user_id, DeviceId, TransactionId, UserId};
+    use ruma::{
+        device_id,
+        events::key::verification::{accept::AcceptMethod, ShortAuthenticationString},
+        user_id, DeviceId, TransactionId, UserId,
+    };
+    use tokio::sync::Mutex;
 
     use super::Sas;
     use crate::{
@@ -883,8 +900,8 @@ mod tests {
         device_id!("BOBDEVCIE")
     }
 
-    #[async_test]
-    async fn sas_wrapper_full() {
+    async fn machine_pair() -> (VerificationStore, ReadOnlyDevice, VerificationStore, ReadOnlyDevice)
+    {
         let alice = ReadOnlyAccount::new(alice_id(), alice_device_id());
         let alice_device = ReadOnlyDevice::from_account(&alice).await;
 
@@ -906,9 +923,16 @@ mod tests {
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())).into(),
         };
 
+        (alice_store, alice_device, bob_store, bob_device)
+    }
+
+    #[async_test]
+    async fn sas_wrapper_full() {
+        let (alice_store, alice_device, bob_store, bob_device) = machine_pair().await;
+
         let identities = alice_store.get_identities(bob_device).await.unwrap();
 
-        let (alice, content) = Sas::start(identities, TransactionId::new(), true, None);
+        let (alice, content) = Sas::start(identities, TransactionId::new(), true, None, None);
 
         assert_matches!(alice.state(), SasState::Started { .. });
 
@@ -974,5 +998,30 @@ mod tests {
         assert!(bob.verified_devices().unwrap().contains(bob.other_device()));
         assert_matches!(alice.state(), SasState::Done { .. });
         assert_matches!(bob.state(), SasState::Done { .. });
+    }
+
+    #[async_test]
+    async fn sas_with_restricted_methods() {
+        let (alice_store, alice_device, bob_store, bob_device) = machine_pair().await;
+        let identities = alice_store.get_identities(bob_device).await.unwrap();
+
+        let short_auth_strings = vec![ShortAuthenticationString::Decimal];
+        let (alice, content) =
+            Sas::start(identities, TransactionId::new(), true, None, Some(short_auth_strings));
+
+        let flow_id = alice.flow_id().to_owned();
+        let content = StartContent::try_from(&content).unwrap();
+
+        let identities = bob_store.get_identities(alice_device).await.unwrap();
+        let bob = Sas::from_start_event(flow_id, &content, identities, None, false).unwrap();
+
+        let request = bob.accept().unwrap();
+
+        let content = OutgoingContent::try_from(request).unwrap();
+        let content = AcceptContent::try_from(&content).unwrap();
+        let content = assert_matches!(content.method(), AcceptMethod::SasV1(content) => content);
+
+        assert!(content.short_authentication_string.contains(&ShortAuthenticationString::Decimal));
+        assert!(!content.short_authentication_string.contains(&ShortAuthenticationString::Emoji));
     }
 }

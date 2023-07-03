@@ -18,7 +18,6 @@ use std::{
 };
 
 use dashmap::DashMap;
-use matrix_sdk_common::locks::Mutex;
 use ruma::{
     events::{
         key::verification::VerificationMethod, AnyToDeviceEvent, AnyToDeviceEventContent,
@@ -28,6 +27,7 @@ use ruma::{
     uint, DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId,
     SecondsSinceUnixEpoch, TransactionId, UInt, UserId,
 };
+use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, trace, warn};
 
 use super::{
@@ -125,7 +125,7 @@ impl VerificationMachine {
         device: ReadOnlyDevice,
     ) -> Result<(Sas, OutgoingVerificationRequest), CryptoStoreError> {
         let identities = self.store.get_identities(device.clone()).await?;
-        let (sas, content) = Sas::start(identities, TransactionId::new(), true, None);
+        let (sas, content) = Sas::start(identities, TransactionId::new(), true, None, None);
 
         let request = match content {
             OutgoingContent::Room(r, c) => {
@@ -135,7 +135,7 @@ impl VerificationMachine {
                 let request = ToDeviceRequest::with_id(
                     device.user_id(),
                     device.device_id().to_owned(),
-                    c,
+                    &c,
                     TransactionId::new(),
                 );
 
@@ -261,7 +261,7 @@ impl VerificationMachine {
             })
             .collect();
 
-        requests.extend(self.verifications.garbage_collect().into_iter());
+        requests.extend(self.verifications.garbage_collect());
 
         for request in requests {
             if let Ok(OutgoingContent::ToDevice(AnyToDeviceEventContent::KeyVerificationCancel(
@@ -285,7 +285,7 @@ impl VerificationMachine {
 
     async fn mark_sas_as_done(
         &self,
-        sas: Sas,
+        sas: &Sas,
         out_content: Option<OutgoingContent>,
     ) -> Result<(), CryptoStoreError> {
         match sas.mark_as_done().await? {
@@ -451,8 +451,10 @@ impl VerificationMachine {
                     return Ok(());
                 }
 
-                let Some((content, request_info)) =
-                    sas.receive_any_event(event.sender(), &content) else { return Ok(()) };
+                let Some((content, request_info)) = sas.receive_any_event(event.sender(), &content)
+                else {
+                    return Ok(());
+                };
 
                 self.queue_up_content(
                     sas.other_user_id(),
@@ -472,7 +474,7 @@ impl VerificationMachine {
                 let content = s.receive_any_event(event.sender(), &content);
 
                 if s.is_done() {
-                    self.mark_sas_as_done(s, content.map(|(c, _)| c)).await?;
+                    self.mark_sas_as_done(&s, content.map(|(c, _)| c)).await?;
                 } else {
                     // Even if we are not done (yet), there might be content to
                     // send out, e.g. in the case where we are done with our
@@ -499,7 +501,7 @@ impl VerificationMachine {
                         let content = sas.receive_any_event(event.sender(), &content);
 
                         if sas.is_done() {
-                            self.mark_sas_as_done(sas, content.map(|(c, _)| c)).await?;
+                            self.mark_sas_as_done(&sas, content.map(|(c, _)| c)).await?;
                         }
                     }
                     #[cfg(feature = "qrcode")]
@@ -527,9 +529,9 @@ impl VerificationMachine {
 mod tests {
     use std::sync::Arc;
 
-    use matrix_sdk_common::locks::Mutex;
     use matrix_sdk_test::async_test;
     use ruma::TransactionId;
+    use tokio::sync::Mutex;
 
     use super::{Sas, VerificationMachine};
     use crate::{
@@ -564,7 +566,8 @@ mod tests {
             bob_store.get_device(alice_id(), alice_device_id()).await.unwrap().unwrap();
 
         let identities = bob_store.get_identities(alice_device).await.unwrap();
-        let (bob_sas, start_content) = Sas::start(identities, TransactionId::new(), true, None);
+        let (bob_sas, start_content) =
+            Sas::start(identities, TransactionId::new(), true, None, None);
 
         machine
             .receive_any_event(&wrap_any_to_device_content(bob_sas.user_id(), start_content))
@@ -672,7 +675,7 @@ mod tests {
 
         // Start the first sas verification.
         let (bob_sas, start_content) =
-            Sas::start(identities.clone(), TransactionId::new(), true, None);
+            Sas::start(identities.clone(), TransactionId::new(), true, None, None);
 
         machine
             .receive_any_event(&wrap_any_to_device_content(bob_sas.user_id(), start_content))
@@ -686,7 +689,7 @@ mod tests {
 
         let second_transaction_id = TransactionId::new();
         let (bob_sas, start_content) =
-            Sas::start(identities, second_transaction_id.clone(), true, None);
+            Sas::start(identities, second_transaction_id.clone(), true, None, None);
         machine
             .receive_any_event(&wrap_any_to_device_content(bob_sas.user_id(), start_content))
             .await

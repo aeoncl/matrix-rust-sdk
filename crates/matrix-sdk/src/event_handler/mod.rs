@@ -50,7 +50,7 @@ use matrix_sdk_base::{
     deserialized_responses::{EncryptionInfo, SyncTimelineEvent},
     SendOutsideWasm, SyncOutsideWasm,
 };
-use ruma::{events::AnySyncStateEvent, serde::Raw, OwnedRoomId};
+use ruma::{events::AnySyncStateEvent, push::Action, serde::Raw, OwnedRoomId};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::{debug, error, field::debug, instrument, warn};
@@ -234,6 +234,7 @@ pub struct EventHandlerData<'a> {
     room: Option<room::Room>,
     raw: &'a RawJsonValue,
     encryption_info: Option<&'a EncryptionInfo>,
+    push_actions: &'a [Action],
     handle: EventHandlerHandle,
 }
 
@@ -327,7 +328,7 @@ impl Client {
     pub(crate) async fn handle_sync_events<T>(
         &self,
         kind: HandlerKind,
-        room: &Option<room::Room>,
+        room: Option<&room::Room>,
         events: &[Raw<T>],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
@@ -338,7 +339,7 @@ impl Client {
 
         for raw_event in events {
             let event_type = raw_event.deserialize_as::<ExtractType<'_>>()?.event_type;
-            self.call_event_handlers(room, raw_event.json(), kind, &event_type, None).await;
+            self.call_event_handlers(room, raw_event.json(), kind, &event_type, None, &[]).await;
         }
 
         Ok(())
@@ -346,7 +347,7 @@ impl Client {
 
     pub(crate) async fn handle_sync_state_events(
         &self,
-        room: &Option<room::Room>,
+        room: Option<&room::Room>,
         state_events: &[Raw<AnySyncStateEvent>],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
@@ -365,7 +366,8 @@ impl Client {
             let redacted = unsigned.and_then(|u| u.redacted_because).is_some();
             let handler_kind = HandlerKind::state_redacted(redacted);
 
-            self.call_event_handlers(room, raw_event.json(), handler_kind, &event_type, None).await;
+            self.call_event_handlers(room, raw_event.json(), handler_kind, &event_type, None, &[])
+                .await;
         }
 
         Ok(())
@@ -373,7 +375,7 @@ impl Client {
 
     pub(crate) async fn handle_sync_timeline_events(
         &self,
-        room: &Option<room::Room>,
+        room: Option<&room::Room>,
         timeline_events: &[SyncTimelineEvent],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
@@ -396,33 +398,57 @@ impl Client {
 
             let raw_event = item.event.json();
             let encryption_info = item.encryption_info.as_ref();
+            let push_actions = &item.push_actions;
 
             // Event handlers for possibly-redacted timeline events
-            self.call_event_handlers(room, raw_event, handler_kind_g, &event_type, encryption_info)
-                .await;
+            self.call_event_handlers(
+                room,
+                raw_event,
+                handler_kind_g,
+                &event_type,
+                encryption_info,
+                push_actions,
+            )
+            .await;
 
             // Event handlers specifically for redacted OR unredacted timeline events
-            self.call_event_handlers(room, raw_event, handler_kind_r, &event_type, encryption_info)
-                .await;
+            self.call_event_handlers(
+                room,
+                raw_event,
+                handler_kind_r,
+                &event_type,
+                encryption_info,
+                push_actions,
+            )
+            .await;
 
             // Event handlers for `AnySyncTimelineEvent`
             let kind = HandlerKind::Timeline;
-            self.call_event_handlers(room, raw_event, kind, &event_type, encryption_info).await;
+            self.call_event_handlers(
+                room,
+                raw_event,
+                kind,
+                &event_type,
+                encryption_info,
+                push_actions,
+            )
+            .await;
         }
 
         Ok(())
     }
 
-    #[instrument(level = "debug", skip_all, fields(?event_kind, ?event_type, room_id))]
+    #[instrument(skip_all, fields(?event_kind, ?event_type, room_id))]
     async fn call_event_handlers(
         &self,
-        room: &Option<room::Room>,
+        room: Option<&room::Room>,
         raw: &RawJsonValue,
         event_kind: HandlerKind,
         event_type: &str,
         encryption_info: Option<&EncryptionInfo>,
+        push_actions: &[Action],
     ) {
-        let room_id = room.as_ref().map(|r| r.room_id());
+        let room_id = room.map(|r| r.room_id());
         if let Some(room_id) = room_id {
             tracing::Span::current().record("room_id", debug(room_id));
         }
@@ -438,9 +464,10 @@ impl Client {
             .map(|(handle, handler_fn)| {
                 let data = EventHandlerData {
                     client: self.clone(),
-                    room: room.clone(),
+                    room: room.cloned(),
                     raw,
                     encryption_info,
+                    push_actions,
                     handle,
                 };
 

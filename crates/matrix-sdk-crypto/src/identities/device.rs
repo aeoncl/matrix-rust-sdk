@@ -23,15 +23,17 @@ use std::{
 };
 
 use atomic::Atomic;
-use matrix_sdk_common::locks::Mutex;
 use ruma::{
     api::client::keys::upload_signatures::v3::Request as SignatureUploadRequest,
-    events::key::verification::VerificationMethod, serde::Raw, DeviceId, DeviceKeyAlgorithm,
-    DeviceKeyId, OwnedDeviceId, OwnedDeviceKeyId, UserId,
+    events::{key::verification::VerificationMethod, AnyToDeviceEventContent},
+    serde::Raw,
+    DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
+    OwnedDeviceKeyId, UInt, UserId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use tracing::warn;
+use tokio::sync::Mutex;
+use tracing::{instrument, trace, warn};
 use vodozemac::{olm::SessionConfig, Curve25519PublicKey, Ed25519PublicKey};
 
 use super::{atomic_bool_deserializer, atomic_bool_serializer};
@@ -40,12 +42,15 @@ use crate::OlmMachine;
 use crate::{
     error::{EventError, OlmError, OlmResult, SignatureError},
     identities::{ReadOnlyOwnUserIdentity, ReadOnlyUserIdentities},
-    olm::{InboundGroupSession, Session, SignedJsonObject, VerifyJson},
+    olm::{
+        InboundGroupSession, OutboundGroupSession, Session, ShareInfo, SignedJsonObject, VerifyJson,
+    },
     store::{Changes, DeviceChanges, DynCryptoStore, Result as StoreResult},
     types::{
         events::{
             forwarded_room_key::ForwardedRoomKeyContent,
-            room::encrypted::ToDeviceEncryptedEventContent, EventType,
+            room::encrypted::ToDeviceEncryptedEventContent, room_key_withheld::WithheldCode,
+            EventType,
         },
         DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures, SignedKey,
     },
@@ -53,6 +58,17 @@ use crate::{
     MegolmError, OutgoingVerificationRequest, ReadOnlyAccount, Sas, ToDeviceRequest,
     VerificationRequest,
 };
+
+pub enum MaybeEncryptedRoomKey {
+    Encrypted {
+        used_session: Session,
+        share_info: ShareInfo,
+        message: Raw<AnyToDeviceEventContent>,
+    },
+    Withheld {
+        code: WithheldCode,
+    },
+}
 
 /// A read-only version of a `Device`.
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,6 +84,22 @@ pub struct ReadOnlyDevice {
         deserialize_with = "local_trust_deserializer"
     )]
     trust_state: Arc<Atomic<LocalTrust>>,
+    /// Flag remembering if we successfully sent an `m.no_olm` withheld code to
+    /// this device.
+    #[serde(
+        default,
+        serialize_with = "atomic_bool_serializer",
+        deserialize_with = "atomic_bool_deserializer"
+    )]
+    withheld_code_sent: Arc<AtomicBool>,
+    /// First time this device was seen in milliseconds since epoch.
+    /// Default to epoch for migration purpose.
+    #[serde(default = "default_timestamp")]
+    first_time_seen_ts: MilliSecondsSinceUnixEpoch,
+}
+
+fn default_timestamp() -> MilliSecondsSinceUnixEpoch {
+    MilliSecondsSinceUnixEpoch(UInt::default())
 }
 
 impl std::fmt::Debug for ReadOnlyDevice {
@@ -79,6 +111,7 @@ impl std::fmt::Debug for ReadOnlyDevice {
             .field("keys", self.keys())
             .field("deleted", &self.deleted.load(Ordering::SeqCst))
             .field("trust_state", &self.trust_state)
+            .field("withheld_code_sent", &self.withheld_code_sent)
             .finish()
     }
 }
@@ -149,8 +182,8 @@ impl Device {
 
         self.user_id() == self.verification_machine.own_user_id()
             && self.device_id() == self.verification_machine.own_device_id()
-            && self.ed25519_key().map(|k| k == own_ed25519_key).unwrap_or(false)
-            && self.curve25519_key().map(|k| k == own_curve25519_key).unwrap_or(false)
+            && self.ed25519_key().is_some_and(|k| k == own_ed25519_key)
+            && self.curve25519_key().is_some_and(|k| k == own_curve25519_key)
     }
 
     /// Does the given `InboundGroupSession` belong to this device?
@@ -181,7 +214,7 @@ impl Device {
             // know that the room key belongs to this device.
             Ok(false)
         } else if let Some(key) =
-            session.signing_keys.get(&DeviceKeyAlgorithm::Ed25519).and_then(|k| k.ed25519())
+            session.signing_keys().get(&DeviceKeyAlgorithm::Ed25519).and_then(|k| k.ed25519())
         {
             // Room keys are received as an `m.room.encrypted` event using the `m.olm`
             // algorithm. Upon decryption of the `m.room.encrypted` event, the
@@ -196,9 +229,9 @@ impl Device {
             // `device_keys` and downloaded by us using a `/keys/query` request.
             //
             // A `Device` is considered to be the owner of a room key iff:
-            //     1. The `Curve25519` key that was used to establish the Olm `Session`
-            //        that was used to decrypt the event is binding the `Ed25519`key
-            //        of this `Device`.
+            //     1. The `Curve25519` key that was used to establish the Olm `Session` that
+            //        was used to decrypt the event is binding the `Ed25519`key of this
+            //        `Device`.
             //     2. The `Ed25519` key of this device has signed a `device_keys` object
             //        that contains the `Curve25519` key from step 1.
             //
@@ -237,7 +270,7 @@ impl Device {
             //
             // [1]: https://spec.matrix.org/v1.5/client-server-api/#molmv1curve25519-aes-sha2
             let ed25519_comparison = self.ed25519_key().map(|k| k == key);
-            let curve25519_comparison = self.curve25519_key().map(|k| k == session.sender_key);
+            let curve25519_comparison = self.curve25519_key().map(|k| k == session.sender_key());
 
             match (ed25519_comparison, curve25519_comparison) {
                 // If we have any of the keys but they don't turn out to match, refuse to decrypt
@@ -257,6 +290,32 @@ impl Device {
         } else {
             Ok(false)
         }
+    }
+
+    /// Is this device cross signed by its owner?
+    pub fn is_cross_signed_by_owner(&self) -> bool {
+        self.device_owner_identity.as_ref().is_some_and(|device_identity| match device_identity {
+            // If it's one of our own devices, just check that
+            // we signed the device.
+            ReadOnlyUserIdentities::Own(identity) => identity.is_device_signed(&self.inner).is_ok(),
+            // If it's a device from someone else, check
+            // if the other user has signed this device.
+            ReadOnlyUserIdentities::Other(device_identity) => {
+                device_identity.is_device_signed(&self.inner).is_ok()
+            }
+        })
+    }
+
+    /// Is the device owner verified by us?
+    pub fn is_device_owner_verified(&self) -> bool {
+        self.device_owner_identity.as_ref().is_some_and(|id| match id {
+            ReadOnlyUserIdentities::Own(own_identity) => own_identity.is_verified(),
+            ReadOnlyUserIdentities::Other(other_identity) => {
+                self.own_identity.as_ref().is_some_and(|oi| {
+                    oi.is_verified() && oi.is_identity_signed(other_identity).is_ok()
+                })
+            }
+        })
     }
 
     /// Request an interactive verification with this `Device`.
@@ -299,6 +358,11 @@ impl Device {
     pub(crate) async fn get_sessions(&self) -> StoreResult<Option<Arc<Mutex<Vec<Session>>>>> {
         let Some(k) = self.curve25519_key() else { return Ok(None) };
         self.verification_machine.store.get_sessions(&k.to_base64()).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_most_recent_session(&self) -> OlmResult<Option<Session>> {
+        self.inner.get_most_recent_session(self.verification_machine.store.inner()).await
     }
 
     /// Is this device considered to be verified.
@@ -369,12 +433,63 @@ impl Device {
     /// # Arguments
     ///
     /// * `content` - The content of the event that should be encrypted.
+    #[instrument(
+        skip_all,
+        fields(
+            recipient = %self.user_id(),
+            recipient_device = %self.device_id(),
+            recipient_key = ?self.curve25519_key(),
+            event_type,
+            session,
+            message_id,
+        ))
+    ]
     pub(crate) async fn encrypt(
         &self,
         event_type: &str,
         content: Value,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
-        self.inner.encrypt(self.verification_machine.store.inner(), event_type, content).await
+        #[cfg(feature = "message-ids")]
+        let message_id = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let id = ulid::Ulid::new().to_string();
+            #[cfg(target_arch = "wasm32")]
+            let id = ruma::TransactionId::new().to_string();
+
+            tracing::Span::current().record("message_id", &id);
+            Some(id)
+        };
+
+        #[cfg(not(feature = "message-ids"))]
+        let message_id = None;
+
+        self.inner
+            .encrypt(self.verification_machine.store.inner(), event_type, content, message_id)
+            .await
+    }
+
+    pub(crate) async fn maybe_encrypt_room_key(
+        &self,
+        session: OutboundGroupSession,
+    ) -> OlmResult<MaybeEncryptedRoomKey> {
+        let content = session.as_content().await;
+        let message_index = session.message_index().await;
+        let event_type = content.event_type();
+        let content =
+            serde_json::to_value(content).expect("We can always serialize our own room key");
+
+        match self.encrypt(event_type, content).await {
+            Ok((session, encrypted)) => Ok(MaybeEncryptedRoomKey::Encrypted {
+                share_info: ShareInfo::new_shared(session.sender_key().to_owned(), message_index),
+                used_session: session,
+                message: encrypted.cast(),
+            }),
+
+            Err(OlmError::MissingSession | OlmError::EventError(EventError::MissingSenderKey)) => {
+                Ok(MaybeEncryptedRoomKey::Withheld { code: WithheldCode::NoOlm })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Encrypt the given inbound group session as a forwarded room key for this
@@ -384,16 +499,16 @@ impl Device {
         session: InboundGroupSession,
         message_index: Option<u32>,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
-        let export = if let Some(index) = message_index {
-            session.export_at_index(index).await
-        } else {
-            session.export().await
+        let (event_type, content) = {
+            let export = if let Some(index) = message_index {
+                session.export_at_index(index).await
+            } else {
+                session.export().await
+            };
+            let content: ForwardedRoomKeyContent = export.try_into()?;
+
+            (content.event_type(), serde_json::to_value(content)?)
         };
-
-        let content: ForwardedRoomKeyContent = export.try_into()?;
-
-        let event_type = content.event_type();
-        let content = serde_json::to_value(content)?;
 
         self.encrypt(event_type, content).await
     }
@@ -491,6 +606,8 @@ impl ReadOnlyDevice {
             inner: device_keys.into(),
             trust_state: Arc::new(Atomic::new(trust_state)),
             deleted: Arc::new(AtomicBool::new(false)),
+            withheld_code_sent: Arc::new(AtomicBool::new(false)),
+            first_time_seen_ts: MilliSecondsSinceUnixEpoch::now(),
         }
     }
 
@@ -559,6 +676,16 @@ impl ReadOnlyDevice {
         self.trust_state.store(state, Ordering::Relaxed)
     }
 
+    pub(crate) fn mark_withheld_code_as_sent(&self) {
+        self.withheld_code_sent.store(true, Ordering::Relaxed)
+    }
+
+    /// Returns true if the `m.no_olm` withheld code was already sent to this
+    /// device.
+    pub fn was_withheld_code_sent(&self) -> bool {
+        self.withheld_code_sent.load(Ordering::Relaxed)
+    }
+
     /// Get the list of algorithms this device supports.
     pub fn algorithms(&self) -> &[EventEncryptionAlgorithm] {
         &self.inner.algorithms
@@ -575,6 +702,32 @@ impl ReadOnlyDevice {
         #[cfg(not(feature = "experimental-algorithms"))]
         {
             self.algorithms().contains(&EventEncryptionAlgorithm::OlmV1Curve25519AesSha2)
+        }
+    }
+
+    /// Find and return the most recently created Olm [`Session`] we are sharing
+    /// with this device.
+    pub(crate) async fn get_most_recent_session(
+        &self,
+        store: &DynCryptoStore,
+    ) -> OlmResult<Option<Session>> {
+        if let Some(sender_key) = self.curve25519_key() {
+            if let Some(s) = store.get_sessions(&sender_key.to_base64()).await? {
+                let mut sessions = s.lock().await;
+
+                sessions.sort_by_key(|s| s.creation_time);
+
+                Ok(sessions.last().cloned())
+            } else {
+                Ok(None)
+            }
+        } else {
+            warn!(
+                "Trying to find a Olm session of a device, but the device doesn't have a \
+                Curve25519 key",
+            );
+
+            Err(EventError::MissingSenderKey.into())
         }
     }
 
@@ -616,28 +769,27 @@ impl ReadOnlyDevice {
         own_identity: &Option<ReadOnlyOwnUserIdentity>,
         device_owner: &Option<ReadOnlyUserIdentities>,
     ) -> bool {
-        own_identity.as_ref().map_or(false, |own_identity| {
-            // Our own identity needs to be marked as verified.
-            own_identity.is_verified()
-                && device_owner
-                    .as_ref()
-                    .map(|device_identity| match device_identity {
+        own_identity.as_ref().zip(device_owner.as_ref()).is_some_and(
+            |(own_identity, device_identity)| {
+                // Our own identity needs to be marked as verified.
+                own_identity.is_verified()
+                    && match device_identity {
                         // If it's one of our own devices, just check that
                         // we signed the device.
                         ReadOnlyUserIdentities::Own(_) => {
-                            own_identity.is_device_signed(self).map_or(false, |_| true)
+                            own_identity.is_device_signed(self).is_ok()
                         }
 
                         // If it's a device from someone else, first check
                         // that our user has signed the other user and then
                         // check if the other user has signed this device.
                         ReadOnlyUserIdentities::Other(device_identity) => {
-                            own_identity.is_identity_signed(device_identity).map_or(false, |_| true)
-                                && device_identity.is_device_signed(self).map_or(false, |_| true)
+                            own_identity.is_identity_signed(device_identity).is_ok()
+                                && device_identity.is_device_signed(self).is_ok()
                         }
-                    })
-                    .unwrap_or(false)
-        })
+                    }
+            },
+        )
     }
 
     pub(crate) async fn encrypt(
@@ -645,38 +797,21 @@ impl ReadOnlyDevice {
         store: &DynCryptoStore,
         event_type: &str,
         content: Value,
+        message_id: Option<String>,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
-        let Some(sender_key) = self.curve25519_key() else {
-            warn!(
-                user_id = ?self.user_id(),
-                device_id = ?self.device_id(),
-                "Trying to encrypt a Megolm session, but the device doesn't \
-                have a curve25519 key",
-            );
-            return Err(EventError::MissingSenderKey.into());
-        };
+        let session = self.get_most_recent_session(store).await?;
 
-        let session = if let Some(s) = store.get_sessions(&sender_key.to_base64()).await? {
-            let mut sessions = s.lock().await;
-            sessions.sort_by_key(|s| s.last_use_time);
-            sessions.get(0).cloned()
+        if let Some(mut session) = session {
+            let message = session.encrypt(self, event_type, content, message_id).await?;
+
+            trace!("Successfully encrypted an event");
+
+            Ok((session, message))
         } else {
-            None
-        };
+            warn!("Trying to encrypt an event for a device, but no Olm session is found.",);
 
-        let Some(mut session) = session else {
-            warn!(
-                "Trying to encrypt a Megolm session for user {} on device {}, \
-                but no Olm session is found",
-                self.user_id(),
-                self.device_id()
-            );
-            return Err(OlmError::MissingSession);
-        };
-
-        let message = session.encrypt(self, event_type, content).await?;
-
-        Ok((session, message))
+            Err(OlmError::MissingSession)
+        }
     }
 
     /// Update a device with a new device keys struct.
@@ -773,8 +908,17 @@ impl ReadOnlyDevice {
     /// replicated locally.
     pub async fn from_account(account: &ReadOnlyAccount) -> ReadOnlyDevice {
         let device_keys = account.device_keys().await;
-        ReadOnlyDevice::try_from(&device_keys)
-            .expect("Creating a device from our own account should always succeed")
+        let mut device = ReadOnlyDevice::try_from(&device_keys)
+            .expect("Creating a device from our own account should always succeed");
+        device.first_time_seen_ts = account.creation_local_time();
+
+        device
+    }
+
+    /// Get the local timestamp of when this device was first persisted, in
+    /// milliseconds since epoch (client local time).
+    pub fn first_time_seen_ts(&self) -> MilliSecondsSinceUnixEpoch {
+        self.first_time_seen_ts
     }
 }
 
@@ -786,6 +930,8 @@ impl TryFrom<&DeviceKeys> for ReadOnlyDevice {
             inner: device_keys.clone().into(),
             deleted: Arc::new(AtomicBool::new(false)),
             trust_state: Arc::new(Atomic::new(LocalTrust::Unset)),
+            withheld_code_sent: Arc::new(AtomicBool::new(false)),
+            first_time_seen_ts: MilliSecondsSinceUnixEpoch::now(),
         };
 
         device.verify_device_keys(device_keys)?;
@@ -842,7 +988,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use ruma::user_id;
+    use ruma::{user_id, MilliSecondsSinceUnixEpoch};
     use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
     use super::testing::{device_keys, get_device};
@@ -850,6 +996,7 @@ pub(crate) mod tests {
 
     #[test]
     fn create_a_device() {
+        let now = MilliSecondsSinceUnixEpoch::now();
         let user_id = user_id!("@example:localhost");
         let device_id = "BNYQQWUMXO";
 
@@ -869,6 +1016,11 @@ pub(crate) mod tests {
             device.ed25519_key().unwrap(),
             Ed25519PublicKey::from_base64("2/5LWJMow5zhJqakV88SIc7q/1pa8fmkfgAzx72w9G4").unwrap(),
         );
+
+        let then = MilliSecondsSinceUnixEpoch::now();
+
+        assert!(device.first_time_seen_ts() >= now);
+        assert!(device.first_time_seen_ts() <= then);
     }
 
     #[test]
@@ -887,6 +1039,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn delete_a_device() {
         let device = get_device();
         assert!(!device.is_deleted());

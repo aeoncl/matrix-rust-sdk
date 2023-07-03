@@ -1,18 +1,19 @@
 use std::ops::Deref;
 
 use thiserror::Error;
+use tracing::{instrument, warn};
 
 use super::{Joined, Left};
 use crate::{
     room::{Common, RoomMember},
-    BaseRoom, Client, Error, Result, RoomType,
+    BaseRoom, Client, Error, Result, RoomState,
 };
 
 /// A room in the invited state.
 ///
-/// This struct contains all methods specific to a `Room` with type
-/// `RoomType::Invited`. Operations may fail once the underlying `Room` changes
-/// `RoomType`.
+/// This struct contains all methods specific to a `Room` with
+/// `RoomState::Invited`. Operations may fail once the underlying `Room` changes
+/// `RoomState`.
 #[derive(Debug, Clone)]
 pub struct Invited {
     pub(crate) inner: Common,
@@ -37,15 +38,15 @@ pub enum InvitationError {
 }
 
 impl Invited {
-    /// Create a new `room::Invited` if the underlying `Room` has type
-    /// `RoomType::Invited`.
+    /// Create a new `room::Invited` if the underlying `Room` has
+    /// `RoomState::Invited`.
     ///
     /// # Arguments
     /// * `client` - The client used to make requests.
     ///
     /// * `room` - The underlying room.
     pub(crate) fn new(client: &Client, room: BaseRoom) -> Option<Self> {
-        if room.room_type() == RoomType::Invited {
+        if room.state() == RoomState::Invited {
             Some(Self { inner: Common::new(client.clone(), room) })
         } else {
             None
@@ -58,8 +59,19 @@ impl Invited {
     }
 
     /// Accept the invitation.
+    #[instrument(skip_all)]
     pub async fn accept_invitation(&self) -> Result<Joined> {
-        self.inner.join().await
+        let joined = self.inner.join().await?;
+        let is_direct_room = self.inner.is_direct().await.unwrap_or_else(|e| {
+            warn!(room_id = ?self.room_id(), "is_direct() failed: {e}");
+            false
+        });
+
+        if is_direct_room {
+            _ = self.inner.set_is_direct(true).await;
+        }
+
+        Ok(joined)
     }
 
     /// The membership details of the (latest) invite for this room.

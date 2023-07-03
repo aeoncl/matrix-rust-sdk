@@ -16,30 +16,22 @@
 #![doc = include_str!("../docs/encryption.md")]
 #![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 
-pub mod identities;
-pub mod verification;
 use std::{
     collections::{BTreeMap, HashSet},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
 };
 
-use futures_util::stream::{self, StreamExt};
-pub use matrix_sdk_base::crypto::{
-    olm::{
-        SessionCreationError as MegolmSessionCreationError,
-        SessionExportError as OlmSessionExportError,
-    },
-    vodozemac, CryptoStoreError, DecryptorError, EventError, KeyExportError, LocalTrust,
-    MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, SecretImportError,
-    SessionCreationError, SignatureError,
+use eyeball::shared::Observable as SharedObservable;
+use futures_util::{
+    future::try_join,
+    stream::{self, StreamExt},
 };
 use matrix_sdk_base::crypto::{
-    CrossSigningStatus, OutgoingRequest, RoomMessageRequest, ToDeviceRequest,
+    store::locks::CryptoStoreLockGuard, OlmMachine, OutgoingRequest, RoomMessageRequest,
+    ToDeviceRequest,
 };
-#[cfg(feature = "e2e-encryption")]
-use ruma::OwnedDeviceId;
 use ruma::{
     api::client::{
         backup::add_backup_keys::v3::Response as KeysBackupResponse,
@@ -52,11 +44,19 @@ use ruma::{
         },
         uiaa::AuthData,
     },
-    assign, DeviceId, OwnedUserId, TransactionId, UserId,
+    assign,
+    events::room::{
+        message::{
+            AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
+            ImageMessageEventContent, MessageType, VideoInfo, VideoMessageEventContent,
+        },
+        ImageInfo, MediaSource, ThumbnailInfo,
+    },
+    DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
+use tokio::sync::RwLockReadGuard;
 use tracing::{debug, instrument, trace, warn};
 
-pub use crate::error::RoomKeyImportError;
 use crate::{
     attachment::{AttachmentInfo, Thumbnail},
     encryption::{
@@ -64,16 +64,31 @@ use crate::{
         verification::{SasVerification, Verification, VerificationRequest},
     },
     error::HttpResult,
-    room, Client, Error, Result,
+    room, Client, Error, Result, TransmissionProgress,
 };
 
+mod futures;
+pub mod identities;
+pub mod verification;
+
+pub use matrix_sdk_base::crypto::{
+    olm::{
+        SessionCreationError as MegolmSessionCreationError,
+        SessionExportError as OlmSessionExportError,
+    },
+    vodozemac, CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, KeyExportError,
+    LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, SecretImportError,
+    SessionCreationError, SignatureError, VERSION,
+};
+
+pub use self::futures::PrepareEncryptedFile;
+pub use crate::error::RoomKeyImportError;
+
 impl Client {
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) fn olm_machine(&self) -> Option<&matrix_sdk_base::crypto::OlmMachine> {
-        self.base_client().olm_machine()
+    pub(crate) async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
+        self.base_client().olm_machine().await
     }
 
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) async fn mark_request_as_sent(
         &self,
         request_id: &TransactionId,
@@ -81,6 +96,8 @@ impl Client {
     ) -> Result<(), matrix_sdk_base::Error> {
         Ok(self
             .olm_machine()
+            .await
+            .as_ref()
             .expect(
                 "We should have an olm machine once we try to mark E2EE related requests as sent",
             )
@@ -93,7 +110,6 @@ impl Client {
     /// # Panics
     ///
     /// Panics if no key query needs to be done.
-    #[cfg(feature = "e2e-encryption")]
     #[instrument(skip(self))]
     pub(crate) async fn keys_query(
         &self,
@@ -108,9 +124,49 @@ impl Client {
         Ok(response)
     }
 
+    /// Construct a [`EncryptedFile`][ruma::events::room::EncryptedFile] by
+    /// encrypting and uploading a provided reader.
+    ///
+    /// # Arguments
+    ///
+    /// * `content_type` - The content type of the file.
+    /// * `reader` - The reader that should be encrypted and uploaded.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # use matrix_sdk::ruma::{room_id, OwnedRoomId};
+    /// use serde::{Deserialize, Serialize};
+    /// use matrix_sdk::ruma::events::{macros::EventContent, room::EncryptedFile};
+    ///
+    /// #[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
+    /// #[ruma_event(type = "com.example.custom", kind = MessageLike)]
+    /// struct CustomEventContent {
+    ///     encrypted_file: EncryptedFile,
+    /// }
+    ///
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// # let room = client.get_joined_room(&room_id!("!test:example.com")).unwrap();
+    /// let mut reader = std::io::Cursor::new(b"Hello, world!");
+    /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
+    ///
+    /// room.send(CustomEventContent { encrypted_file }, None).await?;
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
+        &'a self,
+        content_type: &'a mime::Mime,
+        reader: &'a mut R,
+    ) -> PrepareEncryptedFile<'a, R> {
+        PrepareEncryptedFile::new(self, content_type, reader)
+    }
+
     /// Encrypt and upload the file to be read from `reader` and construct an
     /// attachment message with `body`, `content_type`, `info` and `thumbnail`.
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) async fn prepare_encrypted_attachment_message(
         &self,
         body: &str,
@@ -118,29 +174,80 @@ impl Client {
         data: Vec<u8>,
         info: Option<AttachmentInfo>,
         thumbnail: Option<Thumbnail>,
-    ) -> Result<ruma::events::room::message::MessageType> {
-        let (thumbnail_source, thumbnail_info) = if let Some(thumbnail) = thumbnail {
+        send_progress: SharedObservable<TransmissionProgress>,
+    ) -> Result<MessageType> {
+        let upload_thumbnail =
+            self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
+
+        let upload_attachment = async {
+            let mut cursor = Cursor::new(data);
+            self.prepare_encrypted_file(content_type, &mut cursor)
+                .with_send_progress_observable(send_progress)
+                .await
+        };
+
+        let ((thumbnail_source, thumbnail_info), file) =
+            try_join(upload_thumbnail, upload_attachment).await?;
+
+        Ok(match content_type.type_() {
+            mime::IMAGE => {
+                let info = assign!(info.map(ImageInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(ImageMessageEventContent::encrypted(body.to_owned(), file), {
+                    info: Some(Box::new(info))
+                });
+                MessageType::Image(content)
+            }
+            mime::AUDIO => {
+                let info = assign!(info.map(AudioInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                });
+                let content = assign!(AudioMessageEventContent::encrypted(body.to_owned(), file), {
+                    info: Some(Box::new(info))
+                });
+                MessageType::Audio(content)
+            }
+            mime::VIDEO => {
+                let info = assign!(info.map(VideoInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(VideoMessageEventContent::encrypted(body.to_owned(), file), {
+                    info: Some(Box::new(info))
+                });
+                MessageType::Video(content)
+            }
+            _ => {
+                let info = assign!(info.map(FileInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(FileMessageEventContent::encrypted(body.to_owned(), file), {
+                    info: Some(Box::new(info))
+                });
+                MessageType::File(content)
+            }
+        })
+    }
+
+    async fn upload_encrypted_thumbnail(
+        &self,
+        thumbnail: Option<Thumbnail>,
+        content_type: &mime::Mime,
+        send_progress: SharedObservable<TransmissionProgress>,
+    ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
+        if let Some(thumbnail) = thumbnail {
             let mut cursor = Cursor::new(thumbnail.data);
-            let mut encryptor = matrix_sdk_base::crypto::AttachmentEncryptor::new(&mut cursor);
 
-            let mut buf = Vec::new();
-            encryptor.read_to_end(&mut buf)?;
-
-            let response = self.media().upload(&thumbnail.content_type, buf).await?;
-
-            let file: ruma::events::room::EncryptedFile = {
-                let keys = encryptor.finish();
-                ruma::events::room::EncryptedFileInit {
-                    url: response.content_uri,
-                    key: keys.key,
-                    iv: keys.iv,
-                    hashes: keys.hashes,
-                    v: keys.version,
-                }
-                .into()
-            };
-
-            use ruma::events::room::ThumbnailInfo;
+            let file = self
+                .prepare_encrypted_file(content_type, &mut cursor)
+                .with_send_progress_observable(send_progress)
+                .await?;
 
             #[rustfmt::skip]
             let thumbnail_info =
@@ -148,120 +255,10 @@ impl Client {
                     mimetype: Some(thumbnail.content_type.as_ref().to_owned())
                 });
 
-            (Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info)))
+            Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
         } else {
-            (None, None)
-        };
-
-        let mut cursor = Cursor::new(data);
-        let mut encryptor = matrix_sdk_base::crypto::AttachmentEncryptor::new(&mut cursor);
-        let mut buf = Vec::new();
-        encryptor.read_to_end(&mut buf)?;
-
-        let response = self.media().upload(content_type, buf).await?;
-
-        let file: ruma::events::room::EncryptedFile = {
-            let keys = encryptor.finish();
-            ruma::events::room::EncryptedFileInit {
-                url: response.content_uri,
-                key: keys.key,
-                iv: keys.iv,
-                hashes: keys.hashes,
-                v: keys.version,
-            }
-            .into()
-        };
-
-        use std::io::Cursor;
-
-        use ruma::events::room::{self, message, MediaSource};
-        Ok(match content_type.type_() {
-            mime::IMAGE => {
-                let info = assign!(info.map(room::ImageInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content =
-                    assign!(message::ImageMessageEventContent::encrypted(body.to_owned(), file), {
-                        info: Some(Box::new(info))
-                    });
-                message::MessageType::Image(content)
-            }
-            mime::AUDIO => {
-                let info = assign!(info.map(message::AudioInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                });
-                let content =
-                    assign!(message::AudioMessageEventContent::encrypted(body.to_owned(), file), {
-                        info: Some(Box::new(info))
-                    });
-                message::MessageType::Audio(content)
-            }
-            mime::VIDEO => {
-                let info = assign!(info.map(message::VideoInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content =
-                    assign!(message::VideoMessageEventContent::encrypted(body.to_owned(), file), {
-                        info: Some(Box::new(info))
-                    });
-                message::MessageType::Video(content)
-            }
-            _ => {
-                let info = assign!(info.map(message::FileInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content =
-                    assign!(message::FileMessageEventContent::encrypted(body.to_owned(), file), {
-                        info: Some(Box::new(info))
-                    });
-                message::MessageType::File(content)
-            }
-        })
-    }
-
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) async fn create_dm_room(&self, user_id: OwnedUserId) -> Result<room::Joined> {
-        use ruma::{
-            api::client::room::create_room::v3::RoomPreset, events::direct::DirectEventContent,
-        };
-
-        // First we create the DM room, where we invite the user and tell the
-        // invitee that the room should be a DM.
-        let invite = vec![user_id.clone()];
-
-        let request = assign!(ruma::api::client::room::create_room::v3::Request::new(), {
-            invite,
-            is_direct: true,
-            preset: Some(RoomPreset::TrustedPrivateChat),
-        });
-
-        let room = self.create_room(request).await?;
-
-        // Now we need to mark the room as a DM for ourselves, we fetch the
-        // existing `m.direct` event and append the room to the list of DMs we
-        // have with this user.
-        let mut content = self
-            .account()
-            .account_data::<DirectEventContent>()
-            .await?
-            .map(|c| c.deserialize())
-            .transpose()?
-            .unwrap_or_default();
-
-        content.entry(user_id.to_owned()).or_default().push(room.room_id().to_owned());
-
-        // TODO We should probably save the fact that we need to send this out
-        // because otherwise we might end up in a state where we have a DM that
-        // isn't marked as one.
-        self.account().set_account_data(content).await?;
-
-        Ok(room)
+            Ok((None, None))
+        }
     }
 
     /// Claim one-time keys creating new Olm sessions.
@@ -269,7 +266,6 @@ impl Client {
     /// # Arguments
     ///
     /// * `users` - The list of user/device pairs that we should claim keys for.
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) async fn claim_one_time_keys(
         &self,
         users: impl Iterator<Item = &UserId>,
@@ -278,6 +274,8 @@ impl Client {
 
         if let Some((request_id, request)) = self
             .olm_machine()
+            .await
+            .as_ref()
             .ok_or(Error::AuthenticationRequired)?
             .get_missing_sessions(users)
             .await?
@@ -298,7 +296,6 @@ impl Client {
     ///
     /// Panics if the client isn't logged in, or if no encryption keys need to
     /// be uploaded.
-    #[cfg(feature = "e2e-encryption")]
     #[instrument(skip(self, request))]
     pub(crate) async fn keys_upload(
         &self,
@@ -317,7 +314,6 @@ impl Client {
         Ok(response)
     }
 
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) async fn room_send_helper(
         &self,
         request: &RoomMessageRequest,
@@ -332,7 +328,6 @@ impl Client {
             .await
     }
 
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) async fn send_to_device(
         &self,
         request: &ToDeviceRequest,
@@ -346,7 +341,6 @@ impl Client {
         self.send(request, None).await
     }
 
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) async fn send_verification_request(
         &self,
         request: matrix_sdk_base::crypto::OutgoingVerificationRequest,
@@ -363,8 +357,8 @@ impl Client {
         Ok(())
     }
 
-    #[cfg(feature = "e2e-encryption")]
-    fn get_dm_room(&self, user_id: &UserId) -> Option<room::Joined> {
+    /// Get the existing DM room with the given user, if any.
+    pub fn get_dm_room(&self, user_id: &UserId) -> Option<room::Joined> {
         let rooms = self.joined_rooms();
 
         // Find the room we share with the `user_id` and only with `user_id`
@@ -434,7 +428,12 @@ impl Client {
         }
 
         let outgoing_requests = stream::iter(
-            self.olm_machine().ok_or(Error::AuthenticationRequired)?.outgoing_requests().await?,
+            self.olm_machine()
+                .await
+                .as_ref()
+                .ok_or(Error::AuthenticationRequired)?
+                .outgoing_requests()
+                .await?,
         )
         .map(|r| self.send_outgoing_request(r));
 
@@ -456,14 +455,12 @@ impl Client {
 /// A high-level API to manage the client's encryption.
 ///
 /// To get this, use [`Client::encryption()`].
-#[cfg(feature = "e2e-encryption")]
 #[derive(Debug, Clone)]
 pub struct Encryption {
     /// The underlying client.
     client: Client,
 }
 
-#[cfg(feature = "e2e-encryption")]
 impl Encryption {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
@@ -472,7 +469,7 @@ impl Encryption {
     /// Get the public ed25519 key of our own device. This is usually what is
     /// called the fingerprint of the device.
     pub async fn ed25519_key(&self) -> Option<String> {
-        self.client.olm_machine().map(|o| o.identity_keys().ed25519.to_base64())
+        self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().ed25519.to_base64())
     }
 
     /// Get the status of the private cross signing keys.
@@ -480,7 +477,8 @@ impl Encryption {
     /// This can be used to check which private cross signing keys we have
     /// stored locally.
     pub async fn cross_signing_status(&self) -> Option<CrossSigningStatus> {
-        let machine = self.client.olm_machine()?;
+        let olm = self.client.olm_machine().await;
+        let machine = olm.as_ref()?;
         Some(machine.cross_signing_status().await)
     }
 
@@ -489,7 +487,7 @@ impl Encryption {
     /// Tracked users are users for which we keep the device list of E2EE
     /// capable devices up to date.
     pub async fn tracked_users(&self) -> Result<HashSet<OwnedUserId>, CryptoStoreError> {
-        if let Some(machine) = self.client.olm_machine() {
+        if let Some(machine) = self.client.olm_machine().await.as_ref() {
             machine.tracked_users().await
         } else {
             Ok(HashSet::new())
@@ -498,7 +496,8 @@ impl Encryption {
 
     /// Get a verification object with the given flow id.
     pub async fn get_verification(&self, user_id: &UserId, flow_id: &str) -> Option<Verification> {
-        let olm = self.client.olm_machine()?;
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
         #[allow(clippy::bind_instead_of_map)]
         olm.get_verification(user_id, flow_id).and_then(|v| match v {
             matrix_sdk_base::crypto::Verification::SasV1(s) => {
@@ -519,7 +518,8 @@ impl Encryption {
         user_id: &UserId,
         flow_id: impl AsRef<str>,
     ) -> Option<VerificationRequest> {
-        let olm = self.client.olm_machine()?;
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
 
         olm.get_verification_request(user_id, flow_id)
             .map(|r| VerificationRequest { inner: r, client: self.client.clone() })
@@ -538,13 +538,12 @@ impl Encryption {
     ///
     /// This will always return None if the client hasn't been logged in.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # use matrix_sdk::{Client, ruma::{device_id, user_id}};
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com")?;
     /// # let client = Client::new(homeserver).await?;
@@ -557,14 +556,15 @@ impl Encryption {
     ///         let verification = device.request_verification().await?;
     ///     }
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn get_device(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
     ) -> Result<Option<Device>, CryptoStoreError> {
-        let Some(machine) = self.client.olm_machine() else { return Ok(None) };
+        let olm = self.client.olm_machine().await;
+        let Some(machine) = olm.as_ref() else { return Ok(None) };
         let device = machine.get_device(user_id, device_id, None).await?;
         Ok(device.map(|d| Device { inner: d, client: self.client.clone() }))
     }
@@ -578,27 +578,28 @@ impl Encryption {
     ///
     /// * `user_id` - The unique id of the user that the devices belong to.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # use matrix_sdk::{Client, ruma::user_id};
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com")?;
     /// # let client = Client::new(homeserver).await?;
     /// let devices = client.encryption().get_user_devices(alice).await?;
     ///
     /// for device in devices.devices() {
-    ///     println!("{:?}", device);
+    ///     println!("{device:?}");
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn get_user_devices(&self, user_id: &UserId) -> Result<UserDevices, Error> {
         let devices = self
             .client
             .olm_machine()
+            .await
+            .as_ref()
             .ok_or(Error::AuthenticationRequired)?
             .get_user_devices(user_id, None)
             .await?;
@@ -617,13 +618,12 @@ impl Encryption {
     ///
     /// This will always return None if the client hasn't been logged in.
     ///
-    /// # Example
+    /// # Examples
     ///
     /// ```no_run
     /// # use matrix_sdk::{Client, ruma::user_id};
     /// # use url::Url;
-    /// # use futures::executor::block_on;
-    /// # block_on(async {
+    /// # async {
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com")?;
     /// # let client = Client::new(homeserver).await?;
@@ -634,7 +634,7 @@ impl Encryption {
     ///
     ///     let verification = user.request_verification().await?;
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub async fn get_user_identity(
         &self,
@@ -642,7 +642,8 @@ impl Encryption {
     ) -> Result<Option<crate::encryption::identities::UserIdentity>, CryptoStoreError> {
         use crate::encryption::identities::UserIdentity;
 
-        let Some(olm) = self.client.olm_machine() else { return Ok(None) };
+        let olm = self.client.olm_machine().await;
+        let Some(olm) = olm.as_ref() else { return Ok(None) };
         let identity = olm.get_identity(user_id, None).await?;
 
         Ok(identity.map(|i| match i {
@@ -666,13 +667,13 @@ impl Encryption {
     /// with some `auth_data` provided.
     ///
     /// # Examples
+    ///
     /// ```no_run
     /// # use std::collections::BTreeMap;
     /// # use matrix_sdk::{ruma::api::client::uiaa, Client};
     /// # use url::Url;
-    /// # use futures::executor::block_on;
     /// # use serde_json::json;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://example.com")?;
     /// # let client = Client::new(homeserver).await?;
     /// if let Err(e) = client.encryption().bootstrap_cross_signing(None).await {
@@ -692,9 +693,10 @@ impl Encryption {
     ///         panic!("Error durign cross signing bootstrap {:#?}", e);
     ///     }
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     pub async fn bootstrap_cross_signing(&self, auth_data: Option<AuthData>) -> Result<()> {
-        let olm = self.client.olm_machine().ok_or(Error::AuthenticationRequired)?;
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::AuthenticationRequired)?;
 
         let (request, signature_request) = olm.bootstrap_cross_signing(false).await?;
 
@@ -742,9 +744,8 @@ impl Encryption {
     /// #     Client, config::SyncSettings,
     /// #     ruma::room_id,
     /// # };
-    /// # use futures::executor::block_on;
     /// # use url::Url;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
     /// let path = PathBuf::from("/home/example/e2e-keys.txt");
@@ -762,7 +763,7 @@ impl Encryption {
     ///     .encryption()
     ///     .export_room_keys(path, "secret-passphrase", |s| s.room_id() == room_id)
     ///     .await?;
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn export_room_keys(
@@ -771,7 +772,8 @@ impl Encryption {
         passphrase: &str,
         predicate: impl FnMut(&matrix_sdk_base::crypto::olm::InboundGroupSession) -> bool,
     ) -> Result<()> {
-        let olm = self.client.olm_machine().ok_or(Error::AuthenticationRequired)?;
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::AuthenticationRequired)?;
 
         let keys = olm.export_room_keys(predicate).await?;
         let passphrase = zeroize::Zeroizing::new(passphrase.to_owned());
@@ -811,9 +813,8 @@ impl Encryption {
     /// #     Client, config::SyncSettings,
     /// #     ruma::room_id,
     /// # };
-    /// # use futures::executor::block_on;
     /// # use url::Url;
-    /// # block_on(async {
+    /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
     /// let path = PathBuf::from("/home/example/e2e-keys.txt");
@@ -824,7 +825,7 @@ impl Encryption {
     ///     "Imported {} room keys out of {}",
     ///     result.imported_count, result.total_count
     /// );
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn import_room_keys(
@@ -832,7 +833,8 @@ impl Encryption {
         path: PathBuf,
         passphrase: &str,
     ) -> Result<RoomKeyImportResult, RoomKeyImportError> {
-        let olm = self.client.olm_machine().ok_or(RoomKeyImportError::StoreClosed)?;
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(RoomKeyImportError::StoreClosed)?;
         let passphrase = zeroize::Zeroizing::new(passphrase.to_owned());
 
         let decrypt = move || {
@@ -845,14 +847,111 @@ impl Encryption {
 
         Ok(olm.import_room_keys(import, false, |_, _| {}).await?)
     }
+
+    /// Enables the crypto-store cross-process lock.
+    ///
+    /// This may be required if there are multiple processes that may do writes
+    /// to the same crypto store. In that case, it's necessary to create a
+    /// lock, so that only one process writes to it, otherwise this may
+    /// cause confusing issues because of stale data contained in in-memory
+    /// caches.
+    ///
+    /// The provided `lock_value` must be a unique identifier for this process.
+    pub async fn enable_cross_process_store_lock(&self, lock_value: String) -> Result<(), Error> {
+        let olm_machine = self.client.base_client().olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::AuthenticationRequired)?;
+
+        let lock =
+            olm_machine.store().create_store_lock("cross_process_lock".to_owned(), lock_value);
+
+        // Gently try to initialize the crypto store generation counter.
+        //
+        // If we don't get the lock immediately, then it is already acquired by another
+        // process, and we'll get to reload next time we acquire the lock.
+        {
+            let guard = lock.try_lock_once().await?;
+            if guard.is_some() {
+                olm_machine.initialize_crypto_store_generation().await?;
+            }
+        }
+
+        self.client
+            .inner
+            .cross_process_crypto_store_lock
+            .set(lock)
+            .map_err(|_| Error::BadCryptoStoreState)?;
+
+        Ok(())
+    }
+
+    /// Maybe reload the `OlmMachine` after acquiring the lock for the first
+    /// time.
+    async fn on_lock_newly_acquired(&self) -> Result<(), Error> {
+        let olm_machine_guard = self.client.olm_machine().await;
+        if let Some(olm_machine) = olm_machine_guard.as_ref() {
+            // If the crypto store generation has changed,
+            if olm_machine.maintain_crypto_store_generation().await? {
+                // (get rid of the reference to the current crypto store first)
+                drop(olm_machine_guard);
+                // Recreate the OlmMachine.
+                self.client.base_client().regenerate_olm().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// If a lock was created with [`Self::enable_cross_process_store_lock`],
+    /// spin-waits until the lock is available.
+    ///
+    /// May reload the `OlmMachine`, after obtaining the lock but not on the
+    /// first time.
+    pub async fn spin_lock_store(
+        &self,
+        max_backoff: Option<u32>,
+    ) -> Result<Option<CryptoStoreLockGuard>, Error> {
+        if let Some(lock) = self.client.inner.cross_process_crypto_store_lock.get() {
+            let guard = lock.spin_lock(max_backoff).await?;
+
+            self.on_lock_newly_acquired().await?;
+
+            Ok(Some(guard))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// If a lock was created with [`Self::enable_cross_process_store_lock`],
+    /// attempts to lock it once.
+    ///
+    /// Returns a guard to the lock, if it was obtained.
+    pub async fn try_lock_store_once(&self) -> Result<Option<CryptoStoreLockGuard>, Error> {
+        if let Some(lock) = self.client.inner.cross_process_crypto_store_lock.get() {
+            let maybe_guard = lock.try_lock_once().await?;
+
+            if maybe_guard.is_some() {
+                self.on_lock_newly_acquired().await?;
+            }
+
+            Ok(maybe_guard)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use matrix_sdk_test::{async_test, test_json, EventBuilder, JoinedRoomBuilder, StateTestEvent};
+    use std::time::Duration;
+
+    use matrix_sdk_base::SessionMeta;
+    use matrix_sdk_test::{
+        async_test, test_json, EventBuilder, GlobalAccountDataTestEvent, JoinedRoomBuilder,
+        StateTestEvent,
+    };
     use ruma::{
-        event_id,
+        device_id, event_id,
         events::{reaction::ReactionEventContent, relation::Annotation},
+        user_id,
     };
     use serde_json::json;
     use wiremock::{
@@ -860,7 +959,12 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    use crate::test_utils::logged_in_client;
+    use crate::{
+        config::RequestConfig,
+        matrix_auth::{Session, SessionTokens},
+        test_utils::logged_in_client,
+        Client,
+    };
 
     #[async_test]
     async fn test_reaction_sending() {
@@ -909,5 +1013,158 @@ mod tests {
         room.send_raw(json!({}), "m.reaction", None)
             .await
             .expect("Sending the reaction should not fail");
+    }
+
+    #[async_test]
+    async fn get_dm_room_returns_the_room_we_have_with_this_user() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        // This is the user ID that is inside MemberAdditional.
+        // Note the confusing username, so we can share
+        // GlobalAccountDataTestEvent::Direct with the invited test.
+        let user_id = user_id!("@invited:localhost");
+
+        // When we receive a sync response saying "invited" is invited to a DM
+        let response = EventBuilder::default()
+            .add_joined_room(
+                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberAdditional),
+            )
+            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+
+        // Then get_dm_room finds this room
+        let found_room = client.get_dm_room(user_id).expect("DM not found!");
+        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
+    }
+
+    #[async_test]
+    async fn get_dm_room_still_finds_room_where_participant_is_only_invited() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        // This is the user ID that is inside MemberInvite
+        let user_id = user_id!("@invited:localhost");
+
+        // When we receive a sync response saying "invited" is invited to a DM
+        let response = EventBuilder::default()
+            .add_joined_room(
+                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberInvite),
+            )
+            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+
+        // Then get_dm_room finds this room
+        let found_room = client.get_dm_room(user_id).expect("DM not found!");
+        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
+    }
+
+    #[async_test]
+    async fn get_dm_room_still_finds_left_room() {
+        // See the discussion in https://github.com/matrix-org/matrix-rust-sdk/issues/2017
+        // and the high-level issue at https://github.com/vector-im/element-x-ios/issues/1077
+
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        // This is the user ID that is inside MemberAdditional.
+        // Note the confusing username, so we can share
+        // GlobalAccountDataTestEvent::Direct with the invited test.
+        let user_id = user_id!("@invited:localhost");
+
+        // When we receive a sync response saying "invited" is invited to a DM
+        let response = EventBuilder::default()
+            .add_joined_room(
+                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberLeave),
+            )
+            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+
+        // Then get_dm_room finds this room
+        let found_room = client.get_dm_room(user_id).expect("DM not found!");
+        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[async_test]
+    async fn test_generation_counter_invalidates_olm_machine() {
+        // Create two clients using the same sqlite database.
+        let sqlite_path = std::env::temp_dir().join("generation_counter_sqlite.db");
+        let session = Session {
+            meta: SessionMeta {
+                user_id: user_id!("@example:localhost").to_owned(),
+                device_id: device_id!("DEVICEID").to_owned(),
+            },
+            tokens: SessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        };
+
+        let client1 = Client::builder()
+            .homeserver_url("http://localhost:1234")
+            .request_config(RequestConfig::new().disable_retry())
+            .sqlite_store(&sqlite_path, None)
+            .build()
+            .await
+            .unwrap();
+        client1.matrix_auth().restore_session(session.clone()).await.unwrap();
+
+        let client2 = Client::builder()
+            .homeserver_url("http://localhost:1234")
+            .request_config(RequestConfig::new().disable_retry())
+            .sqlite_store(sqlite_path, None)
+            .build()
+            .await
+            .unwrap();
+        client2.matrix_auth().restore_session(session).await.unwrap();
+
+        // When the lock isn't enabled, any attempt at locking won't return a guard.
+        let guard = client1.encryption().try_lock_store_once().await.unwrap();
+        assert!(guard.is_none());
+
+        client1.encryption().enable_cross_process_store_lock("client1".to_owned()).await.unwrap();
+        client2.encryption().enable_cross_process_store_lock("client2".to_owned()).await.unwrap();
+
+        // One client can take the lock.
+        let acquired1 = client1.encryption().try_lock_store_once().await.unwrap();
+        assert!(acquired1.is_some());
+
+        // Keep the olm machine, so we can see if it's changed later, by comparing Arcs.
+        let initial_olm_machine =
+            client1.olm_machine().await.clone().expect("must have an olm machine");
+
+        // The other client can't take the lock too.
+        let acquired2 = client2.encryption().try_lock_store_once().await.unwrap();
+        assert!(acquired2.is_none());
+
+        // Now have the first client release the lock,
+        drop(acquired1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // And re-take it.
+        let acquired1 = client1.encryption().try_lock_store_once().await.unwrap();
+        assert!(acquired1.is_some());
+
+        // In that case, the Olm Machine shouldn't change.
+        let olm_machine = client1.olm_machine().await.clone().expect("must have an olm machine");
+        assert!(initial_olm_machine.same_as(&olm_machine));
+
+        // Ok, release again.
+        drop(acquired1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Client2 can acquire the lock.
+        let acquired2 = client2.encryption().try_lock_store_once().await.unwrap();
+        assert!(acquired2.is_some());
+
+        // And then release it.
+        drop(acquired2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Client1 can acquire it again,
+        let acquired1 = client1.encryption().try_lock_store_once().await.unwrap();
+        assert!(acquired1.is_some());
+
+        // But now its olm machine has been invalidated and thus regenerated!
+        let olm_machine = client1.olm_machine().await.clone().expect("must have an olm machine");
+        assert!(!initial_olm_machine.same_as(&olm_machine));
     }
 }

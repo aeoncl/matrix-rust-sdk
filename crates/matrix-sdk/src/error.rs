@@ -30,6 +30,7 @@ use ruma::{
         error::{FromHttpResponseError, IntoHttpError},
     },
     events::tag::InvalidUserTagName,
+    push::{InsertPushRuleError, RuleNotFoundError},
     IdParseError,
 };
 use serde_json::Error as JsonError;
@@ -171,6 +172,10 @@ pub enum Error {
     #[error("the queried endpoint requires authentication but was called before logging in")]
     AuthenticationRequired,
 
+    /// This request failed because the local data wasn't sufficient.
+    #[error("Local cache doesn't contain all necessary data to perform the action.")]
+    InsufficientData,
+
     /// Attempting to restore a session after the olm-machine has already been
     /// set up fails
     #[cfg(feature = "e2e-encryption")]
@@ -240,11 +245,6 @@ pub enum Error {
     #[cfg(feature = "experimental-sliding-sync")]
     #[error(transparent)]
     SlidingSync(#[from] crate::sliding_sync::Error),
-
-    /// An error occurred in the timeline.
-    #[cfg(feature = "experimental-timeline")]
-    #[error(transparent)]
-    Timeline(#[from] crate::room::timeline::Error),
 
     /// The client is in inconsistent state. This happens when we set a room to
     /// a specific type, but then cannot get it in this type.
@@ -422,4 +422,30 @@ pub enum RefreshTokenError {
     /// not be forwarded.
     #[error("the access token could not be refreshed")]
     UnableToRefreshToken,
+}
+
+/// Errors that can occur when manipulating push notification settings.
+#[derive(Debug, Error, Clone, PartialEq)]
+pub enum NotificationSettingsError {
+    /// Invalid parameter.
+    #[error("Invalid parameter `{0}`")]
+    InvalidParameter(String),
+    /// Rule not found
+    #[error("Rule not found")]
+    RuleNotFound,
+    /// Unable to add push rule.
+    #[error("Unable to add push rule")]
+    UnableToAddPushRule,
+}
+
+impl From<InsertPushRuleError> for NotificationSettingsError {
+    fn from(_: InsertPushRuleError) -> Self {
+        Self::UnableToAddPushRule
+    }
+}
+
+impl From<RuleNotFoundError> for NotificationSettingsError {
+    fn from(_: RuleNotFoundError) -> Self {
+        Self::RuleNotFound
+    }
 }

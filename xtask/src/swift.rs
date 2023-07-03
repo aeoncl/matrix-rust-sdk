@@ -4,6 +4,7 @@ use std::{
 };
 
 use clap::{Args, Subcommand};
+use uniffi_bindgen::bindings::TargetLanguage;
 use xshell::{cmd, pushd};
 
 use crate::{workspace, Result};
@@ -106,7 +107,7 @@ fn generate_uniffi(library_file: &Path, ffi_directory: &Path) -> Result<()> {
     uniffi_bindgen::generate_bindings(
         udl_file.as_path(),
         None,
-        vec!["swift"],
+        vec![TargetLanguage::Swift],
         Some(outdir_overwrite),
         Some(library_path),
         false,
@@ -131,6 +132,11 @@ fn build_xcframework(
     let root_dir = workspace::root_path()?;
     let apple_dir = root_dir.join("bindings/apple");
     let generated_dir = apple_dir.join("generated");
+
+    // Cleanup destination folder
+    let _ = remove_dir_all(&generated_dir);
+    create_dir_all(&generated_dir)?;
+
     let headers_dir = generated_dir.join("ls");
     let swift_dir = generated_dir.join("swift");
     create_dir_all(headers_dir.clone())?;
@@ -175,7 +181,7 @@ fn build_xcframework(
         (vec![lipo_target_macos, lipo_target_sim, ios_path], darwin_x86_path)
     };
 
-    println!("-- Generate uniffi files");
+    println!("-- Generating uniffi files");
     generate_uniffi(&uniff_lib_path, &generated_dir)?;
 
     rename(generated_dir.join("matrix_sdk_ffiFFI.h"), headers_dir.join("matrix_sdk_ffiFFI.h"))?;
@@ -189,7 +195,7 @@ fn build_xcframework(
 
     rename(generated_dir.join("matrix_sdk_ffi.swift"), swift_dir.join("matrix_sdk_ffi.swift"))?;
 
-    println!("-- Generate MatrixSDKFFI.xcframework framework");
+    println!("-- Generating MatrixSDKFFI.xcframework framework");
     let xcframework_path = generated_dir.join("MatrixSDKFFI.xcframework");
     if xcframework_path.exists() {
         remove_dir_all(xcframework_path.as_path())?;

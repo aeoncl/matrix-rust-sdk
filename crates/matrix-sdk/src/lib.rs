@@ -18,9 +18,13 @@
 
 pub use async_trait::async_trait;
 pub use bytes;
+#[cfg(feature = "e2e-encryption")]
+pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
-    deserialized_responses, DisplayName, Room as BaseRoom, RoomInfo, RoomMember as BaseRoomMember,
-    RoomType, Session, StateChanges, StoreError,
+    deserialized_responses,
+    store::{DynStateStore, StateStoreExt},
+    DisplayName, Room as BaseRoom, RoomInfo, RoomMember as BaseRoomMember, RoomMemberships,
+    RoomState, SessionMeta, StateChanges, StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
@@ -29,12 +33,15 @@ pub use ruma;
 
 mod account;
 pub mod attachment;
+mod authentication;
 mod client;
 pub mod config;
 mod error;
 pub mod event_handler;
 mod http_client;
+pub mod matrix_auth;
 pub mod media;
+pub mod notification_settings;
 pub mod room;
 pub mod sync;
 
@@ -43,22 +50,20 @@ pub mod sliding_sync;
 
 #[cfg(feature = "e2e-encryption")]
 pub mod encryption;
-#[cfg(feature = "experimental-timeline")]
-mod events;
 
 pub use account::Account;
-#[cfg(feature = "sso-login")]
-pub use client::SsoLoginBuilder;
-pub use client::{Client, ClientBuildError, ClientBuilder, LoginBuilder, LoopCtrl};
+pub use authentication::{AuthApi, AuthSession};
+pub use client::{Client, ClientBuildError, ClientBuilder, LoopCtrl, SendRequest, UnknownToken};
 #[cfg(feature = "image-proc")]
 pub use error::ImageError;
 pub use error::{Error, HttpError, HttpResult, RefreshTokenError, Result, RumaApiError};
-pub use http_client::HttpSend;
+pub use http_client::TransmissionProgress;
 pub use media::Media;
+pub use ruma::{IdParseError, OwnedServerName, ServerName};
 #[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
-    RoomListEntry, SlidingSync, SlidingSyncBuilder, SlidingSyncMode, SlidingSyncRoom,
-    SlidingSyncState, SlidingSyncView, SlidingSyncViewBuilder, UpdateSummary,
+    RoomListEntry, SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
+    SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
 };
 
 #[cfg(any(test, feature = "testing"))]
@@ -72,4 +77,40 @@ fn init_logging() {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_subscriber::fmt::layer().with_test_writer())
         .init();
+}
+
+/// Creates a server name from a user supplied string. The string is first
+/// sanitized by removing whitespace, the http(s) scheme and any trailing
+/// slashes before being parsed.
+pub fn sanitize_server_name(s: &str) -> Result<OwnedServerName, IdParseError> {
+    ServerName::parse(
+        s.trim().trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/'),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+
+    use crate::sanitize_server_name;
+
+    #[test]
+    fn test_sanitize_server_name() {
+        assert_eq!(sanitize_server_name("matrix.org").unwrap().as_str(), "matrix.org");
+        assert_eq!(sanitize_server_name("https://matrix.org").unwrap().as_str(), "matrix.org");
+        assert_eq!(sanitize_server_name("http://matrix.org").unwrap().as_str(), "matrix.org");
+        assert_eq!(
+            sanitize_server_name("https://matrix.server.org").unwrap().as_str(),
+            "matrix.server.org"
+        );
+        assert_eq!(
+            sanitize_server_name("https://matrix.server.org/").unwrap().as_str(),
+            "matrix.server.org"
+        );
+        assert_eq!(
+            sanitize_server_name("  https://matrix.server.org// ").unwrap().as_str(),
+            "matrix.server.org"
+        );
+        assert_matches!(sanitize_server_name("https://matrix.server.org/something"), Err(_))
+    }
 }

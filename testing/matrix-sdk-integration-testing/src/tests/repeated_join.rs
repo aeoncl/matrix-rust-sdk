@@ -9,7 +9,7 @@ use matrix_sdk::{
         api::client::room::create_room::v3::Request as CreateRoomRequest,
         events::room::member::{MembershipState, StrippedRoomMemberEvent},
     },
-    Client, RoomType,
+    Client, RoomMemberships, RoomState, StateStoreExt,
 };
 use tokio::sync::Notify;
 
@@ -18,7 +18,7 @@ use crate::helpers::get_client_for_user;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_repeated_join_leave() -> Result<()> {
     let peter = get_client_for_user("peter".to_owned(), true).await?;
-    // FIXME: Run once with memory, once with sled
+    // FIXME: Run once with memory, once with SQLite
     let karl = get_client_for_user("karl".to_owned(), false).await?;
     let karl_id = karl.user_id().expect("karl has a userid!").to_owned();
 
@@ -105,11 +105,11 @@ async fn test_repeated_join_leave() -> Result<()> {
 
     // Now check the underlying state store that it also has the correct information
     // (for when the client restarts).
-    let invited = karl.store().get_invited_user_ids(room_id).await?;
+    let invited = karl.store().get_user_ids(room_id, RoomMemberships::INVITE).await?;
     assert_eq!(invited.len(), 1);
     assert_eq!(invited[0], karl_id);
 
-    let joined = karl.store().get_joined_user_ids(room_id).await?;
+    let joined = karl.store().get_user_ids(room_id, RoomMemberships::JOIN).await?;
     assert!(!joined.contains(&karl_id));
 
     let event = karl
@@ -136,7 +136,7 @@ async fn signal_on_invite(
         return;
     }
 
-    if room.room_type() != RoomType::Invited {
+    if room.state() != RoomState::Invited {
         return;
     }
 

@@ -19,7 +19,7 @@ use matrix_sdk_base::{
         types::MasterPubkey, OwnUserIdentity as InnerOwnUserIdentity,
         UserIdentity as InnerUserIdentity,
     },
-    locks::RwLock,
+    RoomMemberships,
 };
 use ruma::{
     events::{
@@ -28,6 +28,7 @@ use ruma::{
     },
     UserId,
 };
+use tokio::sync::RwLock;
 
 use super::{ManualVerifyError, RequestVerificationError};
 use crate::{encryption::verification::VerificationRequest, room::Joined, Client};
@@ -96,7 +97,7 @@ impl UserIdentity {
     /// # use url::Url;
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # futures::executor::block_on(async {
+    /// # async {
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let user = client.encryption().get_user_identity(alice).await?;
     ///
@@ -104,7 +105,7 @@ impl UserIdentity {
     ///     println!("This user identity belongs to {}", user.user_id().as_str());
     /// }
     ///
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub fn user_id(&self) -> &UserId {
         match &self.inner {
@@ -147,7 +148,7 @@ impl UserIdentity {
     /// # use url::Url;
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # futures::executor::block_on(async {
+    /// # async {
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let user = client.encryption().get_user_identity(alice).await?;
     ///
@@ -155,7 +156,7 @@ impl UserIdentity {
     ///     let verification = user.request_verification().await?;
     /// }
     ///
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     ///
     /// [`request_verification_with_methods()`]:
@@ -202,10 +203,9 @@ impl UserIdentity {
     /// #    }
     /// # };
     /// # use url::Url;
-    /// # use futures::executor::block_on;
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
+    /// # async {
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let user = client.encryption().get_user_identity(alice).await?;
     ///
@@ -217,7 +217,7 @@ impl UserIdentity {
     ///     let verification =
     ///         user.request_verification_with_methods(methods).await?;
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     ///
     /// [`request_verification()`]: #method.request_verification
@@ -281,17 +281,16 @@ impl UserIdentity {
     /// #    }
     /// # };
     /// # use url::Url;
-    /// # use futures::executor::block_on;
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
+    /// # async {
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let user = client.encryption().get_user_identity(alice).await?;
     ///
     /// if let Some(user) = user {
     ///     user.verify().await?;
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     /// [`Encryption::cross_signing_status()`]: crate::encryption::Encryption::cross_signing_status
     pub async fn verify(&self) -> Result<(), ManualVerifyError> {
@@ -324,10 +323,9 @@ impl UserIdentity {
     /// #    }
     /// # };
     /// # use url::Url;
-    /// # use futures::executor::block_on;
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
+    /// # async {
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let user = client.encryption().get_user_identity(alice).await?;
     ///
@@ -338,7 +336,7 @@ impl UserIdentity {
     ///         println!("User {} is not verified", user.user_id().as_str());
     ///     }
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub fn is_verified(&self) -> bool {
         match &self.inner {
@@ -363,10 +361,9 @@ impl UserIdentity {
     /// #    }
     /// # };
     /// # use url::Url;
-    /// # use futures::executor::block_on;
     /// # let alice = user_id!("@alice:example.org");
     /// # let homeserver = Url::parse("http://example.com").unwrap();
-    /// # block_on(async {
+    /// # async {
     /// # let client = Client::new(homeserver).await.unwrap();
     /// let user = client.encryption().get_user_identity(alice).await?;
     ///
@@ -390,7 +387,7 @@ impl UserIdentity {
     ///         );
     ///     }
     /// }
-    /// # anyhow::Ok(()) });
+    /// # anyhow::Ok(()) };
     /// ```
     pub fn master_key(&self) -> &MasterPubkey {
         match &self.inner {
@@ -468,7 +465,7 @@ impl OtherUserIdentity {
         let room = if let Some(room) = self.direct_message_room.read().await.as_ref() {
             // Make sure that the user, to be verified, is still in the room
             if !room
-                .active_members()
+                .members(RoomMemberships::ACTIVE)
                 .await?
                 .iter()
                 .any(|member| member.user_id() == self.inner.user_id())
@@ -477,7 +474,7 @@ impl OtherUserIdentity {
             }
             room.clone()
         } else {
-            self.client.create_dm_room(self.inner.user_id().to_owned()).await?
+            self.client.create_dm(self.inner.user_id()).await?
         };
 
         let response = room

@@ -5,14 +5,15 @@ use xshell::{cmd, pushd};
 
 use crate::{build_docs, workspace, DenyWarnings, Result};
 
+const NIGHTLY: &str = "nightly-2023-07-03";
+const WASM_TIMEOUT_ENV_KEY: &str = "WASM_BINDGEN_TEST_TIMEOUT";
+const WASM_TIMEOUT_VALUE: &str = "120";
+
 #[derive(Args)]
 pub struct CiArgs {
     #[clap(subcommand)]
     cmd: Option<CiCommand>,
 }
-
-const WASM_TIMEOUT_ENV_KEY: &str = "WASM_BINDGEN_TEST_TIMEOUT";
-const WASM_TIMEOUT_VALUE: &str = "120";
 
 #[derive(Subcommand)]
 enum CiCommand {
@@ -61,11 +62,10 @@ enum CiCommand {
 
 #[derive(Subcommand, PartialEq, Eq, PartialOrd, Ord)]
 enum FeatureSet {
-    Default,
     NoEncryption,
-    NoSled,
-    NoEncryptionAndSled,
-    SledCryptostore,
+    NoSqlite,
+    NoEncryptionAndSqlite,
+    SqliteCryptostore,
     RustlsTls,
     Markdown,
     Socks,
@@ -157,7 +157,7 @@ fn check_examples() -> Result<()> {
 }
 
 fn check_style() -> Result<()> {
-    cmd!("rustup run nightly cargo fmt -- --check").run()?;
+    cmd!("rustup run {NIGHTLY} cargo fmt -- --check").run()?;
     Ok(())
 }
 
@@ -169,17 +169,18 @@ fn check_typos() -> Result<()> {
 }
 
 fn check_clippy() -> Result<()> {
-    cmd!("rustup run nightly cargo clippy --all-targets -- -D warnings").run()?;
+    cmd!("rustup run {NIGHTLY} cargo clippy --all-targets --features testing -- -D warnings")
+        .run()?;
     cmd!(
-        "rustup run nightly cargo clippy --workspace --all-targets
+        "rustup run {NIGHTLY} cargo clippy --workspace --all-targets
             --exclude matrix-sdk-crypto --exclude xtask
             --no-default-features
-            --features native-tls,experimental-sliding-sync,sso-login,experimental-timeline
+            --features native-tls,experimental-sliding-sync,sso-login,testing
             -- -D warnings"
     )
     .run()?;
     cmd!(
-        "rustup run nightly cargo clippy --all-targets -p matrix-sdk-crypto
+        "rustup run {NIGHTLY} cargo clippy --all-targets -p matrix-sdk-crypto
             --no-default-features -- -D warnings"
     )
     .run()?;
@@ -192,17 +193,23 @@ fn check_docs() -> Result<()> {
 
 fn run_feature_tests(cmd: Option<FeatureSet>) -> Result<()> {
     let args = BTreeMap::from([
-        (FeatureSet::NoEncryption, "--no-default-features --features sled,native-tls"),
-        (FeatureSet::NoSled, "--no-default-features --features e2e-encryption,native-tls"),
-        (FeatureSet::NoEncryptionAndSled, "--no-default-features --features native-tls"),
         (
-            FeatureSet::SledCryptostore,
-            "--no-default-features --features e2e-encryption,sled,native-tls",
+            FeatureSet::NoEncryption,
+            "--no-default-features --features sqlite,native-tls,experimental-sliding-sync,testing",
         ),
-        (FeatureSet::RustlsTls, "--no-default-features --features rustls-tls"),
-        (FeatureSet::Markdown, "--features markdown"),
-        (FeatureSet::Socks, "--features socks"),
-        (FeatureSet::SsoLogin, "--features sso-login"),
+        (
+            FeatureSet::NoSqlite,
+            "--no-default-features --features e2e-encryption,native-tls,testing",
+        ),
+        (FeatureSet::NoEncryptionAndSqlite, "--no-default-features --features native-tls,testing"),
+        (
+            FeatureSet::SqliteCryptostore,
+            "--no-default-features --features e2e-encryption,sqlite,native-tls,testing",
+        ),
+        (FeatureSet::RustlsTls, "--no-default-features --features rustls-tls,testing"),
+        (FeatureSet::Markdown, "--features markdown,testing"),
+        (FeatureSet::Socks, "--features socks,testing"),
+        (FeatureSet::SsoLogin, "--features sso-login,testing"),
     ]);
 
     let run = |arg_set: &str| {
@@ -233,24 +240,29 @@ fn run_crypto_tests() -> Result<()> {
         "rustup run stable cargo clippy -p matrix-sdk-crypto --features=backups_v1 -- -D warnings"
     )
     .run()?;
-    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --features=backups_v1").run()?;
-    cmd!("rustup run stable cargo test --doc -p matrix-sdk-crypto --features=backups_v1").run()?;
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --no-default-features --features testing").run()?;
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --features=backups_v1,testing")
+        .run()?;
+    cmd!("rustup run stable cargo test --doc -p matrix-sdk-crypto --features=backups_v1,testing")
+        .run()?;
     cmd!(
         "rustup run stable cargo clippy -p matrix-sdk-crypto --features=experimental-algorithms -- -D warnings"
     )
     .run()?;
     cmd!(
-        "rustup run stable cargo nextest run -p matrix-sdk-crypto --features=experimental-algorithms"
+        "rustup run stable cargo nextest run -p matrix-sdk-crypto --features=experimental-algorithms,testing"
     ).run()?;
     cmd!(
-        "rustup run stable cargo test --doc -p matrix-sdk-crypto --features=experimental-algorithms"
+        "rustup run stable cargo test --doc -p matrix-sdk-crypto --features=experimental-algorithms,testing"
     )
     .run()?;
 
     cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto-ffi").run()?;
 
-    cmd!("rustup run stable cargo nextest run -p matrix-sdk-sqlite --features crypto-store")
-        .run()?;
+    cmd!(
+        "rustup run stable cargo nextest run -p matrix-sdk-sqlite --features crypto-store,testing"
+    )
+    .run()?;
 
     Ok(())
 }
@@ -339,34 +351,37 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
         return Ok(());
     }
     let args = BTreeMap::from([
-        (WasmFeatureSet::MatrixSdkQrcode, ("matrix-sdk-qrcode", "")),
+        (WasmFeatureSet::MatrixSdkQrcode, ("crates/matrix-sdk-qrcode", "")),
         (
             WasmFeatureSet::MatrixSdkNoDefault,
-            ("matrix-sdk", "--no-default-features --features js,rustls-tls --lib"),
+            ("crates/matrix-sdk", "--no-default-features --features js,rustls-tls --lib"),
         ),
-        (WasmFeatureSet::MatrixSdkBase, ("matrix-sdk-base", "--features js")),
-        (WasmFeatureSet::MatrixSdkCommon, ("matrix-sdk-common", "--features js")),
-        (WasmFeatureSet::MatrixSdkCryptoJs, ("matrix-sdk-crypto-js", "")),
+        (WasmFeatureSet::MatrixSdkBase, ("crates/matrix-sdk-base", "--features js")),
+        (WasmFeatureSet::MatrixSdkCommon, ("crates/matrix-sdk-common", "--features js")),
+        (WasmFeatureSet::MatrixSdkCryptoJs, ("bindings/matrix-sdk-crypto-js", "")),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStoresNoCrypto,
-            ("matrix-sdk", "--no-default-features --features js,indexeddb,rustls-tls --lib"),
+            ("crates/matrix-sdk", "--no-default-features --features js,indexeddb,rustls-tls --lib"),
         ),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStores,
             (
-                "matrix-sdk",
+                "crates/matrix-sdk",
                 "--no-default-features --features js,indexeddb,e2e-encryption,rustls-tls --lib",
             ),
         ),
-        (WasmFeatureSet::IndexeddbNoCrypto, ("matrix-sdk-indexeddb", "--no-default-features")),
+        (
+            WasmFeatureSet::IndexeddbNoCrypto,
+            ("crates/matrix-sdk-indexeddb", "--no-default-features"),
+        ),
         (
             WasmFeatureSet::IndexeddbWithCrypto,
-            ("matrix-sdk-indexeddb", "--no-default-features --features e2e-encryption"),
+            ("crates/matrix-sdk-indexeddb", "--no-default-features --features e2e-encryption"),
         ),
     ]);
 
     let run = |(folder, arg_set): (&str, &str)| {
-        let _p = pushd(format!("crates/{folder}"));
+        let _pwd = pushd(folder)?;
         cmd!("pwd").env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE).run()?; // print dir so we know what might have failed
         cmd!("wasm-pack test --node -- ")
             .args(arg_set.split_whitespace())

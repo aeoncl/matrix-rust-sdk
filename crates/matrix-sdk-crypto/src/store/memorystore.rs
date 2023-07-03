@@ -12,23 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, convert::Infallible, sync::Arc};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
-use matrix_sdk_common::locks::Mutex;
 use ruma::{
-    DeviceId, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+    DeviceId, OwnedDeviceId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId,
+    UserId,
 };
+use tokio::sync::Mutex;
+use tracing::warn;
 
 use super::{
     caches::{DeviceStore, GroupSessionStore, SessionStore},
-    BackupKeys, Changes, CryptoStore, InboundGroupSession, ReadOnlyAccount, RoomKeyCounts, Session,
+    BackupKeys, Changes, CryptoStore, InboundGroupSession, ReadOnlyAccount, RoomKeyCounts,
+    RoomSettings, Session,
 };
 use crate::{
     gossiping::{GossipRequest, SecretInfo},
     identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
     olm::{OutboundGroupSession, PrivateCrossSigningIdentity},
+    types::events::room_key_withheld::RoomKeyWithheldEvent,
     TrackedUser,
 };
 
@@ -51,6 +60,9 @@ pub struct MemoryStore {
     identities: Arc<DashMap<OwnedUserId, ReadOnlyUserIdentities>>,
     outgoing_key_requests: Arc<DashMap<OwnedTransactionId, GossipRequest>>,
     key_requests_by_info: Arc<DashMap<String, OwnedTransactionId>>,
+    direct_withheld_info: Arc<DashMap<OwnedRoomId, DashMap<String, RoomKeyWithheldEvent>>>,
+    custom_values: Arc<DashMap<String, Vec<u8>>>,
+    leases: Arc<DashMap<String, (String, Instant)>>,
 }
 
 impl Default for MemoryStore {
@@ -63,6 +75,9 @@ impl Default for MemoryStore {
             identities: Default::default(),
             outgoing_key_requests: Default::default(),
             key_requests_by_info: Default::default(),
+            direct_withheld_info: Default::default(),
+            custom_values: Default::default(),
+            leases: Default::default(),
         }
     }
 }
@@ -142,6 +157,15 @@ impl CryptoStore for MemoryStore {
 
             self.outgoing_key_requests.insert(id.clone(), key_request);
             self.key_requests_by_info.insert(info_string, id);
+        }
+
+        for (room_id, data) in changes.withheld_session_info {
+            for (session_id, event) in data {
+                self.direct_withheld_info
+                    .entry(room_id.to_owned())
+                    .or_insert_with(DashMap::new)
+                    .insert(session_id, event);
+            }
         }
 
         Ok(())
@@ -269,6 +293,82 @@ impl CryptoStore for MemoryStore {
 
     async fn load_backup_keys(&self) -> Result<BackupKeys> {
         Ok(BackupKeys::default())
+    }
+
+    async fn get_withheld_info(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<Option<RoomKeyWithheldEvent>> {
+        Ok(self
+            .direct_withheld_info
+            .get(room_id)
+            .and_then(|e| Some(e.value().get(session_id)?.value().to_owned())))
+    }
+
+    async fn get_room_settings(&self, _room_id: &RoomId) -> Result<Option<RoomSettings>> {
+        warn!("Method not implemented");
+        Ok(None)
+    }
+
+    async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.custom_values.get(key).map(|val| val.clone()))
+    }
+
+    async fn set_custom_value(&self, key: &str, value: Vec<u8>) -> Result<()> {
+        self.custom_values.insert(key.to_owned(), value);
+        Ok(())
+    }
+
+    async fn insert_custom_value_if_missing(&self, key: &str, value: Vec<u8>) -> Result<bool> {
+        if self.get_custom_value(key).await?.is_none() {
+            self.set_custom_value(key, value).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn remove_custom_value(&self, key: &str) -> Result<bool> {
+        let was_there = self.custom_values.remove(key).is_some();
+        Ok(was_there)
+    }
+
+    async fn try_take_leased_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> Result<bool> {
+        let now = Instant::now();
+        let expiration = now + Duration::from_millis(lease_duration_ms.into());
+        if let Some(mut prev) = self.leases.get_mut(key) {
+            if prev.0 == holder {
+                // We had the lease before, extend it.
+                prev.1 = expiration;
+                Ok(true)
+            } else {
+                // We didn't have it.
+                if prev.1 < now {
+                    // Steal it!
+                    prev.0 = holder.to_owned();
+                    prev.1 = expiration;
+                    Ok(true)
+                } else {
+                    // We tried our best.
+                    Ok(false)
+                }
+            }
+        } else {
+            self.leases.insert(
+                key.to_owned(),
+                (
+                    holder.to_owned(),
+                    Instant::now() + Duration::from_millis(lease_duration_ms.into()),
+                ),
+            );
+            Ok(true)
+        }
     }
 }
 
