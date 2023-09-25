@@ -1847,10 +1847,10 @@ impl Client {
             }
         }
     }
-
+    
     /// Get the current, if any, sync token of the client.
     /// This will be None if the client didn't sync at least once.
-    pub(crate) async fn sync_token(&self) -> Option<String> {
+    pub async fn sync_token(&self) -> Option<String> {
         self.inner.base_client.sync_token().await
     }
 
