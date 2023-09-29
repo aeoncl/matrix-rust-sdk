@@ -74,6 +74,7 @@ use crate::oidc::Oidc;
 use crate::{
     authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
     config::RequestConfig,
+    deduplicating_handler::DeduplicatingHandler,
     error::{HttpError, HttpResult},
     event_handler::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
@@ -141,54 +142,28 @@ pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
 }
 
-pub(crate) struct ClientInner {
-    /// All the data related to authentication and authorization.
-    pub(crate) auth_ctx: Arc<AuthCtx>,
-
-    /// The URL of the homeserver to connect to.
-    homeserver: RwLock<Url>,
-    /// The sliding sync proxy that is trusted by the homeserver.
-    #[cfg(feature = "experimental-sliding-sync")]
-    sliding_sync_proxy: StdRwLock<Option<Url>>,
-    /// The underlying HTTP client.
-    pub(crate) http_client: HttpClient,
-    /// User session data.
-    base_client: BaseClient,
-    /// The Matrix versions the server supports (well-known ones only)
-    server_versions: OnceCell<Box<[MatrixVersion]>>,
-    /// Locks making sure we only have one group session sharing request in
+#[derive(Default)]
+pub(crate) struct ClientLocks {
+    /// Lock ensuring that only a single room may be marked as a DM at once.
+    /// Look at the [`Room::mark_as_dm()`] method for a more detailed
+    /// explanation.
+    pub(crate) mark_as_dm_lock: Mutex<()>,
+    /// Handler making sure we only have one group session sharing request in
     /// flight per room.
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) group_session_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
+    pub(crate) group_session_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
     /// Lock making sure we're only doing one key claim request at a time.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) key_claim_lock: Mutex<()>,
-    /// Lock to ensure that only one members request is running at a time, per
-    /// room.
-    pub(crate) members_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
-    /// Locks for requests on the encryption state of rooms.
-    pub(crate) encryption_state_request_locks: Mutex<BTreeMap<OwnedRoomId, Arc<Mutex<()>>>>,
-    pub(crate) typing_notice_times: DashMap<OwnedRoomId, Instant>,
-    /// Event handlers. See `add_event_handler`.
-    pub(crate) event_handlers: EventHandlerStore,
-    /// Notification handlers. See `register_notification_handler`.
-    notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
-    pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
-    pub(crate) sync_gap_broadcast_txs: StdMutex<BTreeMap<OwnedRoomId, Observable<()>>>,
-    /// Whether the client should update its homeserver URL with the discovery
-    /// information present in the login response.
-    respect_login_well_known: bool,
-    /// An event that can be listened on to wait for a successful sync. The
-    /// event will only be fired if a sync loop is running. Can be used for
-    /// synchronization, e.g. if we send out a request to create a room, we can
-    /// wait for the sync to get the data to fetch a room object from the state
-    /// store.
-    pub(crate) sync_beat: event_listener::Event,
-
+    /// Handler to ensure that only one members request is running at a time,
+    /// given a room.
+    pub(crate) members_request_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
+    /// Handler to ensure that only one encryption state request is running at a
+    /// time, given a room.
+    pub(crate) encryption_state_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
     #[cfg(feature = "e2e-encryption")]
     pub(crate) cross_process_crypto_store_lock:
         OnceCell<CrossProcessStoreLock<LockableCryptoStore>>,
-
     /// Latest "generation" of data known by the crypto store.
     ///
     /// This is a counter that only increments, set in the database (and can
@@ -209,6 +184,43 @@ pub(crate) struct ClientInner {
     /// outside the `OlmMachine`.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store_generation: Arc<Mutex<Option<u64>>>,
+}
+
+pub(crate) struct ClientInner {
+    /// All the data related to authentication and authorization.
+    pub(crate) auth_ctx: Arc<AuthCtx>,
+
+    /// The URL of the homeserver to connect to.
+    homeserver: RwLock<Url>,
+    /// The sliding sync proxy that is trusted by the homeserver.
+    #[cfg(feature = "experimental-sliding-sync")]
+    sliding_sync_proxy: StdRwLock<Option<Url>>,
+    /// The underlying HTTP client.
+    pub(crate) http_client: HttpClient,
+    /// User session data.
+    base_client: BaseClient,
+    /// The Matrix versions the server supports (well-known ones only)
+    server_versions: OnceCell<Box<[MatrixVersion]>>,
+    /// Collection of locks individual client methods might want to use, either
+    /// to ensure that only a single call to a method happens at once or to
+    /// deduplicate multiple calls to a method.
+    locks: ClientLocks,
+    pub(crate) typing_notice_times: DashMap<OwnedRoomId, Instant>,
+    /// Event handlers. See `add_event_handler`.
+    pub(crate) event_handlers: EventHandlerStore,
+    /// Notification handlers. See `register_notification_handler`.
+    notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
+    pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
+    pub(crate) sync_gap_broadcast_txs: StdMutex<BTreeMap<OwnedRoomId, Observable<()>>>,
+    /// Whether the client should update its homeserver URL with the discovery
+    /// information present in the login response.
+    respect_login_well_known: bool,
+    /// An event that can be listened on to wait for a successful sync. The
+    /// event will only be fired if a sync loop is running. Can be used for
+    /// synchronization, e.g. if we send out a request to create a room, we can
+    /// wait for the sync to get the data to fetch a room object from the state
+    /// store.
+    pub(crate) sync_beat: event_listener::Event,
 }
 
 impl ClientInner {
@@ -234,13 +246,8 @@ impl ClientInner {
             sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
             http_client,
             base_client,
+            locks: Default::default(),
             server_versions: OnceCell::new_with(server_versions),
-            #[cfg(feature = "e2e-encryption")]
-            group_session_locks: Default::default(),
-            #[cfg(feature = "e2e-encryption")]
-            key_claim_lock: Default::default(),
-            members_request_locks: Default::default(),
-            encryption_state_request_locks: Default::default(),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
@@ -248,10 +255,6 @@ impl ClientInner {
             sync_gap_broadcast_txs: Default::default(),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
-            #[cfg(feature = "e2e-encryption")]
-            cross_process_crypto_store_lock: OnceCell::new(),
-            #[cfg(feature = "e2e-encryption")]
-            crypto_store_generation: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -290,6 +293,10 @@ impl Client {
 
     pub(crate) fn base_client(&self) -> &BaseClient {
         &self.inner.base_client
+    }
+
+    pub(crate) fn locks(&self) -> &ClientLocks {
+        &self.inner.locks
     }
 
     /// Change the homeserver URL used by this client.

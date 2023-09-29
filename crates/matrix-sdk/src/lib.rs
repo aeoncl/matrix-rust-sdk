@@ -23,8 +23,9 @@ pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
     store::{DynStateStore, MemoryStore, StateStoreExt},
-    DisplayName, Room as BaseRoom, RoomInfo, RoomMember as BaseRoomMember, RoomMemberships,
-    RoomState, SessionMeta, StateChanges, StateStore, StoreError,
+    DisplayName, Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomInfo,
+    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
+    StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
@@ -34,6 +35,7 @@ pub mod attachment;
 mod authentication;
 mod client;
 pub mod config;
+mod deduplicating_handler;
 #[cfg(feature = "e2e-encryption")]
 pub mod encryption;
 mod error;

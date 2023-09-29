@@ -187,9 +187,6 @@ impl BaseClient {
     ///
     /// * `session_meta` - The meta of a session that the user already has from
     ///   a previous login call.
-    /// * `regenerate_olm`: whether the `OlmMachine` should be regenerated or
-    ///   not. True for
-    /// restored sessions, false for inherited sessions.
     ///
     /// This method panics if it is called twice.
     pub async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
@@ -978,7 +975,7 @@ impl BaseClient {
                 // TODO: All the actions in this loop used to be done only when the membership
                 // event was not in the store before. This was changed with the new room API,
                 // because e.g. leaving a room makes members events outdated and they need to be
-                // fetched by `get_members`. Therefore, they need to be overwritten here, even
+                // fetched by `members`. Therefore, they need to be overwritten here, even
                 // if they exist.
                 // However, this makes a new problem occur where setting the member events here
                 // potentially races with the sync.

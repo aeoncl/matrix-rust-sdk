@@ -1,12 +1,11 @@
 //! High-level room API
 
-use std::{borrow::Borrow, collections::BTreeMap, ops::Deref, sync::Arc, time::Duration};
+use std::{borrow::Borrow, collections::BTreeMap, ops::Deref, time::Duration};
 
 use eyeball::SharedObservable;
 use matrix_sdk_base::{
     deserialized_responses::{
-        MembersResponse, RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
-        TimelineEvent,
+        RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
     instant::Instant,
     store::StateStoreExt,
@@ -67,7 +66,7 @@ use ruma::{
 };
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use tracing::{debug, instrument, warn};
 
 use crate::{
@@ -381,92 +380,58 @@ impl Room {
         Ok(Some((TimelineEvent { event, encryption_info: None, push_actions }, response.state)))
     }
 
-    pub(crate) async fn request_members(&self) -> Result<Option<MembersResponse>> {
-        let mut map = self.client.inner.members_request_locks.lock().await;
+    pub(crate) async fn request_members(&self) -> Result<()> {
+        self.client
+            .locks()
+            .members_request_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
+                let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
+                let response = self.client.send(request, None).await?;
 
-        if let Some(mutex) = map.get(self.inner.room_id()).cloned() {
-            // If a member request is already going on, await the release of
-            // the lock.
-            drop(map);
-            _ = mutex.lock().await;
+                // That's a large `Future`. Let's `Box::pin` to reduce its size on the stack.
+                Box::pin(self.client.base_client().receive_members(self.room_id(), &response))
+                    .await?;
 
-            Ok(None)
-        } else {
-            let mutex = Arc::new(Mutex::new(()));
-            map.insert(self.inner.room_id().to_owned(), mutex.clone());
-
-            let _guard = mutex.lock().await;
-            drop(map);
-
-            let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
-            let response = self.client.send(request, None).await?;
-
-            // That's a large `Future`. Let's `Box::pin` to reduce its size on the stack.
-            let response = Box::pin(
-                self.client.base_client().receive_members(self.inner.room_id(), &response),
-            )
-            .await?;
-
-            self.client.inner.members_request_locks.lock().await.remove(self.inner.room_id());
-
-            Ok(Some(response))
-        }
+                Ok(())
+            })
+            .await
     }
 
     async fn request_encryption_state(&self) -> Result<()> {
-        let mut map = self.client.inner.encryption_state_request_locks.lock().await;
+        self.client
+            .locks()
+            .encryption_state_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
+                // Request the event from the server.
+                let request = get_state_events_for_key::v3::Request::new(
+                    self.room_id().to_owned(),
+                    StateEventType::RoomEncryption,
+                    "".to_owned(),
+                );
+                let response = match self.client.send(request, None).await {
+                    Ok(response) => {
+                        Some(response.content.deserialize_as::<RoomEncryptionEventContent>()?)
+                    }
+                    Err(err) if err.client_api_error_kind() == Some(&ErrorKind::NotFound) => None,
+                    Err(err) => return Err(err.into()),
+                };
 
-        if let Some(mutex) = map.get(self.inner.room_id()).cloned() {
-            // If a encryption state request is already going on, await the release of
-            // the lock.
-            drop(map);
-            _ = mutex.lock().await;
-        } else {
-            let mutex = Arc::new(Mutex::new(()));
-            map.insert(self.inner.room_id().to_owned(), mutex.clone());
+                let _sync_lock = self.client.base_client().sync_lock().read().await;
 
-            let _guard = mutex.lock().await;
-            drop(map);
+                // Persist the event and the fact that we requested it from the server in
+                // `RoomInfo`.
+                let mut room_info = self.clone_info();
+                room_info.mark_encryption_state_synced();
+                room_info.set_encryption_event(response.clone());
+                let mut changes = StateChanges::default();
+                changes.add_room(room_info.clone());
 
-            // Request the event from the server.
-            let request = get_state_events_for_key::v3::Request::new(
-                self.inner.room_id().to_owned(),
-                StateEventType::RoomEncryption,
-                "".to_owned(),
-            );
-            let response = match self.client.send(request, None).await {
-                Ok(response) => {
-                    Some(response.content.deserialize_as::<RoomEncryptionEventContent>()?)
-                }
-                Err(err) if err.client_api_error_kind() == Some(&ErrorKind::NotFound) => None,
-                Err(err) => return Err(err.into()),
-            };
+                self.client.store().save_changes(&changes).await?;
+                self.update_summary(room_info);
 
-            let sync_lock = self.client.base_client().sync_lock().read().await;
-
-            // Persist the event and the fact that we requested it from the server in
-            // `RoomInfo`.
-            let mut room_info = self.inner.clone_info();
-            room_info.mark_encryption_state_synced();
-            room_info.set_encryption_event(response.clone());
-            let mut changes = StateChanges::default();
-            changes.add_room(room_info.clone());
-
-            self.client.store().save_changes(&changes).await?;
-            self.update_summary(room_info);
-
-            // Alright, we're done, release the locks and let the client send an event to
-            // the room.
-            drop(sync_lock);
-            self.client
-                .inner
-                .encryption_state_request_locks
-                .lock()
-                .await
-                .remove(self.inner.room_id());
-        }
-
-        Ok(())
+                Ok(())
+            })
+            .await
     }
 
     /// Check whether this room is encrypted. If the room encryption state is
@@ -497,15 +462,15 @@ impl Room {
     /// This method will de-duplicate requests if it is called multiple times in
     /// quick succession, in that case the return value will be `None`. This
     /// method does nothing if the members are already synced.
-    pub async fn sync_members(&self) -> Result<Option<MembersResponse>> {
+    pub async fn sync_members(&self) -> Result<()> {
         if !self.are_events_visible() {
-            return Ok(None);
+            return Ok(());
         }
 
         if !self.are_members_synced() {
             self.request_members().await
         } else {
-            Ok(None)
+            Ok(())
         }
     }
 
@@ -1240,24 +1205,13 @@ impl Room {
     async fn preshare_room_key(&self) -> Result<()> {
         self.ensure_room_joined()?;
 
-        let inner = || async {
-            let mut map = self.client.inner.group_session_locks.lock().await;
+        // Take and release the lock on the store, if needs be.
+        let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
 
-            if let Some(mutex) = map.get(self.room_id()).cloned() {
-                // If a group session share request is already going on, await the
-                // release of the lock.
-                drop(map);
-                _ = mutex.lock().await;
-            } else {
-                // Otherwise create a new lock and share the group
-                // session.
-                let mutex = Arc::new(Mutex::new(()));
-                map.insert(self.room_id().to_owned(), mutex.clone());
-
-                drop(map);
-
-                let _guard = mutex.lock().await;
-
+        self.client
+            .locks()
+            .group_session_deduplicated_handler
+            .run(self.room_id().to_owned(), async move {
                 {
                     let members = self
                         .client
@@ -1269,8 +1223,6 @@ impl Room {
 
                 let response = self.share_room_key().await;
 
-                self.client.inner.group_session_locks.lock().await.remove(self.room_id());
-
                 // If one of the responses failed invalidate the group
                 // session as using it would end up in undecryptable
                 // messages.
@@ -1281,15 +1233,10 @@ impl Room {
                     }
                     return Err(r);
                 }
-            }
 
-            Ok(())
-        };
-
-        // Take and release the lock on the store, if needs be.
-        let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
-
-        inner().await
+                Ok(())
+            })
+            .await
     }
 
     /// Share a group session for a room.

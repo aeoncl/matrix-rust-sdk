@@ -14,6 +14,7 @@
 
 use std::{ops::Add, sync::Arc, time::Duration};
 
+use as_variant::as_variant;
 use eyeball::{ObservableWriteGuard, SharedObservable, WeakObservable};
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -51,7 +52,7 @@ use super::{
     CancelInfo, Cancelled, FlowId, Verification, VerificationStore,
 };
 use crate::{
-    olm::ReadOnlyAccount, CryptoStoreError, OutgoingVerificationRequest, RoomMessageRequest, Sas,
+    olm::StaticAccountData, CryptoStoreError, OutgoingVerificationRequest, RoomMessageRequest, Sas,
     ToDeviceRequest,
 };
 
@@ -144,7 +145,7 @@ impl From<&InnerRequest> for VerificationRequestState {
 #[derive(Clone, Debug)]
 pub struct VerificationRequest {
     verification_cache: VerificationCache,
-    account: ReadOnlyAccount,
+    account: StaticAccountData,
     flow_id: Arc<FlowId>,
     other_user_id: OwnedUserId,
     inner: SharedObservable<InnerRequest>,
@@ -230,7 +231,7 @@ impl VerificationRequest {
         };
 
         let content = ToDeviceKeyVerificationRequestEventContent::new(
-            self.account.device_id().into(),
+            self.account.device_id.clone(),
             self.flow_id().as_str().into(),
             methods,
             MilliSecondsSinceUnixEpoch::now(),
@@ -268,7 +269,7 @@ impl VerificationRequest {
 
     /// Our own user id.
     pub fn own_user_id(&self) -> &UserId {
-        self.account.user_id()
+        &self.account.user_id
     }
 
     /// The id of the other user that is participating in this verification
@@ -301,11 +302,9 @@ impl VerificationRequest {
     /// Get info about the cancellation if the verification request has been
     /// cancelled.
     pub fn cancel_info(&self) -> Option<CancelInfo> {
-        if let InnerRequest::Cancelled(c) = &*self.inner.read() {
-            Some(c.state.clone().into())
-        } else {
-            None
-        }
+        as_variant!(&*self.inner.read(), InnerRequest::Cancelled(c) => {
+            c.state.clone().into()
+        })
     }
 
     /// Has the verification request been answered by another device.
@@ -371,7 +370,7 @@ impl VerificationRequest {
 
     /// Is this a verification that is veryfying one of our own devices
     pub fn is_self_verification(&self) -> bool {
-        self.account.user_id() == self.other_user()
+        self.account.user_id == self.other_user()
     }
 
     /// Did we initiate the verification request
@@ -559,11 +558,9 @@ impl VerificationRequest {
             ObservableWriteGuard::set(&mut guard, updated);
         }
 
-        let content = if let InnerRequest::Cancelled(c) = &*guard {
-            Some(c.state.as_content(self.flow_id()))
-        } else {
-            None
-        };
+        let content = as_variant!(&*guard, InnerRequest::Cancelled(c) => {
+            c.state.as_content(self.flow_id())
+        });
 
         let request = content.map(|c| match c {
             OutgoingContent::ToDevice(content) => {
@@ -689,8 +686,7 @@ impl VerificationRequest {
                 }
             }
             InnerRequest::Requested(s) => {
-                if sender == self.own_user_id() && content.from_device() != self.account.device_id()
-                {
+                if sender == self.own_user_id() && content.from_device() != self.account.device_id {
                     let new_value = InnerRequest::Passive(s.clone().into_passive(content));
                     ObservableWriteGuard::set(&mut guard, new_value);
                 }
@@ -1128,7 +1124,7 @@ impl RequestState<Requested> {
         let content = match self.flow_id.as_ref() {
             FlowId::ToDevice(i) => AnyToDeviceEventContent::KeyVerificationReady(
                 ToDeviceKeyVerificationReadyEventContent::new(
-                    state.store.account.device_id().to_owned(),
+                    state.store.account.device_id.clone(),
                     methods,
                     i.to_owned(),
                 ),
@@ -1138,7 +1134,7 @@ impl RequestState<Requested> {
                 r.to_owned(),
                 AnyMessageLikeEventContent::KeyVerificationReady(
                     KeyVerificationReadyEventContent::new(
-                        state.store.account.device_id().to_owned(),
+                        state.store.account.device_id.clone(),
                         methods,
                         Reference::new(e.to_owned()),
                     ),
@@ -1366,8 +1362,8 @@ async fn receive_start<T: Clone>(
     };
 
     let identities = request_state.store.get_identities(device.clone()).await?;
-    let own_user_id = request_state.store.account.user_id();
-    let own_device_id = request_state.store.account.device_id();
+    let own_user_id = &request_state.store.account.user_id;
+    let own_device_id = &request_state.store.account.device_id;
 
     match content.method() {
         StartMethod::SasV1(_) => {
@@ -1658,11 +1654,11 @@ mod tests {
         let event_id = event_id!("$1234localhost").to_owned();
         let room_id = room_id!("!test:localhost").to_owned();
 
-        let (alice_store, bob_store) = setup_stores().await;
+        let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         let content = VerificationRequest::request(
-            bob_store.account.user_id(),
-            bob_store.account.device_id(),
+            &bob_store.account.user_id,
+            &bob_store.account.device_id,
             alice_id(),
             None,
         );
@@ -1708,8 +1704,8 @@ mod tests {
     async fn test_request_refusal_to_device() {
         // test what happens when we cancel() a request that we have just received over
         // to-device messages.
-        let (alice_store, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob_store.account).await;
+        let (_alice, alice_store, bob, bob_store) = setup_stores().await;
+        let bob_device = ReadOnlyDevice::from_account(&bob).await;
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), None);
@@ -1745,12 +1741,12 @@ mod tests {
         let event_id = event_id!("$1234localhost");
         let room_id = room_id!("!test:localhost");
 
-        let (alice_store, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob_store.account).await;
+        let (_alice, alice_store, bob, bob_store) = setup_stores().await;
+        let bob_device = ReadOnlyDevice::from_account(&bob).await;
 
         let content = VerificationRequest::request(
-            bob_store.account.user_id(),
-            bob_store.account.device_id(),
+            &bob_store.account.user_id,
+            &bob_store.account.device_id,
             alice_id(),
             None,
         );
@@ -1800,8 +1796,8 @@ mod tests {
 
     #[async_test]
     async fn test_requesting_until_sas_to_device() {
-        let (alice_store, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob_store.account).await;
+        let (_alice, alice_store, bob, bob_store) = setup_stores().await;
+        let bob_device = ReadOnlyDevice::from_account(&bob).await;
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), None);
@@ -1835,7 +1831,7 @@ mod tests {
     #[async_test]
     #[cfg(feature = "qrcode")]
     async fn can_scan_another_qr_after_creating_mine() {
-        let (alice_store, bob_store) = setup_stores().await;
+        let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(
@@ -1887,7 +1883,7 @@ mod tests {
     #[async_test]
     #[cfg(feature = "qrcode")]
     async fn can_start_sas_after_generating_qr_code() {
-        let (alice_store, bob_store) = setup_stores().await;
+        let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), Some(all_methods()));
@@ -1932,7 +1928,7 @@ mod tests {
     #[async_test]
     #[cfg(feature = "qrcode")]
     async fn start_sas_after_scan_cancels_request() {
-        let (alice_store, bob_store) = setup_stores().await;
+        let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), Some(all_methods()));

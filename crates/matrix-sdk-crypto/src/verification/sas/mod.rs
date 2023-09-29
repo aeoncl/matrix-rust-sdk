@@ -42,16 +42,17 @@ use super::{
 };
 use crate::{
     identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    olm::StaticAccountData,
     requests::{OutgoingVerificationRequest, RoomMessageRequest},
     store::CryptoStoreError,
-    Emoji, ReadOnlyAccount, ToDeviceRequest,
+    Emoji, ToDeviceRequest,
 };
 
 /// Short authentication string object.
 #[derive(Clone, Debug)]
 pub struct Sas {
     inner: SharedObservable<InnerSas>,
-    account: ReadOnlyAccount,
+    account: StaticAccountData,
     identities_being_verified: IdentitiesBeingVerified,
     flow_id: Arc<FlowId>,
     we_started: bool,
@@ -188,28 +189,24 @@ impl From<&InnerSas> for SasState {
                 Self::Accepted { accepted_protocols: s.state.accepted_protocols.to_owned() }
             }
             InnerSas::KeysExchanged(s) => {
-                let emojis = if value.supports_emoji() {
+                let emojis = value.supports_emoji().then(|| {
                     let emojis = s.get_emoji();
                     let indices = s.get_emoji_index();
 
-                    Some(EmojiShortAuthString { emojis, indices })
-                } else {
-                    None
-                };
+                    EmojiShortAuthString { emojis, indices }
+                });
 
                 let decimals = s.get_decimal();
 
                 Self::KeysExchanged { emojis, decimals }
             }
             InnerSas::MacReceived(s) => {
-                let emojis = if value.supports_emoji() {
+                let emojis = value.supports_emoji().then(|| {
                     let emojis = s.get_emoji();
                     let indices = s.get_emoji_index();
 
-                    Some(EmojiShortAuthString { emojis, indices })
-                } else {
-                    None
-                };
+                    EmojiShortAuthString { emojis, indices }
+                });
 
                 let decimals = s.get_decimal();
 
@@ -229,12 +226,12 @@ impl From<&InnerSas> for SasState {
 impl Sas {
     /// Get our own user id.
     pub fn user_id(&self) -> &UserId {
-        self.account.user_id()
+        &self.account.user_id
     }
 
     /// Get our own device ID.
     pub fn device_id(&self) -> &DeviceId {
-        self.account.device_id()
+        &self.account.device_id
     }
 
     /// Get the user id of the other side.
@@ -259,11 +256,7 @@ impl Sas {
 
     /// Get the room id if the verification is happening inside a room.
     pub fn room_id(&self) -> Option<&RoomId> {
-        if let FlowId::InRoom(r, _) = self.flow_id() {
-            Some(r)
-        } else {
-            None
-        }
+        as_variant!(self.flow_id(), FlowId::InRoom(r, _) => r)
     }
 
     /// Does this verification flow support displaying emoji for the short
@@ -295,11 +288,9 @@ impl Sas {
     /// Get info about the cancellation if the verification flow has been
     /// cancelled.
     pub fn cancel_info(&self) -> Option<CancelInfo> {
-        if let InnerSas::Cancelled(c) = &*self.inner.read() {
-            Some(c.state.as_ref().clone().into())
-        } else {
-            None
-        }
+        as_variant!(&*self.inner.read(), InnerSas::Cancelled(c) => {
+            c.state.as_ref().clone().into()
+        })
     }
 
     /// Did we initiate the verification flow.
@@ -906,7 +897,7 @@ mod tests {
         let bob_device = ReadOnlyDevice::from_account(&bob).await;
 
         let alice_store = VerificationStore {
-            account: alice.clone(),
+            account: alice.static_data.clone(),
             inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), MemoryStore::new())),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())).into(),
         };
@@ -915,7 +906,7 @@ mod tests {
         bob_store.save_devices(vec![alice_device.clone()]).await;
 
         let bob_store = VerificationStore {
-            account: bob.clone(),
+            account: bob.static_data.clone(),
             inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())).into(),
         };

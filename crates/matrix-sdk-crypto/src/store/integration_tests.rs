@@ -96,7 +96,7 @@ macro_rules! cryptostore_integration_tests {
             #[async_test]
             async fn save_account_via_generic_save() {
                 let store = get_store("save_account_via_generic", None).await;
-                assert!(store.get_account_info().is_none());
+                assert!(store.get_static_account().is_none());
                 assert!(store.load_account().await.unwrap().is_none());
                 let account = get_account();
 
@@ -104,18 +104,18 @@ macro_rules! cryptostore_integration_tests {
                     .save_changes(Changes { account: Some(account), ..Default::default() })
                     .await
                     .expect("Can't save account");
-                assert!(store.get_account_info().is_some());
+                assert!(store.get_static_account().is_some());
             }
 
             #[async_test]
             async fn save_account() {
                 let store = get_store("save_account", None).await;
-                assert!(store.get_account_info().is_none());
+                assert!(store.get_static_account().is_none());
                 assert!(store.load_account().await.unwrap().is_none());
                 let account = get_account();
 
                 store.save_account(account).await.expect("Can't save account");
-                assert!(store.get_account_info().is_some());
+                assert!(store.get_static_account().is_some());
             }
 
             #[async_test]
@@ -515,7 +515,7 @@ macro_rules! cryptostore_integration_tests {
 
                 assert_eq!(loaded_user.master_key(), own_identity.master_key());
                 assert_eq!(loaded_user.self_signing_key(), own_identity.self_signing_key());
-                assert_eq!(loaded_user, own_identity.clone().into());
+                assert_eq!(loaded_user.own().unwrap().clone(), own_identity.clone());
 
                 let other_identity = get_other_identity();
 
@@ -534,7 +534,8 @@ macro_rules! cryptostore_integration_tests {
 
                 assert_eq!(loaded_user.master_key(), other_identity.master_key());
                 assert_eq!(loaded_user.self_signing_key(), other_identity.self_signing_key());
-                assert_eq!(loaded_user, other_identity.into());
+                assert_eq!(loaded_user.user_id(), other_identity.user_id());
+                assert_eq!(loaded_user.other().unwrap().clone(), other_identity);
 
                 own_identity.mark_as_verified();
 

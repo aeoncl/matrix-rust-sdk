@@ -42,10 +42,11 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     ops::Deref,
-    sync::{atomic::AtomicBool, Arc},
+    sync::Arc,
     time::Duration,
 };
 
+use as_variant::as_variant;
 use async_std::sync::{Condvar, Mutex as AsyncStdMutex};
 use atomic::Ordering;
 use dashmap::DashSet;
@@ -56,7 +57,7 @@ use ruma::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use vodozemac::{base64_encode, megolm::SessionOrdering, Curve25519PublicKey};
 use zeroize::Zeroize;
@@ -106,13 +107,39 @@ pub struct Store {
     inner: Arc<StoreInner>,
 }
 
+#[derive(Debug, Default)]
+struct StoreCache {
+    tracked_users: DashSet<OwnedUserId>,
+    tracked_user_loading_lock: RwLock<bool>,
+}
+
+struct StoreCacheGuard<'a> {
+    cache: &'a StoreCache,
+    // TODO: (bnjbvr, #2624) add cross-process lock guard here.
+}
+
+impl<'a> Deref for StoreCacheGuard<'a> {
+    type Target = StoreCache;
+
+    fn deref(&self) -> &Self::Target {
+        self.cache
+    }
+}
+
 #[derive(Debug)]
 struct StoreInner {
     user_id: OwnedUserId,
     identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
     store: Arc<CryptoStoreWrapper>,
+
+    /// In-memory cache for the current crypto store.
+    ///
+    /// ⚠ Must remain private.
+    cache: StoreCache,
+
     verification_machine: VerificationMachine,
-    tracked_users_cache: DashSet<OwnedUserId>,
+
+    account: ReadOnlyAccount, // TODO(bnjbvr, #2624) move this into the store cache
 
     /// Record of the users that are waiting for a /keys/query.
     //
@@ -123,9 +150,6 @@ struct StoreInner {
 
     // condition variable that is notified each time an update is received for a user.
     users_for_key_query_condvar: Condvar,
-
-    tracked_user_loading_lock: Mutex<()>,
-    tracked_users_loaded: AtomicBool,
 }
 
 /// Aggregated changes to be saved in the database.
@@ -184,11 +208,22 @@ impl Changes {
     }
 }
 
+/// This struct is used to remember whether an identity has undergone a change
+/// or remains the same as the one we already know about.
+///
+/// When the homeserver informs us of a potential change in a user's identity or
+/// device during a `/sync` response, it triggers a `/keys/query` request from
+/// our side. In response to this query, the server provides a comprehensive
+/// snapshot of all the user's devices and identities.
+///
+/// Our responsibility is to discern whether a device or identity is new,
+/// changed, or unchanged.
 #[derive(Debug, Clone, Default)]
 #[allow(missing_docs)]
 pub struct IdentityChanges {
     pub new: Vec<ReadOnlyUserIdentities>,
     pub changed: Vec<ReadOnlyUserIdentities>,
+    pub unchanged: Vec<ReadOnlyUserIdentities>,
 }
 
 impl IdentityChanges {
@@ -197,10 +232,11 @@ impl IdentityChanges {
     }
 
     /// Convert the vectors contained in the [`IdentityChanges`] into
-    /// two maps from user id to user identity.
+    /// three maps from user id to user identity (new, updated, unchanged).
     fn into_maps(
         self,
     ) -> (
+        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
         BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
         BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
     ) {
@@ -216,7 +252,13 @@ impl IdentityChanges {
             .map(|identity| (identity.user_id().to_owned(), identity))
             .collect();
 
-        (new, changed)
+        let unchanged: BTreeMap<_, _> = self
+            .unchanged
+            .into_iter()
+            .map(|identity| (identity.user_id().to_owned(), identity))
+            .collect();
+
+        (new, changed, unchanged)
     }
 }
 
@@ -242,12 +284,13 @@ fn collect_device_updates(
     let mut new: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
     let mut changed: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
 
-    let (new_identities, changed_identities) = identities.into_maps();
+    let (new_identities, changed_identities, unchanged_identities) = identities.into_maps();
 
     let map_device = |device: ReadOnlyDevice| {
         let device_owner_identity = new_identities
             .get(device.user_id())
             .or_else(|| changed_identities.get(device.user_id()))
+            .or_else(|| unchanged_identities.get(device.user_id()))
             .cloned();
 
         Device {
@@ -304,6 +347,8 @@ pub struct IdentityUpdates {
     pub new: BTreeMap<OwnedUserId, UserIdentities>,
     /// The list of changed identities.
     pub changed: BTreeMap<OwnedUserId, UserIdentities>,
+    /// The list of unchanged identities.
+    pub unchanged: BTreeMap<OwnedUserId, UserIdentities>,
 }
 
 /// The private part of a backup key.
@@ -487,6 +532,7 @@ impl Store {
     /// Create a new Store
     pub(crate) fn new(
         user_id: OwnedUserId,
+        account: ReadOnlyAccount,
         identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
         store: Arc<CryptoStoreWrapper>,
         verification_machine: VerificationMachine,
@@ -495,12 +541,11 @@ impl Store {
             user_id,
             identity,
             store,
+            account,
             verification_machine,
-            tracked_users_cache: DashSet::new(),
             users_for_key_query: AsyncStdMutex::new(UsersForKeyQuery::new()),
             users_for_key_query_condvar: Condvar::new(),
-            tracked_users_loaded: AtomicBool::new(false),
-            tracked_user_loading_lock: Mutex::new(()),
+            cache: Default::default(),
         });
 
         Self { inner }
@@ -518,7 +563,21 @@ impl Store {
 
     /// The Account associated with this store
     pub(crate) fn account(&self) -> &ReadOnlyAccount {
-        &self.inner.verification_machine.store.account
+        &self.inner.account
+    }
+
+    async fn cache(&self) -> Result<StoreCacheGuard<'_>> {
+        // TODO: (bnjbvr, #2624) If configured with a cross-process lock:
+        // - try to take the lock,
+        // - if acquired, look if another process touched the underlying storage,
+        // - if yes, reload everything; if no, return current cache
+
+        let cache = StoreCacheGuard { cache: &self.inner.cache };
+
+        // Make sure tracked users are always up to date.
+        self.ensure_sync_tracked_users(&cache).await?;
+
+        Ok(cache)
     }
 
     #[cfg(test)]
@@ -702,17 +761,20 @@ impl Store {
 
     ///  Get the Identity of `user_id`
     pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentities>> {
-        let own_identity =
-            self.inner.store.get_user_identity(self.user_id()).await?.and_then(|i| {
-                if let ReadOnlyUserIdentities::Own(i) = i {
-                    Some(i)
-                } else {
-                    None
-                }
-            });
+        let own_identity = self
+            .inner
+            .store
+            .get_user_identity(self.user_id())
+            .await?
+            .and_then(as_variant!(ReadOnlyUserIdentities::Own));
 
         Ok(self.inner.store.get_user_identity(user_id).await?.map(|i| {
-            UserIdentities::new(i, self.inner.verification_machine.to_owned(), own_identity)
+            UserIdentities::new(
+                self.clone(),
+                i,
+                self.inner.verification_machine.to_owned(),
+                own_identity,
+            )
         }))
     }
 
@@ -843,7 +905,7 @@ impl Store {
     /// next time [`Store::users_for_key_query()`] is called.
     pub(crate) async fn mark_user_as_changed(&self, user: &UserId) -> Result<()> {
         self.inner.users_for_key_query.lock().await.insert_user(user);
-        self.inner.tracked_users_cache.insert(user.to_owned());
+        self.cache().await?.tracked_users.insert(user.to_owned());
 
         self.inner.store.save_tracked_users(&[(user, true)]).await
     }
@@ -856,14 +918,14 @@ impl Store {
         &self,
         users: impl Iterator<Item = &UserId>,
     ) -> Result<()> {
-        self.load_tracked_users().await?;
+        let cache = self.cache().await?;
 
         let mut store_updates = Vec::new();
         let mut key_query_lock = self.inner.users_for_key_query.lock().await;
 
         for user_id in users {
-            if !self.inner.tracked_users_cache.contains(user_id) {
-                self.inner.tracked_users_cache.insert(user_id.to_owned());
+            if !cache.tracked_users.contains(user_id) {
+                cache.tracked_users.insert(user_id.to_owned());
                 key_query_lock.insert_user(user_id);
                 store_updates.push((user_id, true))
             }
@@ -882,13 +944,13 @@ impl Store {
         &self,
         users: impl Iterator<Item = &UserId>,
     ) -> Result<()> {
-        self.load_tracked_users().await?;
+        let cache = self.cache().await?;
 
         let mut store_updates: Vec<(&UserId, bool)> = Vec::new();
         let mut key_query_lock = self.inner.users_for_key_query.lock().await;
 
         for user_id in users {
-            if self.inner.tracked_users_cache.contains(user_id) {
+            if cache.tracked_users.contains(user_id) {
                 key_query_lock.insert_user(user_id);
                 store_updates.push((user_id, true));
             }
@@ -910,10 +972,13 @@ impl Store {
         let mut store_updates: Vec<(&UserId, bool)> = Vec::new();
         let mut key_query_lock = self.inner.users_for_key_query.lock().await;
 
-        for user_id in users {
-            if self.inner.tracked_users_cache.contains(user_id) {
-                let clean = key_query_lock.maybe_remove_user(user_id, sequence_number);
-                store_updates.push((user_id, !clean));
+        {
+            let cache = self.cache().await?;
+            for user_id in users {
+                if cache.tracked_users.contains(user_id) {
+                    let clean = key_query_lock.maybe_remove_user(user_id, sequence_number);
+                    store_updates.push((user_id, !clean));
+                }
             }
         }
         self.inner.store.save_tracked_users(&store_updates).await?;
@@ -929,29 +994,36 @@ impl Store {
     /// This method ensures that we're only going to load the users from the
     /// actual [`CryptoStore`] once, it will also make sure that any
     /// concurrent calls to this method get deduplicated.
-    async fn load_tracked_users(&self) -> Result<()> {
-        // If the users are loaded do nothing, otherwise acquire a lock.
-        if !self.inner.tracked_users_loaded.load(Ordering::SeqCst) {
-            let _lock = self.inner.tracked_user_loading_lock.lock().await;
+    async fn ensure_sync_tracked_users(&self, cache: &StoreCacheGuard<'_>) -> Result<()> {
+        // Check if the users are loaded, and in that case do nothing.
+        let loaded = cache.tracked_user_loading_lock.read().await;
+        if *loaded {
+            return Ok(());
+        }
 
-            // Check again if the users have been loaded, in case another call to this
-            // method loaded the tracked users between the time we tried to
-            // acquire the lock and the time we actually acquired the lock.
-            if !self.inner.tracked_users_loaded.load(Ordering::SeqCst) {
-                let tracked_users = self.inner.store.load_tracked_users().await?;
+        // Otherwise, we may load the users.
+        drop(loaded);
+        let mut loaded = cache.tracked_user_loading_lock.write().await;
 
-                let mut query_users_lock = self.inner.users_for_key_query.lock().await;
-                for user in tracked_users {
-                    self.inner.tracked_users_cache.insert(user.user_id.to_owned());
+        // Check again if the users have been loaded, in case another call to this
+        // method loaded the tracked users between the time we tried to
+        // acquire the lock and the time we actually acquired the lock.
+        if *loaded {
+            return Ok(());
+        }
 
-                    if user.dirty {
-                        query_users_lock.insert_user(&user.user_id);
-                    }
-                }
+        let tracked_users = self.inner.store.load_tracked_users().await?;
 
-                self.inner.tracked_users_loaded.store(true, Ordering::SeqCst);
+        let mut query_users_lock = self.inner.users_for_key_query.lock().await;
+        for user in tracked_users {
+            cache.tracked_users.insert(user.user_id.to_owned());
+
+            if user.dirty {
+                query_users_lock.insert_user(&user.user_id);
             }
         }
+
+        *loaded = true;
 
         Ok(())
     }
@@ -970,7 +1042,8 @@ impl Store {
     pub(crate) async fn users_for_key_query(
         &self,
     ) -> Result<(HashSet<OwnedUserId>, SequenceNumber)> {
-        self.load_tracked_users().await?;
+        // Make sure the tracked users set is up to date.
+        let _cache = self.cache().await?;
 
         Ok(self.inner.users_for_key_query.lock().await.users_for_key_query())
     }
@@ -1013,9 +1086,9 @@ impl Store {
 
     /// See the docs for [`crate::OlmMachine::tracked_users()`].
     pub(crate) async fn tracked_users(&self) -> Result<HashSet<OwnedUserId>> {
-        self.load_tracked_users().await?;
+        let cache = self.cache().await?;
 
-        Ok(self.inner.tracked_users_cache.iter().map(|u| u.clone()).collect())
+        Ok(cache.tracked_users.iter().map(|u| u.clone()).collect())
     }
 
     /// Check whether there is a global flag to only encrypt messages for
@@ -1110,13 +1183,15 @@ impl Store {
     pub fn user_identities_stream(&self) -> impl Stream<Item = IdentityUpdates> {
         let verification_machine = self.inner.verification_machine.to_owned();
 
+        let this = self.clone();
         self.inner.store.identities_stream().map(move |(own_identity, identities, _)| {
-            let (new_identities, changed_identities) = identities.into_maps();
+            let (new_identities, changed_identities, unchanged_identities) = identities.into_maps();
 
             let map_identity = |(user_id, identity)| {
                 (
                     user_id,
                     UserIdentities::new(
+                        this.clone(),
                         identity,
                         verification_machine.to_owned(),
                         own_identity.to_owned(),
@@ -1126,8 +1201,9 @@ impl Store {
 
             let new = new_identities.into_iter().map(map_identity).collect();
             let changed = changed_identities.into_iter().map(map_identity).collect();
+            let unchanged = unchanged_identities.into_iter().map(map_identity).collect();
 
-            IdentityUpdates { new, changed }
+            IdentityUpdates { new, changed, unchanged }
         })
     }
 
