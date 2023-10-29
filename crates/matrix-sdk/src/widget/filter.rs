@@ -1,3 +1,17 @@
+// Copyright 2023 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #![allow(dead_code)] // temporary
 
 use ruma::events::{MessageLikeEventType, StateEventType, TimelineEventType};
@@ -5,6 +19,7 @@ use serde::Deserialize;
 
 /// Different kinds of filters for timeline events.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum EventFilter {
     /// Filter for message-like events.
     MessageLike(MessageLikeEventFilter),
@@ -19,10 +34,21 @@ impl EventFilter {
             EventFilter::State(state_filter) => state_filter.matches(matrix_event),
         }
     }
+
+    pub(super) fn matches_state_event_with_any_state_key(
+        &self,
+        event_type: &StateEventType,
+    ) -> bool {
+        matches!(
+            self,
+            Self::State(filter) if filter.matches_state_event_with_any_state_key(event_type)
+        )
+    }
 }
 
 /// Filter for message-like events.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum MessageLikeEventFilter {
     /// Matches message-like events with the given `type`.
     WithType(MessageLikeEventType),
@@ -51,6 +77,7 @@ impl MessageLikeEventFilter {
 
 /// Filter for state events.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum StateEventFilter {
     /// Matches state events with the given `type`, regardless of `state_key`.
     WithType(StateEventType),
@@ -74,6 +101,10 @@ impl StateEventFilter {
                     && state_key == filter_state_key
             }
         }
+    }
+
+    fn matches_state_event_with_any_state_key(&self, event_type: &StateEventType) -> bool {
+        matches!(self, Self::WithType(ty) if ty == event_type)
     }
 }
 
@@ -182,7 +213,14 @@ mod tests {
         )));
     }
 
-    // Tests against an `m.room.member` filter with `state_key = @self:example.me`
+    #[test]
+    fn reaction_event_filter_does_not_match_state_event_any_key() {
+        assert!(
+            !reaction_event_filter().matches_state_event_with_any_state_key(&"m.reaction".into())
+        );
+    }
+
+    // Tests against an `m.room.member` filter with `state_key = "@self:example.me"`
     fn self_member_event_filter() -> EventFilter {
         EventFilter::State(StateEventFilter::WithTypeAndStateKey(
             StateEventType::RoomMember,
@@ -217,7 +255,13 @@ mod tests {
         assert!(!self_member_event_filter().matches(&message_event(TimelineEventType::Reaction)));
     }
 
-    // Tests against an `m.room.member` filter with `state_key = @self:example.me`
+    #[test]
+    fn self_member_event_filter_only_matches_specific_state_key() {
+        assert!(!self_member_event_filter()
+            .matches_state_event_with_any_state_key(&StateEventType::RoomMember));
+    }
+
+    // Tests against an `m.room.member` filter with any `state_key`.
     fn member_event_filter() -> EventFilter {
         EventFilter::State(StateEventFilter::WithType(StateEventType::RoomMember))
     }
@@ -237,5 +281,25 @@ mod tests {
     #[test]
     fn member_event_filter_does_not_match_reaction_event() {
         assert!(!member_event_filter().matches(&message_event(TimelineEventType::Reaction)));
+    }
+
+    #[test]
+    fn member_event_filter_matches_any_state_key() {
+        assert!(member_event_filter()
+            .matches_state_event_with_any_state_key(&StateEventType::RoomMember));
+    }
+
+    // Tests against an `m.room.topic` filter with `state_key = ""`
+    fn topic_event_filter() -> EventFilter {
+        EventFilter::State(StateEventFilter::WithTypeAndStateKey(
+            StateEventType::RoomTopic,
+            "".to_owned(),
+        ))
+    }
+
+    #[test]
+    fn topic_event_filter_does_not_match_any_state_key() {
+        assert!(!topic_event_filter()
+            .matches_state_event_with_any_state_key(&StateEventType::RoomTopic));
     }
 }

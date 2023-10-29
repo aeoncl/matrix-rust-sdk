@@ -15,10 +15,9 @@
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
 };
 
-use dashmap::DashMap;
 use ruma::{
     events::{
         key::verification::VerificationMethod, AnyToDeviceEvent, AnyToDeviceEventContent,
@@ -50,7 +49,7 @@ use crate::{
 pub struct VerificationMachine {
     pub(crate) store: VerificationStore,
     verifications: VerificationCache,
-    requests: Arc<DashMap<OwnedUserId, HashMap<String, VerificationRequest>>>,
+    requests: Arc<StdRwLock<HashMap<OwnedUserId, HashMap<String, VerificationRequest>>>>,
 }
 
 impl VerificationMachine {
@@ -154,11 +153,13 @@ impl VerificationMachine {
         user_id: &UserId,
         flow_id: impl AsRef<str>,
     ) -> Option<VerificationRequest> {
-        self.requests.get(user_id)?.get(flow_id.as_ref()).cloned()
+        self.requests.read().unwrap().get(user_id)?.get(flow_id.as_ref()).cloned()
     }
 
     pub fn get_requests(&self, user_id: &UserId) -> Vec<VerificationRequest> {
         self.requests
+            .read()
+            .unwrap()
             .get(user_id)
             .map(|v| v.iter().map(|(_, value)| value.clone()).collect())
             .unwrap_or_default()
@@ -173,8 +174,8 @@ impl VerificationMachine {
             return;
         }
 
-        let mut entry = self.requests.entry(request.other_user().to_owned()).or_default();
-        let user_requests = entry.value_mut();
+        let mut requests = self.requests.write().unwrap();
+        let user_requests = requests.entry(request.other_user().to_owned()).or_default();
 
         // Cancel all the old verifications requests as well as the new one we
         // have for this user if someone tries to have two verifications going
@@ -245,20 +246,16 @@ impl VerificationMachine {
     pub fn garbage_collect(&self) -> Vec<Raw<AnyToDeviceEvent>> {
         let mut events = vec![];
 
-        for mut user_verification in self.requests.iter_mut() {
-            user_verification.retain(|_, v| !(v.is_done() || v.is_cancelled()));
-        }
-        self.requests.retain(|_, v| !v.is_empty());
+        let mut requests: Vec<OutgoingVerificationRequest> = {
+            let mut requests = self.requests.write().unwrap();
 
-        let mut requests: Vec<OutgoingVerificationRequest> = self
-            .requests
-            .iter()
-            .flat_map(|v| {
-                let requests: Vec<OutgoingVerificationRequest> =
-                    v.value().iter().filter_map(|(_, v)| v.cancel_if_timed_out()).collect();
-                requests
-            })
-            .collect();
+            for user_verification in requests.values_mut() {
+                user_verification.retain(|_, v| !(v.is_done() || v.is_cancelled()));
+            }
+            requests.retain(|_, v| !v.is_empty());
+
+            requests.values().flatten().filter_map(|(_, v)| v.cancel_if_timed_out()).collect()
+        };
 
         requests.extend(self.verifications.garbage_collect());
 
@@ -327,7 +324,7 @@ impl VerificationMachine {
                 flow_id = flow_id.as_str(),
                 "Received a verification event with a mismatched flow id, \
                  the verification object was created for a in-room \
-                 verification but a event was received over to-device \
+                 verification but an event was received over to-device \
                  messaging or vice versa"
             );
         };
@@ -542,7 +539,7 @@ mod tests {
             tests::{alice_device_id, alice_id, setup_stores, wrap_any_to_device_content},
             FlowId, VerificationStore,
         },
-        ReadOnlyAccount, VerificationRequest,
+        Account, VerificationRequest,
     };
 
     async fn verification_machine() -> (VerificationMachine, VerificationStore) {
@@ -577,7 +574,7 @@ mod tests {
 
     #[async_test]
     async fn create() {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
         let _ = VerificationMachine::new(
             alice.static_data,

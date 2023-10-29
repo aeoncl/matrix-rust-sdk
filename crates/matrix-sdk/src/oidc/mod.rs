@@ -165,12 +165,7 @@
 //! [`AuthenticateError::InsufficientScope`]: ruma::api::client::error::AuthenticateError
 //! [`examples/oidc-cli`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/oidc-cli
 
-use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
-    fmt,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use as_variant::as_variant;
 use eyeball::SharedObservable;
@@ -192,6 +187,7 @@ use matrix_sdk_base::{once_cell::sync::OnceCell, SessionMeta};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use ruma::{api::client::discovery::discover_homeserver::AuthenticationServerInfo, OwnedDeviceId};
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use thiserror::Error;
 use tokio::{spawn, sync::Mutex};
 use tracing::{error, trace, warn};
@@ -229,12 +225,19 @@ pub(crate) struct OidcCtx {
     /// Note: only required because we're using the crypto store that might not
     /// be present before reloading a session.
     deferred_cross_process_lock_init: Mutex<Option<String>>,
+
+    /// Whether to allow HTTP issuer URLs.
+    insecure_discover: bool,
 }
 
 impl OidcCtx {
-    pub(crate) fn new(authentication_server_info: Option<AuthenticationServerInfo>) -> Self {
+    pub(crate) fn new(
+        authentication_server_info: Option<AuthenticationServerInfo>,
+        insecure_discover: bool,
+    ) -> Self {
         Self {
             authentication_server_info,
+            insecure_discover,
             cross_process_token_refresh_manager: Default::default(),
             deferred_cross_process_lock_init: Default::default(),
         }
@@ -250,6 +253,7 @@ pub(crate) struct OidcAuthData {
     pub(crate) authorization_data: Mutex<HashMap<String, AuthorizationValidationData>>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl fmt::Debug for OidcAuthData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OidcAuthData")
@@ -301,22 +305,13 @@ impl Oidc {
     /// Must be called after `set_session_meta`.
     async fn deferred_enable_cross_process_refresh_lock(&self) -> Result<()> {
         let deferred_init_lock = self.ctx().deferred_cross_process_lock_init.lock().await;
+
+        // Don't `take()` the value, so that subsequent calls to
+        // `enable_cross_process_refresh_lock` will keep on failing if we've enabled the
+        // lock at least once.
         let Some(lock_value) = deferred_init_lock.as_ref() else {
             return Ok(());
         };
-
-        // If the lock has already been created, don't recreate it from scratch.
-        if let Some(prev_lock) = self.ctx().cross_process_token_refresh_manager.get() {
-            let prev_holder = prev_lock.lock_holder();
-            if prev_holder == lock_value {
-                return Ok(());
-            }
-            warn!(
-                prev_holder,
-                new_holder = lock_value,
-                "recreating cross-process store refresh token lock with a different holder value"
-            );
-        }
 
         // FIXME We shouldn't be using the crypto store for that! see also https://github.com/matrix-org/matrix-rust-sdk/issues/2472
         let olm_machine_lock = self.client.olm_machine().await;
@@ -328,10 +323,9 @@ impl Oidc {
 
         let manager = CrossProcessRefreshManager::new(store.clone(), lock);
 
-        self.ctx()
-            .cross_process_token_refresh_manager
-            .set(manager)
-            .map_err(|_| crate::Error::Oidc(CrossProcessRefreshLockError::DuplicatedLock.into()))?;
+        // This method is guarded with the `deferred_cross_process_lock_init` lock held,
+        // so this `set` can't be an error.
+        let _ = self.ctx().cross_process_token_refresh_manager.set(manager);
 
         Ok(())
     }
@@ -420,7 +414,7 @@ impl Oidc {
         &self,
         issuer: &str,
     ) -> Result<VerifiedProviderMetadata, OidcError> {
-        self.backend.discover(issuer).await
+        self.backend.discover(issuer, self.ctx().insecure_discover).await
     }
 
     /// Fetch the OpenID Connect metadata of the issuer.
@@ -639,7 +633,7 @@ impl Oidc {
         client_metadata: VerifiedClientMetadata,
         software_statement: Option<String>,
     ) -> Result<ClientRegistrationResponse, OidcError> {
-        let provider_metadata = self.backend.discover(issuer).await?;
+        let provider_metadata = self.given_provider_metadata(issuer).await?;
 
         let registration_endpoint = provider_metadata
             .registration_endpoint
@@ -918,7 +912,21 @@ impl Oidc {
         };
 
         self.client.base_client().set_session_meta(session).await.map_err(crate::Error::from)?;
+        // At this point the Olm machine has been set up.
+
+        // Enable the cross-process lock for refreshes, if needs be.
         self.deferred_enable_cross_process_refresh_lock().await?;
+
+        // Bootstrap cross signing, if needs be.
+        // TODO: (#2763) put this into a background task.
+        if self.client.encryption().settings().auto_enable_cross_signing {
+            // According to MSC3967, OIDC doesn't require User-Interactive Authentication to
+            // call this API. Let's find out!
+            if let Err(err) = self.client.encryption().bootstrap_cross_signing_if_needed(None).await
+            {
+                warn!("cross-signing bootstrapping failed: {err}");
+            }
+        }
 
         if let Some(cross_process_manager) = self.ctx().cross_process_token_refresh_manager.get() {
             if let Some(tokens) = self.session_tokens() {
@@ -1055,8 +1063,8 @@ impl Oidc {
 
         spawn(async move {
             tracing::trace!(
-                "Token refresh: attempting to refresh with refresh_token {}",
-                hash(&refresh_token)
+                "Token refresh: attempting to refresh with refresh_token {:?}",
+                hash_str(&refresh_token)
             );
 
             match this
@@ -1073,9 +1081,9 @@ impl Oidc {
             {
                 Ok(new_tokens) => {
                     trace!(
-                        "Token refresh: new refresh_token: {:?} / access_token: {}",
-                        new_tokens.refresh_token.as_ref().map(hash),
-                        hash(&new_tokens.access_token)
+                        "Token refresh: new refresh_token: {:?} / access_token: {:?}",
+                        new_tokens.refresh_token.as_deref().map(hash_str),
+                        hash_str(&new_tokens.access_token)
                     );
 
                     let tokens = OidcSessionTokens {
@@ -1303,6 +1311,7 @@ pub struct OidcSessionTokens {
     pub latest_id_token: Option<IdToken<'static>>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl fmt::Debug for OidcSessionTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionTokens").finish_non_exhaustive()
@@ -1344,14 +1353,6 @@ impl AuthorizationResponse {
         }
 
         Err(RedirectUriQueryParseError::UnknownFormat)
-    }
-
-    /// Access the state field, on either variant.
-    pub fn state(&self) -> &str {
-        match self {
-            Self::Success(code) => &code.state,
-            Self::Error(error) => &error.state,
-        }
     }
 }
 
@@ -1473,8 +1474,6 @@ fn rng() -> Result<StdRng, OidcError> {
     StdRng::from_rng(rand::thread_rng()).map_err(OidcError::Rand)
 }
 
-fn hash<T: Hash>(x: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    x.hash(&mut hasher);
-    hasher.finish()
+fn hash_str(x: &str) -> impl std::fmt::Debug {
+    sha2::Sha256::new().chain_update(x).finalize()
 }

@@ -56,9 +56,10 @@ use super::traits::Decryptor;
 use super::{
     event_item::EventItemIdentifier,
     item::timeline_item,
+    pagination::PaginationTokens,
     reactions::ReactionToggleResult,
     traits::RoomDataProvider,
-    util::{compare_events_positions, rfind_event_by_id, rfind_event_item, RelativePosition},
+    util::{rfind_event_by_id, rfind_event_item, RelativePosition},
     AnnotationKey, EventSendState, EventTimelineItem, InReplyToDetails, Message, Profile,
     RepliedToEvent, TimelineDetails, TimelineItem, TimelineItemContent, TimelineItemKind,
 };
@@ -66,7 +67,8 @@ use super::{
 mod state;
 
 pub(super) use self::state::{
-    TimelineInnerMetadata, TimelineInnerState, TimelineInnerStateTransaction,
+    EventMeta, FullEventMeta, TimelineInnerMetadata, TimelineInnerState,
+    TimelineInnerStateTransaction,
 };
 
 #[derive(Clone, Debug)]
@@ -205,7 +207,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         };
 
         let sender = self.room_data_provider.own_user_id().to_owned();
-        let sender_profile = self.room_data_provider.profile(&sender).await;
+        let sender_profile = self.room_data_provider.profile_from_user_id(&sender).await;
         let reaction_state = match (to_redact_local, to_redact_remote) {
             (None, None) => {
                 // No record of the reaction, create a local echo
@@ -227,7 +229,6 @@ impl<P: RoomDataProvider> TimelineInner<P> {
                     sender_profile,
                     txn_id.clone(),
                     event_content.clone(),
-                    &self.settings,
                 );
                 ReactionState::Sending(txn_id)
             }
@@ -248,7 +249,6 @@ impl<P: RoomDataProvider> TimelineInner<P> {
                     TransactionId::new(),
                     to_redact,
                     no_reason.clone(),
-                    &self.settings,
                 );
 
                 // Remember the remote echo to redact on the homeserver
@@ -291,28 +291,54 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         Ok(result)
     }
 
-    pub(super) async fn set_initial_user_receipt(
-        &mut self,
-        receipt_type: ReceiptType,
-        receipt: (OwnedEventId, Receipt),
-    ) {
+    pub(super) async fn populate_initial_user_receipt(&mut self, receipt_type: ReceiptType) {
         let own_user_id = self.room_data_provider.own_user_id().to_owned();
+
+        let mut read_receipt = self
+            .room_data_provider
+            .user_receipt(receipt_type.clone(), ReceiptThread::Unthreaded, &own_user_id)
+            .await;
+
+        // Fallback to the one in the main thread.
+        if read_receipt.is_none() {
+            read_receipt = self
+                .room_data_provider
+                .user_receipt(receipt_type.clone(), ReceiptThread::Main, &own_user_id)
+                .await;
+        }
+
+        let Some(read_receipt) = read_receipt else {
+            return;
+        };
+
         self.state
             .write()
             .await
+            .read_receipts
             .users_read_receipts
             .entry(own_user_id)
             .or_default()
-            .insert(receipt_type, receipt);
+            .insert(receipt_type, read_receipt);
     }
 
-    pub(super) async fn add_initial_events(&mut self, events: Vector<SyncTimelineEvent>) {
+    pub(super) async fn add_initial_events(
+        &mut self,
+        events: Vector<SyncTimelineEvent>,
+        back_pagination_token: Option<String>,
+    ) {
         if events.is_empty() {
             return;
         }
 
         let mut state = self.state.write().await;
-        state.add_initial_events(events, &self.room_data_provider, &self.settings).await;
+        state
+            .add_initial_events(
+                events,
+                back_pagination_token,
+                &self.room_data_provider,
+                &self.settings,
+            )
+            .await;
     }
 
     pub(super) async fn clear(&self) {
@@ -343,10 +369,10 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         content: AnyMessageLikeEventContent,
     ) {
         let sender = self.room_data_provider.own_user_id().to_owned();
-        let profile = self.room_data_provider.profile(&sender).await;
+        let profile = self.room_data_provider.profile_from_user_id(&sender).await;
 
         let mut state = self.state.write().await;
-        state.handle_local_event(sender, profile, txn_id, content, &self.settings);
+        state.handle_local_event(sender, profile, txn_id, content);
     }
 
     /// Handle the creation of a new local event.
@@ -358,10 +384,10 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         content: RoomRedactionEventContent,
     ) {
         let sender = self.room_data_provider.own_user_id().to_owned();
-        let profile = self.room_data_provider.profile(&sender).await;
+        let profile = self.room_data_provider.profile_from_user_id(&sender).await;
 
         let mut state = self.state.write().await;
-        state.handle_local_redaction(sender, profile, txn_id, to_redact, content, &self.settings);
+        state.handle_local_redaction(sender, profile, txn_id, to_redact, content);
     }
 
     /// Update the send state of a local event represented by a transaction ID.
@@ -558,17 +584,48 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         }
     }
 
+    /// Get the back-pagination token of the first [`EventTimelineItem`].
+    ///
+    /// Returns `None` if there are no `EventTimelineItem`s, or the first one
+    /// doesn't have a back-pagination token.
+    pub(super) async fn back_pagination_token(&self) -> Option<String> {
+        let state = self.state.read().await;
+        Some(state.back_pagination_token()?.to_owned())
+    }
+
     /// Handle a list of back-paginated events.
     ///
     /// Returns the number of timeline updates that were made. Short-circuits
     /// and returns `None` if the number of items added or updated exceeds
     /// `u16::MAX`, which should practically never happen.
+    ///
+    /// # Arguments
+    ///
+    /// * `events` - The events from back-pagination
+    ///
+    /// * `back_pagination_token` - The back-pagination token for loading
+    ///   further events
     pub(super) async fn handle_back_paginated_events(
         &self,
         events: Vec<TimelineEvent>,
-    ) -> Option<HandleManyEventsResult> {
+        pagination_tokens: PaginationTokens,
+    ) -> Result<HandleManyEventsResult, HandleBackPaginatedEventsError> {
         let mut state = self.state.write().await;
-        state.handle_back_paginated_events(events, &self.room_data_provider, &self.settings).await
+        if let Some(token) = pagination_tokens.from {
+            if state.back_pagination_token() != Some(&token) {
+                return Err(HandleBackPaginatedEventsError::TokenMismatch);
+            }
+        }
+
+        state
+            .handle_back_paginated_events(
+                events,
+                pagination_tokens.to,
+                &self.room_data_provider,
+                &self.settings,
+            )
+            .await
+            .ok_or(HandleBackPaginatedEventsError::ResultOverflow)
     }
 
     pub(super) async fn set_fully_read_event(&self, fully_read_event_id: OwnedEventId) {
@@ -738,7 +795,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
                 continue;
             }
 
-            match self.room_data_provider.profile(event_item.sender()).await {
+            match self.room_data_provider.profile_from_user_id(event_item.sender()).await {
                 Some(profile) => {
                     trace!(event_id, transaction_id, "Adding profile");
                     let updated_item =
@@ -767,6 +824,16 @@ impl<P: RoomDataProvider> TimelineInner<P> {
     pub(super) async fn handle_read_receipts(&self, receipt_event_content: ReceiptEventContent) {
         let own_user_id = self.room_data_provider.own_user_id();
         self.state.write().await.handle_read_receipts(receipt_event_content, own_user_id);
+    }
+
+    /// Get the latest read receipt for the given user.
+    ///
+    /// Useful to get the latest read receipt, whether it's private or public.
+    pub(super) async fn latest_user_read_receipt(
+        &self,
+        user_id: &UserId,
+    ) -> Option<(OwnedEventId, Receipt)> {
+        self.state.read().await.latest_user_read_receipt(user_id, &self.room_data_provider).await
     }
 }
 
@@ -869,17 +936,6 @@ impl TimelineInner {
         Ok(())
     }
 
-    /// Get the latest read receipt for the given user.
-    ///
-    /// Useful to get the latest read receipt, whether it's private or public.
-    pub(super) async fn latest_user_read_receipt(
-        &self,
-        user_id: &UserId,
-    ) -> Option<(OwnedEventId, Receipt)> {
-        let room = self.room();
-        self.state.read().await.latest_user_read_receipt(user_id, room).await
-    }
-
     /// Check whether the given receipt should be sent.
     ///
     /// Returns `false` if the given receipt is older than the current one.
@@ -904,7 +960,7 @@ impl TimelineInner {
                     state.user_receipt(own_user_id, ReceiptType::Read, room).await
                 {
                     if let Some(relative_pos) =
-                        compare_events_positions(&old_pub_read, event_id, &state.items)
+                        state.meta.compare_events_positions(&old_pub_read, event_id)
                     {
                         return relative_pos == RelativePosition::After;
                     }
@@ -917,7 +973,7 @@ impl TimelineInner {
                     state.latest_user_read_receipt(own_user_id, room).await
                 {
                     if let Some(relative_pos) =
-                        compare_events_positions(&old_priv_read, event_id, &state.items)
+                        state.meta.compare_events_positions(&old_priv_read, event_id)
                     {
                         return relative_pos == RelativePosition::After;
                     }
@@ -925,11 +981,10 @@ impl TimelineInner {
             }
             SendReceiptType::FullyRead => {
                 if let Some(old_fully_read) = self.fully_read_event().await {
-                    if let Some(relative_pos) = compare_events_positions(
-                        &old_fully_read.content.event_id,
-                        event_id,
-                        &state.items,
-                    ) {
+                    if let Some(relative_pos) = state
+                        .meta
+                        .compare_events_positions(&old_fully_read.content.event_id, event_id)
+                    {
                         return relative_pos == RelativePosition::After;
                     }
                 }
@@ -946,6 +1001,22 @@ impl TimelineInner {
 pub(super) struct HandleManyEventsResult {
     pub items_added: u16,
     pub items_updated: u16,
+}
+
+#[derive(Debug)]
+pub(super) enum HandleBackPaginatedEventsError {
+    /// The `from` token is not equal to the first event item's back-pagination
+    /// token.
+    ///
+    /// This means that prepending the events from the back-pagination response
+    /// would result in a gap in the timeline. Back-pagination must be retried
+    /// with the current back-pagination token.
+    TokenMismatch,
+
+    /// `u16` overflow when computing the number of events affected.
+    ///
+    /// This *should* never happen.
+    ResultOverflow,
 }
 
 async fn fetch_replied_to_event(

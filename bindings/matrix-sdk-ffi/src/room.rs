@@ -7,7 +7,7 @@ use matrix_sdk::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
         BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
     },
-    room::{Receipts, Room as SdkRoom},
+    room::Room as SdkRoom,
     ruma::{
         api::client::{receipt::create_receipt::v3::ReceiptType, room::report_content},
         events::{
@@ -20,7 +20,7 @@ use matrix_sdk::{
             room::{
                 avatar::ImageInfo as RumaAvatarImageInfo,
                 message::{
-                    AddMentions, ForwardThread, LocationMessageEventContent, MessageType,
+                    ForwardThread, LocationMessageEventContent, MessageType,
                     RoomMessageEventContentWithoutRelation,
                 },
             },
@@ -145,6 +145,24 @@ impl Room {
         self.inner.state().into()
     }
 
+    /// Is there a non expired membership with application "m.call" and scope
+    /// "m.room" in this room.
+    pub fn has_active_room_call(&self) -> bool {
+        self.inner.has_active_room_call()
+    }
+
+    /// Returns a Vec of userId's that participate in the room call.
+    ///
+    /// matrix_rtc memberships with application "m.call" and scope "m.room" are
+    /// considered. A user can occur twice if they join with two devices.
+    /// convert to a set depending if the different users are required or the
+    /// amount of sessions.
+    ///
+    /// The vector is ordered by oldest membership user to newest.
+    pub fn active_room_call_participants(&self) -> Vec<String> {
+        self.inner.active_room_call_participants().iter().map(|u| u.to_string()).collect()
+    }
+
     pub fn inviter(&self) -> Option<Arc<RoomMember>> {
         if self.inner.state() == RoomState::Invited {
             RUNTIME.block_on(async move {
@@ -197,10 +215,6 @@ impl Room {
         Ok(())
     }
 
-    pub fn fetch_members_blocking(self: Arc<Self>) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move { self.fetch_members().await })
-    }
-
     pub fn display_name(&self) -> Result<String, ClientError> {
         let r = self.inner.clone();
         RUNTIME.block_on(async move { Ok(r.display_name().await?.to_string()) })
@@ -218,21 +232,10 @@ impl Room {
         Ok(Arc::new(RoomMembersIterator::new(self.inner.members(RoomMemberships::empty()).await?)))
     }
 
-    pub fn members_blocking(self: Arc<Self>) -> Result<Arc<RoomMembersIterator>, ClientError> {
-        RUNTIME.block_on(async move { self.members().await })
-    }
-
     pub async fn member(&self, user_id: String) -> Result<Arc<RoomMember>, ClientError> {
         let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
         let member = self.inner.get_member(&user_id).await?.context("No user found")?;
         Ok(Arc::new(RoomMember::new(member)))
-    }
-
-    pub fn member_blocking(
-        self: Arc<Self>,
-        user_id: String,
-    ) -> Result<Arc<RoomMember>, ClientError> {
-        RUNTIME.block_on(async move { self.member(user_id).await })
     }
 
     pub fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
@@ -259,15 +262,16 @@ impl Room {
         &self,
         listener: Box<dyn TimelineListener>,
     ) -> RoomTimelineListenerResult {
-        let timeline = self
-            .timeline
-            .write()
-            .await
-            .get_or_insert_with(|| {
-                let timeline = RUNTIME.block_on(self.inner.timeline());
-                Arc::new(timeline)
-            })
-            .clone();
+        let timeline = {
+            let mut write_guard = self.timeline.write().await;
+            if let Some(timeline) = &*write_guard {
+                timeline.clone()
+            } else {
+                let timeline = Arc::new(self.inner.timeline().await);
+                *write_guard = Some(timeline.clone());
+                timeline
+            }
+        };
 
         let (timeline_items, timeline_stream) = timeline.subscribe_batched().await;
         let timeline_stream = TaskHandle::new(RUNTIME.spawn(async move {
@@ -283,13 +287,6 @@ impl Room {
             items: timeline_items.into_iter().map(TimelineItem::from_arc).collect(),
             items_stream: Arc::new(timeline_stream),
         }
-    }
-
-    pub async fn add_timeline_listener_blocking(
-        self: Arc<Self>,
-        listener: Box<dyn TimelineListener>,
-    ) -> RoomTimelineListenerResult {
-        RUNTIME.block_on(async move { self.add_timeline_listener(listener).await })
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
@@ -315,10 +312,10 @@ impl Room {
 
         // Otherwise, fallback to the classical path.
         let latest_event = match self.inner.latest_event() {
-            Some(ev) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
+            Some(latest_event) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
                 self.inner.client(),
                 self.inner.room_id(),
-                ev,
+                latest_event,
             )
             .await
             .map(EventTimelineItem)
@@ -326,10 +323,6 @@ impl Room {
             None => None,
         };
         Ok(RoomInfo::new(&self.inner, avatar_url, latest_event).await?)
-    }
-
-    pub fn room_info_blocking(self: Arc<Self>) -> Result<RoomInfo, ClientError> {
-        RUNTIME.block_on(async move { self.room_info().await })
     }
 
     pub fn subscribe_to_room_info_updates(
@@ -392,29 +385,13 @@ impl Room {
         let event_id = EventId::parse(event_id)?;
 
         RUNTIME.block_on(async move {
-            self.inner
+            self.timeline
+                .read()
+                .await
+                .clone()
+                .context("Timeline not set up, can't send read receipt")?
                 .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
                 .await?;
-            Ok(())
-        })
-    }
-
-    pub fn send_read_marker(
-        &self,
-        fully_read_event_id: String,
-        read_receipt_event_id: Option<String>,
-    ) -> Result<(), ClientError> {
-        let fully_read =
-            EventId::parse(fully_read_event_id).context("parsing fully read event ID")?;
-        let read_receipt = read_receipt_event_id
-            .map(EventId::parse)
-            .transpose()
-            .context("parsing read receipt event ID")?;
-        let receipts =
-            Receipts::new().fully_read_marker(fully_read).public_read_receipt(read_receipt);
-
-        RUNTIME.block_on(async move {
-            self.inner.send_multiple_receipts(receipts).await?;
             Ok(())
         })
     }
@@ -534,14 +511,7 @@ impl Room {
         };
 
         RUNTIME.block_on(async move {
-            timeline
-                .send_reply(
-                    (*msg).clone().with_relation(None),
-                    &reply_item.0,
-                    ForwardThread::Yes,
-                    AddMentions::No,
-                )
-                .await?;
+            timeline.send_reply((*msg).clone(), &reply_item.0, ForwardThread::Yes).await?;
             anyhow::Ok(())
         })?;
 
@@ -841,6 +811,30 @@ impl Room {
         }))
     }
 
+    pub fn send_voice_message(
+        self: Arc<Self>,
+        url: String,
+        audio_info: AudioInfo,
+        waveform: Vec<u16>,
+        progress_watcher: Option<Box<dyn ProgressWatcher>>,
+    ) -> Arc<SendAttachmentJoinHandle> {
+        SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+            let mime_str =
+                audio_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+            let mime_type =
+                mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+            let base_audio_info: BaseAudioInfo = BaseAudioInfo::try_from(&audio_info)
+                .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            let attachment_info =
+                AttachmentInfo::Voice { audio_info: base_audio_info, waveform: Some(waveform) };
+            let attachment_config = AttachmentConfig::new().info(attachment_info);
+
+            self.send_attachment(url, mime_type, attachment_config, progress_watcher).await
+        }))
+    }
+
     pub fn send_file(
         self: Arc<Self>,
         url: String,
@@ -980,17 +974,9 @@ impl Room {
         Ok(self.inner.can_user_redact(&user_id).await?)
     }
 
-    pub fn can_user_redact_blocking(self: Arc<Self>, user_id: String) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_redact(user_id).await })
-    }
-
     pub async fn can_user_ban(&self, user_id: String) -> Result<bool, ClientError> {
         let user_id = UserId::parse(&user_id)?;
         Ok(self.inner.can_user_ban(&user_id).await?)
-    }
-
-    pub fn can_user_ban_blocking(self: Arc<Self>, user_id: String) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_ban(user_id).await })
     }
 
     pub async fn can_user_invite(&self, user_id: String) -> Result<bool, ClientError> {
@@ -998,17 +984,9 @@ impl Room {
         Ok(self.inner.can_user_invite(&user_id).await?)
     }
 
-    pub fn can_user_invite_blocking(self: Arc<Self>, user_id: String) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_invite(user_id).await })
-    }
-
     pub async fn can_user_kick(&self, user_id: String) -> Result<bool, ClientError> {
         let user_id = UserId::parse(&user_id)?;
         Ok(self.inner.can_user_kick(&user_id).await?)
-    }
-
-    pub fn can_user_kick_blocking(self: Arc<Self>, user_id: String) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_kick(user_id).await })
     }
 
     pub async fn can_user_send_state(
@@ -1020,14 +998,6 @@ impl Room {
         Ok(self.inner.can_user_send_state(&user_id, state_event.into()).await?)
     }
 
-    pub fn can_user_send_state_blocking(
-        self: Arc<Self>,
-        user_id: String,
-        state_event: StateEventType,
-    ) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_send_state(user_id, state_event).await })
-    }
-
     pub async fn can_user_send_message(
         &self,
         user_id: String,
@@ -1037,27 +1007,12 @@ impl Room {
         Ok(self.inner.can_user_send_message(&user_id, message.into()).await?)
     }
 
-    pub fn can_user_send_message_blocking(
-        self: Arc<Self>,
-        user_id: String,
-        message: MessageLikeEventType,
-    ) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_send_message(user_id, message).await })
-    }
-
     pub async fn can_user_trigger_room_notification(
         &self,
         user_id: String,
     ) -> Result<bool, ClientError> {
         let user_id = UserId::parse(&user_id)?;
         Ok(self.inner.can_user_trigger_room_notification(&user_id).await?)
-    }
-
-    pub fn can_user_trigger_room_notification_blocking(
-        self: Arc<Self>,
-        user_id: String,
-    ) -> Result<bool, ClientError> {
-        RUNTIME.block_on(async move { self.can_user_trigger_room_notification(user_id).await })
     }
 
     pub fn own_user_id(&self) -> String {
@@ -1132,10 +1087,6 @@ impl SendAttachmentJoinHandle {
     pub async fn join(&self) -> Result<(), RoomError> {
         let join_hdl = self.join_hdl.clone();
         RUNTIME.spawn(async move { (&mut *join_hdl.lock().await).await.unwrap() }).await.unwrap()
-    }
-
-    pub fn join_blocking(self: Arc<Self>) -> Result<(), RoomError> {
-        RUNTIME.block_on(async move { self.join().await })
     }
 
     pub fn cancel(&self) {

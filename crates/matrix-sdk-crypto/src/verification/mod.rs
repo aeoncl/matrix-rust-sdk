@@ -748,7 +748,7 @@ pub(crate) mod tests {
         requests::{OutgoingRequest, OutgoingRequests},
         store::{Changes, CryptoStore, CryptoStoreWrapper, IdentityChanges, MemoryStore},
         types::events::ToDeviceEvents,
-        OutgoingVerificationRequest, ReadOnlyAccount, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
+        Account, OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
         ReadOnlyUserIdentity,
     };
 
@@ -821,15 +821,14 @@ pub(crate) mod tests {
         device_id!("BOBDEVCIE")
     }
 
-    pub(crate) async fn setup_stores(
-    ) -> (ReadOnlyAccount, VerificationStore, ReadOnlyAccount, VerificationStore) {
-        let alice = ReadOnlyAccount::with_device_id(alice_id(), alice_device_id());
+    pub(crate) async fn setup_stores() -> (Account, VerificationStore, Account, VerificationStore) {
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
         let alice_store = MemoryStore::new();
         let (alice_private_identity, _, _) =
             PrivateCrossSigningIdentity::with_account(&alice).await;
         let alice_private_identity = Mutex::new(alice_private_identity);
 
-        let bob = ReadOnlyAccount::with_device_id(bob_id(), bob_device_id());
+        let bob = Account::with_device_id(bob_id(), bob_device_id());
         let bob_store = MemoryStore::new();
         let (bob_private_identity, _, _) = PrivateCrossSigningIdentity::with_account(&bob).await;
         let bob_private_identity = Mutex::new(bob_private_identity);
@@ -843,8 +842,8 @@ pub(crate) mod tests {
         let bob_readonly_identity =
             ReadOnlyOwnUserIdentity::from_private(&*bob_private_identity.lock().await).await;
 
-        let alice_device = ReadOnlyDevice::from_account(&alice).await;
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let alice_device = ReadOnlyDevice::from_account(&alice);
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         let alice_changes = Changes {
             identities: IdentityChanges {
@@ -855,7 +854,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         alice_store.save_changes(alice_changes).await.unwrap();
-        alice_store.save_devices(vec![bob_device]).await;
+        alice_store.save_devices(vec![bob_device]);
 
         let bob_changes = Changes {
             identities: IdentityChanges {
@@ -866,7 +865,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         bob_store.save_changes(bob_changes).await.unwrap();
-        bob_store.save_devices(vec![alice_device]).await;
+        bob_store.save_devices(vec![alice_device]);
 
         let alice_store = VerificationStore {
             inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), alice_store)),

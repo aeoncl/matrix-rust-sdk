@@ -1041,24 +1041,24 @@ impl Room {
         self.ensure_room_joined()?;
 
         // Only send a request to the homeserver if the old timeout has elapsed
-        // or the typing notice changed state within the
-        // TYPING_NOTICE_TIMEOUT
-        let send =
-            if let Some(typing_time) = self.client.inner.typing_notice_times.get(self.room_id()) {
-                if typing_time.elapsed() > TYPING_NOTICE_RESEND_TIMEOUT {
-                    // We always reactivate the typing notice if typing is true or
-                    // we may need to deactivate it if it's
-                    // currently active if typing is false
-                    typing || typing_time.elapsed() <= TYPING_NOTICE_TIMEOUT
-                } else {
-                    // Only send a request when we need to deactivate typing
-                    !typing
-                }
+        // or the typing notice changed state within the `TYPING_NOTICE_TIMEOUT`
+        let send = if let Some(typing_time) =
+            self.client.inner.typing_notice_times.read().unwrap().get(self.room_id())
+        {
+            if typing_time.elapsed() > TYPING_NOTICE_RESEND_TIMEOUT {
+                // We always reactivate the typing notice if typing is true or
+                // we may need to deactivate it if it's
+                // currently active if typing is false
+                typing || typing_time.elapsed() <= TYPING_NOTICE_TIMEOUT
             } else {
-                // Typing notice is currently deactivated, therefore, send a request
-                // only when it's about to be activated
-                typing
-            };
+                // Only send a request when we need to deactivate typing
+                !typing
+            }
+        } else {
+            // Typing notice is currently deactivated, therefore, send a request
+            // only when it's about to be activated
+            typing
+        };
 
         if send {
             self.send_typing_notice(typing).await?;
@@ -1070,10 +1070,15 @@ impl Room {
     #[instrument(name = "typing_notice", skip(self))]
     async fn send_typing_notice(&self, typing: bool) -> Result<()> {
         let typing = if typing {
-            self.client.inner.typing_notice_times.insert(self.room_id().to_owned(), Instant::now());
+            self.client
+                .inner
+                .typing_notice_times
+                .write()
+                .unwrap()
+                .insert(self.room_id().to_owned(), Instant::now());
             Typing::Yes(TYPING_NOTICE_TIMEOUT)
         } else {
-            self.client.inner.typing_notice_times.remove(self.room_id());
+            self.client.inner.typing_notice_times.write().unwrap().remove(self.room_id());
             Typing::No
         };
 
@@ -2448,6 +2453,8 @@ mod tests {
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
     #[async_test]
     async fn test_cache_invalidation_while_encrypt() {
+        use matrix_sdk_test::DEFAULT_TEST_ROOM_ID;
+
         let sqlite_path = std::env::temp_dir().join("cache_invalidation_while_encrypt.db");
         let session = MatrixSession {
             meta: SessionMeta {
@@ -2470,7 +2477,6 @@ mod tests {
 
         // Mock receiving an event to create an internal room.
         let server = MockServer::start().await;
-        let room_id = &test_json::DEFAULT_SYNC_ROOM_ID;
         {
             Mock::given(method("GET"))
                 .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
@@ -2492,7 +2498,7 @@ mod tests {
             client.base_client().receive_sync_response(response).await.unwrap();
         }
 
-        let room = client.get_room(room_id).expect("Room should exist");
+        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
 
         // Step 1, preshare the room keys.
         room.preshare_room_key().await.unwrap();

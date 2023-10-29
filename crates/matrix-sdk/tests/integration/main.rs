@@ -16,9 +16,13 @@ use wiremock::{
 };
 
 mod client;
+#[cfg(feature = "e2e-encryption")]
+mod encryption;
 mod matrix_auth;
 mod refresh_token;
 mod room;
+#[cfg(feature = "experimental-widgets")]
+mod widget;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[ctor::ctor]

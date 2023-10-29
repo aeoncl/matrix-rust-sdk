@@ -36,7 +36,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
-    olm::{Account, InboundGroupSession, SignedJsonObject},
+    olm::{InboundGroupSession, SignedJsonObject},
     store::{BackupDecryptionKey, BackupKeys, Changes, RoomKeyCounts, Store},
     types::{MegolmV1AuthData, RoomKeyBackupInfo, Signatures},
     CryptoStoreError, Device, KeysBackupRequest, OutgoingRequest,
@@ -54,7 +54,6 @@ pub use keys::{DecodeError, DecryptionError, MegolmV1BackupKey};
 /// using the [`BackupMachine::backup`] method.
 #[derive(Debug, Clone)]
 pub struct BackupMachine {
-    account: Account,
     store: Store,
     backup_key: Arc<RwLock<Option<MegolmV1BackupKey>>>,
     pending_backup: Arc<RwLock<Option<PendingBackup>>>,
@@ -145,13 +144,8 @@ impl SignatureState {
 impl BackupMachine {
     const BACKUP_BATCH_SIZE: usize = 100;
 
-    pub(crate) fn new(
-        account: Account,
-        store: Store,
-        backup_key: Option<MegolmV1BackupKey>,
-    ) -> Self {
+    pub(crate) fn new(store: Store, backup_key: Option<MegolmV1BackupKey>) -> Self {
         Self {
-            account,
             store,
             backup_key: RwLock::new(backup_key).into(),
             pending_backup: RwLock::new(None).into(),
@@ -169,7 +163,7 @@ impl BackupMachine {
         signatures: &Signatures,
         auth_data: &str,
     ) -> SignatureState {
-        match self.store.account().has_signed_raw(signatures, auth_data) {
+        match self.store.static_account().has_signed_raw(signatures, auth_data) {
             Ok(_) => SignatureState::ValidAndTrusted,
             Err(e) => match e {
                 crate::SignatureError::NoSignatureFound => SignatureState::Missing,
@@ -185,7 +179,7 @@ impl BackupMachine {
         signatures: &Signatures,
         auth_data: &str,
     ) -> Result<SignatureState, CryptoStoreError> {
-        let user_id = &self.account.static_data.user_id;
+        let user_id = &self.store.static_account().user_id;
         let identity = self.store.get_identity(user_id).await?;
 
         let ret = if let Some(identity) = identity.and_then(|i| i.own()) {
@@ -238,12 +232,12 @@ impl BackupMachine {
     ) -> Result<BTreeMap<OwnedDeviceId, SignatureState>, CryptoStoreError> {
         let mut result = BTreeMap::new();
 
-        if let Some(user_signatures) = signatures.get(&self.account.static_data.user_id) {
+        if let Some(user_signatures) = signatures.get(&self.store.static_account().user_id) {
             for device_key_id in user_signatures.keys() {
                 if device_key_id.algorithm() == DeviceKeyAlgorithm::Ed25519 {
                     // No need to check our own device here, we're doing that using
                     // the check_own_device_signature().
-                    if device_key_id.device_id() == self.account.static_data.device_id {
+                    if device_key_id.device_id() == self.store.static_account().device_id {
                         continue;
                     }
 
@@ -294,8 +288,6 @@ impl BackupMachine {
         auth_data: MegolmV1AuthData,
         compute_all_signatures: bool,
     ) -> Result<SignatureVerification, CryptoStoreError> {
-        trace!(?auth_data, "Verifying backup auth data");
-
         let serialized_auth_data = match auth_data.to_canonical_json() {
             Ok(s) => s,
             Err(e) => {
@@ -648,7 +640,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn verify_auth_data() -> Result<(), OlmError> {
+    async fn test_verify_auth_data() -> Result<(), OlmError> {
         let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
         let backup_machine = machine.backup_machine();
 
@@ -676,7 +668,7 @@ mod tests {
         assert!(!state.user_identity_signature.trusted());
         assert!(!state.other_signatures.values().any(|s| s.trusted()));
 
-        let signatures = machine.sign(&serialized).await;
+        let signatures = machine.sign(&serialized).await?;
 
         let backup_version = json!({
             "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
@@ -702,7 +694,7 @@ mod tests {
             .await
             .expect("Bootstrapping a new identity always works");
 
-        let signatures = machine.sign(&serialized).await;
+        let signatures = machine.sign(&serialized).await?;
 
         let backup_version = json!({
             "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",

@@ -27,6 +27,7 @@ mod identities;
 mod machine;
 pub mod olm;
 pub mod requests;
+pub mod secret_storage;
 mod session_manager;
 pub mod store;
 pub mod types;
@@ -80,10 +81,10 @@ pub use identities::{
     Device, LocalTrust, OwnUserIdentity, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
     ReadOnlyUserIdentities, ReadOnlyUserIdentity, UserDevices, UserIdentities, UserIdentity,
 };
-pub use machine::{EncryptionSyncChanges, OlmMachine};
+pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
-pub use olm::{CrossSigningStatus, EncryptionSettings, ReadOnlyAccount, Session};
+pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 pub use requests::{
     IncomingResponse, KeysBackupRequest, KeysQueryRequest, OutgoingRequest, OutgoingRequests,
     OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest, UploadSigningKeysRequest,

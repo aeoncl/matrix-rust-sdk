@@ -39,17 +39,15 @@
 //! [`CryptoStore`]: trait.Cryptostore.html
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Debug,
     ops::Deref,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc, RwLock as StdRwLock},
     time::Duration,
 };
 
 use as_variant::as_variant;
 use async_std::sync::{Condvar, Mutex as AsyncStdMutex};
-use atomic::Ordering;
-use dashmap::DashSet;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use ruma::{
@@ -57,7 +55,7 @@ use ruma::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, MutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tracing::{info, warn};
 use vodozemac::{base64_encode, megolm::SessionOrdering, Curve25519PublicKey};
 use zeroize::Zeroize;
@@ -68,8 +66,8 @@ use crate::{
         user::UserIdentities, Device, ReadOnlyDevice, ReadOnlyUserIdentities, UserDevices,
     },
     olm::{
-        InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
-        ReadOnlyAccount, Session,
+        Account, InboundGroupSession, OlmMessageHash, OutboundGroupSession,
+        PrivateCrossSigningIdentity, Session, StaticAccountData,
     },
     types::{events::room_key_withheld::RoomKeyWithheldEvent, EventEncryptionAlgorithm},
     verification::VerificationMachine,
@@ -107,39 +105,265 @@ pub struct Store {
     inner: Arc<StoreInner>,
 }
 
-#[derive(Debug, Default)]
-struct StoreCache {
-    tracked_users: DashSet<OwnedUserId>,
+#[derive(Debug)]
+pub(crate) struct StoreCache {
+    store: Arc<CryptoStoreWrapper>,
+
+    tracked_users: StdRwLock<BTreeSet<OwnedUserId>>,
     tracked_user_loading_lock: RwLock<bool>,
+    account: Mutex<Option<Account>>,
 }
 
-struct StoreCacheGuard<'a> {
-    cache: &'a StoreCache,
+impl StoreCache {
+    /// Returns a reference to the `Account.`
+    ///
+    /// Either load the account from the cache, or the store, if missing from
+    /// the cache.
+    ///
+    /// Note there should always be an account stored at least in the store, so
+    /// this doesn't return an `Option`.
+    pub async fn account(&self) -> Result<impl Deref<Target = Account> + '_> {
+        let mut guard = self.account.lock().await;
+        if guard.is_some() {
+            Ok(MutexGuard::map(guard, |acc| acc.as_mut().unwrap()))
+        } else {
+            match self.store.load_account().await? {
+                Some(account) => {
+                    *guard = Some(account);
+                    Ok(MutexGuard::map(guard, |acc| acc.as_mut().unwrap()))
+                }
+                None => Err(CryptoStoreError::AccountUnset),
+            }
+        }
+    }
+
+    /// Load the list of users for whom we are tracking their device lists and
+    /// fill out our caches.
+    ///
+    /// This method ensures that we're only going to load the users from the
+    /// actual [`CryptoStore`] once, it will also make sure that any
+    /// concurrent calls to this method get deduplicated.
+    async fn ensure_sync_tracked_users(&self, store: &Store) -> Result<()> {
+        // Check if the users are loaded, and in that case do nothing.
+        let loaded = self.tracked_user_loading_lock.read().await;
+        if *loaded {
+            return Ok(());
+        }
+
+        // Otherwise, we may load the users.
+        drop(loaded);
+        let mut loaded = self.tracked_user_loading_lock.write().await;
+
+        // Check again if the users have been loaded, in case another call to this
+        // method loaded the tracked users between the time we tried to
+        // acquire the lock and the time we actually acquired the lock.
+        if *loaded {
+            return Ok(());
+        }
+
+        let tracked_users = store.inner.store.load_tracked_users().await?;
+
+        let mut query_users_lock = store.inner.users_for_key_query.lock().await;
+        let mut tracked_users_cache = self.tracked_users.write().unwrap();
+        for user in tracked_users {
+            tracked_users_cache.insert(user.user_id.to_owned());
+
+            if user.dirty {
+                query_users_lock.insert_user(&user.user_id);
+            }
+        }
+
+        *loaded = true;
+
+        Ok(())
+    }
+
+    /// Process notifications that users have changed devices.
+    ///
+    /// This is used to handle the list of device-list updates that is received
+    /// from the `/sync` response. Any users *whose device lists we are
+    /// tracking* are flagged as needing a key query. Users whose devices we
+    /// are not tracking are ignored.
+    pub(crate) async fn mark_tracked_users_as_changed(
+        &self,
+        store: &Store,
+        users: impl Iterator<Item = &UserId>,
+    ) -> Result<()> {
+        let mut store_updates: Vec<(&UserId, bool)> = Vec::new();
+        let mut key_query_lock = store.inner.users_for_key_query.lock().await;
+
+        {
+            let tracked_users = &self.tracked_users.read().unwrap();
+            for user_id in users {
+                if tracked_users.contains(user_id) {
+                    key_query_lock.insert_user(user_id);
+                    store_updates.push((user_id, true));
+                }
+            }
+        }
+
+        store.inner.store.save_tracked_users(&store_updates).await
+    }
+
+    /// Mark the given user as being tracked for device lists, and mark that it
+    /// has an outdated device list.
+    ///
+    /// This means that the user will be considered for a `/keys/query` request
+    /// next time [`Store::users_for_key_query()`] is called.
+    pub(crate) async fn mark_user_as_changed(&self, store: &Store, user: &UserId) -> Result<()> {
+        store.inner.users_for_key_query.lock().await.insert_user(user);
+        self.tracked_users.write().unwrap().insert(user.to_owned());
+
+        store.inner.store.save_tracked_users(&[(user, true)]).await
+    }
+
+    /// Add entries to the list of users being tracked for device changes
+    ///
+    /// Any users not already on the list are flagged as awaiting a key query.
+    /// Users that were already in the list are unaffected.
+    pub(crate) async fn update_tracked_users(
+        &self,
+        store: &Store,
+        users: impl Iterator<Item = &UserId>,
+    ) -> Result<()> {
+        let mut store_updates = Vec::new();
+        let mut key_query_lock = store.inner.users_for_key_query.lock().await;
+
+        {
+            let mut tracked_users = self.tracked_users.write().unwrap();
+            for user_id in users {
+                if tracked_users.insert(user_id.to_owned()) {
+                    key_query_lock.insert_user(user_id);
+                    store_updates.push((user_id, true))
+                }
+            }
+        }
+
+        store.inner.store.save_tracked_users(&store_updates).await
+    }
+
+    /// See the docs for [`crate::OlmMachine::tracked_users()`].
+    pub(crate) fn tracked_users(&self) -> HashSet<OwnedUserId> {
+        self.tracked_users.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Flag that the given users devices are now up-to-date.
+    ///
+    /// This is called after processing the response to a /keys/query request.
+    /// Any users whose device lists we are tracking are removed from the
+    /// list of those pending a /keys/query.
+    pub(crate) async fn mark_tracked_users_as_up_to_date(
+        &self,
+        store: &Store,
+        users: impl Iterator<Item = &UserId>,
+        sequence_number: SequenceNumber,
+    ) -> Result<()> {
+        let mut store_updates: Vec<(&UserId, bool)> = Vec::new();
+        let mut key_query_lock = store.inner.users_for_key_query.lock().await;
+
+        {
+            let tracked_users = self.tracked_users.read().unwrap();
+            for user_id in users {
+                if tracked_users.contains(user_id) {
+                    let clean = key_query_lock.maybe_remove_user(user_id, sequence_number);
+                    store_updates.push((user_id, !clean));
+                }
+            }
+        }
+
+        store.inner.store.save_tracked_users(&store_updates).await?;
+        // wake up any tasks that may have been waiting for updates
+        store.inner.users_for_key_query_condvar.notify_all();
+
+        Ok(())
+    }
+}
+
+pub(crate) struct StoreCacheGuard {
+    cache: OwnedRwLockReadGuard<StoreCache>,
     // TODO: (bnjbvr, #2624) add cross-process lock guard here.
 }
 
-impl<'a> Deref for StoreCacheGuard<'a> {
+impl Deref for StoreCacheGuard {
     type Target = StoreCache;
 
     fn deref(&self) -> &Self::Target {
-        self.cache
+        &self.cache
+    }
+}
+
+/// A temporary transaction (that implies a write) to the underlying store.
+#[allow(missing_debug_implementations)]
+pub struct StoreTransaction {
+    store: Store,
+    changes: PendingChanges,
+    // TODO hold onto the cross-process crypto store lock + cache.
+    cache: OwnedRwLockWriteGuard<StoreCache>,
+}
+
+impl StoreTransaction {
+    /// Starts a new `StoreTransaction`.
+    pub async fn new(store: Store) -> Result<Self> {
+        let cache = store.inner.cache.clone();
+
+        Ok(Self {
+            store,
+            changes: PendingChanges::default(),
+            cache: cache.clone().write_owned().await,
+        })
+    }
+
+    pub(crate) fn cache(&self) -> &StoreCache {
+        &self.cache
+    }
+
+    /// Returns a reference to the current `Store`.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Gets a `Account` for update.
+    pub async fn account(&mut self) -> Result<&mut Account> {
+        if self.changes.account.is_none() {
+            // Make sure the cache loaded the account.
+            let _ = self.cache.account().await?;
+            self.changes.account = self.cache.account.lock().await.take();
+        }
+        Ok(self.changes.account.as_mut().unwrap())
+    }
+
+    /// Commits all dirty fields to the store, and maintains the cache so it
+    /// reflects the current state of the database.
+    pub async fn commit(self) -> Result<()> {
+        if self.changes.is_empty() {
+            return Ok(());
+        }
+
+        // Save changes in the database.
+        let account = self.changes.account.as_ref().map(|acc| acc.deep_clone());
+
+        self.store.save_pending_changes(self.changes).await?;
+
+        // Make the cache coherent with the database.
+        if let Some(account) = account {
+            *self.cache.account.lock().await = Some(account);
+        }
+
+        Ok(())
     }
 }
 
 #[derive(Debug)]
 struct StoreInner {
-    user_id: OwnedUserId,
     identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
     store: Arc<CryptoStoreWrapper>,
 
     /// In-memory cache for the current crypto store.
     ///
     /// ⚠ Must remain private.
-    cache: StoreCache,
+    cache: Arc<RwLock<StoreCache>>,
 
     verification_machine: VerificationMachine,
-
-    account: ReadOnlyAccount, // TODO(bnjbvr, #2624) move this into the store cache
 
     /// Record of the users that are waiting for a /keys/query.
     //
@@ -150,6 +374,28 @@ struct StoreInner {
 
     // condition variable that is notified each time an update is received for a user.
     users_for_key_query_condvar: Condvar,
+
+    /// Static account data that never changes (and thus can be loaded once and
+    /// for all when creating the store).
+    static_account: StaticAccountData,
+}
+
+/// Aggregated changes to be saved in the database.
+///
+/// This is an update version of `Changes` that will replace it as #2624
+/// progresses.
+// If you ever add a field here, make sure to update `Changes::is_empty` too.
+#[derive(Default, Debug)]
+#[allow(missing_docs)]
+pub struct PendingChanges {
+    pub account: Option<Account>,
+}
+
+impl PendingChanges {
+    /// Are there any changes stored or is this an empty `Changes` struct?
+    pub fn is_empty(&self) -> bool {
+        self.account.is_none()
+    }
 }
 
 /// Aggregated changes to be saved in the database.
@@ -157,7 +403,6 @@ struct StoreInner {
 #[derive(Default, Debug)]
 #[allow(missing_docs)]
 pub struct Changes {
-    pub account: Option<ReadOnlyAccount>,
     pub private_identity: Option<PrivateCrossSigningIdentity>,
     pub backup_version: Option<String>,
     pub backup_decryption_key: Option<BackupDecryptionKey>,
@@ -188,10 +433,9 @@ pub struct TrackedUser {
 }
 
 impl Changes {
-    /// Are there any changes stored or is this an empty `Changes` struct
+    /// Are there any changes stored or is this an empty `Changes` struct?
     pub fn is_empty(&self) -> bool {
-        self.account.is_none()
-            && self.private_identity.is_none()
+        self.private_identity.is_none()
             && self.backup_version.is_none()
             && self.backup_decryption_key.is_none()
             && self.sessions.is_empty()
@@ -427,7 +671,7 @@ pub struct BackupKeys {
 
 /// A struct containing private cross signing keys that can be backed up or
 /// uploaded to the secret store.
-#[derive(Zeroize)]
+#[derive(Default, Zeroize)]
 #[zeroize(drop)]
 pub struct CrossSigningKeyExport {
     /// The seed of the master key encoded as unpadded base64.
@@ -529,31 +773,34 @@ impl From<&InboundGroupSession> for RoomKeyInfo {
 }
 
 impl Store {
-    /// Create a new Store
+    /// Create a new Store.
     pub(crate) fn new(
-        user_id: OwnedUserId,
-        account: ReadOnlyAccount,
+        account: StaticAccountData,
         identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
         store: Arc<CryptoStoreWrapper>,
         verification_machine: VerificationMachine,
     ) -> Self {
-        let inner = Arc::new(StoreInner {
-            user_id,
-            identity,
-            store,
-            account,
-            verification_machine,
-            users_for_key_query: AsyncStdMutex::new(UsersForKeyQuery::new()),
-            users_for_key_query_condvar: Condvar::new(),
-            cache: Default::default(),
-        });
-
-        Self { inner }
+        Self {
+            inner: Arc::new(StoreInner {
+                static_account: account,
+                identity,
+                store: store.clone(),
+                verification_machine,
+                users_for_key_query: AsyncStdMutex::new(UsersForKeyQuery::new()),
+                users_for_key_query_condvar: Condvar::new(),
+                cache: Arc::new(RwLock::new(StoreCache {
+                    store,
+                    tracked_users: Default::default(),
+                    tracked_user_loading_lock: Default::default(),
+                    account: Default::default(),
+                })),
+            }),
+        }
     }
 
     /// UserId associated with this store
     pub(crate) fn user_id(&self) -> &UserId {
-        &self.inner.user_id
+        &self.inner.static_account.user_id
     }
 
     /// DeviceId associated with this store
@@ -561,29 +808,49 @@ impl Store {
         self.inner.verification_machine.own_device_id()
     }
 
-    /// The Account associated with this store
-    pub(crate) fn account(&self) -> &ReadOnlyAccount {
-        &self.inner.account
+    /// The static data for the account associated with this store.
+    pub(crate) fn static_account(&self) -> &StaticAccountData {
+        &self.inner.static_account
     }
 
-    async fn cache(&self) -> Result<StoreCacheGuard<'_>> {
+    pub(crate) async fn cache(&self) -> Result<StoreCacheGuard> {
         // TODO: (bnjbvr, #2624) If configured with a cross-process lock:
         // - try to take the lock,
         // - if acquired, look if another process touched the underlying storage,
         // - if yes, reload everything; if no, return current cache
 
-        let cache = StoreCacheGuard { cache: &self.inner.cache };
+        let cache = StoreCacheGuard { cache: self.inner.cache.clone().read_owned().await };
 
         // Make sure tracked users are always up to date.
-        self.ensure_sync_tracked_users(&cache).await?;
+        cache.ensure_sync_tracked_users(self).await?;
 
         Ok(cache)
+    }
+
+    pub(crate) async fn transaction(&self) -> Result<StoreTransaction> {
+        StoreTransaction::new(self.clone()).await
+    }
+
+    // Note: bnjbvr lost against borrowck here. Ideally, the `F` parameter would
+    // take a `&StoreTransaction`, but callers didn't quite like that.
+    pub(crate) async fn with_transaction<
+        T,
+        Fut: futures_core::Future<Output = Result<(StoreTransaction, T), crate::OlmError>>,
+        F: FnOnce(StoreTransaction) -> Fut,
+    >(
+        &self,
+        func: F,
+    ) -> Result<T, crate::OlmError> {
+        let tr = self.transaction().await?;
+        let (tr, res) = func(tr).await?;
+        tr.commit().await?;
+        Ok(res)
     }
 
     #[cfg(test)]
     /// test helper to reset the cross signing identity
     pub(crate) async fn reset_cross_signing_identity(&self) {
-        self.inner.identity.lock().await.reset().await;
+        self.inner.identity.lock().await.reset();
     }
 
     /// PrivateCrossSigningIdentity associated with this store
@@ -849,6 +1116,8 @@ impl Store {
             info!(?status, "Successfully imported the private cross-signing keys");
 
             self.save_changes(changes).await?;
+        } else {
+            warn!("No public identity found while importing cross-signing keys, a /keys/query needs to be done");
         }
 
         Ok(self.inner.identity.lock().await.status().await)
@@ -898,136 +1167,6 @@ impl Store {
         Ok(())
     }
 
-    /// Mark the given user as being tracked for device lists, and mark that it
-    /// has an outdated device list.
-    ///
-    /// This means that the user will be considered for a `/keys/query` request
-    /// next time [`Store::users_for_key_query()`] is called.
-    pub(crate) async fn mark_user_as_changed(&self, user: &UserId) -> Result<()> {
-        self.inner.users_for_key_query.lock().await.insert_user(user);
-        self.cache().await?.tracked_users.insert(user.to_owned());
-
-        self.inner.store.save_tracked_users(&[(user, true)]).await
-    }
-
-    /// Add entries to the list of users being tracked for device changes
-    ///
-    /// Any users not already on the list are flagged as awaiting a key query.
-    /// Users that were already in the list are unaffected.
-    pub(crate) async fn update_tracked_users(
-        &self,
-        users: impl Iterator<Item = &UserId>,
-    ) -> Result<()> {
-        let cache = self.cache().await?;
-
-        let mut store_updates = Vec::new();
-        let mut key_query_lock = self.inner.users_for_key_query.lock().await;
-
-        for user_id in users {
-            if !cache.tracked_users.contains(user_id) {
-                cache.tracked_users.insert(user_id.to_owned());
-                key_query_lock.insert_user(user_id);
-                store_updates.push((user_id, true))
-            }
-        }
-
-        self.inner.store.save_tracked_users(&store_updates).await
-    }
-
-    /// Process notifications that users have changed devices.
-    ///
-    /// This is used to handle the list of device-list updates that is received
-    /// from the `/sync` response. Any users *whose device lists we are
-    /// tracking* are flagged as needing a key query. Users whose devices we
-    /// are not tracking are ignored.
-    pub(crate) async fn mark_tracked_users_as_changed(
-        &self,
-        users: impl Iterator<Item = &UserId>,
-    ) -> Result<()> {
-        let cache = self.cache().await?;
-
-        let mut store_updates: Vec<(&UserId, bool)> = Vec::new();
-        let mut key_query_lock = self.inner.users_for_key_query.lock().await;
-
-        for user_id in users {
-            if cache.tracked_users.contains(user_id) {
-                key_query_lock.insert_user(user_id);
-                store_updates.push((user_id, true));
-            }
-        }
-
-        self.inner.store.save_tracked_users(&store_updates).await
-    }
-
-    /// Flag that the given users devices are now up-to-date.
-    ///
-    /// This is called after processing the response to a /keys/query request.
-    /// Any users whose device lists we are tracking are removed from the
-    /// list of those pending a /keys/query.
-    pub(crate) async fn mark_tracked_users_as_up_to_date(
-        &self,
-        users: impl Iterator<Item = &UserId>,
-        sequence_number: SequenceNumber,
-    ) -> Result<()> {
-        let mut store_updates: Vec<(&UserId, bool)> = Vec::new();
-        let mut key_query_lock = self.inner.users_for_key_query.lock().await;
-
-        {
-            let cache = self.cache().await?;
-            for user_id in users {
-                if cache.tracked_users.contains(user_id) {
-                    let clean = key_query_lock.maybe_remove_user(user_id, sequence_number);
-                    store_updates.push((user_id, !clean));
-                }
-            }
-        }
-        self.inner.store.save_tracked_users(&store_updates).await?;
-        // wake up any tasks that may have been waiting for updates
-        self.inner.users_for_key_query_condvar.notify_all();
-
-        Ok(())
-    }
-
-    /// Load the list of users for whom we are tracking their device lists and
-    /// fill out our caches.
-    ///
-    /// This method ensures that we're only going to load the users from the
-    /// actual [`CryptoStore`] once, it will also make sure that any
-    /// concurrent calls to this method get deduplicated.
-    async fn ensure_sync_tracked_users(&self, cache: &StoreCacheGuard<'_>) -> Result<()> {
-        // Check if the users are loaded, and in that case do nothing.
-        let loaded = cache.tracked_user_loading_lock.read().await;
-        if *loaded {
-            return Ok(());
-        }
-
-        // Otherwise, we may load the users.
-        drop(loaded);
-        let mut loaded = cache.tracked_user_loading_lock.write().await;
-
-        // Check again if the users have been loaded, in case another call to this
-        // method loaded the tracked users between the time we tried to
-        // acquire the lock and the time we actually acquired the lock.
-        if *loaded {
-            return Ok(());
-        }
-
-        let tracked_users = self.inner.store.load_tracked_users().await?;
-
-        let mut query_users_lock = self.inner.users_for_key_query.lock().await;
-        for user in tracked_users {
-            cache.tracked_users.insert(user.user_id.to_owned());
-
-            if user.dirty {
-                query_users_lock.insert_user(&user.user_id);
-            }
-        }
-
-        *loaded = true;
-
-        Ok(())
-    }
-
     /// Get the set of users that has the outdate/dirty flag set for their list
     /// of devices.
     ///
@@ -1042,9 +1181,6 @@ impl Store {
     pub(crate) async fn users_for_key_query(
         &self,
     ) -> Result<(HashSet<OwnedUserId>, SequenceNumber)> {
-        // Make sure the tracked users set is up to date.
-        let _cache = self.cache().await?;
-
         Ok(self.inner.users_for_key_query.lock().await.users_for_key_query())
     }
 
@@ -1058,19 +1194,20 @@ impl Store {
         timeout_duration: Duration,
         user: &UserId,
     ) -> UserKeyQueryResult {
-        let mut g = self.inner.users_for_key_query.lock().await;
+        let mut users_for_key_query = self.inner.users_for_key_query.lock().await;
 
-        let Some(w) = g.maybe_register_waiting_task(user) else {
+        let Some(waiter) = users_for_key_query.maybe_register_waiting_task(user) else {
             return UserKeyQueryResult::WasNotPending;
         };
 
-        let f1 = async {
-            while !w.completed.load(Ordering::Relaxed) {
-                g = self.inner.users_for_key_query_condvar.wait(g).await;
+        let wait_for_completion = async {
+            while !waiter.completed.load(Ordering::Relaxed) {
+                users_for_key_query =
+                    self.inner.users_for_key_query_condvar.wait(users_for_key_query).await;
             }
         };
 
-        match timeout(Box::pin(f1), timeout_duration).await {
+        match timeout(Box::pin(wait_for_completion), timeout_duration).await {
             Err(_) => {
                 warn!(
                     user_id = ?user,
@@ -1082,13 +1219,6 @@ impl Store {
             }
             _ => UserKeyQueryResult::WasPending,
         }
-    }
-
-    /// See the docs for [`crate::OlmMachine::tracked_users()`].
-    pub(crate) async fn tracked_users(&self) -> Result<HashSet<OwnedUserId>> {
-        let cache = self.cache().await?;
-
-        Ok(cache.tracked_users.iter().map(|u| u.clone()).collect())
     }
 
     /// Check whether there is a global flag to only encrypt messages for

@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use language_tags::LanguageTag;
 use matrix_sdk::{
     async_trait,
     widget::{MessageLikeEventFilter, StateEventFilter},
@@ -15,16 +16,16 @@ pub struct WidgetDriverAndHandle {
 }
 
 #[uniffi::export]
-pub fn make_widget_driver(settings: WidgetSettings) -> WidgetDriverAndHandle {
-    let (driver, handle) = matrix_sdk::widget::WidgetDriver::new(settings.into());
-    WidgetDriverAndHandle {
+pub fn make_widget_driver(settings: WidgetSettings) -> Result<WidgetDriverAndHandle, ParseError> {
+    let (driver, handle) = matrix_sdk::widget::WidgetDriver::new(settings.try_into()?);
+    Ok(WidgetDriverAndHandle {
         driver: Arc::new(WidgetDriver(Mutex::new(Some(driver)))),
         handle: Arc::new(WidgetDriverHandle(handle)),
-    }
+    })
 }
 
 /// An object that handles all interactions of a widget living inside a webview
-/// or iframe with the Matrix world.
+/// or IFrame with the Matrix world.
 #[derive(uniffi::Object)]
 pub struct WidgetDriver(Mutex<Option<matrix_sdk::widget::WidgetDriver>>);
 
@@ -33,40 +34,208 @@ impl WidgetDriver {
     pub async fn run(
         &self,
         room: Arc<Room>,
-        permissions_provider: Box<dyn WidgetPermissionsProvider>,
+        capabilities_provider: Box<dyn WidgetCapabilitiesProvider>,
     ) {
         let Some(driver) = self.0.lock().unwrap().take() else {
             error!("Can't call run multiple times on a WidgetDriver");
             return;
         };
 
-        let permissions_provider = PermissionsProviderWrap(permissions_provider.into());
-        if let Err(()) = driver.run(room.inner.clone(), permissions_provider).await {
+        let capabilities_provider = CapabilitiesProviderWrap(capabilities_provider.into());
+        if let Err(()) = driver.run(room.inner.clone(), capabilities_provider).await {
             // TODO
         }
     }
 }
 
 /// Information about a widget.
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone)]
 pub struct WidgetSettings {
     /// Widget's unique identifier.
-    pub id: String,
+    pub widget_id: String,
     /// Whether or not the widget should be initialized on load message
     /// (`ContentLoad` message), or upon creation/attaching of the widget to
     /// the SDK's state machine that drives the API.
-    pub init_on_load: bool,
+    pub init_after_content_load: bool,
+    /// This contains the url from the widget state event.
+    /// In this url placeholders can be used to pass information from the client
+    /// to the widget. Possible values are: `$widgetId`, `$parentUrl`,
+    /// `$userId`, `$lang`, `$fontScale`, `$analyticsID`.
+    ///
+    /// # Examples
+    ///
+    /// e.g `http://widget.domain?username=$userId`
+    /// will become: `http://widget.domain?username=@user_matrix_id:server.domain`.
+    raw_url: String,
 }
 
-impl From<WidgetSettings> for matrix_sdk::widget::WidgetSettings {
-    fn from(value: WidgetSettings) -> Self {
-        let WidgetSettings { id, init_on_load } = value;
-        Self { id, init_on_load }
+impl TryFrom<WidgetSettings> for matrix_sdk::widget::WidgetSettings {
+    type Error = ParseError;
+
+    fn try_from(value: WidgetSettings) -> Result<Self, Self::Error> {
+        let WidgetSettings { widget_id, init_after_content_load, raw_url } = value;
+        Ok(matrix_sdk::widget::WidgetSettings::new(widget_id, init_after_content_load, &raw_url)?)
+    }
+}
+
+impl From<matrix_sdk::widget::WidgetSettings> for WidgetSettings {
+    fn from(value: matrix_sdk::widget::WidgetSettings) -> Self {
+        WidgetSettings {
+            widget_id: value.widget_id().to_owned(),
+            init_after_content_load: value.init_on_content_load(),
+            raw_url: value.raw_url().to_string(),
+        }
+    }
+}
+
+/// Create the actual url that can be used to setup the WebView or IFrame
+/// that contains the widget.
+///
+/// # Arguments
+/// * `widget_settings` - The widget settings to generate the url for.
+/// * `room` - A matrix room which is used to query the logged in username
+/// * `props` - Properties from the client that can be used by a widget to adapt
+///   to the client. e.g. language, font-scale...
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn generate_webview_url(
+    widget_settings: WidgetSettings,
+    room: Arc<Room>,
+    props: ClientProperties,
+) -> Result<String, ParseError> {
+    Ok(matrix_sdk::widget::WidgetSettings::generate_webview_url(
+        &widget_settings.clone().try_into()?,
+        &room.inner,
+        props.into(),
+    )
+    .await
+    .map(|url| url.to_string())?)
+}
+
+/// Properties to create a new virtual Element Call widget.
+#[derive(uniffi::Record, Clone)]
+pub struct VirtualElementCallWidgetOptions {
+    /// The url to the app.
+    ///
+    /// E.g. <https://call.element.io>, <https://call.element.dev>
+    pub element_call_url: String,
+
+    /// The widget id.
+    pub widget_id: String,
+
+    /// The url that is used as the target for the PostMessages sent
+    /// by the widget (to the client).
+    ///
+    /// For a web app client this is the client url. In case of using other
+    /// platforms the client most likely is setup up to listen to
+    /// postmessages in the same webview the widget is hosted. In this case
+    /// the `parent_url` is set to the url of the webview with the widget. Be
+    /// aware that this means that the widget will receive its own postmessage
+    /// messages. The `matrix-widget-api` (js) ignores those so this works but
+    /// it might break custom implementations.
+    ///
+    /// Defaults to `element_call_url` for the non-iframe (dedicated webview)
+    /// usecase.
+    pub parent_url: Option<String>,
+
+    /// Whether the branding header of Element call should be hidden.
+    ///
+    /// Default: `true`
+    pub hide_header: Option<bool>,
+
+    /// If set, the lobby will be skipped and the widget will join the
+    /// call on the `io.element.join` action.
+    ///
+    /// Default: `false`
+    pub preload: Option<bool>,
+
+    /// The font scale which will be used inside element call.
+    ///
+    /// Default: `1`
+    pub font_scale: Option<f64>,
+
+    /// Whether element call should prompt the user to open in the browser or
+    /// the app.
+    ///
+    /// Default: `false`
+    pub app_prompt: Option<bool>,
+
+    /// Don't show the lobby and join the call immediately.
+    ///
+    /// Default: `false`
+    pub skip_lobby: Option<bool>,
+
+    /// Make it not possible to get to the calls list in the webview.
+    ///
+    /// Default: `true`
+    pub confine_to_room: Option<bool>,
+
+    /// The font to use, to adapt to the system font.
+    pub font: Option<String>,
+
+    /// Can be used to pass a PostHog id to element call.
+    pub analytics_id: Option<String>,
+}
+
+impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElementCallWidgetOptions {
+    fn from(value: VirtualElementCallWidgetOptions) -> Self {
+        Self {
+            element_call_url: value.element_call_url,
+            widget_id: value.widget_id,
+            parent_url: value.parent_url,
+            hide_header: value.hide_header,
+            preload: value.preload,
+            font_scale: value.font_scale,
+            app_prompt: value.app_prompt,
+            skip_lobby: value.skip_lobby,
+            confine_to_room: value.confine_to_room,
+            font: value.font,
+            analytics_id: value.analytics_id,
+        }
+    }
+}
+
+/// `WidgetSettings` are usually created from a state event.
+/// (currently unimplemented)
+///
+/// In some cases the client wants to create custom `WidgetSettings`
+/// for specific rooms based on other conditions.
+/// This function returns a `WidgetSettings` object which can be used
+/// to setup a widget using `run_client_widget_api`
+/// and to generate the correct url for the widget.
+///  # Arguments
+/// * - `props` A struct containing the configuration parameters for a element
+///   call widget.
+#[uniffi::export]
+pub fn new_virtual_element_call_widget(
+    props: VirtualElementCallWidgetOptions,
+) -> Result<WidgetSettings, ParseError> {
+    Ok(matrix_sdk::widget::WidgetSettings::new_virtual_element_call_widget(props.into())
+        .map(|w| w.into())?)
+}
+
+#[derive(uniffi::Record)]
+pub struct ClientProperties {
+    /// The client_id provides the widget with the option to behave differently
+    /// for different clients. e.g org.example.ios.
+    client_id: String,
+    /// The language tag the client is set to e.g. en-us. (Undefined and invalid
+    /// becomes: `en-US`)
+    language_tag: Option<String>,
+    /// A string describing the theme (dark, light) or org.example.dark.
+    /// (default: `light`)
+    theme: Option<String>,
+}
+
+impl From<ClientProperties> for matrix_sdk::widget::ClientProperties {
+    fn from(value: ClientProperties) -> Self {
+        let ClientProperties { client_id, language_tag, theme } = value;
+        let language_tag = language_tag.and_then(|l| LanguageTag::parse(&l).ok());
+        Self::new(&client_id, language_tag, theme)
     }
 }
 
 /// A handle that encapsulates the communication between a widget driver and the
-/// corresponding widget (inside a webview or iframe).
+/// corresponding widget (inside a webview or IFrame).
 #[derive(uniffi::Object)]
 pub struct WidgetDriverHandle(matrix_sdk::widget::WidgetDriverHandle);
 
@@ -89,29 +258,37 @@ impl WidgetDriverHandle {
     }
 }
 
-/// Permissions that a widget can request from a client.
+/// Capabilities that a widget can request from a client.
 #[derive(uniffi::Record)]
-pub struct WidgetPermissions {
+pub struct WidgetCapabilities {
     /// Types of the messages that a widget wants to be able to fetch.
     pub read: Vec<WidgetEventFilter>,
     /// Types of the messages that a widget wants to be able to send.
     pub send: Vec<WidgetEventFilter>,
+    /// If this capability is requested by the widget, it can not operate
+    /// separately from the matrix client.
+    ///
+    /// This means clients should not offer to open the widget in a separate
+    /// browser/tab/webview that is not connected to the postmessage widget-api.
+    pub requires_client: bool,
 }
 
-impl From<WidgetPermissions> for matrix_sdk::widget::Permissions {
-    fn from(value: WidgetPermissions) -> Self {
+impl From<WidgetCapabilities> for matrix_sdk::widget::Capabilities {
+    fn from(value: WidgetCapabilities) -> Self {
         Self {
             read: value.read.into_iter().map(Into::into).collect(),
             send: value.send.into_iter().map(Into::into).collect(),
+            requires_client: value.requires_client,
         }
     }
 }
 
-impl From<matrix_sdk::widget::Permissions> for WidgetPermissions {
-    fn from(value: matrix_sdk::widget::Permissions) -> Self {
+impl From<matrix_sdk::widget::Capabilities> for WidgetCapabilities {
+    fn from(value: matrix_sdk::widget::Capabilities) -> Self {
         Self {
             read: value.read.into_iter().map(Into::into).collect(),
             send: value.send.into_iter().map(Into::into).collect(),
+            requires_client: value.requires_client,
         }
     }
 }
@@ -170,26 +347,73 @@ impl From<matrix_sdk::widget::EventFilter> for WidgetEventFilter {
 }
 
 #[uniffi::export(callback_interface)]
-pub trait WidgetPermissionsProvider: Send + Sync {
-    fn acquire_permissions(&self, permissions: WidgetPermissions) -> WidgetPermissions;
+pub trait WidgetCapabilitiesProvider: Send + Sync {
+    fn acquire_capabilities(&self, capabilities: WidgetCapabilities) -> WidgetCapabilities;
 }
 
-struct PermissionsProviderWrap(Arc<dyn WidgetPermissionsProvider>);
+struct CapabilitiesProviderWrap(Arc<dyn WidgetCapabilitiesProvider>);
 
 #[async_trait]
-impl matrix_sdk::widget::PermissionsProvider for PermissionsProviderWrap {
-    async fn acquire_permissions(
+impl matrix_sdk::widget::CapabilitiesProvider for CapabilitiesProviderWrap {
+    async fn acquire_capabilities(
         &self,
-        permissions: matrix_sdk::widget::Permissions,
-    ) -> matrix_sdk::widget::Permissions {
+        capabilities: matrix_sdk::widget::Capabilities,
+    ) -> matrix_sdk::widget::Capabilities {
         let this = self.0.clone();
         // This could require a prompt to the user. Ideally the callback
         // interface would just be async, but that's not supported yet so use
         // one of tokio's blocking task threads instead.
         RUNTIME
-            .spawn_blocking(move || this.acquire_permissions(permissions.into()).into())
+            .spawn_blocking(move || this.acquire_capabilities(capabilities.into()).into())
             .await
             // propagate panics from the blocking task
             .unwrap()
+    }
+}
+
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum ParseError {
+    #[error("empty host")]
+    EmptyHost,
+    #[error("invalid international domain name")]
+    IdnaError,
+    #[error("invalid port number")]
+    InvalidPort,
+    #[error("invalid IPv4 address")]
+    InvalidIpv4Address,
+    #[error("invalid IPv6 address")]
+    InvalidIpv6Address,
+    #[error("invalid domain character")]
+    InvalidDomainCharacter,
+    #[error("relative URL without a base")]
+    RelativeUrlWithoutBase,
+    #[error("relative URL with a cannot-be-a-base base")]
+    RelativeUrlWithCannotBeABaseBase,
+    #[error("a cannot-be-a-base URL doesn’t have a host to set")]
+    SetHostOnCannotBeABaseUrl,
+    #[error("URLs more than 4 GB are not supported")]
+    Overflow,
+    #[error("unknown URL parsing error")]
+    Other,
+}
+
+impl From<url::ParseError> for ParseError {
+    fn from(value: url::ParseError) -> Self {
+        match value {
+            url::ParseError::EmptyHost => Self::EmptyHost,
+            url::ParseError::IdnaError => Self::IdnaError,
+            url::ParseError::InvalidPort => Self::InvalidPort,
+            url::ParseError::InvalidIpv4Address => Self::InvalidIpv4Address,
+            url::ParseError::InvalidIpv6Address => Self::InvalidIpv6Address,
+            url::ParseError::InvalidDomainCharacter => Self::InvalidDomainCharacter,
+            url::ParseError::RelativeUrlWithoutBase => Self::RelativeUrlWithoutBase,
+            url::ParseError::RelativeUrlWithCannotBeABaseBase => {
+                Self::RelativeUrlWithCannotBeABaseBase
+            }
+            url::ParseError::SetHostOnCannotBeABaseUrl => Self::SetHostOnCannotBeABaseUrl,
+            url::ParseError::Overflow => Self::Overflow,
+            _ => Self::Other,
+        }
     }
 }

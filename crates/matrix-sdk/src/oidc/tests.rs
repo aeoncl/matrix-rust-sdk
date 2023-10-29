@@ -14,8 +14,18 @@ use mas_oidc_client::{
 use matrix_sdk_base::SessionMeta;
 #[cfg(test)]
 use matrix_sdk_test::async_test;
-use ruma::{api::client::discovery::discover_homeserver::AuthenticationServerInfo, owned_user_id};
+use matrix_sdk_test::test_json;
+use ruma::{
+    api::client::discovery::discover_homeserver::AuthenticationServerInfo, owned_user_id,
+    ServerName,
+};
+use serde_json::json;
+use stream_assert::{assert_next_matches, assert_pending};
 use url::Url;
+use wiremock::{
+    matchers::{method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 use super::{
     backend::mock::{MockImpl, AUTHORIZATION_URL, ISSUER_URL},
@@ -23,7 +33,7 @@ use super::{
     OidcAccountManagementAction, OidcError, OidcSession, OidcSessionTokens,
     RedirectUriQueryParseError, UserSession,
 };
-use crate::test_utils::test_client_builder;
+use crate::{test_utils::test_client_builder, Client};
 
 const CLIENT_ID: &str = "test_client_id";
 
@@ -138,7 +148,7 @@ async fn test_account_management_url() {
 
 #[async_test]
 async fn test_login() -> anyhow::Result<()> {
-    let client = test_client_builder(None).build().await?;
+    let client = test_client_builder(Some("https://example.org".to_owned())).build().await?;
 
     let device_id = "D3V1C31D".to_owned(); // yo this is 1999 speaking
 
@@ -234,7 +244,7 @@ fn test_authorization_response() -> anyhow::Result<()> {
 
 #[async_test]
 async fn test_finish_authorization() -> anyhow::Result<()> {
-    let client = test_client_builder(None).build().await?;
+    let client = test_client_builder(Some("https://example.org".to_owned())).build().await?;
 
     let session_tokens = OidcSessionTokens {
         access_token: "4cc3ss".to_owned(),
@@ -294,6 +304,143 @@ async fn test_finish_authorization() -> anyhow::Result<()> {
 
     assert_eq!(oidc.session_tokens(), Some(session_tokens));
     assert!(oidc.data().unwrap().authorization_data.lock().await.get(&state).is_none());
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_getters() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let server_url = server.uri();
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/matrix/client"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(
+                json!({
+                    "m.homeserver": {
+                        "base_url": server_url
+                    },
+                    "org.matrix.msc2965.authentication": {
+                        "issuer": ISSUER_URL
+                    }
+                })
+                .to_string(),
+                "application/json",
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    // Create an insecure client with the homeserver_url method.
+    let client = Client::builder()
+        .insecure_server_name_no_tls(&ServerName::parse(server_url.replace("http://", ""))?)
+        .build()
+        .await?;
+    let backend = Arc::new(MockImpl::new());
+    let oidc = Oidc { client: client.clone(), backend: backend.clone() };
+
+    // Test the authentication_server_info getter.
+    let discovered_info = oidc.authentication_server_info().expect("discovered homeserver info");
+    assert_eq!(discovered_info.issuer, ISSUER_URL);
+    assert_eq!(discovered_info.account, None);
+
+    let tokens = OidcSessionTokens {
+        access_token: "4cc3ss".to_owned(),
+        refresh_token: Some("r3fr3sh".to_owned()),
+        latest_id_token: None,
+    };
+
+    let session = mock_session(tokens.clone());
+    oidc.restore_session(session.clone()).await?;
+
+    // Test a few extra getters.
+    assert_eq!(*oidc.client_metadata().unwrap(), session.metadata);
+    assert_eq!(oidc.access_token().unwrap(), tokens.access_token);
+    assert_eq!(oidc.refresh_token(), tokens.refresh_token);
+
+    let user_session = oidc.user_session().unwrap();
+    assert_eq!(user_session.meta, session.user.meta);
+    assert_eq!(user_session.tokens, tokens);
+    assert_eq!(user_session.issuer_info.issuer, ISSUER_URL);
+
+    let full_session = oidc.full_session().unwrap();
+
+    assert_matches!(full_session.credentials, ClientCredentials::None { client_id } => {
+        assert_eq!(client_id, CLIENT_ID);
+    });
+    assert_eq!(full_session.metadata, session.metadata);
+    assert_eq!(full_session.user.meta, session.user.meta);
+    assert_eq!(full_session.user.tokens, tokens);
+    assert_eq!(full_session.user.issuer_info.issuer, ISSUER_URL);
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_insecure_clients() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let server_url = server.uri();
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/matrix/client"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+
+    let prev_tokens = OidcSessionTokens {
+        access_token: "prev-access-token".to_owned(),
+        refresh_token: Some("prev-refresh-token".to_owned()),
+        latest_id_token: None,
+    };
+
+    let next_tokens = OidcSessionTokens {
+        access_token: "next-access-token".to_owned(),
+        refresh_token: Some("next-refresh-token".to_owned()),
+        latest_id_token: None,
+    };
+
+    for client in [
+        // Create an insecure client with the homeserver_url method.
+        Client::builder().homeserver_url("http://example.org").build().await?,
+        // Create an insecure client with the insecure_server_name_no_tls method.
+        Client::builder()
+            .insecure_server_name_no_tls(&ServerName::parse(
+                server_url.strip_prefix("http://").unwrap(),
+            )?)
+            .build()
+            .await?,
+    ] {
+        let backend = Arc::new(
+            MockImpl::new()
+                .mark_insecure()
+                .next_session_tokens(next_tokens.clone())
+                .expected_refresh_token(prev_tokens.refresh_token.as_ref().unwrap().clone()),
+        );
+        let oidc = Oidc { client: client.clone(), backend: backend.clone() };
+
+        // Restore the previous session so we have an existing set of refresh tokens.
+        oidc.restore_session(mock_session(prev_tokens.clone())).await?;
+
+        let mut session_token_stream = oidc.session_tokens_stream().expect("stream available");
+
+        assert_pending!(session_token_stream);
+
+        // A refresh in insecure mode should work Just Fine.
+        oidc.refresh_access_token().await?;
+
+        assert_next_matches!(session_token_stream, new_tokens => {
+            assert_eq!(new_tokens, next_tokens);
+        });
+
+        assert_pending!(session_token_stream);
+
+        // There should have been exactly one refresh.
+        assert_eq!(*backend.num_refreshes.lock().unwrap(), 1);
+    }
 
     Ok(())
 }
