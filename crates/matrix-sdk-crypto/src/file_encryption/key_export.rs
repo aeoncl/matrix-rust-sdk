@@ -130,7 +130,7 @@ pub fn decrypt_room_key_export(
 /// # async {
 /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
 /// let room_id = room_id!("!test:localhost");
-/// let exported_keys = machine.export_room_keys(|s| s.room_id() == room_id).await.unwrap();
+/// let exported_keys = machine.store().export_room_keys(|s| s.room_id() == room_id).await.unwrap();
 /// let encrypted_export = encrypt_room_key_export(&exported_keys, "1234", 1);
 /// # };
 /// ```
@@ -292,8 +292,8 @@ mod tests {
         let (machine, _) = get_prepared_machine_test_helper(user_id, false).await;
         let room_id = room_id!("!test:localhost");
 
-        machine.create_outbound_group_session_with_defaults(room_id).await.unwrap();
-        let export = machine.export_room_keys(|s| s.room_id() == room_id).await.unwrap();
+        machine.create_outbound_group_session_with_defaults_test_helper(room_id).await.unwrap();
+        let export = machine.store().export_room_keys(|s| s.room_id() == room_id).await.unwrap();
 
         assert!(!export.is_empty());
 
@@ -305,7 +305,7 @@ mod tests {
         }
 
         assert_eq!(
-            machine.import_room_keys(decrypted, false, |_, _| {}).await.unwrap(),
+            machine.store().import_exported_room_keys(decrypted, |_, _| {}).await.unwrap(),
             RoomKeyImportResult::new(0, 1, BTreeMap::new())
         );
     }
@@ -316,7 +316,7 @@ mod tests {
 
         let (machine, _) = get_prepared_machine_test_helper(user_id, false).await;
         let room_id = room_id!("!test:localhost");
-        let session = machine.create_inbound_session(room_id).await?;
+        let session = machine.create_inbound_session_test_helper(room_id).await?;
 
         let export = vec![session.export_at_index(10).await];
 
@@ -332,19 +332,22 @@ mod tests {
             )]),
         );
 
-        assert_eq!(machine.import_room_keys(export, false, |_, _| {}).await?, keys);
+        assert_eq!(machine.store().import_exported_room_keys(export, |_, _| {}).await?, keys);
 
         let export = vec![session.export_at_index(10).await];
         assert_eq!(
-            machine.import_room_keys(export, false, |_, _| {}).await?,
+            machine.store().import_exported_room_keys(export, |_, _| {}).await?,
             RoomKeyImportResult::new(0, 1, BTreeMap::new())
         );
 
         let better_export = vec![session.export().await];
 
-        assert_eq!(machine.import_room_keys(better_export, false, |_, _| {}).await?, keys);
+        assert_eq!(
+            machine.store().import_exported_room_keys(better_export, |_, _| {}).await?,
+            keys
+        );
 
-        let another_session = machine.create_inbound_session(room_id).await?;
+        let another_session = machine.create_inbound_session_test_helper(room_id).await?;
         let export = vec![another_session.export_at_index(10).await];
 
         let keys = RoomKeyImportResult::new(
@@ -359,7 +362,7 @@ mod tests {
             )]),
         );
 
-        assert_eq!(machine.import_room_keys(export, false, |_, _| {}).await?, keys);
+        assert_eq!(machine.store().import_exported_room_keys(export, |_, _| {}).await?, keys);
 
         Ok(())
     }

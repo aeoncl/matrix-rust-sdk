@@ -30,7 +30,7 @@ fn keys_query_response() -> get_keys::v3::Response {
     let data: Value = serde_json::from_slice(data).unwrap();
     let data = response_from_file(&data);
     get_keys::v3::Response::try_from_http_response(data)
-        .expect("Can't parse the keys upload response")
+        .expect("Can't parse the `/keys/upload` response")
 }
 
 fn keys_claim_response() -> claim_keys::v3::Response {
@@ -38,7 +38,7 @@ fn keys_claim_response() -> claim_keys::v3::Response {
     let data: Value = serde_json::from_slice(data).unwrap();
     let data = response_from_file(&data);
     claim_keys::v3::Response::try_from_http_response(data)
-        .expect("Can't parse the keys upload response")
+        .expect("Can't parse the `/keys/upload` response")
 }
 
 fn huge_keys_query_response() -> get_keys::v3::Response {
@@ -46,7 +46,7 @@ fn huge_keys_query_response() -> get_keys::v3::Response {
     let data: Value = serde_json::from_slice(data).unwrap();
     let data = response_from_file(&data);
     get_keys::v3::Response::try_from_http_response(data)
-        .expect("Can't parse the keys query response")
+        .expect("Can't parse the `/keys/query` response")
 }
 
 pub fn keys_query(c: &mut Criterion) {
@@ -194,7 +194,7 @@ pub fn room_key_sharing(c: &mut Criterion) {
                 machine.mark_request_as_sent(&request.txn_id, &to_device_response).await.unwrap();
             }
 
-            machine.invalidate_group_session(room_id).await.unwrap();
+            machine.discard_room_key(room_id).await.unwrap();
         })
     });
 
@@ -225,7 +225,7 @@ pub fn room_key_sharing(c: &mut Criterion) {
                 machine.mark_request_as_sent(&request.txn_id, &to_device_response).await.unwrap();
             }
 
-            machine.invalidate_group_session(room_id).await.unwrap();
+            machine.discard_room_key(room_id).await.unwrap();
         })
     });
 

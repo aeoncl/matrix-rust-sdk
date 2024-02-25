@@ -245,7 +245,7 @@ pub(super) struct KeysQueryWaiter {
 /// which each user was last invalidated. Then, we attach the current sequence
 /// number to each `/keys/query` request, and when we get the response we can
 /// tell if any users have been invalidated more recently than that request.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct UsersForKeyQuery {
     /// The sequence number we will assign to the next addition to user_map
     next_sequence_number: SequenceNumber,
@@ -262,15 +262,6 @@ pub(super) struct UsersForKeyQuery {
 }
 
 impl UsersForKeyQuery {
-    /// Create a new, empty, `UsersForKeyQueryCache`
-    pub(super) fn new() -> Self {
-        UsersForKeyQuery {
-            next_sequence_number: Default::default(),
-            user_map: Default::default(),
-            tasks_awaiting_key_query: Default::default(),
-        }
-    }
-
     /// Record a new user that requires a key query
     pub(super) fn insert_user(&mut self, user: &UserId) {
         let sequence_number = self.next_sequence_number;
@@ -368,22 +359,19 @@ impl UsersForKeyQuery {
         &mut self,
         user: &UserId,
     ) -> Option<Arc<KeysQueryWaiter>> {
-        match self.user_map.get(user) {
-            None => None,
-            Some(&sequence_number) => {
-                trace!(?user, %sequence_number, "Registering new waiting task");
+        self.user_map.get(user).map(|&sequence_number| {
+            trace!(?user, %sequence_number, "Registering new waiting task");
 
-                let waiter = Arc::new(KeysQueryWaiter {
-                    sequence_number,
-                    user: user.to_owned(),
-                    completed: AtomicBool::new(false),
-                });
+            let waiter = Arc::new(KeysQueryWaiter {
+                sequence_number,
+                user: user.to_owned(),
+                completed: AtomicBool::new(false),
+            });
 
-                self.tasks_awaiting_key_query.push(Arc::downgrade(&waiter));
+            self.tasks_awaiting_key_query.push(Arc::downgrade(&waiter));
 
-                Some(waiter)
-            }
-        }
+            waiter
+        })
     }
 }
 

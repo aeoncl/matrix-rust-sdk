@@ -267,10 +267,7 @@ impl NotificationSettings {
     pub async fn is_room_mention_enabled(&self) -> Result<bool, NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let enabled = notification_settings
-            .is_push_rule_enabled(
-                RuleKind::Override,
-                PredefinedOverrideRuleId::IsRoomMention.as_str(),
-            )
+            .is_push_rule_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention)
             .await?;
         Ok(enabled)
     }
@@ -284,7 +281,7 @@ impl NotificationSettings {
         notification_settings
             .set_push_rule_enabled(
                 RuleKind::Override,
-                PredefinedOverrideRuleId::IsRoomMention.as_str(),
+                PredefinedOverrideRuleId::IsRoomMention,
                 enabled,
             )
             .await?;
@@ -295,12 +292,31 @@ impl NotificationSettings {
     pub async fn is_user_mention_enabled(&self) -> Result<bool, NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let enabled = notification_settings
-            .is_push_rule_enabled(
-                RuleKind::Override,
-                PredefinedOverrideRuleId::IsUserMention.as_str(),
-            )
+            .is_push_rule_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention)
             .await?;
         Ok(enabled)
+    }
+
+    /// Returns true if [MSC 4028 push rule][rule] is supported and enabled.
+    ///
+    /// [rule]: https://github.com/matrix-org/matrix-spec-proposals/blob/giomfo/push_encrypted_events/proposals/4028-push-all-encrypted-events-except-for-muted-rooms.md
+    pub async fn can_push_encrypted_event_to_device(&self) -> bool {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        // Check stable identifier
+        if let Ok(enabled) = notification_settings
+            .is_push_rule_enabled(RuleKind::Override, ".m.rule.encrypted_event")
+            .await
+        {
+            enabled
+        // Check unstable identifier
+        } else if let Ok(enabled) = notification_settings
+            .is_push_rule_enabled(RuleKind::Override, ".org.matrix.msc4028.encrypted_event")
+            .await
+        {
+            enabled
+        } else {
+            false
+        }
     }
 
     /// Set whether user mentions are enabled.
@@ -312,7 +328,7 @@ impl NotificationSettings {
         notification_settings
             .set_push_rule_enabled(
                 RuleKind::Override,
-                PredefinedOverrideRuleId::IsUserMention.as_str(),
+                PredefinedOverrideRuleId::IsUserMention,
                 enabled,
             )
             .await?;
@@ -323,7 +339,7 @@ impl NotificationSettings {
     pub async fn is_call_enabled(&self) -> Result<bool, NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         let enabled = notification_settings
-            .is_push_rule_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::Call.as_str())
+            .is_push_rule_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::Call)
             .await?;
         Ok(enabled)
     }
@@ -332,9 +348,33 @@ impl NotificationSettings {
     pub async fn set_call_enabled(&self, enabled: bool) -> Result<(), NotificationSettingsError> {
         let notification_settings = self.sdk_notification_settings.read().await;
         notification_settings
+            .set_push_rule_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::Call, enabled)
+            .await?;
+        Ok(())
+    }
+
+    /// Get whether the `.m.rule.invite_for_me` push rule is enabled
+    pub async fn is_invite_for_me_enabled(&self) -> Result<bool, NotificationSettingsError> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        let enabled = notification_settings
+            .is_push_rule_enabled(
+                RuleKind::Override,
+                PredefinedOverrideRuleId::InviteForMe.as_str(),
+            )
+            .await?;
+        Ok(enabled)
+    }
+
+    /// Set whether the `.m.rule.invite_for_me` push rule is enabled
+    pub async fn set_invite_for_me_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        notification_settings
             .set_push_rule_enabled(
-                RuleKind::Underride,
-                PredefinedUnderrideRuleId::Call.as_str(),
+                RuleKind::Override,
+                PredefinedOverrideRuleId::InviteForMe.as_str(),
                 enabled,
             )
             .await?;

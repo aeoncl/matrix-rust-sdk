@@ -4,6 +4,7 @@ use assert_matches::assert_matches;
 use matrix_sdk::{
     config::RequestConfig,
     matrix_auth::{MatrixSession, MatrixSessionTokens},
+    test_utils::{logged_in_client_with_server, no_retry_test_client_with_server},
     AuthApi, AuthSession, Client, RumaApiError,
 };
 use matrix_sdk_base::SessionMeta;
@@ -31,11 +32,9 @@ use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
 };
 
-use crate::{logged_in_client, no_retry_test_client, test_client_builder};
-
 #[async_test]
 async fn test_restore_session() {
-    let (client, _) = logged_in_client().await;
+    let (client, _) = logged_in_client_with_server().await;
     let auth = client.matrix_auth();
 
     assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
@@ -46,7 +45,7 @@ async fn test_restore_session() {
 
 #[async_test]
 async fn test_login() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
     let homeserver = Url::parse(&server.uri()).unwrap();
 
     Mock::given(method("GET"))
@@ -85,7 +84,7 @@ async fn test_login() {
 
 #[async_test]
 async fn test_login_with_discovery() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
@@ -103,7 +102,7 @@ async fn test_login_with_discovery() {
 
 #[async_test]
 async fn test_login_no_discovery() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
@@ -122,7 +121,7 @@ async fn test_login_no_discovery() {
 #[async_test]
 #[cfg(feature = "sso-login")]
 async fn test_login_with_sso() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
@@ -159,7 +158,7 @@ async fn test_login_with_sso() {
 
 #[async_test]
 async fn test_login_with_sso_token() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("GET"))
         .and(path("/_matrix/client/r0/login"))
@@ -194,7 +193,7 @@ async fn test_login_with_sso_token() {
 
 #[async_test]
 async fn test_login_error() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
@@ -225,7 +224,7 @@ async fn test_login_error() {
 
 #[async_test]
 async fn test_register_error() {
-    let (client, server) = no_retry_test_client().await;
+    let (client, server) = no_retry_test_client_with_server().await;
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/register"))
@@ -439,6 +438,7 @@ async fn test_login_with_cross_signing_bootstrapping() {
             .server_versions([MatrixVersion::V1_0])
             .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
                 auto_enable_cross_signing: true,
+                ..Default::default()
             })
             .request_config(RequestConfig::new().disable_retry())
             .build()
@@ -450,6 +450,8 @@ async fn test_login_with_cross_signing_bootstrapping() {
 
         assert!(client.logged_in(), "Client should be logged in");
         assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
+
+        client.encryption().wait_for_e2ee_initialization_tasks().await;
 
         let me = client.user_id().expect("we are now logged in");
         let own_identity =
@@ -489,6 +491,7 @@ async fn test_login_with_cross_signing_bootstrapping() {
             .server_versions([MatrixVersion::V1_0])
             .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
                 auto_enable_cross_signing: true,
+                ..Default::default()
             })
             .request_config(RequestConfig::new().disable_retry())
             .build()
@@ -500,6 +503,8 @@ async fn test_login_with_cross_signing_bootstrapping() {
 
         assert!(client.logged_in(), "Client should be logged in");
         assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
+
+        client.encryption().wait_for_e2ee_initialization_tasks().await;
 
         let me = client.user_id().expect("we are now logged in");
         let own_identity =
@@ -562,6 +567,7 @@ async fn test_login_doesnt_fail_if_cross_signing_bootstrapping_failed() {
         .server_versions([MatrixVersion::V1_0])
         .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
             auto_enable_cross_signing: true,
+            ..Default::default()
         })
         .request_config(RequestConfig::new().disable_retry())
         .build()
@@ -576,6 +582,8 @@ async fn test_login_doesnt_fail_if_cross_signing_bootstrapping_failed() {
 
     let me = client.user_id().expect("we are now logged in");
 
+    client.encryption().wait_for_e2ee_initialization_tasks().await;
+
     let own_identity = client.encryption().get_user_identity(me).await.expect("succeeds");
     let identity = own_identity.expect("created local default identity");
     assert!(identity.is_verified());
@@ -586,7 +594,7 @@ async fn test_login_doesnt_fail_if_cross_signing_bootstrapping_failed() {
 async fn test_login_with_cross_signing_bootstrapping_already_bootstrapped() {
     // Even if we enabled cross-signing bootstrap for another device, it won't
     // restart the procedure.
-    let (builder, server) = test_client_builder().await;
+    let (builder, server) = matrix_sdk::test_utils::test_client_builder_with_server().await;
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/r0/login"))
@@ -680,6 +688,7 @@ async fn test_login_with_cross_signing_bootstrapping_already_bootstrapped() {
     let client = builder
         .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
             auto_enable_cross_signing: true,
+            ..Default::default()
         })
         .request_config(RequestConfig::new().disable_retry())
         .build()

@@ -41,7 +41,6 @@ mod traits;
 use matrix_sdk_crypto::store::{DynCryptoStore, IntoCryptoStore};
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 use ruma::{
-    api::client::push::get_notifications::v3::Notification,
     events::{
         presence::PresenceEvent,
         receipt::ReceiptEventContent,
@@ -52,13 +51,13 @@ use ruma::{
     serde::Raw,
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// BoxStream of owned Types
 pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
 
 use crate::{
-    rooms::{RoomInfo, RoomState},
+    rooms::{normal::RoomInfoUpdate, RoomInfo, RoomState},
     MinimalRoomMemberEvent, Room, RoomStateFilter, SessionMeta,
 };
 
@@ -145,11 +144,8 @@ pub(crate) struct Store {
     pub(super) sync_token: Arc<RwLock<Option<String>>>,
     rooms: Arc<StdRwLock<BTreeMap<OwnedRoomId, Room>>>,
     /// A lock to synchronize access to the store, such that data by the sync is
-    /// never overwritten. The sync processing is supposed to use write access,
-    /// such that only it is currently accessing the store overall. Other things
-    /// might acquire read access, such that access to different rooms can be
-    /// parallelized.
-    sync_lock: Arc<RwLock<()>>,
+    /// never overwritten.
+    sync_lock: Arc<Mutex<()>>,
 }
 
 impl Store {
@@ -165,7 +161,7 @@ impl Store {
     }
 
     /// Get access to the syncing lock.
-    pub fn sync_lock(&self) -> &RwLock<()> {
+    pub fn sync_lock(&self) -> &Mutex<()> {
         &self.sync_lock
     }
 
@@ -175,9 +171,18 @@ impl Store {
     /// inner `StateStore`.
     ///
     /// This method panics if it is called twice.
-    pub async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
+    pub async fn set_session_meta(
+        &self,
+        session_meta: SessionMeta,
+        roominfo_update_sender: &broadcast::Sender<RoomInfoUpdate>,
+    ) -> Result<()> {
         for info in self.inner.get_room_infos().await? {
-            let room = Room::restore(&session_meta.user_id, self.inner.clone(), info);
+            let room = Room::restore(
+                &session_meta.user_id,
+                self.inner.clone(),
+                info,
+                roominfo_update_sender.clone(),
+            );
             self.rooms.write().unwrap().insert(room.room_id().to_owned(), room);
         }
 
@@ -218,7 +223,12 @@ impl Store {
 
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist
     /// yet in the store
-    pub fn get_or_create_room(&self, room_id: &RoomId, room_type: RoomState) -> Room {
+    pub fn get_or_create_room(
+        &self,
+        room_id: &RoomId,
+        room_type: RoomState,
+        roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
+    ) -> Room {
         let user_id =
             &self.session_meta.get().expect("Creating room while not being logged in").user_id;
 
@@ -226,7 +236,9 @@ impl Store {
             .write()
             .unwrap()
             .entry(room_id.to_owned())
-            .or_insert_with(|| Room::new(user_id, self.inner.clone(), room_id, room_type))
+            .or_insert_with(|| {
+                Room::new(user_id, self.inner.clone(), room_id, room_type, roominfo_update_sender)
+            })
             .clone()
     }
 }
@@ -291,8 +303,6 @@ pub struct StateChanges {
     /// A map from room id to a map of a display name and a set of user ids that
     /// share that display name in the given room.
     pub ambiguity_maps: BTreeMap<OwnedRoomId, BTreeMap<String, BTreeSet<OwnedUserId>>>,
-    /// A map of `RoomId` to a vector of `Notification`s
-    pub notifications: BTreeMap<OwnedRoomId, Vec<Notification>>,
 }
 
 impl StateChanges {
@@ -377,12 +387,6 @@ impl StateChanges {
             .entry(room_id.to_owned())
             .or_default()
             .insert(redacted_event_id.to_owned(), redaction);
-    }
-
-    /// Update the `StateChanges` struct with the given room with a new
-    /// `Notification`.
-    pub fn add_notification(&mut self, room_id: &RoomId, notification: Notification) {
-        self.notifications.entry(room_id.to_owned()).or_default().push(notification);
     }
 
     /// Update the `StateChanges` struct with the given room with a new

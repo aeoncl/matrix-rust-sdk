@@ -23,14 +23,14 @@ use ruma::{
         room::message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
     },
-    owned_event_id, room_id, uint,
+    owned_event_id, room_id, uint, RoomVersionId,
 };
 use stream_assert::{assert_next_matches, assert_pending};
 
 use super::{ReadReceiptMap, TestRoomDataProvider, TestTimeline};
 use crate::timeline::inner::TimelineInnerSettings;
 
-fn filter_notice(ev: &AnySyncTimelineEvent) -> bool {
+fn filter_notice(ev: &AnySyncTimelineEvent, _room_version: &RoomVersionId) -> bool {
     match ev {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(msg),
@@ -40,7 +40,7 @@ fn filter_notice(ev: &AnySyncTimelineEvent) -> bool {
 }
 
 #[async_test]
-async fn read_receipts_updates_on_live_events() {
+async fn test_read_receipts_updates_on_live_events() {
     let timeline = TestTimeline::new()
         .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
     let mut stream = timeline.subscribe().await;
@@ -138,7 +138,7 @@ async fn read_receipts_updates_on_back_paginated_events() {
 }
 
 #[async_test]
-async fn read_receipts_updates_on_filtered_events() {
+async fn test_read_receipts_updates_on_filtered_events() {
     let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
         track_read_receipts: true,
         event_filter: Arc::new(filter_notice),
@@ -341,12 +341,12 @@ async fn read_receipts_updates_on_message_decryption() {
         events::room::encrypted::{
             EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
         },
-        user_id,
+        user_id, RoomVersionId,
     };
 
     use crate::timeline::{EncryptedMessage, TimelineItemContent};
 
-    fn filter_text_msg(ev: &AnySyncTimelineEvent) -> bool {
+    fn filter_text_msg(ev: &AnySyncTimelineEvent, _room_version_id: &RoomVersionId) -> bool {
         match ev {
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                 SyncRoomMessageEvent::Original(msg),
@@ -438,7 +438,7 @@ async fn read_receipts_updates_on_message_decryption() {
     let exported_keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "1234").unwrap();
 
     let olm_machine = OlmMachine::new(own_user_id, "SomeDeviceId".into()).await;
-    olm_machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
+    olm_machine.store().import_exported_room_keys(exported_keys, |_, _| {}).await.unwrap();
 
     timeline
         .inner
@@ -563,4 +563,53 @@ async fn initial_private_main_thread_receipt() {
 
     let (receipt_event_id, _) = timeline.inner.latest_user_read_receipt(*ALICE).await.unwrap();
     assert_eq!(receipt_event_id, event_id);
+}
+
+#[async_test]
+async fn clear_read_receipts() {
+    let room_id = room_id!("!room:localhost");
+    let event_a_id = event_id!("$event_a");
+    let event_b_id = event_id!("$event_b");
+
+    let timeline = TestTimeline::new()
+        .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
+
+    let event_a_content = RoomMessageEventContent::text_plain("A");
+    timeline.handle_live_message_event_with_id(*BOB, event_a_id, event_a_content.clone()).await;
+
+    let items = timeline.inner.items().await;
+    assert_eq!(items.len(), 2);
+
+    // Implicit read receipt of Bob.
+    let event_a = items[1].as_event().unwrap();
+    assert_eq!(event_a.read_receipts().len(), 1);
+    assert!(event_a.read_receipts().get(*BOB).is_some());
+
+    // We received a limited timeline.
+    timeline.inner.clear().await;
+
+    // New message via sync.
+    timeline
+        .handle_live_message_event_with_id(
+            *BOB,
+            event_b_id,
+            RoomMessageEventContent::text_plain("B"),
+        )
+        .await;
+    // Old message via back-pagination.
+    timeline
+        .handle_back_paginated_message_event_with_id(*BOB, room_id, event_a_id, event_a_content)
+        .await;
+
+    let items = timeline.inner.items().await;
+    assert_eq!(items.len(), 3);
+
+    // Old implicit read receipt of Bob is gone.
+    let event_a = items[1].as_event().unwrap();
+    assert_eq!(event_a.read_receipts().len(), 0);
+
+    // New implicit read receipt of Bob.
+    let event_b = items[2].as_event().unwrap();
+    assert_eq!(event_b.read_receipts().len(), 1);
+    assert!(event_b.read_receipts().get(*BOB).is_some());
 }

@@ -74,6 +74,11 @@ use crate::{
     OlmError, SignatureError,
 };
 
+#[derive(Debug)]
+enum PrekeyBundle {
+    Olm3DH { key: SignedKey },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum SessionType {
     New(Session),
@@ -245,7 +250,6 @@ impl StaticAccountData {
     /// **Note**: Use this method with caution, the `canonical_json` needs to be
     /// correctly canonicalized and make sure that the object you are checking
     /// the signature for is allowed to be signed by our own device.
-    #[cfg(any(test, feature = "backups_v1"))]
     pub fn has_signed_raw(
         &self,
         signatures: &crate::types::Signatures,
@@ -314,7 +318,7 @@ impl StaticAccountData {
 pub struct Account {
     pub(crate) static_data: StaticAccountData,
     /// `vodozemac` account.
-    inner: InnerAccount,
+    inner: Box<InnerAccount>,
     /// Is this account ready to encrypt messages? (i.e. has it shared keys with
     /// a homeserver)
     shared: bool,
@@ -397,7 +401,7 @@ impl Account {
                 identity_keys: Arc::new(identity_keys),
                 creation_local_time: MilliSecondsSinceUnixEpoch::now(),
             },
-            inner: account,
+            inner: Box::new(account),
             shared: false,
             uploaded_signed_key_count: 0,
         }
@@ -460,7 +464,7 @@ impl Account {
     }
 
     /// Generate count number of one-time keys.
-    pub fn generate_one_time_keys_helper(&mut self, count: usize) -> OneTimeKeyGenerationResult {
+    pub fn generate_one_time_keys(&mut self, count: usize) -> OneTimeKeyGenerationResult {
         self.inner.generate_one_time_keys(count)
     }
 
@@ -489,7 +493,7 @@ impl Account {
             }
 
             self.update_uploaded_key_count(count);
-            self.generate_one_time_keys();
+            self.generate_one_time_keys_if_needed();
         }
 
         if let Some(unused) = unused_fallback_keys {
@@ -509,34 +513,34 @@ impl Account {
     /// Generally `Some` means that keys should be uploaded, while `None` means
     /// that keys should not be uploaded.
     #[instrument(skip_all)]
-    pub fn generate_one_time_keys(&mut self) -> Option<u64> {
+    pub fn generate_one_time_keys_if_needed(&mut self) -> Option<u64> {
         // Only generate one-time keys if there aren't any, otherwise the caller
         // might have failed to upload them the last time this method was
         // called.
-        if self.one_time_keys().is_empty() {
-            let count = self.uploaded_key_count();
-            let max_keys = self.max_one_time_keys();
-
-            if count >= max_keys as u64 {
-                return None;
-            }
-
-            let key_count = (max_keys as u64) - count;
-            let key_count: usize = key_count.try_into().unwrap_or(max_keys);
-
-            let result = self.generate_one_time_keys_helper(key_count);
-
-            debug!(
-                count = key_count,
-                discarded_keys = ?result.removed,
-                created_keys = ?result.created,
-                "Generated new one-time keys"
-            );
-
-            Some(key_count as u64)
-        } else {
-            Some(0)
+        if !self.one_time_keys().is_empty() {
+            return Some(0);
         }
+
+        let count = self.uploaded_key_count();
+        let max_keys = self.max_one_time_keys();
+
+        if count >= max_keys as u64 {
+            return None;
+        }
+
+        let key_count = (max_keys as u64) - count;
+        let key_count: usize = key_count.try_into().unwrap_or(max_keys);
+
+        let result = self.generate_one_time_keys(key_count);
+
+        debug!(
+            count = key_count,
+            discarded_keys = ?result.removed,
+            created_keys = ?result.created,
+            "Generated new one-time keys"
+        );
+
+        Some(key_count as u64)
     }
 
     pub(crate) fn generate_fallback_key_helper(&mut self) {
@@ -601,7 +605,7 @@ impl Account {
             .expect("We should be able to convert a freshly created Account into a libolm pickle");
 
         let data = DehydratedDeviceData::V1(DehydratedDeviceV1::new(device_pickle));
-        Raw::from_json(to_raw_value(&data).expect("Coulnd't our dehydrated device data"))
+        Raw::from_json(to_raw_value(&data).expect("Couldn't serialize our dehydrated device data"))
     }
 
     pub(crate) async fn rehydrate(
@@ -644,7 +648,7 @@ impl Account {
                 identity_keys: Arc::new(identity_keys),
                 creation_local_time: pickle.creation_local_time,
             },
-            inner: account,
+            inner: Box::new(account),
             shared: pickle.shared,
             uploaded_signed_key_count: pickle.uploaded_signed_key_count,
         })
@@ -725,9 +729,9 @@ impl Account {
         self.inner.sign_json(json)
     }
 
-    /// Generate, sign and prepare one-time keys to be uploaded.
+    /// Sign and prepare one-time keys to be uploaded.
     ///
-    /// If no one-time keys need to be uploaded returns an empty BTreeMap.
+    /// If no one-time keys need to be uploaded, returns an empty `BTreeMap`.
     pub fn signed_one_time_keys(
         &self,
     ) -> BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>> {
@@ -836,6 +840,43 @@ impl Account {
         }
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            user_id = ?device.user_id(),
+            device_id = ?device.device_id(),
+            algorithms = ?device.algorithms()
+        )
+    )]
+    fn find_pre_key_bundle(
+        device: &ReadOnlyDevice,
+        key_map: &BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>>,
+    ) -> Result<PrekeyBundle, SessionCreationError> {
+        let mut keys = key_map.iter();
+
+        let first_key = keys.next().ok_or_else(|| {
+            SessionCreationError::OneTimeKeyMissing(
+                device.user_id().to_owned(),
+                device.device_id().into(),
+            )
+        })?;
+
+        let first_key_id = first_key.0.to_owned();
+        let first_key = OneTimeKey::deserialize(first_key_id.algorithm(), first_key.1)?;
+
+        let result = match first_key {
+            OneTimeKey::SignedKey(key) => Ok(PrekeyBundle::Olm3DH { key }),
+            _ => Err(SessionCreationError::OneTimeKeyUnknown(
+                device.user_id().to_owned(),
+                device.device_id().into(),
+            )),
+        };
+
+        trace!(?result, "Finished searching for a valid pre-key bundle");
+
+        result
+    }
+
     /// Create a new session with another account given a one-time key and a
     /// device.
     ///
@@ -853,50 +894,37 @@ impl Account {
         device: &ReadOnlyDevice,
         key_map: &BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>>,
     ) -> Result<Session, SessionCreationError> {
-        let one_time_key = key_map.values().next().ok_or_else(|| {
-            SessionCreationError::OneTimeKeyMissing(
-                device.user_id().to_owned(),
-                device.device_id().into(),
-            )
-        })?;
+        let pre_key_bundle = Self::find_pre_key_bundle(device, key_map)?;
 
-        let one_time_key: SignedKey = match one_time_key.deserialize_as() {
-            Ok(OneTimeKey::SignedKey(k)) => k,
-            Ok(OneTimeKey::Key(_)) => {
-                return Err(SessionCreationError::OneTimeKeyNotSigned(
-                    device.user_id().to_owned(),
-                    device.device_id().into(),
-                ));
+        match pre_key_bundle {
+            PrekeyBundle::Olm3DH { key } => {
+                device.verify_one_time_key(&key).map_err(|error| {
+                    SessionCreationError::InvalidSignature {
+                        signing_key: device.ed25519_key().map(Box::new),
+                        one_time_key: key.clone().into(),
+                        error: error.into(),
+                    }
+                })?;
+
+                let identity_key = device.curve25519_key().ok_or_else(|| {
+                    SessionCreationError::DeviceMissingCurveKey(
+                        device.user_id().to_owned(),
+                        device.device_id().into(),
+                    )
+                })?;
+
+                let is_fallback = key.fallback();
+                let one_time_key = key.key();
+                let config = device.olm_session_config();
+
+                Ok(self.create_outbound_session_helper(
+                    config,
+                    identity_key,
+                    one_time_key,
+                    is_fallback,
+                ))
             }
-            Ok(_) => {
-                return Err(SessionCreationError::OneTimeKeyUnknown(
-                    device.user_id().to_owned(),
-                    device.device_id().into(),
-                ));
-            }
-            Err(e) => return Err(SessionCreationError::InvalidJson(e)),
-        };
-
-        device.verify_one_time_key(&one_time_key).map_err(|error| {
-            SessionCreationError::InvalidSignature {
-                signing_key: device.ed25519_key(),
-                one_time_key: one_time_key.clone(),
-                error,
-            }
-        })?;
-
-        let identity_key = device.curve25519_key().ok_or_else(|| {
-            SessionCreationError::DeviceMissingCurveKey(
-                device.user_id().to_owned(),
-                device.device_id().into(),
-            )
-        })?;
-
-        let is_fallback = one_time_key.fallback();
-        let one_time_key = one_time_key.key();
-        let config = device.olm_session_config();
-
-        Ok(self.create_outbound_session_helper(config, identity_key, one_time_key, is_fallback))
+        }
     }
 
     /// Create a new session with another account given a pre-key Olm message.
@@ -909,19 +937,12 @@ impl Account {
     ///
     /// * `message` - A pre-key Olm message that was sent to us by the other
     /// account.
-    #[instrument(
-        skip_all,
-        fields(
-            message,
-            session_id = message.session_id(),
-            session,
-        )
-    )]
     pub fn create_inbound_session(
         &mut self,
         their_identity_key: Curve25519PublicKey,
         message: &PreKeyMessage,
     ) -> Result<InboundCreationResult, SessionCreationError> {
+        Span::current().record("session_id", debug(message.session_id()));
         debug!("Creating a new Olm session from a pre-key message");
 
         let result = self.inner.create_inbound_session(their_identity_key, message)?;
@@ -952,25 +973,22 @@ impl Account {
     #[cfg(any(test, feature = "testing"))]
     #[allow(dead_code)]
     /// Testing only helper to create a session for the given Account
-    pub async fn create_session_for(&mut self, other: &mut Account) -> (Session, Session) {
+    pub async fn create_session_for_test_helper(
+        &mut self,
+        other: &mut Account,
+    ) -> (Session, Session) {
         use ruma::events::dummy::ToDeviceDummyEventContent;
 
-        other.generate_one_time_keys_helper(1);
-        let one_time = other.signed_one_time_keys();
-
+        other.generate_one_time_keys(1);
+        let one_time_map = other.signed_one_time_keys();
         let device = ReadOnlyDevice::from_account(other);
 
-        let mut our_session = self.create_outbound_session(&device, &one_time).unwrap();
+        let mut our_session = self.create_outbound_session(&device, &one_time_map).unwrap();
 
         other.mark_keys_as_published();
 
         let message = our_session
-            .encrypt(
-                &device,
-                "m.dummy",
-                serde_json::to_value(ToDeviceDummyEventContent::new()).unwrap(),
-                None,
-            )
+            .encrypt(&device, "m.dummy", ToDeviceDummyEventContent::new(), None)
             .await
             .unwrap()
             .deserialize()
@@ -1038,7 +1056,7 @@ impl Account {
         self.decrypt_olm_helper(store, sender, content.sender_key, &content.ciphertext).await
     }
 
-    #[instrument(skip_all, fields(sender, sender_key = %content.sender_key))]
+    #[instrument(skip_all, fields(sender, sender_key = ?content.sender_key))]
     async fn decrypt_olm_v1(
         &mut self,
         store: &Store,
@@ -1215,7 +1233,7 @@ impl Account {
 
     /// Decrypt an Olm message, creating a new Olm session if necessary, and
     /// parse the result.
-    #[instrument(skip(self, store, message))]
+    #[instrument(skip(self, store), fields(session, session_id))]
     async fn decrypt_and_parse_olm_message(
         &mut self,
         store: &Store,
@@ -1226,15 +1244,7 @@ impl Account {
         let (session, plaintext) =
             self.decrypt_olm_message(store, sender, sender_key, message).await?;
 
-        {
-            let session_id = match &session {
-                SessionType::New(s) => s.session_id(),
-                SessionType::Existing(s) => s.session_id(),
-            };
-
-            Span::current().record("session_id", session_id);
-            trace!("Successfully decrypted an Olm message");
-        }
+        trace!("Successfully decrypted an Olm message");
 
         match self.parse_decrypted_to_device_event(store, sender, sender_key, plaintext).await {
             Ok(result) => Ok((session, result)),
@@ -1405,13 +1415,13 @@ mod tests {
 
         account.mark_keys_as_published();
         account.update_uploaded_key_count(50);
-        account.generate_one_time_keys();
+        account.generate_one_time_keys_if_needed();
 
         let (_, third_one_time_keys, _) = account.keys_for_upload();
         assert!(third_one_time_keys.is_empty());
 
         account.update_uploaded_key_count(0);
-        account.generate_one_time_keys();
+        account.generate_one_time_keys_if_needed();
 
         let (_, fourth_one_time_keys, _) = account.keys_for_upload();
         assert!(!fourth_one_time_keys.is_empty());

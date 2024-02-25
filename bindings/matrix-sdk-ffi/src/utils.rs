@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod oidc;
+use ruma::UInt;
+use tracing::warn;
 
-// TODO(pixlwave) Move AuthenticationService from the FFI into here.
+pub(crate) fn u64_to_uint(u: u64) -> UInt {
+    UInt::new(u).unwrap_or_else(|| {
+        warn!("u64 -> UInt conversion overflowed, falling back to UInt::MAX");
+        UInt::MAX
+    })
+}

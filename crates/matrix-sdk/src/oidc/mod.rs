@@ -198,6 +198,7 @@ mod backend;
 mod cross_process;
 mod data_serde;
 mod end_session_builder;
+pub mod registrations;
 #[cfg(test)]
 mod tests;
 
@@ -712,7 +713,7 @@ impl Oidc {
             authorization_data: Default::default(),
         };
 
-        self.client.base_client().set_session_meta(meta).await?;
+        self.client.set_session_meta(meta).await?;
         self.deferred_enable_cross_process_refresh_lock().await?;
 
         self.client
@@ -741,7 +742,7 @@ impl Oidc {
             // hash. Otherwise, we save our hash into the database.
 
             if guard.hash_mismatch {
-                self.handle_session_hash_mismatch(&mut guard)
+                Box::pin(self.handle_session_hash_mismatch(&mut guard))
                     .await
                     .map_err(|err| crate::Error::Oidc(err.into()))?;
             } else {
@@ -754,6 +755,9 @@ impl Oidc {
                 // sync with what we had.
             }
         }
+
+        #[cfg(feature = "e2e-encryption")]
+        self.client.encryption().run_initialization_tasks(None).await?;
 
         Ok(())
     }
@@ -911,22 +915,11 @@ impl Oidc {
             device_id: whoami_res.device_id.ok_or(OidcError::MissingDeviceId)?,
         };
 
-        self.client.base_client().set_session_meta(session).await.map_err(crate::Error::from)?;
+        self.client.set_session_meta(session).await.map_err(crate::Error::from)?;
         // At this point the Olm machine has been set up.
 
         // Enable the cross-process lock for refreshes, if needs be.
         self.deferred_enable_cross_process_refresh_lock().await?;
-
-        // Bootstrap cross signing, if needs be.
-        // TODO: (#2763) put this into a background task.
-        if self.client.encryption().settings().auto_enable_cross_signing {
-            // According to MSC3967, OIDC doesn't require User-Interactive Authentication to
-            // call this API. Let's find out!
-            if let Err(err) = self.client.encryption().bootstrap_cross_signing_if_needed(None).await
-            {
-                warn!("cross-signing bootstrapping failed: {err}");
-            }
-        }
 
         if let Some(cross_process_manager) = self.ctx().cross_process_token_refresh_manager.get() {
             if let Some(tokens) = self.session_tokens() {
@@ -951,6 +944,9 @@ impl Oidc {
                     .map_err(|err| crate::Error::Oidc(err.into()))?;
             }
         }
+
+        #[cfg(feature = "e2e-encryption")]
+        self.client.encryption().run_initialization_tasks(None).await?;
 
         Ok(())
     }
@@ -1062,8 +1058,8 @@ impl Oidc {
         let metadata = data.metadata.clone();
 
         spawn(async move {
-            tracing::trace!(
-                "Token refresh: attempting to refresh with refresh_token {:?}",
+            trace!(
+                "Token refresh: attempting to refresh with refresh_token {:x}",
                 hash_str(&refresh_token)
             );
 
@@ -1081,8 +1077,12 @@ impl Oidc {
             {
                 Ok(new_tokens) => {
                     trace!(
-                        "Token refresh: new refresh_token: {:?} / access_token: {:?}",
-                        new_tokens.refresh_token.as_deref().map(hash_str),
+                        "Token refresh: new refresh_token: {} / access_token: {:x}",
+                        new_tokens
+                            .refresh_token
+                            .as_deref()
+                            .map(|token| format!("{:x}", hash_str(token)))
+                            .unwrap_or_else(|| "<none>".to_owned()),
                         hash_str(&new_tokens.access_token)
                     );
 
@@ -1175,7 +1175,7 @@ impl Oidc {
                 };
 
                 if cross_process_guard.hash_mismatch {
-                    self.handle_session_hash_mismatch(&mut cross_process_guard)
+                    Box::pin(self.handle_session_hash_mismatch(&mut cross_process_guard))
                         .await
                         .map_err(|err| RefreshTokenError::Oidc(Arc::new(err.into())))?;
                     // Optimistic exit: assume that the underlying process did update fast enough.
@@ -1474,6 +1474,6 @@ fn rng() -> Result<StdRng, OidcError> {
     StdRng::from_rng(rand::thread_rng()).map_err(OidcError::Rand)
 }
 
-fn hash_str(x: &str) -> impl std::fmt::Debug {
+fn hash_str(x: &str) -> impl std::fmt::LowerHex {
     sha2::Sha256::new().chain_update(x).finalize()
 }

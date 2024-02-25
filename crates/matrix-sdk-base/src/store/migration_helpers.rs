@@ -44,7 +44,7 @@ use crate::{
     deserialized_responses::SyncOrStrippedState,
     rooms::{
         normal::{RoomSummary, SyncInfo},
-        BaseRoomInfo,
+        BaseRoomInfo, RoomNotableTags,
     },
     sync::UnreadNotificationsCount,
     MinimalStateEvent, OriginalMinimalStateEvent, RoomInfo, RoomState,
@@ -117,7 +117,8 @@ impl RoomInfoV1 {
             sync_info,
             encryption_state_synced,
             #[cfg(feature = "experimental-sliding-sync")]
-            latest_event: latest_event.map(LatestEvent::new),
+            latest_event: latest_event.map(|ev| Box::new(LatestEvent::new(ev))),
+            read_receipts: Default::default(),
             base_info: base_info.migrate(create),
         }
     }
@@ -157,7 +158,10 @@ struct BaseRoomInfoV1 {
 
 impl BaseRoomInfoV1 {
     /// Migrate this to a [`BaseRoomInfo`].
-    fn migrate(self, create: Option<&SyncOrStrippedState<RoomCreateEventContent>>) -> BaseRoomInfo {
+    fn migrate(
+        self,
+        create: Option<&SyncOrStrippedState<RoomCreateEventContent>>,
+    ) -> Box<BaseRoomInfo> {
         let BaseRoomInfoV1 {
             avatar,
             canonical_alias,
@@ -186,7 +190,7 @@ impl BaseRoomInfoV1 {
             MinimalStateEvent::Redacted(ev) => MinimalStateEvent::Redacted(ev),
         });
 
-        BaseRoomInfo {
+        Box::new(BaseRoomInfo {
             avatar,
             canonical_alias,
             create,
@@ -200,7 +204,9 @@ impl BaseRoomInfoV1 {
             tombstone,
             topic,
             rtc_member: BTreeMap::new(),
-        }
+            is_marked_unread: false,
+            notable_tags: RoomNotableTags::empty(),
+        })
     }
 }
 

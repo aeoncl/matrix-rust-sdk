@@ -13,14 +13,15 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Deref,
     sync::Arc,
+    time::Duration,
 };
 
 use futures_util::future::join_all;
 use itertools::Itertools;
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{executor::spawn, failures_cache::FailuresCache};
 use ruma::{
     api::client::keys::get_keys::v3::Response as KeysQueryResponse, serde::Raw, OwnedDeviceId,
     OwnedServerName, OwnedTransactionId, OwnedUserId, ServerName, TransactionId, UserId,
@@ -36,12 +37,11 @@ use crate::{
     olm::PrivateCrossSigningIdentity,
     requests::KeysQueryRequest,
     store::{
-        caches::SequenceNumber, Changes, DeviceChanges, IdentityChanges, Result as StoreResult,
-        Store, StoreCache,
+        caches::SequenceNumber, Changes, DeviceChanges, IdentityChanges, KeyQueryManager,
+        Result as StoreResult, Store, StoreCache, UserKeyQueryResult,
     },
     types::{CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, UserSigningPubkey},
-    utilities::FailuresCache,
-    LocalTrust, SignatureError,
+    CryptoStoreError, LocalTrust, SignatureError,
 };
 
 enum DeviceChange {
@@ -61,8 +61,14 @@ enum IdentityUpdateResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct IdentityManager {
+    /// Servers that have previously appeared in the `failures` section of a
+    /// `/keys/query` response.
+    ///
+    /// See also [`crate::session_manager::SessionManager::failures`].
     failures: FailuresCache<OwnedServerName>,
     store: Store,
+
+    pub(crate) key_query_manager: Arc<KeyQueryManager>,
 
     /// Details of the current "in-flight" key query request, if any
     keys_query_request_details: Arc<Mutex<Option<KeysQueryRequestDetails>>>,
@@ -89,6 +95,7 @@ impl IdentityManager {
 
         IdentityManager {
             store,
+            key_query_manager: Default::default(),
             failures: Default::default(),
             keys_query_request_details: keys_query_request_details.into(),
         }
@@ -98,7 +105,7 @@ impl IdentityManager {
         &self.store.static_account().user_id
     }
 
-    /// Receive a successful keys query response.
+    /// Receive a successful `/keys/query` response.
     ///
     /// Returns a list of devices newly discovered devices and devices that
     /// changed.
@@ -107,7 +114,7 @@ impl IdentityManager {
     ///
     /// * `request_id` - The request_id returned by `users_for_key_query` or
     ///   `build_key_query_for_users`
-    /// * `response` - The keys query response of the request that the client
+    /// * `response` - The response of the `/keys/query` request that the client
     /// performed.
     pub async fn receive_keys_query_response(
         &self,
@@ -118,7 +125,7 @@ impl IdentityManager {
             ?request_id,
             users = ?response.device_keys.keys().collect::<BTreeSet<_>>(),
             failures = ?response.failures,
-            "Handling a keys query response"
+            "Handling a `/keys/query` response"
         );
 
         // Parse the strings into server names and filter out our own server. We should
@@ -166,11 +173,11 @@ impl IdentityManager {
         };
 
         if let Some(sequence_number) = sequence_number {
-            self.store
-                .cache()
+            let cache = self.store.cache().await?;
+            self.key_query_manager
+                .synced(&cache)
                 .await?
                 .mark_tracked_users_as_up_to_date(
-                    &self.store,
                     response.device_keys.keys().map(Deref::deref),
                     sequence_number,
                 )
@@ -206,7 +213,7 @@ impl IdentityManager {
             ?deleted_devices,
             ?new_identities,
             ?changed_identities,
-            "Finished handling of the keys/query response"
+            "Finished handling of the `/keys/query` response"
         );
 
         Ok((devices, identities))
@@ -222,8 +229,8 @@ impl IdentityManager {
         if let Some(mut device) = old_device {
             if let Err(e) = device.update_device(&device_keys) {
                 warn!(
-                    user_id = device.user_id().as_str(),
-                    device_id = device.device_id().as_str(),
+                    user_id = ?device.user_id(),
+                    device_id = ?device.device_id(),
                     error = ?e,
                     "Failed to update device keys",
                 );
@@ -245,8 +252,8 @@ impl IdentityManager {
                             d.set_trust_state(LocalTrust::Verified);
 
                             trace!(
-                                user_id = d.user_id().as_str(),
-                                device_id = d.device_id().as_str(),
+                                user_id = ?d.user_id(),
+                                device_id = ?d.device_id(),
                                 keys = ?d.keys(),
                                 "Adding our own device to the device store, \
                                 marking it as locally verified",
@@ -258,8 +265,8 @@ impl IdentityManager {
                         }
                     } else {
                         trace!(
-                            user_id = d.user_id().as_str(),
-                            device_id = d.device_id().as_str(),
+                            user_id = ?d.user_id(),
+                            device_id = ?d.device_id(),
                             keys = ?d.keys(),
                             "Adding a new device to the device store",
                         );
@@ -269,8 +276,8 @@ impl IdentityManager {
                 }
                 Err(e) => {
                     warn!(
-                        user_id = device_keys.user_id.as_str(),
-                        device_id = device_keys.device_id.as_str(),
+                        user_id = ?device_keys.user_id,
+                        device_id = ?device_keys.device_id,
                         error = ?e,
                         "Failed to create a new device",
                     );
@@ -298,10 +305,10 @@ impl IdentityManager {
             Ok(device_keys) => {
                 if user_id != device_keys.user_id || device_id != device_keys.device_id {
                     warn!(
-                        user_id = user_id.as_str(),
-                        device_id = device_id.as_str(),
-                        device_key_user = device_keys.user_id.as_str(),
-                        device_key_device_id = device_keys.device_id.as_str(),
+                        ?user_id,
+                        ?device_id,
+                        device_key_user = ?device_keys.user_id,
+                        device_key_device_id = ?device_keys.device_id,
                         "Mismatch in the device keys payload",
                     );
                     None
@@ -311,9 +318,7 @@ impl IdentityManager {
             }
             Err(e) => {
                 warn!(
-                    user_id = user_id.as_str(),
-                    device_id = device_id.as_str(),
-                    error = ?e,
+                    ?user_id, ?device_id, error = ?e,
                     "Device keys failed to deserialize",
                 );
                 None
@@ -343,8 +348,8 @@ impl IdentityManager {
                 let identity_keys = store.static_account().identity_keys();
 
                 warn!(
-                    user_id = own_user_id.as_str(),
-                    device_id = own_device_id.as_str(),
+                    user_id = ?own_user_id,
+                    device_id = ?own_device_id,
                     curve25519_key = ?identity_keys.curve25519,
                     ed25519_key = ?identity_keys.ed25519,
                     "Our own device might have been deleted"
@@ -541,7 +546,7 @@ impl IdentityManager {
         }
     }
 
-    /// Try to deserialize the the master key and self-signing key of an
+    /// Try to deserialize the master key and self-signing key of an
     /// identity from a `/keys/query` response.
     ///
     /// Each user identity *must* at least contain a master and self-signing
@@ -792,8 +797,6 @@ impl IdentityManager {
         // Forget about any previous key queries in flight.
         *self.keys_query_request_details.lock().await = None;
 
-        let (users, sequence_number) = self.store.users_for_key_query().await?;
-
         // We always want to track our own user, but in case we aren't in an encrypted
         // room yet, we won't be tracking ourselves yet. This ensures we are always
         // tracking ourselves.
@@ -801,9 +804,13 @@ impl IdentityManager {
         // The check for emptiness is done first for performance.
         let (users, sequence_number) = {
             let cache = self.store.cache().await?;
-            if users.is_empty() && !cache.tracked_users().contains(self.user_id()) {
-                cache.mark_user_as_changed(&self.store, self.user_id()).await?;
-                self.store.users_for_key_query().await?
+            let key_query_manager = self.key_query_manager.synced(&cache).await?;
+
+            let (users, sequence_number) = key_query_manager.users_for_key_query().await;
+
+            if users.is_empty() && !key_query_manager.tracked_users().contains(self.user_id()) {
+                key_query_manager.mark_user_as_changed(self.user_id()).await?;
+                key_query_manager.users_for_key_query().await
             } else {
                 (users, sequence_number)
             }
@@ -862,7 +869,7 @@ impl IdentityManager {
         cache: &StoreCache,
         users: impl Iterator<Item = &UserId>,
     ) -> StoreResult<()> {
-        cache.mark_tracked_users_as_changed(&self.store, users).await
+        self.key_query_manager.synced(cache).await?.mark_tracked_users_as_changed(users).await
     }
 
     /// See the docs for [`OlmMachine::update_tracked_users()`].
@@ -870,7 +877,139 @@ impl IdentityManager {
         &self,
         users: impl IntoIterator<Item = &UserId>,
     ) -> StoreResult<()> {
-        self.store.cache().await?.update_tracked_users(&self.store, users.into_iter()).await
+        let cache = self.store.cache().await?;
+        self.key_query_manager.synced(&cache).await?.update_tracked_users(users.into_iter()).await
+    }
+
+    /// Retrieve a list of a user's current devices, so we can encrypt a message
+    /// to them.
+    ///
+    /// If we have not yet seen any devices for the user, and their device list
+    /// has been marked as outdated, then we wait for the `/keys/query` request
+    /// to complete. This helps ensure that we attempt at least once to fetch a
+    /// user's devices before encrypting to them.
+    pub async fn get_user_devices_for_encryption(
+        &self,
+        users: impl Iterator<Item = &UserId>,
+    ) -> StoreResult<HashMap<OwnedUserId, HashMap<OwnedDeviceId, ReadOnlyDevice>>> {
+        // How long we wait for /keys/query to complete.
+        const KEYS_QUERY_WAIT_TIME: Duration = Duration::from_secs(5);
+
+        let mut devices_by_user = HashMap::new();
+        let mut users_with_no_devices_on_failed_servers = Vec::new();
+        let mut users_with_no_devices_on_unfailed_servers = Vec::new();
+
+        for user_id in users {
+            // First of all, check the store for this user.
+            let devices = self.store.get_readonly_devices_filtered(user_id).await?;
+
+            // Now, look for users who have no devices at all.
+            //
+            // If a user has no devices at all, that implies we have never (successfully)
+            // done a `/keys/query` for them; we wait for one to complete if it is
+            // in flight. (Of course, the user might genuinely have no devices, but
+            // that's fine, it just means we redundantly grab the cache guard and
+            // check the pending-query flag.)
+            if !devices.is_empty() {
+                // This user has at least one known device.
+                //
+                // The device list may also be outdated in this case; but in this
+                // situation, we are racing between sending a message and retrieving their
+                // device list. That's an inherently racy situation and there is no real
+                // benefit to waiting for the `/keys/query` request to complete. So we don't
+                // bother.
+                //
+                // We just add their devices to the result and carry on.
+                devices_by_user.insert(user_id.to_owned(), devices);
+                continue;
+            }
+
+            // *However*, if the user's server is currently subject to a backoff due to
+            // previous failures, then `users_for_key_query` won't attempt to query
+            // for the user's devices, so there's no point waiting.
+            //
+            // XXX: this is racy. It's possible that:
+            //  * `failures` included the user's server when `users_for_key_query` was
+            //    called, so the user was not returned in the `KeyQueryRequest`, and:
+            //  * The backoff has now expired.
+            //
+            // In that case, we'll end up waiting for the *next* `users_for_key_query` call,
+            // which might not be for 30 seconds or so. (And by then, it might be `failed`
+            // again.)
+            if self.failures.contains(user_id.server_name()) {
+                users_with_no_devices_on_failed_servers.push(user_id);
+                continue;
+            }
+
+            users_with_no_devices_on_unfailed_servers.push(user_id);
+        }
+
+        if !users_with_no_devices_on_failed_servers.is_empty() {
+            info!(
+                ?users_with_no_devices_on_failed_servers,
+                "Not waiting for `/keys/query` for users whose server has previously failed"
+            );
+        }
+
+        if !users_with_no_devices_on_unfailed_servers.is_empty() {
+            // For each user with no devices, fire off a task to wait for a `/keys/query`
+            // result if one is pending.
+            //
+            // We don't actually update the `devices_by_user` map here since that could
+            // require concurrent access to it. Instead each task returns a
+            // `(OwnedUserId, HashMap)` pair (or rather, an `Option` of one) so that we can
+            // add the results to the map.
+            let results = join_all(
+                users_with_no_devices_on_unfailed_servers
+                    .into_iter()
+                    .map(|user_id| self.get_updated_keys_for_user(KEYS_QUERY_WAIT_TIME, user_id)),
+            )
+            .await;
+
+            // Once all the tasks have completed, process the results.
+            let mut updated_users = Vec::new();
+            for result in results {
+                if let Some((user_id, updated_devices)) = result? {
+                    devices_by_user.insert(user_id.to_owned(), updated_devices);
+                    updated_users.push(user_id);
+                }
+            }
+
+            if !updated_users.is_empty() {
+                info!(
+                    ?updated_users,
+                    "Waited for `/keys/query` to complete for users who have no devices"
+                );
+            }
+        }
+
+        Ok(devices_by_user)
+    }
+
+    /// Helper for get_user_devices_for_encryption.
+    ///
+    /// Waits for any pending `/keys/query` for the given user. If one was
+    /// pending, reloads the device list and returns `Some(user_id,
+    /// device_list)`. If no request was pending, returns `None`.
+    #[allow(clippy::type_complexity)]
+    #[instrument(skip(self))]
+    async fn get_updated_keys_for_user<'a>(
+        &self,
+        timeout_duration: Duration,
+        user_id: &'a UserId,
+    ) -> Result<Option<(&'a UserId, HashMap<OwnedDeviceId, ReadOnlyDevice>)>, CryptoStoreError>
+    {
+        let cache = self.store.cache().await?;
+        match self
+            .key_query_manager
+            .wait_if_user_key_query_pending(cache, timeout_duration, user_id)
+            .await?
+        {
+            UserKeyQueryResult::WasPending => {
+                Ok(Some((user_id, self.store.get_readonly_devices_filtered(user_id).await?)))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -981,7 +1120,7 @@ pub(crate) mod testing {
             "user_signing_keys": {}
         }));
         KeyQueryResponse::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     // An updated version of `other_key_query` featuring an additional signature on
@@ -1047,7 +1186,7 @@ pub(crate) mod testing {
             "user_signing_keys": {}
         }));
         KeyQueryResponse::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     /// Mocked response to a /keys/query request.
@@ -1149,7 +1288,7 @@ pub(crate) mod testing {
           }
         }));
         KeyQueryResponse::try_from_http_response(data)
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 
     pub fn own_key_query() -> KeyQueryResponse {
@@ -1180,7 +1319,7 @@ pub(crate) mod testing {
         );
 
         KeyQueryResponse::try_from_http_response(response_from_file(&json))
-            .expect("Can't parse the keys upload response")
+            .expect("Can't parse the `/keys/upload` response")
     }
 }
 
@@ -1227,21 +1366,20 @@ pub(crate) mod tests {
         let manager = manager_test_helper(user_id(), device_id()).await;
         let alice = user_id!("@alice:example.org");
 
-        {
-            let cache = manager.store.cache().await.unwrap();
+        let cache = manager.store.cache().await.unwrap();
+        let key_query_manager = manager.key_query_manager.synced(&cache).await.unwrap();
 
-            assert!(cache.tracked_users().is_empty(), "No users are initially tracked");
+        assert!(key_query_manager.tracked_users().is_empty(), "No users are initially tracked");
 
-            manager.receive_device_changes(&cache, [alice].iter().map(Deref::deref)).await.unwrap();
-
-            assert!(
-                !cache.tracked_users().contains(alice),
-                "Receiving a device changes update for a user we don't track does nothing"
-            );
-        }
+        manager.receive_device_changes(&cache, [alice].iter().map(Deref::deref)).await.unwrap();
 
         assert!(
-            !manager.store.users_for_key_query().await.unwrap().0.contains(alice),
+            !key_query_manager.tracked_users().contains(alice),
+            "Receiving a device changes update for a user we don't track does nothing"
+        );
+
+        assert!(
+            !key_query_manager.users_for_key_query().await.0.contains(alice),
             "The user we don't track doesn't end up in the `/keys/query` request"
         );
     }
@@ -1249,7 +1387,8 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_manager_creation() {
         let manager = manager_test_helper(user_id(), device_id()).await;
-        assert!(manager.store.cache().await.unwrap().tracked_users().is_empty())
+        let cache = manager.store.cache().await.unwrap();
+        assert!(manager.key_query_manager.synced(&cache).await.unwrap().tracked_users().is_empty())
     }
 
     #[async_test]
@@ -1349,7 +1488,7 @@ pub(crate) mod tests {
         });
 
         let response = KeysQueryResponse::try_from_http_response(response_from_file(&response))
-            .expect("Can't parse the keys query response");
+            .expect("Can't parse the `/keys/query` response");
 
         manager.receive_keys_query_response(&TransactionId::new(), &response).await.unwrap();
 
@@ -1399,7 +1538,7 @@ pub(crate) mod tests {
         });
 
         let response = KeysQueryResponse::try_from_http_response(response_from_file(&response))
-            .expect("Can't parse the keys query response");
+            .expect("Can't parse the `/keys/query` response");
 
         let (_, private_identity) = manager.handle_cross_signing_keys(&response).await.unwrap();
 
@@ -1412,16 +1551,23 @@ pub(crate) mod tests {
     async fn test_no_tracked_users_key_query_request() {
         let manager = manager_test_helper(user_id(), device_id()).await;
 
+        let cache = manager.store.cache().await.unwrap();
         assert!(
-            manager.store.cache().await.unwrap().tracked_users().is_empty(),
+            manager.key_query_manager.synced(&cache).await.unwrap().tracked_users().is_empty(),
             "No users are initially tracked"
         );
 
         let requests = manager.users_for_key_query().await.unwrap();
-
         assert!(!requests.is_empty(), "We query the keys for our own user");
+
         assert!(
-            manager.store.cache().await.unwrap().tracked_users().contains(manager.user_id()),
+            manager
+                .key_query_manager
+                .synced(&cache)
+                .await
+                .unwrap()
+                .tracked_users()
+                .contains(manager.user_id()),
             "Our own user is now tracked"
         );
     }
@@ -1467,12 +1613,13 @@ pub(crate) mod tests {
 
         {
             let cache = manager.store.cache().await.unwrap();
-            assert!(cache.tracked_users().is_empty(), "No users are initially tracked");
+            let key_query_manager = manager.key_query_manager.synced(&cache).await.unwrap();
+            assert!(key_query_manager.tracked_users().is_empty(), "No users are initially tracked");
 
-            cache.mark_user_as_changed(&manager.store, alice).await.unwrap();
+            key_query_manager.mark_user_as_changed(alice).await.unwrap();
 
             assert!(
-                cache.tracked_users().contains(alice),
+                key_query_manager.tracked_users().contains(alice),
                 "Alice is tracked after being marked as tracked"
             );
         }
@@ -1575,7 +1722,7 @@ pub(crate) mod tests {
         let (new_request_id, _) =
             manager.as_ref().unwrap().build_key_query_for_users(vec![user_id()]);
 
-        // A second `keys/query` response with the same result shouldn't fire a change
+        // A second `/keys/query` response with the same result shouldn't fire a change
         // notification: the identity should be unchanged.
         manager
             .as_ref()

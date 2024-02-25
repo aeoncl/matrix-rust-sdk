@@ -18,7 +18,7 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::config::SyncSettings;
+use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
     async_test, sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
     SyncResponseBuilder,
@@ -26,7 +26,7 @@ use matrix_sdk_test::{
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItemContent, VirtualTimelineItem};
 use ruma::{room_id, user_id};
 
-use crate::{logged_in_client, mock_sync};
+use crate::mock_sync;
 
 mod echo;
 mod edit;
@@ -40,9 +40,9 @@ mod subscribe;
 pub(crate) mod sliding_sync;
 
 #[async_test]
-async fn reaction() {
+async fn test_reaction() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
@@ -53,7 +53,7 @@ async fn reaction() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     ev_builder.add_joined_room(
@@ -87,17 +87,35 @@ async fn reaction() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    // The day divider.
     assert_let!(Some(VectorDiff::PushBack { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
-    assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
-    assert_matches!(message.as_event().unwrap().content(), TimelineItemContent::Message(_));
 
+    // The new message starts with their author's read receipt.
+    assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+    let event_item = message.as_event().unwrap();
+    assert_matches!(event_item.content(), TimelineItemContent::Message(_));
+    assert_eq!(event_item.read_receipts().len(), 1);
+
+    // The new message is getting the reaction, which implies an implicit read
+    // receipt that's obtained first.
     assert_let!(
         Some(VectorDiff::Set { index: 1, value: updated_message }) = timeline_stream.next().await
     );
     let event_item = updated_message.as_event().unwrap();
     assert_let!(TimelineItemContent::Message(msg) = event_item.content());
     assert!(!msg.is_edited());
+    assert_eq!(event_item.read_receipts().len(), 2);
+    assert_eq!(event_item.reactions().len(), 0);
+
+    // Then the reaction is taken into account.
+    assert_let!(
+        Some(VectorDiff::Set { index: 1, value: updated_message }) = timeline_stream.next().await
+    );
+    let event_item = updated_message.as_event().unwrap();
+    assert_let!(TimelineItemContent::Message(msg) = event_item.content());
+    assert!(!msg.is_edited());
+    assert_eq!(event_item.read_receipts().len(), 2);
     assert_eq!(event_item.reactions().len(), 1);
     let group = &event_item.reactions()["👍"];
     assert_eq!(group.len(), 1);
@@ -131,9 +149,9 @@ async fn reaction() {
 }
 
 #[async_test]
-async fn redacted_message() {
+async fn test_redacted_message() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
@@ -144,7 +162,7 @@ async fn redacted_message() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     ev_builder.add_joined_room(
@@ -189,9 +207,9 @@ async fn redacted_message() {
 }
 
 #[async_test]
-async fn read_marker() {
+async fn test_read_marker() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
@@ -202,7 +220,7 @@ async fn read_marker() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
@@ -264,9 +282,9 @@ async fn read_marker() {
 }
 
 #[async_test]
-async fn sync_highlighted() {
+async fn test_sync_highlighted() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
@@ -283,7 +301,7 @@ async fn sync_highlighted() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(

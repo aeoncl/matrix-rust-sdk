@@ -12,14 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use eyeball::SharedObservable;
-use imbl::Vector;
+use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
-    deserialized_responses::SyncTimelineEvent, executor::spawn, sync::RoomUpdate, Room,
+    event_cache::{self, RoomEventCacheUpdate},
+    executor::spawn,
+    Room,
 };
-use ruma::events::{receipt::ReceiptType, AnySyncTimelineEvent};
+use matrix_sdk_base::sync::JoinedRoomUpdate;
+use ruma::{
+    events::{receipt::ReceiptType, AnySyncTimelineEvent},
+    RoomVersionId,
+};
 use tokio::sync::{broadcast, mpsc, Notify};
 use tracing::{info, info_span, trace, warn, Instrument, Span};
 
@@ -38,34 +44,26 @@ use super::{
 pub struct TimelineBuilder {
     room: Room,
     prev_token: Option<String>,
-    events: Vector<SyncTimelineEvent>,
     settings: TimelineInnerSettings,
 }
 
 impl TimelineBuilder {
     pub(super) fn new(room: &Room) -> Self {
-        Self {
-            room: room.clone(),
-            prev_token: None,
-            events: Vector::new(),
-            settings: TimelineInnerSettings::default(),
-        }
+        Self { room: room.clone(), prev_token: None, settings: TimelineInnerSettings::default() }
     }
 
     /// Add initial events to the timeline.
-    pub(crate) fn events(
-        mut self,
-        prev_token: Option<String>,
-        events: Vector<SyncTimelineEvent>,
-    ) -> Self {
+    ///
+    /// TODO: remove this, the EventCache should hold the pagination token in
+    /// the first place.
+    pub fn with_pagination_token(mut self, prev_token: Option<String>) -> Self {
         self.prev_token = prev_token;
-        self.events = events;
         self
     }
 
     /// Enable tracking of the fully-read marker and the read receipts on the
     /// timeline.
-    pub(crate) fn track_read_marker_and_receipts(mut self) -> Self {
+    pub fn track_read_marker_and_receipts(mut self) -> Self {
         self.settings.track_read_receipts = true;
         self
     }
@@ -78,17 +76,26 @@ impl TimelineBuilder {
     ///   return `true` if the event should be added to the `Timeline`.
     ///
     /// If this is not overridden, the timeline uses the default filter that
-    /// allows every event.
+    /// only allows events that are materialized into a `Timeline` item. For
+    /// instance, reactions and edits don't get their own timeline item (as
+    /// they affect another existing one), so they're "filtered out" to
+    /// reflect that.
+    ///
+    /// You can use the default event filter with
+    /// [`crate::timeline::default_event_filter`] so as to chain it with
+    /// your own event filter, if you want to avoid situations where a read
+    /// receipt would be attached to an event that doesn't get its own
+    /// timeline item.
     ///
     /// Note that currently:
     ///
     /// - Not all event types have a representation as a `TimelineItem` so these
     ///   are not added no matter what the filter returns.
     /// - It is not possible to filter out `m.room.encrypted` events (otherwise
-    ///   they couldn't by decrypted when the appropriate room key arrives)
+    ///   they couldn't be decrypted when the appropriate room key arrives).
     pub fn event_filter<F>(mut self, filter: F) -> Self
     where
-        F: Fn(&AnySyncTimelineEvent) -> bool + Send + Sync + 'static,
+        F: Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool + Send + Sync + 'static,
     {
         self.settings.event_filter = Arc::new(filter);
         self
@@ -107,13 +114,22 @@ impl TimelineBuilder {
         skip(self),
         fields(
             room_id = ?self.room.room_id(),
-            events_length = self.events.len(),
             track_read_receipts = self.settings.track_read_receipts,
             prev_token = self.prev_token,
         )
     )]
-    pub async fn build(self) -> Timeline {
-        let Self { room, prev_token, events, settings } = self;
+    pub async fn build(self) -> event_cache::Result<Timeline> {
+        let Self { room, prev_token, settings } = self;
+
+        let client = room.client();
+        let event_cache = client.event_cache();
+
+        // Subscribe the event cache to sync responses, in case we hadn't done it yet.
+        event_cache.subscribe()?;
+
+        let (room_event_cache, event_cache_drop) = event_cache.for_room(room.room_id()).await?;
+        let (events, mut event_subscriber) = room_event_cache.subscribe().await?;
+
         let has_events = !events.is_empty();
         let track_read_marker_and_receipts = settings.track_read_receipts;
 
@@ -135,7 +151,6 @@ impl TimelineBuilder {
         let client = room.client();
 
         let sync_response_notify = Arc::new(Notify::new());
-        let mut room_update_rx = room.subscribe_to_updates();
         let room_update_join_handle = spawn({
             let sync_response_notify = sync_response_notify.clone();
             let inner = inner.clone();
@@ -145,8 +160,12 @@ impl TimelineBuilder {
             span.follows_from(Span::current());
 
             async move {
+                trace!("Spawned the event subscriber task");
+
                 loop {
-                    let update = match room_update_rx.recv().await {
+                    trace!("Waiting for an event");
+
+                    let update = match event_subscriber.recv().await {
                         Ok(up) => up,
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -156,21 +175,49 @@ impl TimelineBuilder {
                         }
                     };
 
-                    trace!("Handling a room update");
-
                     match update {
-                        RoomUpdate::Left { updates, .. } => {
-                            inner.handle_sync_timeline(updates.timeline).await;
+                        RoomEventCacheUpdate::Clear => {
+                            trace!("Clearing the timeline.");
+                            inner.clear().await;
                         }
-                        RoomUpdate::Joined { updates, .. } => {
-                            inner.handle_joined_room_update(updates).await;
-                        }
-                        RoomUpdate::Invited { .. } => {
-                            warn!("Room is in invited state, can't build or update its timeline");
+
+                        RoomEventCacheUpdate::Append {
+                            events,
+                            prev_batch,
+                            account_data,
+                            ephemeral,
+                            ambiguity_changes,
+                        } => {
+                            trace!("Received new events");
+
+                            // XXX this timeline and the joined room updates are synthetic, until
+                            // we get rid of `handle_joined_room_update` by adding all functionality
+                            // back in the event cache, and replacing it with a simple
+                            // `handle_add_events`.
+                            let timeline = matrix_sdk_base::sync::Timeline {
+                                limited: false,
+                                prev_batch,
+                                events,
+                            };
+                            let update = JoinedRoomUpdate {
+                                unread_notifications: Default::default(),
+                                timeline,
+                                state: Default::default(),
+                                account_data,
+                                ephemeral,
+                                ambiguity_changes: Default::default(),
+                            };
+                            inner.handle_joined_room_update(update).await;
+
+                            let member_ambiguity_changes = ambiguity_changes
+                                .values()
+                                .flat_map(|change| change.user_ids())
+                                .collect::<BTreeSet<_>>();
+                            inner.force_update_sender_profiles(&member_ambiguity_changes).await;
+
+                            sync_response_notify.notify_waiters();
                         }
                     }
-
-                    sync_response_notify.notify_waiters();
                 }
             }
             .instrument(span)
@@ -179,11 +226,16 @@ impl TimelineBuilder {
         let mut ignore_user_list_stream = client.subscribe_to_ignore_user_list_changes();
         let ignore_user_list_update_join_handle = spawn({
             let inner = inner.clone();
+
+            let span = info_span!(parent: Span::none(), "ignore_user_list_update_handler", room_id = ?room.room_id());
+            span.follows_from(Span::current());
+
             async move {
                 while ignore_user_list_stream.next().await.is_some() {
                     inner.clear().await;
                 }
             }
+            .instrument(span)
         });
 
         // Not using room.add_event_handler here because RoomKey events are
@@ -205,6 +257,35 @@ impl TimelineBuilder {
             forwarded_room_key_handle,
         ];
 
+        let room_key_from_backups_join_handle = {
+            let inner = inner.clone();
+            let room_id = inner.room().room_id();
+
+            let stream = client.encryption().backups().room_keys_for_room_stream(room_id);
+
+            spawn(async move {
+                pin_mut!(stream);
+
+                while let Some(update) = stream.next().await {
+                    let room = inner.room();
+
+                    match update {
+                        Ok(info) => {
+                            let mut session_ids = BTreeSet::new();
+
+                            for set in info.into_values() {
+                                session_ids.extend(set);
+                            }
+
+                            inner.retry_event_decryption(room, Some(session_ids)).await;
+                        }
+                        // We lagged, so retry every event.
+                        Err(_) => inner.retry_event_decryption(room, None).await,
+                    }
+                }
+            })
+        };
+
         let (msg_sender, msg_receiver) = mpsc::channel(1);
         info!("Starting message-sending loop");
         spawn(send_queued_messages(inner.clone(), room.clone(), msg_receiver));
@@ -220,6 +301,8 @@ impl TimelineBuilder {
                 event_handler_handles: handles,
                 room_update_join_handle,
                 ignore_user_list_update_join_handle,
+                room_key_from_backups_join_handle,
+                _event_cache_drop_handle: event_cache_drop,
             }),
         };
 
@@ -231,6 +314,6 @@ impl TimelineBuilder {
             timeline.retry_decryption_for_all_events().await;
         }
 
-        timeline
+        Ok(timeline)
     }
 }

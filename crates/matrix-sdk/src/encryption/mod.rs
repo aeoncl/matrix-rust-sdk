@@ -21,6 +21,7 @@ use std::{
     io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use eyeball::SharedObservable;
@@ -32,6 +33,7 @@ use futures_util::{
 use matrix_sdk_base::crypto::{
     CrossSigningBootstrapRequests, OlmMachine, OutgoingRequest, RoomMessageRequest, ToDeviceRequest,
 };
+use matrix_sdk_common::executor::spawn;
 use ruma::{
     api::client::{
         backup::add_backup_keys::v3::Response as KeysBackupResponse,
@@ -55,10 +57,19 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
 use tokio::sync::RwLockReadGuard;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
+use self::{
+    backups::{types::BackupClientState, Backups},
+    futures::PrepareEncryptedFile,
+    identities::{DeviceUpdates, IdentityUpdates},
+    recovery::{Recovery, RecoveryState},
+    secret_storage::SecretStorage,
+    tasks::{BackupDownloadTask, BackupUploadingTask, ClientTasks},
+};
 use crate::{
     attachment::{AttachmentInfo, Thumbnail},
+    client::ClientInner,
     encryption::{
         identities::{Device, UserDevices},
         verification::{SasVerification, Verification, VerificationRequest},
@@ -68,8 +79,12 @@ use crate::{
     Client, Error, Result, Room, TransmissionProgress,
 };
 
-mod futures;
+pub mod backups;
+pub mod futures;
 pub mod identities;
+pub mod recovery;
+pub mod secret_storage;
+pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
@@ -82,9 +97,48 @@ pub use matrix_sdk_base::crypto::{
     SessionCreationError, SignatureError, VERSION,
 };
 
-pub use self::futures::PrepareEncryptedFile;
-use self::identities::{DeviceUpdates, IdentityUpdates};
 pub use crate::error::RoomKeyImportError;
+
+/// All the data related to the encryption state.
+pub(crate) struct EncryptionData {
+    /// Background tasks related to encryption (key backup, initialization
+    /// tasks, etc.).
+    pub tasks: StdMutex<ClientTasks>,
+
+    /// End-to-end encryption settings.
+    pub encryption_settings: EncryptionSettings,
+
+    /// All state related to key backup.
+    pub backup_state: BackupClientState,
+
+    /// All state related to secret storage recovery.
+    pub recovery_state: SharedObservable<RecoveryState>,
+}
+
+impl EncryptionData {
+    pub fn new(encryption_settings: EncryptionSettings) -> Self {
+        Self {
+            encryption_settings,
+
+            tasks: StdMutex::new(Default::default()),
+            backup_state: Default::default(),
+            recovery_state: Default::default(),
+        }
+    }
+
+    pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
+        let weak_client = Arc::downgrade(client);
+
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
+
+        if self.encryption_settings.backup_download_strategy
+            == BackupDownloadStrategy::AfterDecryptionFailure
+        {
+            tasks.download_room_keys = Some(BackupDownloadTask::new(weak_client));
+        }
+    }
+}
 
 /// Settings for end-to-end encryption features.
 #[derive(Clone, Copy, Debug, Default)]
@@ -95,6 +149,41 @@ pub struct EncryptionSettings {
     /// This requires to login with a username and password, or that MSC3967 is
     /// enabled on the server, as of 2023-10-20.
     pub auto_enable_cross_signing: bool,
+
+    /// Select a strategy to download room keys from the backup, by default room
+    /// keys won't be downloaded from the backup automatically.
+    ///
+    /// Take a look at the [`BackupDownloadStrategy`] enum for more options.
+    pub backup_download_strategy: BackupDownloadStrategy,
+
+    /// Automatically create a backup version if no backup exists.
+    pub auto_enable_backups: bool,
+}
+
+/// Settings for end-to-end encryption features.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackupDownloadStrategy {
+    /// Automatically download all room keys from the backup when the backup
+    /// recovery key has been received. The backup recovery key can be received
+    /// in two ways:
+    ///
+    /// 1. Received as a `m.secret.send` to-device event, after a successful
+    ///    interactive verification.
+    /// 2. Imported from secret storage (4S) using the
+    ///    [`SecretStore::import_secrets()`] method.
+    ///
+    /// [`SecretStore::import_secrets()`]: crate::encryption::secret_storage::SecretStore::import_secrets
+    OneShot,
+
+    /// Attempt to download a single room key if an event fails to be decrypted.
+    AfterDecryptionFailure,
+
+    /// Don't download any room keys automatically. The user can manually
+    /// download room keys using the [`Backups::download_room_key()`] methods.
+    ///
+    /// This is the default option.
+    #[default]
+    Manual,
 }
 
 impl Client {
@@ -133,6 +222,7 @@ impl Client {
 
         let response = self.send(request, None).await?;
         self.mark_request_as_sent(request_id, &response).await?;
+        self.encryption().recovery().update_state_after_keys_query(&response).await;
 
         Ok(response)
     }
@@ -167,7 +257,7 @@ impl Client {
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
     /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
-    /// room.send(CustomEventContent { encrypted_file }, None).await?;
+    /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
     pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
@@ -337,7 +427,8 @@ impl Client {
 
         self.get_room(room_id)
             .expect("Can't send a message to a room that isn't known to the store")
-            .send(content, Some(txn_id))
+            .send(content)
+            .with_transaction_id(txn_id)
             .await
     }
 
@@ -489,7 +580,7 @@ impl Encryption {
 
     /// Returns the current encryption settings for this client.
     pub(crate) fn settings(&self) -> EncryptionSettings {
-        self.client.inner.encryption_settings
+        self.client.inner.e2ee.encryption_settings
     }
 
     /// Get the public ed25519 key of our own device. This is usually what is
@@ -685,14 +776,7 @@ impl Encryption {
         let Some(olm) = olm.as_ref() else { return Ok(None) };
         let identity = olm.get_identity(user_id, None).await?;
 
-        Ok(identity.map(|i| match i {
-            matrix_sdk_base::crypto::UserIdentities::Own(i) => {
-                UserIdentity::new_own(self.client.clone(), i)
-            }
-            matrix_sdk_base::crypto::UserIdentities::Other(i) => {
-                UserIdentity::new_other(self.client.clone(), i)
-            }
-        }))
+        Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
     }
 
     /// Returns a stream of device updates, allowing users to listen for
@@ -979,7 +1063,7 @@ impl Encryption {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        let keys = olm.export_room_keys(predicate).await?;
+        let keys = olm.store().export_room_keys(predicate).await?;
         let passphrase = zeroize::Zeroizing::new(passphrase.to_owned());
 
         let encrypt = move || -> Result<()> {
@@ -1049,7 +1133,26 @@ impl Encryption {
         let task = tokio::task::spawn_blocking(decrypt);
         let import = task.await.expect("Task join error")?;
 
-        Ok(olm.import_room_keys(import, false, |_, _| {}).await?)
+        let ret = olm.store().import_exported_room_keys(import, |_, _| {}).await?;
+
+        self.backups().maybe_trigger_backup();
+
+        Ok(ret)
+    }
+
+    /// Get the secret storage manager of the client.
+    pub fn secret_storage(&self) -> SecretStorage {
+        SecretStorage { client: self.client.to_owned() }
+    }
+
+    /// Get the backups manager of the client.
+    pub fn backups(&self) -> Backups {
+        Backups { client: self.client.to_owned() }
+    }
+
+    /// Get the recovery manager of the client.
+    pub fn recovery(&self) -> Recovery {
+        Recovery { client: self.client.to_owned() }
     }
 
     /// Enables the crypto-store cross-process lock.
@@ -1165,6 +1268,63 @@ impl Encryption {
         let olm_machine = olm_machine.as_ref().ok_or(Error::AuthenticationRequired)?;
         Ok(olm_machine.uploaded_key_count().await?)
     }
+
+    /// Bootstrap encryption and enables event listeners for the E2EE support.
+    ///
+    /// Based on the `EncryptionSettings`, this call might:
+    /// - Bootstrap cross-signing if needed (POST `/device_signing/upload`)
+    /// - Create a key backup if needed (POST `/room_keys/version`)
+    /// - Create a secret storage if needed (PUT `/account_data/{type}`)
+    ///
+    /// As part of this process, and if needed, the current device keys would be
+    /// uploaded to the server, new account data would be added, and cross
+    /// signing keys and signatures might be uploaded.
+    ///
+    /// Should be called once we
+    /// created a [`OlmMachine`], i.e. after logging in.
+    ///
+    /// # Arguments
+    ///
+    /// * `auth_data` - Some requests may require re-authentication. To prevent
+    /// the user from having to re-enter their password (or use other methods),
+    /// we can provide the authentication data here. This is necessary for
+    /// uploading cross-signing keys. However, please note that there is a
+    /// proposal (MSC3967) to remove this requirement, which would allow for
+    /// the initial upload of cross-signing keys without authentication,
+    /// rendering this parameter obsolete.
+    pub(crate) async fn run_initialization_tasks(&self, auth_data: Option<AuthData>) -> Result<()> {
+        let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+
+        let this = self.clone();
+        tasks.setup_e2ee = Some(spawn(async move {
+            if this.settings().auto_enable_cross_signing {
+                if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
+                    error!("Couldn't bootstrap cross signing {e:?}");
+                }
+            }
+
+            if let Err(e) = this.backups().setup_and_resume().await {
+                error!("Couldn't setup and resume backups {e:?}");
+            }
+            if let Err(e) = this.recovery().setup().await {
+                error!("Couldn't setup and resume recovery {e:?}");
+            }
+        }));
+
+        Ok(())
+    }
+
+    /// Waits for end-to-end encryption initialization tasks to finish, if any
+    /// was running in the background.
+    pub async fn wait_for_e2ee_initialization_tasks(&self) {
+        let task = self.client.inner.e2ee.tasks.lock().unwrap().setup_e2ee.take();
+
+        if let Some(task) = task {
+            if let Err(err) = task.await {
+                warn!("error when initializing backups: {err}");
+            }
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1235,11 +1395,9 @@ mod tests {
 
         let event_id = event_id!("$1:example.org");
         let reaction = ReactionEventContent::new(Annotation::new(event_id.into(), "🐈".to_owned()));
-        room.send(reaction, None).await.expect("Sending the reaction should not fail");
+        room.send(reaction).await.expect("Sending the reaction should not fail");
 
-        room.send_raw(json!({}), "m.reaction", None)
-            .await
-            .expect("Sending the reaction should not fail");
+        room.send_raw("m.reaction", json!({})).await.expect("Sending the reaction should not fail");
     }
 
     #[async_test]
@@ -1358,6 +1516,21 @@ mod tests {
         let initial_olm_machine =
             client1.olm_machine().await.clone().expect("must have an olm machine");
 
+        // Also enable backup to check that new machine has the same backup keys.
+        let decryption_key = matrix_sdk_base::crypto::store::BackupDecryptionKey::new()
+            .expect("Can't create new recovery key");
+        let backup_key = decryption_key.megolm_v1_public_key();
+        backup_key.set_version("1".to_owned());
+        initial_olm_machine
+            .backup_machine()
+            .save_decryption_key(Some(decryption_key.to_owned()), Some("1".to_owned()))
+            .await
+            .expect("Should save");
+
+        initial_olm_machine.backup_machine().enable_backup_v1(backup_key.clone()).await.unwrap();
+
+        assert!(client1.encryption().backups().are_enabled().await);
+
         // The other client can't take the lock too.
         let acquired2 = client2.encryption().try_lock_store_once().await.unwrap();
         assert!(acquired2.is_none());
@@ -1392,7 +1565,16 @@ mod tests {
 
         // But now its olm machine has been invalidated and thus regenerated!
         let olm_machine = client1.olm_machine().await.clone().expect("must have an olm machine");
+
         assert!(!initial_olm_machine.same_as(&olm_machine));
+
+        let backup_key_new = olm_machine.backup_machine().get_backup_keys().await.unwrap();
+        assert!(backup_key_new.decryption_key.is_some());
+        assert_eq!(
+            backup_key_new.decryption_key.unwrap().megolm_v1_public_key().to_base64(),
+            backup_key.to_base64()
+        );
+        assert!(client1.encryption().backups().are_enabled().await);
     }
 
     #[cfg(feature = "sqlite")]

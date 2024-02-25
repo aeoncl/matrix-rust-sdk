@@ -24,16 +24,16 @@ use crate::widget::machine::{
 
 #[test]
 fn machine_can_negotiate_capabilities_immediately() {
-    let (mut machine, initial_actions) =
-        WidgetMachine::new(WIDGET_ID.to_owned(), owned_room_id!("!a98sd12bjh:example.org"), false);
-    assert_capabilities_dance(&mut machine, initial_actions);
+    let room_id = owned_room_id!("!a98sd12bjh:example.org");
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    assert_capabilities_dance(&mut machine, actions, None);
 }
 
 #[test]
 fn machine_can_request_capabilities_on_content_load() {
-    let (mut machine, initial_actions) =
-        WidgetMachine::new(WIDGET_ID.to_owned(), owned_room_id!("!a98sd12bjh:example.org"), true);
-    assert!(initial_actions.is_empty());
+    let room_id = owned_room_id!("!a98sd12bjh:example.org");
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, true, None);
+    assert!(actions.is_empty());
 
     // Content loaded event processed.
     let actions = {
@@ -63,13 +63,13 @@ fn machine_can_request_capabilities_on_content_load() {
         actions
     };
 
-    assert_capabilities_dance(&mut machine, actions);
+    assert_capabilities_dance(&mut machine, actions, None);
 }
 
 #[test]
 fn capabilities_failure_results_into_empty_capabilities() {
-    let (mut machine, actions) =
-        WidgetMachine::new(WIDGET_ID.to_owned(), owned_room_id!("!a98sd12bjh:example.org"), false);
+    let room_id = owned_room_id!("!a98sd12bjh:example.org");
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
 
     // Ask widget to provide desired capabilities.
     let actions = {
@@ -136,7 +136,16 @@ fn capabilities_failure_results_into_empty_capabilities() {
     );
 }
 
-pub(super) fn assert_capabilities_dance(machine: &mut WidgetMachine, actions: Vec<Action>) {
+/// Performs a capability "dance", if no capability is specified, we assume that
+/// it's: `org.matrix.msc2762.receive.state_event:m.room.member`.
+pub(super) fn assert_capabilities_dance(
+    machine: &mut WidgetMachine,
+    actions: Vec<Action>,
+    capability_str: Option<&str>,
+) {
+    let capability =
+        capability_str.unwrap_or("org.matrix.msc2762.receive.state_event:m.room.member");
+
     // Ask widget to provide desired capabilities.
     let actions = {
         let [action]: [Action; 1] = actions.try_into().unwrap();
@@ -159,7 +168,7 @@ pub(super) fn assert_capabilities_dance(machine: &mut WidgetMachine, actions: Ve
             "action": "capabilities",
             "data": {},
             "response": {
-                "capabilities": ["org.matrix.msc2762.receive.state_event:m.room.member"],
+                "capabilities": [capability],
             },
         })))
     };
@@ -174,17 +183,17 @@ pub(super) fn assert_capabilities_dance(machine: &mut WidgetMachine, actions: Ve
             } = action
         );
         let capabilities = data.desired_capabilities;
-        assert_eq!(
-            capabilities,
-            from_value(json!(["org.matrix.msc2762.receive.state_event:m.room.member"])).unwrap()
-        );
+        assert_eq!(capabilities, from_value(json!([capability])).unwrap());
 
         let response = Ok(MatrixDriverResponse::CapabilitiesAcquired(capabilities));
         let message = IncomingMessage::MatrixDriverResponse { request_id, response };
         machine.process(message)
     };
 
-    // We get the `Subscribe` command since we requested some reading capabilities.
+    // We get the `Subscribe` command if we requested some reading capabilities.
+    if ["org.matrix.msc2762.receive.state_event", "org.matrix.msc2762.receive.event"]
+        .into_iter()
+        .any(|c| capability.starts_with(c))
     {
         let action = actions.remove(0);
         assert_matches!(action, Action::Subscribe);
@@ -202,8 +211,8 @@ pub(super) fn assert_capabilities_dance(machine: &mut WidgetMachine, actions: Ve
                 "widgetId": WIDGET_ID,
                 "action": "notify_capabilities",
                 "data": {
-                    "requested": ["org.matrix.msc2762.receive.state_event:m.room.member"],
-                    "approved": ["org.matrix.msc2762.receive.state_event:m.room.member"],
+                    "requested": [capability],
+                    "approved": [capability],
                 },
             }),
         );
@@ -214,8 +223,8 @@ pub(super) fn assert_capabilities_dance(machine: &mut WidgetMachine, actions: Ve
             "requestId": request_id,
             "action": "notify_capabilities",
             "data": {
-                "requested": ["org.matrix.msc2762.receive.state_event:m.room.member"],
-                "approved": ["org.matrix.msc2762.receive.state_event:m.room.member"],
+                "requested": [capability],
+                "approved": [capability],
             },
             "response": {},
         })));

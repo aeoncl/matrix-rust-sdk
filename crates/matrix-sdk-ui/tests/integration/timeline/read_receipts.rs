@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::{ops::Not as _, time::Duration};
 
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::{config::SyncSettings, room::Receipts};
+use matrix_sdk::{config::SyncSettings, room::Receipts, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
     async_test, sync_timeline_event, EphemeralTestEvent, JoinedRoomBuilder,
     RoomAccountDataTestEvent, SyncResponseBuilder, ALICE, BOB,
@@ -32,7 +32,7 @@ use ruma::{
         room::message::{MessageType, SyncRoomMessageEvent},
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
     },
-    room_id, user_id,
+    room_id, user_id, RoomVersionId,
 };
 use serde_json::json;
 use wiremock::{
@@ -40,9 +40,9 @@ use wiremock::{
     Mock, ResponseTemplate,
 };
 
-use crate::{logged_in_client, mock_sync};
+use crate::mock_sync;
 
-fn filter_notice(ev: &AnySyncTimelineEvent) -> bool {
+fn filter_notice(ev: &AnySyncTimelineEvent, _room_version: &RoomVersionId) -> bool {
     match ev {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(msg),
@@ -52,9 +52,9 @@ fn filter_notice(ev: &AnySyncTimelineEvent) -> bool {
 }
 
 #[async_test]
-async fn read_receipts_updates() {
+async fn test_read_receipts_updates() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let own_user_id = client.user_id().unwrap();
@@ -72,7 +72,7 @@ async fn read_receipts_updates() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
     assert!(items.is_empty());
@@ -281,9 +281,9 @@ async fn read_receipts_updates() {
 }
 
 #[async_test]
-async fn read_receipts_updates_on_filtered_events() {
+async fn test_read_receipts_updates_on_filtered_events() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let own_user_id = client.user_id().unwrap();
@@ -300,17 +300,26 @@ async fn read_receipts_updates_on_filtered_events() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline_builder().event_filter(filter_notice).build().await;
+    let timeline = room.timeline_builder().event_filter(filter_notice).build().await.unwrap();
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
     assert!(items.is_empty());
 
     let own_receipt = timeline.latest_user_read_receipt(own_user_id).await;
     assert_matches!(own_receipt, None);
+    let own_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await;
+    assert_matches!(own_receipt_timeline_event, None);
     let alice_receipt = timeline.latest_user_read_receipt(*ALICE).await;
     assert_matches!(alice_receipt, None);
+    let alice_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await;
+    assert_matches!(alice_receipt_timeline_event, None);
     let bob_receipt = timeline.latest_user_read_receipt(*BOB).await;
     assert_matches!(bob_receipt, None);
+    let bob_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await;
+    assert_matches!(bob_receipt_timeline_event, None);
 
     ev_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
@@ -363,14 +372,22 @@ async fn read_receipts_updates_on_filtered_events() {
 
     let (own_receipt_event_id, _) = timeline.latest_user_read_receipt(own_user_id).await.unwrap();
     assert_eq!(own_receipt_event_id, event_a_id);
+    let own_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
+    assert_eq!(own_receipt_timeline_event, event_a_id);
 
     // Implicit read receipt of @bob:localhost.
     assert_let!(Some(VectorDiff::Set { index: 1, value: item_a }) = timeline_stream.next().await);
     let event_a = item_a.as_event().unwrap();
     assert_eq!(event_a.read_receipts().len(), 1);
 
+    // Real receipt is on event B.
     let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
     assert_eq!(bob_receipt_event_id, event_b_id);
+    // Visible receipt is on event A.
+    let bob_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_timeline_event, event_a.event_id().unwrap());
 
     // Implicit read receipt of @alice:localhost.
     assert_let!(Some(VectorDiff::PushBack { value: item_c }) = timeline_stream.next().await);
@@ -379,6 +396,9 @@ async fn read_receipts_updates_on_filtered_events() {
 
     let (alice_receipt_event_id, _) = timeline.latest_user_read_receipt(*ALICE).await.unwrap();
     assert_eq!(alice_receipt_event_id, event_c_id);
+    let alice_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await.unwrap();
+    assert_eq!(alice_receipt_timeline_event, event_c_id);
 
     // Read receipt on filtered event.
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_ephemeral_event(
@@ -400,8 +420,13 @@ async fn read_receipts_updates_on_filtered_events() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    // Real receipt changed to event B.
     let (own_receipt_event_id, _) = timeline.latest_user_read_receipt(own_user_id).await.unwrap();
     assert_eq!(own_receipt_event_id, event_b_id);
+    // Visible receipt is still on event A.
+    let own_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
+    assert_eq!(own_receipt_timeline_event, event_a.event_id().unwrap());
 
     // Update with explicit read receipt.
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_ephemeral_event(
@@ -431,8 +456,12 @@ async fn read_receipts_updates_on_filtered_events() {
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 2);
 
+    // Both real and visible receipts are now on event C.
     let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
     assert_eq!(bob_receipt_event_id, event_c_id);
+    let bob_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_timeline_event, event_c_id);
 
     // Private read receipt is updated.
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_ephemeral_event(
@@ -454,15 +483,19 @@ async fn read_receipts_updates_on_filtered_events() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    // Both real and visible receipts are now on event C.
     let (own_user_receipt_event_id, _) =
         timeline.latest_user_read_receipt(own_user_id).await.unwrap();
     assert_eq!(own_user_receipt_event_id, event_c_id);
+    let own_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
+    assert_eq!(own_receipt_timeline_event, event_c_id);
 }
 
 #[async_test]
-async fn send_single_receipt() {
+async fn test_send_single_receipt() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let own_user_id = client.user_id().unwrap();
@@ -475,7 +508,7 @@ async fn send_single_receipt() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
 
     // Unknown receipts are sent.
     let first_receipts_event_id = event_id!("$first_receipts_event_id");
@@ -807,9 +840,9 @@ async fn send_single_receipt() {
 }
 
 #[async_test]
-async fn send_multiple_receipts() {
+async fn test_mark_as_read() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let own_user_id = client.user_id().unwrap();
@@ -822,7 +855,110 @@ async fn send_multiple_receipts() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
+
+    let original_event_id = event_id!("$original_event_id");
+    let reaction_event_id = event_id!("$reaction_event_id");
+
+    // When I receive an event with a reaction on it,
+    ev_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(sync_timeline_event!({
+                "content": {
+                    "body": "I like big Rust and I cannot lie",
+                    "msgtype": "m.text",
+                },
+                "event_id": original_event_id,
+                "origin_server_ts": 152046694,
+                "sender": "@sir-axalot:example.org",
+                "type": "m.room.message",
+            }))
+            .add_ephemeral_event(EphemeralTestEvent::Custom(json!({
+                "content": {
+                    original_event_id: {
+                        "m.read": {
+                            own_user_id: {
+                                "ts": 1436453550,
+                            },
+                        },
+                    },
+                },
+                "type": "m.receipt",
+            })))
+            .add_timeline_event(sync_timeline_event!({
+                "content": {
+                    "m.relates_to": {
+                        "event_id": original_event_id,
+                        "key": "🔥🔥🔥",
+                        "rel_type": "m.annotation",
+                    },
+                },
+                "event_id": reaction_event_id,
+                "origin_server_ts": 152038300,
+                "sender": "@prime-minirusta:example.org",
+                "type": "m.reaction",
+            })),
+    );
+
+    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // And I try to mark the latest event related to a timeline item as read,
+    let latest_event = timeline.latest_event().await.expect("missing timeline event item");
+    let latest_event_id =
+        latest_event.event_id().expect("missing event id for latest timeline event item");
+
+    let has_sent = timeline
+        .send_single_receipt(
+            ReceiptType::Read,
+            ReceiptThread::Unthreaded,
+            latest_event_id.to_owned(),
+        )
+        .await
+        .unwrap();
+
+    // Then no request is actually sent, because the event forming the timeline item
+    // (the message) is known as read.
+    assert!(has_sent.not());
+    server.reset().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/receipt/m\.read/"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("Public read receipt")
+        .mount(&server)
+        .await;
+
+    // But when I mark the room as read by sending a read receipt to the latest
+    // event,
+    let has_sent = timeline.mark_as_read(ReceiptType::Read).await.unwrap();
+
+    // It works.
+    assert!(has_sent);
+
+    server.reset().await;
+}
+
+#[async_test]
+async fn test_send_multiple_receipts() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let own_user_id = client.user_id().unwrap();
+
+    let mut ev_builder = SyncResponseBuilder::new();
+    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
 
     // Unknown receipts are sent.
     let first_receipts_event_id = event_id!("$first_receipts_event_id");
@@ -1015,9 +1151,9 @@ async fn send_multiple_receipts() {
 }
 
 #[async_test]
-async fn latest_user_read_receipt() {
+async fn test_latest_user_read_receipt() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let own_user_id = client.user_id().unwrap();
@@ -1036,7 +1172,7 @@ async fn latest_user_read_receipt() {
     server.reset().await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
     let (items, _) = timeline.subscribe().await;
 
     assert!(items.is_empty());

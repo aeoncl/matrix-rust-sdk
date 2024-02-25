@@ -1,4 +1,8 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    mem::ManuallyDrop,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{anyhow, Context as _};
 use matrix_sdk::{
@@ -36,6 +40,10 @@ use matrix_sdk_ui::notification_client::NotificationProcessSetup as MatrixNotifi
 use mime::Mime;
 use ruma::{
     api::client::discovery::discover_homeserver::AuthenticationServerInfo,
+    events::{
+        ignored_user_list::IgnoredUserListEventContent,
+        room::power_levels::RoomPowerLevelsEventContent, GlobalAccountDataEventType,
+    },
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
 };
 use serde::{Deserialize, Serialize};
@@ -47,9 +55,11 @@ use url::Url;
 use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
 use crate::{
     client,
+    encryption::Encryption,
     notification::NotificationClientBuilder,
     notification_settings::NotificationSettings,
     sync_service::{SyncService, SyncServiceBuilder},
+    task_handle::TaskHandle,
     ClientError,
 };
 
@@ -147,10 +157,24 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 
 #[derive(uniffi::Object)]
 pub struct Client {
-    pub(crate) inner: MatrixClient,
+    pub(crate) inner: ManuallyDrop<MatrixClient>,
     delegate: RwLock<Option<Arc<dyn ClientDelegate>>>,
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Dropping the inner OlmMachine must happen within a tokio context
+        // because deadpool drops sqlite connections in the DB pool on tokio's
+        // blocking threadpool to avoid blocking async worker threads.
+        let _guard = RUNTIME.enter();
+        // SAFETY: self.inner is never used again, which is the only requirement
+        //         for ManuallyDrop::drop to be used safely.
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
+    }
 }
 
 impl Client {
@@ -158,7 +182,7 @@ impl Client {
         sdk_client: MatrixClient,
         cross_process_refresh_lock_id: Option<String>,
         session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
-    ) -> Result<Arc<Self>, ClientError> {
+    ) -> Result<Self, ClientError> {
         let session_verification_controller: Arc<
             tokio::sync::RwLock<Option<SessionVerificationController>>,
         > = Default::default();
@@ -172,26 +196,11 @@ impl Client {
             }
         });
 
-        let client = Arc::new(Client {
-            inner: sdk_client,
+        let client = Client {
+            inner: ManuallyDrop::new(sdk_client),
             delegate: RwLock::new(None),
             session_verification_controller,
-        });
-
-        let mut session_change_receiver = client.inner.subscribe_to_session_changes();
-        let client_clone = client.clone();
-        RUNTIME.spawn(async move {
-            loop {
-                match session_change_receiver.recv().await {
-                    Ok(session_change) => client_clone.process_session_change(session_change),
-                    Err(receive_error) => {
-                        if let RecvError::Closed = receive_error {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        };
 
         if let Some(process_id) = cross_process_refresh_lock_id {
             if session_delegate.is_none() {
@@ -230,7 +239,7 @@ impl Client {
     }
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl Client {
     /// Login using a username and password.
     pub fn login(
@@ -253,31 +262,30 @@ impl Client {
         })
     }
 
-    pub fn get_media_file(
+    pub async fn get_media_file(
         &self,
         media_source: Arc<MediaSource>,
         body: Option<String>,
         mime_type: String,
+        use_cache: bool,
         temp_dir: Option<String>,
     ) -> Result<Arc<MediaFileHandle>, ClientError> {
-        let client = self.inner.clone();
         let source = (*media_source).clone();
         let mime_type: mime::Mime = mime_type.parse()?;
 
-        RUNTIME.block_on(async move {
-            let handle = client
-                .media()
-                .get_media_file(
-                    &MediaRequest { source, format: MediaFormat::File },
-                    body,
-                    &mime_type,
-                    true,
-                    temp_dir,
-                )
-                .await?;
+        let handle = self
+            .inner
+            .media()
+            .get_media_file(
+                &MediaRequest { source, format: MediaFormat::File },
+                body,
+                &mime_type,
+                use_cache,
+                temp_dir,
+            )
+            .await?;
 
-            Ok(Arc::new(MediaFileHandle { inner: handle }))
-        })
+        Ok(Arc::new(MediaFileHandle::new(handle)))
     }
 
     /// Restores the client from a `Session`.
@@ -343,14 +351,35 @@ impl Client {
     }
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl Client {
-    pub fn set_delegate(&self, delegate: Option<Box<dyn ClientDelegate>>) {
-        *self.delegate.write().unwrap() = delegate.map(Arc::from);
+    pub fn set_delegate(
+        self: Arc<Self>,
+        delegate: Option<Box<dyn ClientDelegate>>,
+    ) -> Option<Arc<TaskHandle>> {
+        delegate.map(|delegate| {
+            let mut session_change_receiver = self.inner.subscribe_to_session_changes();
+            let client_clone = self.clone();
+            let session_change_task = RUNTIME.spawn(async move {
+                loop {
+                    match session_change_receiver.recv().await {
+                        Ok(session_change) => client_clone.process_session_change(session_change),
+                        Err(receive_error) => {
+                            if let RecvError::Closed = receive_error {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            *self.delegate.write().unwrap() = Some(Arc::from(delegate));
+            Arc::new(TaskHandle::new(session_change_task))
+        })
     }
 
     pub fn session(&self) -> Result<Session, ClientError> {
-        RUNTIME.block_on(async move { Self::session_inner(self.inner.clone()).await })
+        RUNTIME.block_on(async move { Self::session_inner((*self.inner).clone()).await })
     }
 
     pub fn account_url(
@@ -460,68 +489,65 @@ impl Client {
         })
     }
 
-    pub fn upload_media(
+    pub async fn upload_media(
         &self,
         mime_type: String,
         data: Vec<u8>,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<String, ClientError> {
-        let l = self.inner.clone();
+        let mime_type: mime::Mime = mime_type.parse().context("Parsing mime type")?;
+        let request = self.inner.media().upload(&mime_type, data);
 
-        RUNTIME.block_on(async move {
-            let mime_type: mime::Mime = mime_type.parse().context("Parsing mime type")?;
-            let request = l.media().upload(&mime_type, data);
-            if let Some(progress_watcher) = progress_watcher {
-                let mut subscriber = request.subscribe_to_send_progress();
-                RUNTIME.spawn(async move {
-                    while let Some(progress) = subscriber.next().await {
-                        progress_watcher.transmission_progress(progress.into());
-                    }
-                });
-            }
-            let response = request.await?;
-            Ok(String::from(response.content_uri))
-        })
+        if let Some(progress_watcher) = progress_watcher {
+            let mut subscriber = request.subscribe_to_send_progress();
+            RUNTIME.spawn(async move {
+                while let Some(progress) = subscriber.next().await {
+                    progress_watcher.transmission_progress(progress.into());
+                }
+            });
+        }
+
+        let response = request.await?;
+
+        Ok(String::from(response.content_uri))
     }
 
-    pub fn get_media_content(
+    pub async fn get_media_content(
         &self,
         media_source: Arc<MediaSource>,
     ) -> Result<Vec<u8>, ClientError> {
-        let l = self.inner.clone();
         let source = (*media_source).clone();
 
-        RUNTIME.block_on(async move {
-            Ok(l.media()
-                .get_media_content(&MediaRequest { source, format: MediaFormat::File }, true)
-                .await?)
-        })
+        Ok(self
+            .inner
+            .media()
+            .get_media_content(&MediaRequest { source, format: MediaFormat::File }, true)
+            .await?)
     }
 
-    pub fn get_media_thumbnail(
+    pub async fn get_media_thumbnail(
         &self,
         media_source: Arc<MediaSource>,
         width: u64,
         height: u64,
     ) -> Result<Vec<u8>, ClientError> {
-        let l = self.inner.clone();
         let source = (*media_source).clone();
 
-        RUNTIME.block_on(async move {
-            Ok(l.media()
-                .get_media_content(
-                    &MediaRequest {
-                        source,
-                        format: MediaFormat::Thumbnail(MediaThumbnailSize {
-                            method: Method::Scale,
-                            width: UInt::new(width).unwrap(),
-                            height: UInt::new(height).unwrap(),
-                        }),
-                    },
-                    true,
-                )
-                .await?)
-        })
+        Ok(self
+            .inner
+            .media()
+            .get_media_content(
+                &MediaRequest {
+                    source,
+                    format: MediaFormat::Thumbnail(MediaThumbnailSize {
+                        method: Method::Scale,
+                        width: UInt::new(width).unwrap(),
+                        height: UInt::new(height).unwrap(),
+                    }),
+                },
+                true,
+            )
+            .await?)
     }
 
     pub fn get_session_verification_controller(
@@ -622,22 +648,6 @@ impl Client {
         Ok(dm)
     }
 
-    pub fn ignore_user(&self, user_id: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let user_id = UserId::parse(user_id)?;
-            self.inner.account().ignore_user(&user_id).await?;
-            Ok(())
-        })
-    }
-
-    pub fn unignore_user(&self, user_id: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let user_id = UserId::parse(user_id)?;
-            self.inner.account().unignore_user(&user_id).await?;
-            Ok(())
-        })
-    }
-
     pub fn search_users(
         &self,
         search_term: String,
@@ -665,24 +675,76 @@ impl Client {
     }
 
     pub fn notification_client(
-        &self,
+        self: Arc<Self>,
         process_setup: NotificationProcessSetup,
     ) -> Result<Arc<NotificationClientBuilder>, ClientError> {
-        NotificationClientBuilder::new(self.inner.clone(), process_setup.into())
+        NotificationClientBuilder::new(self.clone(), process_setup.into())
     }
 
     pub fn sync_service(&self) -> Arc<SyncServiceBuilder> {
-        SyncServiceBuilder::new(self.inner.clone())
+        SyncServiceBuilder::new((*self.inner).clone())
     }
 
     pub fn get_notification_settings(&self) -> Arc<NotificationSettings> {
         RUNTIME.block_on(async move {
             Arc::new(NotificationSettings::new(
-                self.inner.clone(),
+                (*self.inner).clone(),
                 self.inner.notification_settings().await,
             ))
         })
     }
+
+    pub fn encryption(&self) -> Arc<Encryption> {
+        Arc::new(self.inner.encryption().into())
+    }
+
+    // Ignored users
+
+    pub async fn ignored_users(&self) -> Result<Vec<String>, ClientError> {
+        if let Some(raw_content) = self
+            .inner
+            .account()
+            .fetch_account_data(GlobalAccountDataEventType::IgnoredUserList)
+            .await?
+        {
+            let content = raw_content.deserialize_as::<IgnoredUserListEventContent>()?;
+            let user_ids: Vec<String> =
+                content.ignored_users.keys().map(|id| id.to_string()).collect();
+
+            return Ok(user_ids);
+        }
+
+        Ok(vec![])
+    }
+
+    pub async fn ignore_user(&self, user_id: String) -> Result<(), ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        self.inner.account().ignore_user(&user_id).await?;
+        Ok(())
+    }
+
+    pub async fn unignore_user(&self, user_id: String) -> Result<(), ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        self.inner.account().unignore_user(&user_id).await?;
+        Ok(())
+    }
+
+    pub fn subscribe_to_ignored_users(
+        &self,
+        listener: Box<dyn IgnoredUsersListener>,
+    ) -> Arc<TaskHandle> {
+        let mut subscriber = self.inner.subscribe_to_ignore_user_list_changes();
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            while let Some(user_ids) = subscriber.next().await {
+                listener.call(user_ids);
+            }
+        })))
+    }
+}
+
+#[uniffi::export(callback_interface)]
+pub trait IgnoredUsersListener: Sync + Send {
+    fn call(&self, ignored_user_ids: Vec<String>);
 }
 
 #[derive(uniffi::Enum)]
@@ -739,6 +801,7 @@ impl From<&search_users::v3::User> for UserProfile {
 impl Client {
     fn process_session_change(&self, session_change: SessionChange) {
         if let Some(delegate) = self.delegate.read().unwrap().clone() {
+            debug!("Applying session change: {session_change:?}");
             RUNTIME.spawn_blocking(move || match session_change {
                 SessionChange::UnknownToken { soft_logout } => {
                     delegate.did_receive_auth_error(soft_logout);
@@ -747,6 +810,10 @@ impl Client {
                     delegate.did_refresh_tokens();
                 }
             });
+        } else {
+            debug!(
+                "No client delegate found, session change couldn't be applied: {session_change:?}"
+            );
         }
     }
 
@@ -783,6 +850,86 @@ impl Client {
 }
 
 #[derive(uniffi::Record)]
+pub struct NotificationPowerLevels {
+    pub room: i32,
+}
+
+impl From<NotificationPowerLevels> for ruma::power_levels::NotificationPowerLevels {
+    fn from(value: NotificationPowerLevels) -> Self {
+        let mut notification_power_levels = Self::new();
+        notification_power_levels.room = value.room.into();
+        notification_power_levels
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct PowerLevels {
+    pub users_default: Option<i32>,
+    pub events_default: Option<i32>,
+    pub state_default: Option<i32>,
+    pub ban: Option<i32>,
+    pub kick: Option<i32>,
+    pub redact: Option<i32>,
+    pub invite: Option<i32>,
+    pub notifications: Option<NotificationPowerLevels>,
+    pub users: HashMap<String, i32>,
+    pub events: HashMap<String, i32>,
+}
+
+impl From<PowerLevels> for RoomPowerLevelsEventContent {
+    fn from(value: PowerLevels) -> Self {
+        let mut power_levels = RoomPowerLevelsEventContent::new();
+
+        if let Some(users_default) = value.users_default {
+            power_levels.users_default = users_default.into();
+        }
+        if let Some(state_default) = value.state_default {
+            power_levels.state_default = state_default.into();
+        }
+        if let Some(events_default) = value.events_default {
+            power_levels.events_default = events_default.into();
+        }
+        if let Some(ban) = value.ban {
+            power_levels.ban = ban.into();
+        }
+        if let Some(kick) = value.kick {
+            power_levels.kick = kick.into();
+        }
+        if let Some(redact) = value.redact {
+            power_levels.redact = redact.into();
+        }
+        if let Some(invite) = value.invite {
+            power_levels.invite = invite.into();
+        }
+        if let Some(notifications) = value.notifications {
+            power_levels.notifications = notifications.into()
+        }
+        power_levels.users = value
+            .users
+            .iter()
+            .filter_map(|(user_id, power_level)| match UserId::parse(user_id) {
+                Ok(id) => Some((id, (*power_level).into())),
+                Err(e) => {
+                    error!(user_id, "Skipping invalid user ID, error: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        power_levels.events = value
+            .events
+            .iter()
+            .map(|(event_type, power_level)| {
+                let event_type: ruma::events::TimelineEventType = event_type.as_str().into();
+                (event_type, (*power_level).into())
+            })
+            .collect();
+
+        power_levels
+    }
+}
+
+#[derive(uniffi::Record)]
 pub struct CreateRoomParameters {
     pub name: Option<String>,
     #[uniffi(default = None)]
@@ -796,6 +943,8 @@ pub struct CreateRoomParameters {
     pub invite: Option<Vec<String>>,
     #[uniffi(default = None)]
     pub avatar: Option<String>,
+    #[uniffi(default = None)]
+    pub power_level_content_override: Option<PowerLevels>,
 }
 
 impl From<CreateRoomParameters> for create_room::v3::Request {
@@ -833,8 +982,18 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
             content.url = Some(url.into());
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
-
         request.initial_state = initial_state;
+
+        if let Some(power_levels) = value.power_level_content_override {
+            match Raw::new(&power_levels.into()) {
+                Ok(power_levels) => {
+                    request.power_level_content_override = Some(power_levels);
+                }
+                Err(e) => {
+                    error!("Failed to serialize power levels, error: {e}");
+                }
+            }
+        }
 
         request
     }
@@ -1101,13 +1260,45 @@ fn gen_transaction_id() -> String {
 /// is dropped, the file will be removed from the disk.
 #[derive(uniffi::Object)]
 pub struct MediaFileHandle {
-    inner: SdkMediaFileHandle,
+    inner: RwLock<Option<SdkMediaFileHandle>>,
+}
+
+impl MediaFileHandle {
+    fn new(handle: SdkMediaFileHandle) -> Self {
+        Self { inner: RwLock::new(Some(handle)) }
+    }
 }
 
 #[uniffi::export]
 impl MediaFileHandle {
     /// Get the media file's path.
-    pub fn path(&self) -> String {
-        self.inner.path().to_str().unwrap().to_owned()
+    pub fn path(&self) -> Result<String, ClientError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .as_ref()
+            .context("MediaFileHandle must not be used after calling persist")?
+            .path()
+            .to_str()
+            .unwrap()
+            .to_owned())
+    }
+
+    pub fn persist(&self, path: String) -> Result<bool, ClientError> {
+        let mut guard = self.inner.write().unwrap();
+        Ok(
+            match guard
+                .take()
+                .context("MediaFileHandle was already persisted")?
+                .persist(path.as_ref())
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    *guard = Some(e.file);
+                    false
+                }
+            },
+        )
     }
 }

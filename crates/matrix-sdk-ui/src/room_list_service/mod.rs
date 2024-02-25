@@ -66,15 +66,15 @@ mod room;
 mod room_list;
 mod state;
 
-use std::{future::ready, sync::Arc, time::Duration};
+use std::{future::ready, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
 use futures_util::{pin_mut, Stream, StreamExt};
 pub use matrix_sdk::RoomListEntry;
 use matrix_sdk::{
-    sliding_sync::Ranges, Client, Error as SlidingSyncError, SlidingSync, SlidingSyncList,
-    SlidingSyncListBuilder, SlidingSyncMode,
+    event_cache::EventCacheError, sliding_sync::Ranges, Client, Error as SlidingSyncError,
+    SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
 };
 use matrix_sdk_base::ring_buffer::RingBuffer;
 pub use room::*;
@@ -82,7 +82,7 @@ pub use room_list::*;
 use ruma::{
     api::client::sync::sync_events::v4::{
         AccountDataConfig, E2EEConfig, ReceiptsConfig, RoomReceiptConfig, SyncRequestListFilters,
-        ToDeviceConfig,
+        ToDeviceConfig, TypingConfig,
     },
     assign,
     events::{StateEventType, TimelineEventType},
@@ -125,7 +125,8 @@ impl RoomListService {
     /// This number should be high enough so that navigating to a room
     /// previously visited is almost instant, but also not too high so as to
     /// avoid exhausting memory.
-    const ROOM_OBJECT_CACHE_SIZE: usize = 128;
+    // SAFETY: `new_unchecked` is safe because 128 is not zero.
+    const ROOM_OBJECT_CACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(128) };
 
     /// Create a new `RoomList`.
     ///
@@ -156,6 +157,9 @@ impl RoomListService {
             .with_receipt_extension(assign!(ReceiptsConfig::default(), {
                 enabled: Some(true),
                 rooms: Some(vec![RoomReceiptConfig::AllSubscribed])
+            }))
+            .with_typing_extension(assign!(TypingConfig::default(), {
+                enabled: Some(true),
             }));
 
         if with_encryption {
@@ -178,6 +182,7 @@ impl RoomListService {
                         (StateEventType::RoomAvatar, "".to_owned()),
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
+                        (StateEventType::RoomMember, "$ME".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
                     ]),
             ))
@@ -206,6 +211,9 @@ impl RoomListService {
             .await
             .map(Arc::new)
             .map_err(Error::SlidingSync)?;
+
+        // Eagerly subscribe the event cache to sync responses.
+        client.event_cache().subscribe()?;
 
         Ok(Self {
             client,
@@ -504,6 +512,15 @@ pub enum Error {
     /// The requested room doesn't exist.
     #[error("Room `{0}` not found")]
     RoomNotFound(OwnedRoomId),
+
+    #[error("A timeline instance already exists for room {0}")]
+    TimelineAlreadyExists(OwnedRoomId),
+
+    #[error("An error occurred while initializing the timeline")]
+    InitializingTimeline(#[source] EventCacheError),
+
+    #[error("The attached event cache ran into an error")]
+    EventCache(#[from] EventCacheError),
 }
 
 /// An input for the [`RoomList`]' state machine.

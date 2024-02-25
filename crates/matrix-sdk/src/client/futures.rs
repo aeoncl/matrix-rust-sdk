@@ -1,8 +1,20 @@
-use std::{
-    fmt::Debug,
-    future::{Future, IntoFuture},
-    pin::Pin,
-};
+// Copyright 2023 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![deny(unreachable_pub)]
+
+use std::{fmt::Debug, future::IntoFuture};
 
 use cfg_vis::cfg_vis;
 use eyeball::SharedObservable;
@@ -16,6 +28,7 @@ use mas_oidc_client::{
     },
     types::errors::ClientErrorCode,
 };
+use matrix_sdk_common::boxed_into_future;
 use ruma::api::{client::error::ErrorKind, error::FromHttpResponseError, OutgoingRequest};
 #[cfg(feature = "experimental-oidc")]
 use tracing::error;
@@ -34,7 +47,7 @@ use crate::{
 #[allow(missing_debug_implementations)]
 pub struct SendRequest<R> {
     pub(crate) client: Client,
-    pub(crate) sliding_sync_proxy_url: Option<String>,
+    pub(crate) homeserver_override: Option<String>,
     pub(crate) request: R,
     pub(crate) config: Option<RequestConfig>,
     pub(crate) send_progress: SharedObservable<TransmissionProgress>,
@@ -56,6 +69,16 @@ impl<R> SendRequest<R> {
         self
     }
 
+    /// Replace this request's target (homeserver) with a custom one.
+    ///
+    /// This is useful at the moment because the current sliding sync
+    /// implementation uses a proxy server.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn with_homeserver_override(mut self, homeserver_override: Option<String>) -> Self {
+        self.homeserver_override = homeserver_override;
+        self
+    }
+
     /// Get a subscriber to observe the progress of sending the request
     /// body.
     #[cfg(not(target_arch = "wasm32"))]
@@ -71,19 +94,16 @@ where
     HttpError: From<FromHttpResponseError<R::EndpointError>>,
 {
     type Output = HttpResult<R::IncomingResponse>;
-    #[cfg(target_arch = "wasm32")]
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
-    #[cfg(not(target_arch = "wasm32"))]
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { client, request, config, send_progress, sliding_sync_proxy_url } = self;
+        let Self { client, request, config, send_progress, homeserver_override } = self;
 
         Box::pin(async move {
             let res = Box::pin(client.send_inner(
                 request.clone(),
                 config,
-                sliding_sync_proxy_url.clone(),
+                homeserver_override.clone(),
                 send_progress.clone(),
             ))
             .await;
@@ -151,7 +171,7 @@ where
                     return Box::pin(client.send_inner(
                         request,
                         config,
-                        sliding_sync_proxy_url,
+                        homeserver_override,
                         send_progress,
                     ))
                     .await;

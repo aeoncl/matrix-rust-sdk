@@ -1,13 +1,12 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug, pin::Pin};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_core::future::BoxFuture;
-use opentelemetry::{
-    sdk::{runtime::RuntimeChannel, trace::Tracer, util::tokio_interval_stream, Resource},
-    KeyValue,
-};
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_sdk::{runtime::RuntimeChannel, trace::Tracer, Resource};
 use tokio::runtime::Handle;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_core::Subscriber;
 use tracing_subscriber::{
     fmt::{self, time::FormatTime, FormatEvent, FormatFields, FormattedFields},
@@ -20,17 +19,17 @@ use tracing_subscriber::{
 use crate::RUNTIME;
 
 #[derive(Clone, Debug)]
-struct TracingRuntime {
+struct TokioRuntime {
     runtime: Handle,
 }
 
-impl opentelemetry::runtime::Runtime for TracingRuntime {
+impl opentelemetry_sdk::runtime::Runtime for TokioRuntime {
     type Interval = tokio_stream::wrappers::IntervalStream;
-    type Delay = ::std::pin::Pin<Box<tokio::time::Sleep>>;
+    type Delay = Pin<Box<tokio::time::Sleep>>;
 
-    fn interval(&self, duration: std::time::Duration) -> Self::Interval {
+    fn interval(&self, period: std::time::Duration) -> Self::Interval {
         let _guard = self.runtime.enter();
-        tokio_interval_stream(duration)
+        tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(period))
     }
 
     fn spawn(&self, future: BoxFuture<'static, ()>) {
@@ -44,11 +43,14 @@ impl opentelemetry::runtime::Runtime for TracingRuntime {
     }
 }
 
-impl<T: Debug + Send> RuntimeChannel<T> for TracingRuntime {
-    type Receiver = tokio_stream::wrappers::ReceiverStream<T>;
-    type Sender = tokio::sync::mpsc::Sender<T>;
+impl RuntimeChannel for TokioRuntime {
+    type Receiver<T: Debug + Send> = tokio_stream::wrappers::ReceiverStream<T>;
+    type Sender<T: Debug + Send> = tokio::sync::mpsc::Sender<T>;
 
-    fn batch_message_channel(&self, capacity: usize) -> (Self::Sender, Self::Receiver) {
+    fn batch_message_channel<T: Debug + Send>(
+        &self,
+        capacity: usize,
+    ) -> (Self::Sender<T>, Self::Receiver<T>) {
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         (sender, tokio_stream::wrappers::ReceiverStream::new(receiver))
     }
@@ -73,14 +75,14 @@ pub fn create_otlp_tracer(
         .with_endpoint(otlp_endpoint)
         .with_headers(headers);
 
-    let tracer_runtime = TracingRuntime { runtime: runtime.to_owned() };
+    let tracer_runtime = TokioRuntime { runtime: runtime.to_owned() };
 
     let _guard = runtime.enter();
     let tracer = opentelemetry_otlp::new_pipeline()
         .tracing()
         .with_exporter(exporter)
         .with_trace_config(
-            opentelemetry::sdk::trace::config()
+            opentelemetry_sdk::trace::config()
                 .with_resource(Resource::new(vec![KeyValue::new("service.name", client_name)])),
         )
         .install_batch(tracer_runtime)?;
@@ -201,13 +203,26 @@ where
     }
 
     let file_layer = config.write_to_files.map(|c| {
+        let mut builder = RollingFileAppender::builder()
+            .rotation(Rotation::HOURLY)
+            .filename_prefix(&c.file_prefix);
+
+        if let Some(max_files) = c.max_files {
+            builder = builder.max_log_files(max_files as usize)
+        };
+        if let Some(file_suffix) = c.file_suffix {
+            builder = builder.filename_suffix(file_suffix)
+        }
+
+        let writer = builder.build(&c.path).expect("Failed to create a rolling file appender.");
+
         fmt::layer()
             .event_format(EventFormatter::new())
             // EventFormatter doesn't support ANSI colors anyways, but the
             // default field formatter does, which is unhelpful for iOS +
             // Android logs, but enabled by default.
             .with_ansi(false)
-            .with_writer(tracing_appender::rolling::hourly(c.path, c.file_prefix))
+            .with_writer(writer)
     });
 
     Layer::and_then(
@@ -236,6 +251,8 @@ where
 pub struct TracingFileConfiguration {
     path: String,
     file_prefix: String,
+    file_suffix: Option<String>,
+    max_files: Option<u64>,
 }
 
 #[derive(uniffi::Record)]

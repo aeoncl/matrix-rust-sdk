@@ -18,7 +18,7 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::config::SyncSettings;
+use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{async_test, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder, ALICE};
 use matrix_sdk_ui::timeline::{EventItemOrigin, EventSendState, RoomExt};
 use ruma::{events::room::message::RoomMessageEventContent, room_id};
@@ -30,12 +30,12 @@ use wiremock::{
     Mock, ResponseTemplate,
 };
 
-use crate::{logged_in_client, mock_encryption_state, mock_sync};
+use crate::{mock_encryption_state, mock_sync};
 
 #[async_test]
-async fn message_order() {
+async fn test_message_order() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
@@ -48,7 +48,7 @@ async fn message_order() {
     mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = Arc::new(room.timeline().await);
+    let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
@@ -105,9 +105,9 @@ async fn message_order() {
 }
 
 #[async_test]
-async fn retry_order() {
+async fn test_retry_order() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
@@ -120,7 +120,7 @@ async fn retry_order() {
     mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = Arc::new(room.timeline().await);
+    let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
@@ -211,9 +211,9 @@ async fn retry_order() {
 }
 
 #[async_test]
-async fn clear_with_echoes() {
+async fn test_clear_with_echoes() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let event_builder = EventBuilder::new();
@@ -227,7 +227,7 @@ async fn clear_with_echoes() {
     mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = room.timeline().await;
+    let timeline = room.timeline().await.unwrap();
 
     // Send a message without mocking the server response.
     {

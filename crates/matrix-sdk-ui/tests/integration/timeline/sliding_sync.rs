@@ -14,22 +14,23 @@
 
 use std::{pin::Pin, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::{pin_mut, FutureExt, Stream, StreamExt};
 use matrix_sdk::{
-    SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode, UpdateSummary,
+    test_utils::logged_in_client_with_server, SlidingSync, SlidingSyncList, SlidingSyncListBuilder,
+    SlidingSyncMode, UpdateSummary,
 };
 use matrix_sdk_test::async_test;
-use matrix_sdk_ui::timeline::{
-    SlidingSyncRoomExt, TimelineItem, TimelineItemKind, VirtualTimelineItem,
+use matrix_sdk_ui::{
+    timeline::{TimelineItem, TimelineItemKind, VirtualTimelineItem},
+    Timeline,
 };
-use ruma::{room_id, RoomId};
+use ruma::{room_id, user_id, RoomId};
 use serde_json::json;
 use wiremock::{http::Method, Match, Mock, MockServer, Request, ResponseTemplate};
-
-use crate::logged_in_client;
 
 macro_rules! receive_response {
     (
@@ -199,7 +200,7 @@ macro_rules! assert_timeline_stream {
 pub(crate) use assert_timeline_stream;
 
 async fn new_sliding_sync(lists: Vec<SlidingSyncListBuilder>) -> Result<(MockServer, SlidingSync)> {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
 
     let mut sliding_sync_builder = client.sliding_sync("integration-test")?;
 
@@ -237,25 +238,36 @@ async fn create_one_room(
 
     assert!(update.rooms.contains(&room_id.to_owned()));
 
-    let room = sliding_sync.get_room(room_id).await.context("`get_room`")?;
-    assert_eq!(room.name(), Some(room_name.clone()));
+    let _room = sliding_sync.get_room(room_id).await.context("`get_room`")?;
 
     Ok(())
 }
 
-async fn timeline(
+async fn timeline_test_helper(
     sliding_sync: &SlidingSync,
     room_id: &RoomId,
 ) -> Result<(Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>)> {
-    Ok(sliding_sync
-        .get_room(room_id)
-        .await
-        .unwrap()
-        .timeline()
-        .await
-        .context("`timeline`")?
-        .subscribe()
-        .await)
+    let sliding_sync_room = sliding_sync.get_room(room_id).await.unwrap();
+
+    let room_id = sliding_sync_room.room_id();
+    let client = sliding_sync_room.client();
+    let sdk_room = client.get_room(room_id).ok_or_else(|| {
+        anyhow::anyhow!("Room {room_id} not found in client. Can't provide a timeline for it")
+    })?;
+
+    // TODO: when the event cache handles its own cache, we can remove this.
+    client
+        .event_cache()
+        .add_initial_events(room_id, sliding_sync_room.timeline_queue().iter().cloned().collect())
+        .await?;
+
+    let timeline = Timeline::builder(&sdk_room)
+        .with_pagination_token(sliding_sync_room.prev_batch())
+        .track_read_marker_and_receipts()
+        .build()
+        .await?;
+
+    Ok(timeline.subscribe().await)
 }
 
 struct SlidingSyncMatcher;
@@ -280,7 +292,8 @@ async fn test_timeline_basic() -> Result<()> {
 
     create_one_room(&server, &sliding_sync, &mut stream, room_id, "Room Name".to_owned()).await?;
 
-    let (timeline_items, mut timeline_stream) = timeline(&sliding_sync, room_id).await?;
+    let (timeline_items, mut timeline_stream) =
+        timeline_test_helper(&sliding_sync, room_id).await?;
     assert!(timeline_items.is_empty());
 
     // Receiving a bunch of events.
@@ -326,7 +339,7 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
     create_one_room(&server, &sliding_sync, &mut stream, room_id, "Room Name".to_owned()).await?;
 
-    let (_, mut timeline_stream) = timeline(&sliding_sync, room_id).await?;
+    let (_, mut timeline_stream) = timeline_test_helper(&sliding_sync, room_id).await?;
 
     // Receiving events.
     {
@@ -385,6 +398,98 @@ async fn test_timeline_duplicated_events() -> Result<()> {
             update[3] "$x1:bar.org";
             append    "$x4:bar.org";
         };
+    }
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
+    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+        .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
+    .await?;
+
+    let stream = sliding_sync.sync();
+    pin_mut!(stream);
+
+    let room_id = room_id!("!foo:bar.org");
+
+    create_one_room(&server, &sliding_sync, &mut stream, room_id, "Room Name".to_owned()).await?;
+
+    let (timeline_items, mut timeline_stream) =
+        timeline_test_helper(&sliding_sync, room_id).await?;
+    assert!(timeline_items.is_empty());
+
+    // Receiving initial events.
+    {
+        receive_response! {
+            [server, stream]
+            {
+                "pos": "1",
+                "lists": {},
+                "rooms": {
+                    room_id: {
+                        "timeline": [
+                            timeline_event!("$x1:bar.org" at 1 sec),
+                            timeline_event!("$x2:bar.org" at 2 sec),
+                        ]
+                    }
+                }
+            }
+        };
+
+        assert_timeline_stream! {
+            [timeline_stream]
+            --- day divider ---;
+            append    "$x1:bar.org";
+            update[1] "$x1:bar.org";
+            append    "$x2:bar.org";
+        };
+    }
+
+    // Now receiving a read receipt from another user in the room.
+    {
+        receive_response! {
+            [server, stream]
+            {
+                "pos": "2",
+                "lists": {},
+                "rooms": {},
+                "extensions":{
+                    "receipts": {
+                        "rooms": {
+                            room_id: {
+                                "room_id": "!foo:bar.org",
+                                "type": "m.receipt",
+                                "content": {
+                                    "$x2:bar.org": {
+                                        "m.read": {
+                                            "@bob:bar.org": {
+                                                "ts": 1436451550
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        assert_let!(
+            Some(Some(VectorDiff::Set { index: 2, value })) = timeline_stream.next().now_or_never()
+        );
+
+        assert_let!(TimelineItemKind::Event(event_timeline_item) = &**value);
+        assert_eq!(event_timeline_item.event_id().unwrap().as_str(), "$x2:bar.org");
+
+        let read_receipts = event_timeline_item.read_receipts();
+        assert_eq!(read_receipts.len(), 2);
+        // Implicit read receipt from Alice.
+        assert!(read_receipts.get(user_id!("@alice:bar.org")).is_some());
+        // Explicit read receipt from Bob.
+        assert!(read_receipts.get(user_id!("@bob:bar.org")).is_some());
     }
 
     Ok(())

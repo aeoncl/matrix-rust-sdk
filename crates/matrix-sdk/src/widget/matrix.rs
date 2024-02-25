@@ -31,7 +31,7 @@ use ruma::{
     serde::Raw,
     OwnedEventId, RoomId,
 };
-use serde_json::{value::RawValue as RawJsonValue, Value as JsonValue};
+use serde_json::value::RawValue as RawJsonValue;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tracing::error;
 
@@ -111,12 +111,12 @@ impl MatrixDriver {
         &self,
         event_type: TimelineEventType,
         state_key: Option<String>,
-        content: JsonValue,
+        content: Box<RawJsonValue>,
     ) -> Result<OwnedEventId> {
         let type_str = event_type.to_string();
         Ok(match state_key {
-            Some(key) => self.room.send_state_event_raw(content, &type_str, &key).await?.event_id,
-            None => self.room.send_raw(content, &type_str, None).await?.event_id,
+            Some(key) => self.room.send_state_event_raw(&type_str, &key, content).await?.event_id,
+            None => self.room.send_raw(&type_str, content).await?.event_id,
         })
     }
 

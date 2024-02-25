@@ -452,7 +452,7 @@ impl NotificationClient {
         }
 
         Ok(NotificationStatus::Event(
-            NotificationItem::new(&room, &raw_event, push_actions.as_deref(), Vec::new()).await?,
+            NotificationItem::new(&room, raw_event, push_actions.as_deref(), Vec::new()).await?,
         ))
     }
 
@@ -501,7 +501,7 @@ impl NotificationClient {
         Ok(Some(
             NotificationItem::new(
                 &room,
-                &RawNotificationEvent::Timeline(timeline_event.event.cast()),
+                RawNotificationEvent::Timeline(timeline_event.event.cast()),
                 timeline_event.push_actions.as_deref(),
                 state_events,
             )
@@ -573,14 +573,26 @@ impl NotificationClientBuilder {
     }
 }
 
-enum RawNotificationEvent {
+/// The Notification event as it was fetched from remote for the
+/// given `event_id`, represented as Raw but decrypted, thus only
+/// whether it is an invite or regular Timeline event has been
+/// determined.
+#[derive(Debug)]
+pub enum RawNotificationEvent {
+    /// The raw event for a timeline event
     Timeline(Raw<AnySyncTimelineEvent>),
+    /// The notification contains an invitation with the given
+    /// StrippedRoomMemberEvent (in raw here)
     Invite(Raw<StrippedRoomMemberEvent>),
 }
 
+/// The deserialized Event as it was fetched from remote for the
+/// given `event_id` and after decryption (if possible).
 #[derive(Debug)]
 pub enum NotificationEvent {
+    /// The Notification was for a TimelineEvent
     Timeline(AnySyncTimelineEvent),
+    /// The Notification is an invite with the given stripped room event data
     Invite(StrippedRoomMemberEvent),
 }
 
@@ -599,10 +611,15 @@ pub struct NotificationItem {
     /// Underlying Ruma event.
     pub event: NotificationEvent,
 
+    /// The raw of the underlying event.
+    pub raw_event: RawNotificationEvent,
+
     /// Display name of the sender.
     pub sender_display_name: Option<String>,
     /// Avatar URL of the sender.
     pub sender_avatar_url: Option<String>,
+    /// Is the sender's name ambiguous?
+    pub is_sender_name_ambiguous: bool,
 
     /// Room display name.
     pub room_display_name: String,
@@ -622,16 +639,17 @@ pub struct NotificationItem {
     ///
     /// It is set if and only if the push actions could be determined.
     pub is_noisy: Option<bool>,
+    pub has_mention: Option<bool>,
 }
 
 impl NotificationItem {
     async fn new(
         room: &Room,
-        raw_event: &RawNotificationEvent,
+        raw_event: RawNotificationEvent,
         push_actions: Option<&[Action]>,
         state_events: Vec<Raw<AnyStateEvent>>,
     ) -> Result<Self, Error> {
-        let event = match raw_event {
+        let event = match &raw_event {
             RawNotificationEvent::Timeline(raw_event) => {
                 let mut event = raw_event.deserialize().map_err(|_| Error::InvalidRumaEvent)?;
                 if let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
@@ -652,13 +670,15 @@ impl NotificationItem {
             _ => room.get_member_no_sync(event.sender()).await?,
         };
 
-        let (mut sender_display_name, mut sender_avatar_url) = match &sender {
-            Some(sender) => (
-                sender.display_name().map(|s| s.to_owned()),
-                sender.avatar_url().map(|s| s.to_string()),
-            ),
-            None => (None, None),
-        };
+        let (mut sender_display_name, mut sender_avatar_url, is_sender_name_ambiguous) =
+            match &sender {
+                Some(sender) => (
+                    sender.display_name().map(|s| s.to_owned()),
+                    sender.avatar_url().map(|s| s.to_string()),
+                    sender.name_ambiguous(),
+                ),
+                None => (None, None, false),
+            };
 
         if sender_display_name.is_none() || sender_avatar_url.is_none() {
             let sender_id = event.sender();
@@ -685,11 +705,14 @@ impl NotificationItem {
         }
 
         let is_noisy = push_actions.map(|actions| actions.iter().any(|a| a.sound().is_some()));
+        let has_mention = push_actions.map(|actions| actions.iter().any(|a| a.is_highlight()));
 
         let item = NotificationItem {
             event,
+            raw_event,
             sender_display_name,
             sender_avatar_url,
+            is_sender_name_ambiguous,
             room_display_name: room.display_name().await?.to_string(),
             room_avatar_url: room.avatar_url().map(|s| s.to_string()),
             room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
@@ -697,6 +720,7 @@ impl NotificationItem {
             is_room_encrypted: room.is_encrypted().await.ok(),
             joined_members_count: room.joined_members_count(),
             is_noisy,
+            has_mention,
         };
 
         Ok(item)

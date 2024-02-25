@@ -1,4 +1,109 @@
-# unreleased
+# UNRELEASED
+
+Breaking changes:
+
+- Rename the `OlmMachine::invalidate_group_session` method to
+  `OlmMachine::discard_room_key`
+
+- Move `OlmMachine::export_room_keys` to `matrix_sdk_crypto::store::Store`.
+  (Call it with `olm_machine.store().export_room_keys(...)`.)
+
+Additions:
+
+- Expose new methods `OlmMachine::set_room_settings` and
+  `OlmMachine::get_room_settings`.
+  ([#3042](https://github.com/matrix-org/matrix-rust-sdk/pull/3042))
+
+- Add new properties `session_rotation_period` and
+  `session_rotation_period_msgs` to `store::RoomSettings`.
+  ([#3042](https://github.com/matrix-org/matrix-rust-sdk/pull/3042))
+
+- Fix bug which caused `SecretStorageKey` to incorrectly reject secret storage
+  keys whose metadata lacked check fields.
+  ([#3046](https://github.com/matrix-org/matrix-rust-sdk/pull/3046))
+
+- Add new API `Device::encrypt_event_raw` that allows
+  to encrypt an event to a specific device.
+  ([#3091](https://github.com/matrix-org/matrix-rust-sdk/pull/3091))
+
+- Add new API `store::Store::export_room_keys_stream` that provides room
+  keys on demand.
+
+# 0.7.0
+
+- Add method to mark a list of inbound group sessions as backed up:
+  `CryptoStore::mark_inbound_group_sessions_as_backed_up`
+
+- `OlmMachine::toggle_room_key_forwarding` is replaced by two separate methods:
+
+  * `OlmMachine::set_room_key_requests_enabled`, which controls whether
+    outgoing room key requests are enabled, and:
+
+  * `OlmMachine::set_room_key_forwarding_enabled`, which controls whether we
+    automatically reply to incoming room key requests.
+
+  `OlmMachine::is_room_key_forwarding_enabled` is updated to return the setting
+  of `OlmMachine::set_room_key_forwarding_enabled`, while
+  `OlmMachine::are_room_key_requests_enabled` is added to return the setting of
+  `OlmMachine::set_room_key_requests_enabled`.
+
+  ([#2902](https://github.com/matrix-org/matrix-rust-sdk/pull/2902))
+
+- Improve performance of `share_room_key`.
+  ([#2862](https://github.com/matrix-org/matrix-rust-sdk/pull/2862))
+
+- `get_missing_sessions`: Don't block waiting for `/keys/query` requests on
+  blacklisted servers, and improve performance.
+  ([#2845](https://github.com/matrix-org/matrix-rust-sdk/pull/2845))
+
+- Generalize `olm::Session::encrypt` to accept any value implementing
+  `Serialize` for the `value` parameter, instead of specifically
+  `serde_json::Value`. Note that references to `Serialize`-implementing types
+  themselves implement `Serialize`.
+
+- Change the argument to `OlmMachine::receive_sync_changes` to be an
+  `EncryptionSyncChanges` struct packing all the arguments instead of many
+  single arguments. The new `next_batch_token` field there should be the
+  `next_batch` value read from the latest sync response.
+
+- Handle missing devices in `/keys/claim` responses.
+  ([#2805](https://github.com/matrix-org/matrix-rust-sdk/pull/2805))
+
+- Add the higher level decryption method `decrypt_session_data` to the
+  `BackupDecryptionKey` type.
+
+- Add a higher level method to create signatures for the backup info. The
+  `OlmMachine::backup_machine()::sign_backup()` method can be used to add
+  signatures to a `RoomKeyBackupInfo`.
+
+- Remove the `backups_v1` feature, backups support is now enabled by default.
+
+- Use the `Signatures` type as the return value for the
+  `MegolmV1BackupKey::signatures()` method.
+
+- Add two new methods to import room keys,
+  `OlmMachine::store()::import_exported_room_keys()` for file exports and
+  `OlmMachine::backup_machine()::import_backed_up_room_keys()` for backups. The
+  `OlmMachine::import_room_keys()` method is now deprecated.
+
+- The parameter order of `OlmMachine::encrypt_room_event_raw` and
+  `OutboundGroupSession::encrypt` has changed, `content` is now last
+  - The parameter type of `content` has also changed, from `serde_json::Value`
+    to `&Raw<AnyMessageLikeEventContent>`
+
+- Change the return value of `bootstrap_cross_signing` so it returns an extra
+  keys upload request.  The three requests must be sent in the order they
+  appear in the return tuple.
+
+- Stop logging large quantities of data about the `Store` during olm
+  decryption.
+
+- Remove spurious "Unknown outgoing secret request" warning which was logged
+  for every outgoing secret request.
+
+- Clean up the logging of to-device messages in `share_room_key`.
+
+- Expose new `OlmMachine::get_room_event_encryption_info` method.
 
 - Add support for secret storage.
 
@@ -63,16 +168,3 @@
 
 - Change the returned success value type of `BackupMachine::backup` from
   `OutgoingRequest` to `(OwnedTransactionId, KeysBackupRequest)`.
-
-- Expose new `OlmMachine::get_room_event_encryption_info` method.
-
-- Clean up the logging of to-device messages in `share_room_key`.
-
-- Remove spurious "Unknown outgoing secret request" warning which was logged
-  for every outgoing secret request.
-
-- Stop logging large quantities of data about the `Store` during olm
-  decryption.
-
-- Change the return value of `bootstrap_cross_signing` so it returns an extra keys upload request.
-  The three requests must be sent in the order they appear in the return tuple.

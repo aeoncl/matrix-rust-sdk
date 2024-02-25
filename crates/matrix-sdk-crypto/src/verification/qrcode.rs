@@ -155,6 +155,7 @@ pub struct QrVerification {
     we_started: bool,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for QrVerification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QrVerification")
@@ -193,6 +194,11 @@ impl QrVerification {
     /// Get the device ID of the other side.
     pub fn other_device_id(&self) -> &DeviceId {
         self.identities.other_device_id()
+    }
+
+    /// Get the device of the other user.
+    pub fn other_device(&self) -> &ReadOnlyDevice {
+        self.identities.other_device()
     }
 
     /// Did we initiate the verification request
@@ -477,7 +483,7 @@ impl QrVerification {
             };
 
             trace!(
-                sender = sender.as_str(),
+                ?sender,
                 code = content.cancel_code().as_str(),
                 "Cancelling a QR verification, other user has cancelled"
             );

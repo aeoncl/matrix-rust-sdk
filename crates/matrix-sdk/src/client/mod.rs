@@ -27,10 +27,14 @@ use futures_core::Stream;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
-    store::DynStateStore, BaseClient, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
+    store::DynStateStore,
+    sync::{Notification, RoomUpdates},
+    BaseClient, RoomInfoUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     SyncOutsideWasm,
 };
 use matrix_sdk_common::instant::Instant;
+#[cfg(feature = "e2e-encryption")]
+use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
     api::{
         client::{
@@ -45,7 +49,7 @@ use ruma::{
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             membership::{join_room_by_id, join_room_by_id_or_alias},
             profile::get_profile,
-            push::{get_notifications::v3::Notification, set_pusher, Pusher},
+            push::{set_pusher, Pusher},
             room::create_room,
             session::login::v3::DiscoveryInfo,
             sync::sync_events,
@@ -57,14 +61,15 @@ use ruma::{
     },
     assign,
     push::Ruleset,
-    DeviceId, OwnedDeviceId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId, RoomOrAliasId,
-    ServerName, UInt, UserId,
+    DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
+    RoomOrAliasId, ServerName, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, Instrument, Span};
 use url::Url;
 
+use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
 use crate::{
@@ -72,6 +77,7 @@ use crate::{
     config::RequestConfig,
     deduplicating_handler::DeduplicatingHandler,
     error::{HttpError, HttpResult},
+    event_cache::EventCache,
     event_handler::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
     },
@@ -84,17 +90,14 @@ use crate::{
 };
 #[cfg(feature = "e2e-encryption")]
 use crate::{
-    encryption::{Encryption, EncryptionSettings},
+    encryption::{Encryption, EncryptionData, EncryptionSettings},
     store_locks::CrossProcessStoreLock,
 };
 
 mod builder;
-mod futures;
+pub(crate) mod futures;
 
-pub use self::{
-    builder::{ClientBuildError, ClientBuilder},
-    futures::SendRequest,
-};
+pub use self::builder::{ClientBuildError, ClientBuilder};
 
 #[cfg(not(target_arch = "wasm32"))]
 type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -144,9 +147,31 @@ pub struct Client {
 #[derive(Default)]
 pub(crate) struct ClientLocks {
     /// Lock ensuring that only a single room may be marked as a DM at once.
-    /// Look at the [`Room::mark_as_dm()`] method for a more detailed
+    /// Look at the [`Account::mark_as_dm()`] method for a more detailed
     /// explanation.
     pub(crate) mark_as_dm_lock: Mutex<()>,
+    /// Lock ensuring that only a single secret store is getting opened at the
+    /// same time.
+    ///
+    /// This is important so we don't accidentally create multiple different new
+    /// default secret storage keys.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) open_secret_store_lock: Mutex<()>,
+    /// Lock ensuring that we're only storing a single secret at a time.
+    ///
+    /// Take a look at the [`SecretStore::put_secret`] method for a more
+    /// detailed explanation.
+    ///
+    /// [`SecretStore::put_secret`]: crate::encryption::secret_storage::SecretStore::put_secret
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) store_secret_lock: Mutex<()>,
+    /// Lock ensuring that only one method at a time might modify our backup.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) backup_modify_lock: Mutex<()>,
+    /// Lock ensuring that we're going to attempt to upload backups for a single
+    /// requester.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) backup_upload_lock: Mutex<()>,
     /// Handler making sure we only have one group session sharing request in
     /// flight per room.
     #[cfg(feature = "e2e-encryption")]
@@ -160,6 +185,11 @@ pub(crate) struct ClientLocks {
     /// Handler to ensure that only one encryption state request is running at a
     /// time, given a room.
     pub(crate) encryption_state_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
+
+    /// Deduplicating handler for sending read receipts. The string is an
+    /// internal implementation detail, see [`Self::send_single_receipt`].
+    pub(crate) read_receipt_deduplicated_handler: DeduplicatingHandler<(String, OwnedEventId)>,
+
     #[cfg(feature = "e2e-encryption")]
     pub(crate) cross_process_crypto_store_lock:
         OnceCell<CrossProcessStoreLock<LockableCryptoStore>>,
@@ -191,37 +221,61 @@ pub(crate) struct ClientInner {
 
     /// The URL of the homeserver to connect to.
     homeserver: StdRwLock<Url>,
+
     /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
     sliding_sync_proxy: StdRwLock<Option<Url>>,
+
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
+
     /// User session data.
     base_client: BaseClient,
+
     /// The Matrix versions the server supports (well-known ones only)
     server_versions: OnceCell<Box<[MatrixVersion]>>,
+
     /// Collection of locks individual client methods might want to use, either
     /// to ensure that only a single call to a method happens at once or to
     /// deduplicate multiple calls to a method.
-    locks: ClientLocks,
+    pub(crate) locks: ClientLocks,
+
+    /// A mapping of the times at which the current user sent typing notices,
+    /// keyed by room.
     pub(crate) typing_notice_times: StdRwLock<BTreeMap<OwnedRoomId, Instant>>,
+
     /// Event handlers. See `add_event_handler`.
     pub(crate) event_handlers: EventHandlerStore,
+
     /// Notification handlers. See `register_notification_handler`.
     notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
+
+    /// The sender-side of channels used to receive room updates.
     pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
+
+    /// The sender-side of a channel used to observe all the room updates of a
+    /// sync response.
+    pub(crate) room_updates_sender: broadcast::Sender<RoomUpdates>,
+
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
     respect_login_well_known: bool,
+
     /// An event that can be listened on to wait for a successful sync. The
     /// event will only be fired if a sync loop is running. Can be used for
     /// synchronization, e.g. if we send out a request to create a room, we can
     /// wait for the sync to get the data to fetch a room object from the state
     /// store.
     pub(crate) sync_beat: event_listener::Event,
-    /// End-to-end encryption settings.
+
+    /// A central cache for events, inactive first.
+    ///
+    /// It becomes active when [`EventCache::subscribe`] is called.
+    pub(crate) event_cache: OnceCell<EventCache>,
+
+    /// End-to-end encryption related state.
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) encryption_settings: EncryptionSettings,
+    pub(crate) e2ee: EncryptionData,
 }
 
 impl ClientInner {
@@ -231,7 +285,7 @@ impl ClientInner {
     /// upon instantiation of a sub-client, e.g. a client specialized for
     /// notifications.
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    async fn new(
         auth_ctx: Arc<AuthCtx>,
         homeserver: Url,
         #[cfg(feature = "experimental-sliding-sync")] sliding_sync_proxy: Option<Url>,
@@ -239,9 +293,10 @@ impl ClientInner {
         base_client: BaseClient,
         server_versions: Option<Box<[MatrixVersion]>>,
         respect_login_well_known: bool,
+        event_cache: OnceCell<EventCache>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        let client = Self {
             homeserver: StdRwLock::new(homeserver),
             auth_ctx,
             #[cfg(feature = "experimental-sliding-sync")]
@@ -254,11 +309,25 @@ impl ClientInner {
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
             room_update_channels: Default::default(),
+            // A single `RoomUpdates` is sent once per sync, so we assume that 32 is sufficient
+            // ballast for all observers to catch up.
+            room_updates_sender: broadcast::Sender::new(32),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
+            event_cache,
             #[cfg(feature = "e2e-encryption")]
-            encryption_settings,
-        }
+            e2ee: EncryptionData::new(encryption_settings),
+        };
+
+        #[allow(clippy::let_and_return)]
+        let client = Arc::new(client);
+
+        #[cfg(feature = "e2e-encryption")]
+        client.e2ee.initialize_room_key_tasks(&client);
+
+        let _ = client.event_cache.get_or_init(|| async { EventCache::new(&client) }).await;
+
+        client
     }
 }
 
@@ -285,7 +354,7 @@ impl Client {
 
     /// Returns a subscriber that publishes an event every time the ignore user
     /// list changes.
-    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<()> {
+    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<String>> {
         self.inner.base_client.subscribe_to_ignore_user_list_changes()
     }
 
@@ -381,6 +450,13 @@ impl Client {
     /// Otherwise it returns `None`.
     pub fn session_meta(&self) -> Option<&SessionMeta> {
         self.base_client().session_meta()
+    }
+
+    /// Returns a receiver that gets events for each room info update. To watch
+    /// for new events, use `receiver.resubscribe()`. Each event contains the
+    /// room and a boolean whether this event should trigger a room list update.
+    pub fn roominfo_update_receiver(&self) -> broadcast::Receiver<RoomInfoUpdate> {
+        self.base_client().roominfo_update_receiver()
     }
 
     /// Performs a search for users.
@@ -511,7 +587,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # use url::Url;
     /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// use matrix_sdk::{
@@ -662,7 +738,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # use url::Url;
     /// # use tokio::sync::mpsc;
     /// #
@@ -714,7 +790,7 @@ impl Client {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use matrix_sdk::{
     ///     event_handler::Ctx, ruma::events::room::message::SyncRoomMessageEvent,
     ///     Room,
@@ -781,6 +857,12 @@ impl Client {
             }
             btree_map::Entry::Occupied(entry) => entry.get().subscribe(),
         }
+    }
+
+    /// Subscribe to all updates to all rooms, whenever any has been received in
+    /// a sync response.
+    pub fn subscribe_to_all_room_updates(&self) -> broadcast::Receiver<RoomUpdates> {
+        self.inner.room_updates_sender.subscribe()
     }
 
     pub(crate) async fn notification_handlers(
@@ -888,10 +970,15 @@ impl Client {
     pub async fn restore_session(&self, session: impl Into<AuthSession>) -> Result<()> {
         let session = session.into();
         match session {
-            AuthSession::Matrix(s) => self.matrix_auth().restore_session(s).await,
+            AuthSession::Matrix(s) => Box::pin(self.matrix_auth().restore_session(s)).await,
             #[cfg(feature = "experimental-oidc")]
-            AuthSession::Oidc(s) => self.oidc().restore_session(s).await,
+            AuthSession::Oidc(s) => Box::pin(self.oidc().restore_session(s)).await,
         }
+    }
+
+    pub(crate) async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
+        self.base_client().set_session_meta(session_meta).await?;
+        Ok(())
     }
 
     /// Refresh the access token using the authentication API used to log into
@@ -907,12 +994,12 @@ impl Client {
         match auth_api {
             AuthApi::Matrix(api) => {
                 trace!("Token refresh: Using the homeserver.");
-                api.refresh_access_token().await?;
+                Box::pin(api.refresh_access_token()).await?;
             }
             #[cfg(feature = "experimental-oidc")]
             AuthApi::Oidc(api) => {
                 trace!("Token refresh: Using OIDC.");
-                api.refresh_access_token().await?;
+                Box::pin(api.refresh_access_token()).await?;
             }
         }
 
@@ -1124,13 +1211,30 @@ impl Client {
     /// Convenience shorthand for [`create_room`][Self::create_room] with the
     /// given user being invited, the room marked `is_direct` and both the
     /// creator and invitee getting the default maximum power level.
+    ///
+    /// If the `e2e-encryption` feature is enabled, the room will also be
+    /// encrypted.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user to create a DM for.
     pub async fn create_dm(&self, user_id: &UserId) -> Result<Room> {
-        self.create_room(assign!(create_room::v3::Request::new(), {
+        #[cfg(feature = "e2e-encryption")]
+        let initial_state =
+            vec![InitialStateEvent::new(RoomEncryptionEventContent::with_recommended_defaults())
+                .to_raw_any()];
+
+        #[cfg(not(feature = "e2e-encryption"))]
+        let initial_state = vec![];
+
+        let request = assign!(create_room::v3::Request::new(), {
             invite: vec![user_id.to_owned()],
             is_direct: true,
             preset: Some(create_room::v3::RoomPreset::TrustedPrivateChat),
-        }))
-        .await
+            initial_state,
+        });
+
+        self.create_room(request).await
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -1223,29 +1327,7 @@ impl Client {
             request,
             config,
             send_progress: Default::default(),
-            sliding_sync_proxy_url: None,
-        }
-    }
-
-    #[cfg(feature = "experimental-sliding-sync")]
-    // FIXME: remove this as soon as Sliding-Sync isn't needing an external server
-    // anymore
-    pub(crate) fn send_with_homeserver<Request>(
-        &self,
-        request: Request,
-        config: Option<RequestConfig>,
-        sliding_sync_proxy: Option<String>,
-    ) -> SendRequest<Request>
-    where
-        Request: OutgoingRequest + Clone + Debug,
-        HttpError: From<FromHttpResponseError<Request::EndpointError>>,
-    {
-        SendRequest {
-            client: self.clone(),
-            request,
-            config,
-            send_progress: Default::default(),
-            sliding_sync_proxy_url: sliding_sync_proxy,
+            homeserver_override: None,
         }
     }
 
@@ -1253,14 +1335,14 @@ impl Client {
         &self,
         request: Request,
         config: Option<RequestConfig>,
-        homeserver: Option<String>,
+        homeserver_override: Option<String>,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> HttpResult<Request::IncomingResponse>
     where
         Request: OutgoingRequest + Debug,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
-        let homeserver = match homeserver {
+        let homeserver = match homeserver_override {
             Some(hs) => hs,
             None => self.homeserver().to_string(),
         };
@@ -1312,8 +1394,11 @@ impl Client {
     }
 
     pub(crate) async fn server_versions(&self) -> HttpResult<&[MatrixVersion]> {
-        let server_versions =
-            self.inner.server_versions.get_or_try_init(|| self.request_server_versions()).await?;
+        let server_versions = self
+            .inner
+            .server_versions
+            .get_or_try_init(|| Box::pin(self.request_server_versions()))
+            .await?;
 
         Ok(server_versions)
     }
@@ -1911,19 +1996,24 @@ impl Client {
 
     /// Create a new specialized `Client` that can process notifications.
     pub async fn notification_client(&self) -> Result<Client> {
+        #[cfg(feature = "experimental-sliding-sync")]
+        let sliding_sync_proxy = self.inner.sliding_sync_proxy.read().unwrap().clone();
+
         let client = Client {
-            inner: Arc::new(ClientInner::new(
+            inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
                 self.homeserver(),
                 #[cfg(feature = "experimental-sliding-sync")]
-                self.inner.sliding_sync_proxy.read().unwrap().clone(),
+                sliding_sync_proxy,
                 self.inner.http_client.clone(),
                 self.inner.base_client.clone_with_in_memory_state_store(),
                 self.inner.server_versions.get().cloned(),
                 self.inner.respect_login_well_known,
+                self.inner.event_cache.clone(),
                 #[cfg(feature = "e2e-encryption")]
-                self.inner.encryption_settings,
-            )),
+                self.inner.e2ee.encryption_settings,
+            )
+            .await,
         };
 
         // Copy the parent's session meta into the child. This initializes the in-memory
@@ -1934,10 +2024,16 @@ impl Client {
         // overwrite the session information shared with the parent too, and it
         // must be initialized at most once.
         if let Some(session) = self.session() {
-            client.base_client().set_session_meta(session.into_meta()).await?;
+            client.set_session_meta(session.into_meta()).await?;
         }
 
         Ok(client)
+    }
+
+    /// The [`EventCache`] instance for this [`Client`].
+    pub fn event_cache(&self) -> &EventCache {
+        // SAFETY: always initialized in the `Client` ctor.
+        self.inner.event_cache.get().unwrap()
     }
 }
 
@@ -2168,11 +2264,11 @@ pub(crate) mod tests {
             .await;
 
         let response = client.search_users("test", 50).await.unwrap();
-        let result = response.results.first().unwrap();
+        assert_eq!(response.results.len(), 1);
+        let result = &response.results[0];
         assert_eq!(result.user_id.to_string(), "@test:example.me");
         assert_eq!(result.display_name.clone().unwrap(), "Test");
         assert_eq!(result.avatar_url.clone().unwrap().to_string(), "mxc://example.me/someid");
-        assert_eq!(response.results.len(), 1);
         assert!(!response.limited);
     }
 }

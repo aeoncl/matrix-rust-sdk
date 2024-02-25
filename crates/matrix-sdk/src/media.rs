@@ -17,16 +17,14 @@
 
 #[cfg(feature = "e2e-encryption")]
 use std::io::Read;
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::Path;
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{fmt, fs::File, io, path::Path};
 
 use eyeball::SharedObservable;
 use futures_util::future::try_join;
 pub use matrix_sdk_base::media::*;
 use mime::Mime;
-#[cfg(not(target_arch = "wasm32"))]
-use mime2ext;
 use ruma::{
     api::client::media::{create_content, get_content, get_content_thumbnail},
     assign,
@@ -47,7 +45,8 @@ use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
 
 use crate::{
     attachment::{AttachmentInfo, Thumbnail},
-    Client, Result, SendRequest, TransmissionProgress,
+    futures::SendRequest,
+    Client, Result, TransmissionProgress,
 };
 
 /// A conservative upload speed of 1Mbps
@@ -80,6 +79,37 @@ impl MediaFileHandle {
     /// Get the media file's path.
     pub fn path(&self) -> &Path {
         self.file.path()
+    }
+
+    /// Persist the media file to the given path.
+    pub fn persist(self, path: &Path) -> Result<File, PersistError> {
+        self.file.persist(path).map_err(|e| PersistError {
+            error: e.error,
+            file: Self { file: e.file, _directory: self._directory },
+        })
+    }
+}
+
+/// Error returned when [`MediaFileHandle::persist`] fails.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct PersistError {
+    /// The underlying IO error.
+    pub error: io::Error,
+    /// The temporary file that couldn't be persisted.
+    pub file: MediaFileHandle,
+}
+
+#[cfg(not(any(target_arch = "wasm32", tarpaulin_include)))]
+impl fmt::Debug for PersistError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PersistError({:?})", self.error)
+    }
+}
+
+#[cfg(not(any(target_arch = "wasm32", tarpaulin_include)))]
+impl fmt::Display for PersistError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to persist temporary file: {}", self.error)
     }
 }
 
@@ -232,12 +262,12 @@ impl Media {
         request: &MediaRequest,
         use_cache: bool,
     ) -> Result<Vec<u8>> {
-        let content =
-            if use_cache { self.client.store().get_media_content(request).await? } else { None };
-
-        if let Some(content) = content {
-            return Ok(content);
-        }
+        // Read from the cache.
+        if use_cache {
+            if let Some(content) = self.client.store().get_media_content(request).await? {
+                return Ok(content);
+            }
+        };
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
@@ -246,13 +276,17 @@ impl Media {
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
+                    let content_len = content.len();
                     let mut cursor = std::io::Cursor::new(content);
                     let mut reader = matrix_sdk_base::crypto::AttachmentDecryptor::new(
                         &mut cursor,
                         file.as_ref().clone().into(),
                     )?;
 
-                    let mut decrypted = Vec::new();
+                    // Encrypted size should be the same as the decrypted size,
+                    // rounded up to a cipher block.
+                    let mut decrypted = Vec::with_capacity(content_len);
+
                     reader.read_to_end(&mut decrypted)?;
 
                     decrypted
@@ -315,7 +349,7 @@ impl Media {
     /// * `use_cache` - If we should use the media cache for this file.
     pub async fn get_file(
         &self,
-        event_content: impl MediaEventContent,
+        event_content: &impl MediaEventContent,
         use_cache: bool,
     ) -> Result<Option<Vec<u8>>> {
         let Some(source) = event_content.source() else { return Ok(None) };
@@ -333,7 +367,7 @@ impl Media {
     /// # Arguments
     ///
     /// * `event_content` - The media event content.
-    pub async fn remove_file(&self, event_content: impl MediaEventContent) -> Result<()> {
+    pub async fn remove_file(&self, event_content: &impl MediaEventContent) -> Result<()> {
         if let Some(source) = event_content.source() {
             self.remove_media_content(&MediaRequest { source, format: MediaFormat::File }).await?;
         }
@@ -361,7 +395,7 @@ impl Media {
     /// * `use_cache` - If we should use the media cache for this thumbnail.
     pub async fn get_thumbnail(
         &self,
-        event_content: impl MediaEventContent,
+        event_content: &impl MediaEventContent,
         size: MediaThumbnailSize,
         use_cache: bool,
     ) -> Result<Option<Vec<u8>>> {
@@ -388,7 +422,7 @@ impl Media {
     ///   requested with [`get_thumbnail`](#method.get_thumbnail).
     pub async fn remove_thumbnail(
         &self,
-        event_content: impl MediaEventContent,
+        event_content: &impl MediaEventContent,
         size: MediaThumbnailSize,
     ) -> Result<()> {
         if let Some(source) = event_content.source() {

@@ -23,12 +23,16 @@ pub use ruma;
 pub mod debug;
 pub mod deserialized_responses;
 pub mod executor;
+pub mod failures_cache;
 pub mod ring_buffer;
 pub mod store_locks;
 pub mod timeout;
 pub mod tracing_timer;
 
-#[cfg(target_arch = "wasm32")]
+// We cannot currently measure test coverage in the WASM environment, so
+// js_tracing is incorrectly flagged as untested. Disable coverage checking for
+// it.
+#[cfg(all(target_arch = "wasm32", not(tarpaulin_include)))]
 pub mod js_tracing;
 
 pub use store_locks::LEASE_DURATION_MS;
@@ -66,3 +70,21 @@ impl<T> SyncOutsideWasm for T {}
 /// implemented, while other targets will.
 pub trait AsyncTraitDeps: std::fmt::Debug + SendOutsideWasm + SyncOutsideWasm {}
 impl<T: std::fmt::Debug + SendOutsideWasm + SyncOutsideWasm> AsyncTraitDeps for T {}
+
+// TODO: Remove in favor of impl Trait once allowed in associated types
+#[macro_export]
+macro_rules! boxed_into_future {
+    () => {
+        $crate::boxed_into_future!(extra_bounds: );
+    };
+    (extra_bounds: $($extra_bounds:tt)*) => {
+        #[cfg(target_arch = "wasm32")]
+        type IntoFuture = ::std::pin::Pin<::std::boxed::Box<
+            dyn ::std::future::Future<Output = Self::Output> + $($extra_bounds)*
+        >>;
+        #[cfg(not(target_arch = "wasm32"))]
+        type IntoFuture = ::std::pin::Pin<::std::boxed::Box<
+            dyn ::std::future::Future<Output = Self::Output> + Send + $($extra_bounds)*
+        >>;
+    };
+}

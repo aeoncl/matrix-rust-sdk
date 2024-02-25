@@ -38,7 +38,7 @@ use ruma::{
     serde::JsonObject,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 use crate::{
     authentication::AuthData,
@@ -58,6 +58,7 @@ pub(crate) struct MatrixAuthData {
     pub(crate) tokens: SharedObservable<MatrixSessionTokens>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl fmt::Debug for MatrixAuthData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MatrixAuthData").finish_non_exhaustive()
@@ -485,7 +486,9 @@ impl MatrixAuth {
                 if let Some(save_session_callback) =
                     self.client.inner.auth_ctx.save_session_callback.get()
                 {
-                    save_session_callback(self.client.clone());
+                    if let Err(err) = save_session_callback(self.client.clone()).await {
+                        error!("when saving session after refresh: {err}");
+                    }
                 }
 
                 _ = self
@@ -505,6 +508,9 @@ impl MatrixAuth {
     }
 
     /// Register a user to the server.
+    ///
+    /// If registration was successful and a session token was returned by the
+    /// server, the client session is set (the client is logged in).
     ///
     /// # Arguments
     ///
@@ -536,15 +542,33 @@ impl MatrixAuth {
     /// # };
     /// ```
     #[instrument(skip_all)]
-    pub async fn register(
-        &self,
-        request: register::v3::Request,
-    ) -> HttpResult<register::v3::Response> {
+    pub async fn register(&self, request: register::v3::Request) -> Result<register::v3::Response> {
         let homeserver = self.client.homeserver();
         info!("Registering to {homeserver}");
-        self.client.send(request, None).await
-    }
 
+        #[cfg(feature = "e2e-encryption")]
+        let login_info = match (&request.username, &request.password) {
+            (Some(u), Some(p)) => Some(ruma::api::client::session::login::v3::LoginInfo::Password(
+                ruma::api::client::session::login::v3::Password::new(
+                    UserIdentifier::UserIdOrLocalpart(u.into()),
+                    p.clone(),
+                ),
+            )),
+            _ => None,
+        };
+
+        let response = self.client.send(request, None).await?;
+        if let Some(session) = MatrixSession::from_register_response(&response) {
+            let _ = self
+                .set_session(
+                    session,
+                    #[cfg(feature = "e2e-encryption")]
+                    login_info,
+                )
+                .await;
+        }
+        Ok(response)
+    }
     /// Log out the current user.
     pub async fn logout(&self) -> HttpResult<logout::v3::Response> {
         let request = logout::v3::Request::new();
@@ -801,7 +825,12 @@ impl MatrixAuth {
     #[instrument(skip_all)]
     pub async fn restore_session(&self, session: MatrixSession) -> Result<()> {
         debug!("Restoring Matrix auth session");
-        self.set_session(session).await?;
+        self.set_session(
+            session,
+            #[cfg(feature = "e2e-encryption")]
+            None,
+        )
+        .await?;
         debug!("Done restoring Matrix auth session");
         Ok(())
     }
@@ -815,17 +844,42 @@ impl MatrixAuth {
     pub(crate) async fn receive_login_response(
         &self,
         response: &login::v3::Response,
+        #[cfg(feature = "e2e-encryption")] login_info: Option<login::v3::LoginInfo>,
     ) -> Result<()> {
         self.client.maybe_update_login_well_known(response.well_known.as_ref());
 
-        self.set_session(response.into()).await?;
+        self.set_session(
+            response.into(),
+            #[cfg(feature = "e2e-encryption")]
+            login_info,
+        )
+        .await?;
 
         Ok(())
     }
 
-    async fn set_session(&self, session: MatrixSession) -> Result<()> {
+    async fn set_session(
+        &self,
+        session: MatrixSession,
+        #[cfg(feature = "e2e-encryption")] login_info: Option<login::v3::LoginInfo>,
+    ) -> Result<()> {
         self.set_session_tokens(session.tokens);
-        self.client.base_client().set_session_meta(session.meta).await?;
+        self.client.set_session_meta(session.meta).await?;
+
+        #[cfg(feature = "e2e-encryption")]
+        {
+            use ruma::api::client::uiaa::{AuthData, Password};
+
+            let auth_data = match login_info {
+                Some(login::v3::LoginInfo::Password(p)) => {
+                    Some(AuthData::Password(Password::new(p.identifier, p.password)))
+                }
+                // Other methods can't be immediately translated to an auth.
+                _ => None,
+            };
+
+            self.client.encryption().run_initialization_tasks(auth_data).await?;
+        }
 
         Ok(())
     }
@@ -883,6 +937,21 @@ impl From<&login::v3::Response> for MatrixSession {
                 refresh_token: refresh_token.clone(),
             },
         }
+    }
+}
+
+impl MatrixSession {
+    #[allow(clippy::question_mark)] // clippy falsely complains about the let-unpacking
+    fn from_register_response(response: &register::v3::Response) -> Option<Self> {
+        let register::v3::Response { user_id, access_token, device_id, refresh_token, .. } =
+            response;
+        Some(Self {
+            meta: SessionMeta { user_id: user_id.clone(), device_id: device_id.clone()? },
+            tokens: MatrixSessionTokens {
+                access_token: access_token.clone()?,
+                refresh_token: refresh_token.clone(),
+            },
+        })
     }
 }
 

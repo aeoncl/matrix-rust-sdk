@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    env::consts::{DLL_PREFIX, DLL_SUFFIX},
+};
 
 use clap::{Args, Subcommand};
 use xshell::{cmd, pushd};
 
-use crate::{build_docs, workspace, DenyWarnings, Result};
+use crate::{build_docs, workspace, DenyWarnings, Result, NIGHTLY};
 
-const NIGHTLY: &str = "nightly-2023-07-03";
 const WASM_TIMEOUT_ENV_KEY: &str = "WASM_BINDGEN_TEST_TIMEOUT";
 const WASM_TIMEOUT_VALUE: &str = "120";
 
@@ -85,11 +87,14 @@ enum WasmFeatureSet {
     MatrixSdkIndexeddbStoresNoCrypto,
     /// Check `matrix-sdk` crate with `indexeddb` and `e2e-encryption` features
     MatrixSdkIndexeddbStores,
-    /// Check `matrix-sdk-indexeddb` crate without `e2e-encryption` feature
-    IndexeddbNoCrypto,
+    /// Check `matrix-sdk-indexeddb` crate with all features
+    IndexeddbAllFeatures,
     /// Check `matrix-sdk-indexeddb` crate with `e2e-encryption` feature
-    IndexeddbWithCrypto,
-    /// Equivalent to `IndexeddbNoCrypto` followed by `IndexeddbWithCrypto`
+    IndexeddbCrypto,
+    /// Check `matrix-sdk-indexeddb` crate with `state-store` feature
+    IndexeddbState,
+    /// Equivalent to `indexeddb-all-features`, `indexeddb-crypto` and
+    /// `indexeddb-state`
     Indexeddb,
 }
 
@@ -131,22 +136,22 @@ fn check_bindings() -> Result<()> {
     cmd!(
         "
         rustup run stable cargo run -p uniffi-bindgen -- generate
+            --library
             --language kotlin
             --language swift
-            --lib-file target/debug/libmatrix_sdk_ffi.a
             --out-dir target/generated-bindings
-            bindings/matrix-sdk-ffi/src/api.udl
+            target/debug/{DLL_PREFIX}matrix_sdk_ffi{DLL_SUFFIX}
         "
     )
     .run()?;
     cmd!(
         "
         rustup run stable cargo run -p uniffi-bindgen -- generate
+            --library
             --language kotlin
             --language swift
-            --lib-file target/debug/libmatrix_sdk_crypto_ffi.a
             --out-dir target/generated-bindings
-            bindings/matrix-sdk-crypto-ffi/src/olm.udl
+            target/debug/{DLL_PREFIX}matrix_sdk_crypto_ffi{DLL_SUFFIX}
         "
     )
     .run()?;
@@ -239,15 +244,10 @@ fn run_feature_tests(cmd: Option<FeatureSet>) -> Result<()> {
 }
 
 fn run_crypto_tests() -> Result<()> {
-    cmd!(
-        "rustup run stable cargo clippy -p matrix-sdk-crypto --features=backups_v1 -- -D warnings"
-    )
-    .run()?;
+    cmd!("rustup run stable cargo clippy -p matrix-sdk-crypto -- -D warnings").run()?;
     cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --no-default-features --features testing").run()?;
-    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --features=backups_v1,testing")
-        .run()?;
-    cmd!("rustup run stable cargo test --doc -p matrix-sdk-crypto --features=backups_v1,testing")
-        .run()?;
+    cmd!("rustup run stable cargo nextest run -p matrix-sdk-crypto --features=testing").run()?;
+    cmd!("rustup run stable cargo test --doc -p matrix-sdk-crypto --features=testing").run()?;
     cmd!(
         "rustup run stable cargo clippy -p matrix-sdk-crypto --features=experimental-algorithms -- -D warnings"
     )
@@ -272,8 +272,9 @@ fn run_crypto_tests() -> Result<()> {
 
 fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
     if let Some(WasmFeatureSet::Indexeddb) = cmd {
-        run_wasm_checks(Some(WasmFeatureSet::IndexeddbNoCrypto))?;
-        run_wasm_checks(Some(WasmFeatureSet::IndexeddbWithCrypto))?;
+        run_wasm_checks(Some(WasmFeatureSet::IndexeddbAllFeatures))?;
+        run_wasm_checks(Some(WasmFeatureSet::IndexeddbCrypto))?;
+        run_wasm_checks(Some(WasmFeatureSet::IndexeddbState))?;
         return Ok(());
     }
 
@@ -293,10 +294,14 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
             WasmFeatureSet::MatrixSdkIndexeddbStores,
             "-p matrix-sdk --no-default-features --features js,indexeddb,e2e-encryption,rustls-tls",
         ),
-        (WasmFeatureSet::IndexeddbNoCrypto, "-p matrix-sdk-indexeddb --no-default-features "),
+        (WasmFeatureSet::IndexeddbAllFeatures, "-p matrix-sdk-indexeddb"),
         (
-            WasmFeatureSet::IndexeddbWithCrypto,
+            WasmFeatureSet::IndexeddbCrypto,
             "-p matrix-sdk-indexeddb --no-default-features --features e2e-encryption",
+        ),
+        (
+            WasmFeatureSet::IndexeddbState,
+            "-p matrix-sdk-indexeddb --no-default-features --features state-store",
         ),
     ]);
 
@@ -324,8 +329,9 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
 
 fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
     if let Some(WasmFeatureSet::Indexeddb) = cmd {
-        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbNoCrypto))?;
-        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbWithCrypto))?;
+        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbAllFeatures))?;
+        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbCrypto))?;
+        run_wasm_pack_tests(Some(WasmFeatureSet::IndexeddbState))?;
         return Ok(());
     }
     let args = BTreeMap::from([
@@ -348,12 +354,16 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
             ),
         ),
         (
-            WasmFeatureSet::IndexeddbNoCrypto,
-            ("crates/matrix-sdk-indexeddb", "--no-default-features"),
+            WasmFeatureSet::IndexeddbAllFeatures,
+            ("crates/matrix-sdk-indexeddb", ""),
         ),
         (
-            WasmFeatureSet::IndexeddbWithCrypto,
+            WasmFeatureSet::IndexeddbCrypto,
             ("crates/matrix-sdk-indexeddb", "--no-default-features --features e2e-encryption"),
+        ),
+        (
+            WasmFeatureSet::IndexeddbState,
+            ("crates/matrix-sdk-indexeddb", "--no-default-features --features state-store"),
         ),
     ]);
 

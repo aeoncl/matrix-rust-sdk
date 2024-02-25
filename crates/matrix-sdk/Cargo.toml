@@ -9,7 +9,7 @@ name = "matrix-sdk"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version = { workspace = true }
-version = "0.6.2"
+version = "0.7.1"
 
 [package.metadata.docs.rs]
 features = ["docsrs"]
@@ -17,7 +17,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "native-tls"]
-testing = ["matrix-sdk-sqlite?/testing", "matrix-sdk-indexeddb?/testing", "matrix-sdk-base/testing"]
+testing = ["matrix-sdk-sqlite?/testing", "matrix-sdk-indexeddb?/testing", "matrix-sdk-base/testing", "wiremock"]
 
 e2e-encryption = [
     "matrix-sdk-base/e2e-encryption",
@@ -29,7 +29,7 @@ js = ["matrix-sdk-common/js", "matrix-sdk-base/js"]
 
 sqlite = ["dep:matrix-sdk-sqlite", "matrix-sdk-sqlite?/state-store"]
 bundled-sqlite = ["sqlite", "matrix-sdk-sqlite?/bundled"]
-indexeddb = ["dep:matrix-sdk-indexeddb"]
+indexeddb = ["matrix-sdk-indexeddb/state-store"]
 
 qrcode = ["e2e-encryption", "matrix-sdk-base/qrcode"]
 automatic-room-key-forwarding = ["e2e-encryption", "matrix-sdk-base/automatic-room-key-forwarding"]
@@ -40,6 +40,8 @@ socks = ["reqwest/socks"]
 sso-login = ["dep:hyper", "dep:rand", "dep:tower"]
 image-proc = ["dep:image"]
 image-rayon = ["image-proc", "image?/jpeg_rayon"]
+
+uniffi = ["dep:uniffi"]
 
 experimental-oidc = [
     "ruma/unstable-msc2967",
@@ -57,20 +59,21 @@ experimental-sliding-sync = [
 ]
 experimental-widgets = ["dep:language-tags", "dep:uuid"]
 
-docsrs = ["e2e-encryption", "sqlite", "sso-login", "qrcode", "image-proc"]
+docsrs = ["e2e-encryption", "sqlite", "indexeddb", "sso-login", "qrcode", "image-proc"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
 anymap2 = "0.13.0"
+aquamarine = "0.5.0"
 as_variant = { workspace = true }
-async-channel = "1.9.0"
+async-channel = "2.1.0"
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 bytes = "1.1.0"
 bytesize = "1.1"
 cfg-vis = "0.3.0"
 chrono = { version = "0.4.23", optional = true }
-event-listener = "3.0.0"
+event-listener = "4.0.0"
 eyeball = { workspace = true }
 eyeball-im = { workspace = true }
 eyeball-im-util = { workspace = true, optional = true }
@@ -81,23 +84,27 @@ http = { workspace = true }
 hyper = { version = "0.14.20", features = ["http1", "http2", "server"], optional = true }
 imbl = { version = "2.0.0", features = ["serde"] }
 indexmap = "2.0.2"
+js_int = "0.2.2"
 language-tags = { version = "0.3.2", optional = true }
-matrix-sdk-base = { version = "0.6.0", path = "../matrix-sdk-base", default_features = false }
-matrix-sdk-common = { version = "0.6.0", path = "../matrix-sdk-common" }
-matrix-sdk-indexeddb = { version = "0.2.0", path = "../matrix-sdk-indexeddb", default-features = false, optional = true }
-matrix-sdk-sqlite = { version = "0.1.0", path = "../matrix-sdk-sqlite", default-features = false, optional = true }
+mas-oidc-client = { version = "0.7.0", optional = true }
+matrix-sdk-base = { workspace = true, features = ["uniffi"] }
+matrix-sdk-common = { workspace = true }
+matrix-sdk-indexeddb = { workspace = true, optional = true }
+matrix-sdk-sqlite = { workspace = true, optional = true }
 mime = "0.3.16"
 mime2ext = "0.1.52"
-rand = { version = "0.8.5", optional = true }
-ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat"] }
+rand = { workspace = true , optional = true }
+ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat", "unstable-msc2867"] }
 serde = { workspace = true }
 serde_html_form = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true, optional = true }
 tempfile = "3.3.0"
 thiserror = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tower = { version = "0.4.13", features = ["make"], optional = true }
 tracing = { workspace = true, features = ["attributes"] }
+uniffi = { workspace = true, optional = true }
 url = "2.2.2"
 urlencoding = "2.1.3"
 uuid = { version = "1.4.1", features = ["serde", "v4"], optional = true }
@@ -123,11 +130,6 @@ features = [
 ]
 optional = true
 
-[dependencies.mas-oidc-client]
-git = "https://github.com/matrix-org/matrix-authentication-service"
-rev = "4280045b24bc71ef1fa100c0a046ed15e6e20748"
-optional = true
-
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 reqwest = { version = "0.11.10", default_features = false }
@@ -140,6 +142,7 @@ backoff = { version = "0.4.0", features = ["tokio"] }
 reqwest = { version = "0.11.10", default_features = false, features = ["stream"] }
 tokio = { workspace = true, features = ["fs", "rt", "macros"] }
 tokio-util = "0.7.9"
+wiremock = { version = "0.5.13", optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -148,8 +151,8 @@ assert_matches = { workspace = true }
 assert_matches2 = { workspace = true }
 dirs = "5.0.1"
 futures-executor = { workspace = true }
-matrix-sdk-base = { version = "0.6.0", path = "../matrix-sdk-base", default_features = false, features = ["testing"] }
-matrix-sdk-test = { version = "0.6.0", path = "../../testing/matrix-sdk-test" }
+matrix-sdk-base = { workspace = true, features = ["testing"] }
+matrix-sdk-test = { workspace = true }
 once_cell = { workspace = true }
 serde_urlencoded = "0.7.1"
 stream_assert = { workspace = true }
@@ -159,6 +162,8 @@ tracing-subscriber = { version = "0.3.11", features = ["env-filter"] }
 wasm-bindgen-test = "0.3.33"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-ctor = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-wiremock = "0.5.13"
+
+[[test]]
+name = "integration"
+required-features = ["testing"]

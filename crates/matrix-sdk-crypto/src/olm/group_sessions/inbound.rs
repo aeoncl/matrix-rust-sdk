@@ -111,7 +111,7 @@ pub struct InboundGroupSession {
     inner: Arc<Mutex<InnerSession>>,
 
     /// A copy of [`InnerSession::session_id`] to avoid having to acquire a lock
-    /// to get to the sesison ID.
+    /// to get to the session ID.
     session_id: Arc<str>,
 
     /// A copy of [`InnerSession::first_known_index`] to avoid having to acquire
@@ -398,7 +398,6 @@ impl InboundGroupSession {
 
     /// Export the inbound group session into a format that can be uploaded to
     /// the server as a backup.
-    #[cfg(feature = "backups_v1")]
     pub async fn to_backup(&self) -> BackedUpRoomKey {
         self.export().await.into()
     }

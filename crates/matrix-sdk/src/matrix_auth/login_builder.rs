@@ -14,11 +14,11 @@
 // limitations under the License.
 #![cfg_attr(not(target_arch = "wasm32"), deny(clippy::future_not_send))]
 
-use std::{
-    future::{Future, IntoFuture},
-    pin::Pin,
-};
+#[cfg(feature = "sso-login")]
+use std::future::Future;
+use std::future::IntoFuture;
 
+use matrix_sdk_common::boxed_into_future;
 use ruma::{
     api::client::{session::login, uiaa::UserIdentifier},
     assign,
@@ -183,28 +183,13 @@ impl LoginBuilder {
         });
 
         let response = client.send(request, Some(RequestConfig::short_retry())).await?;
-        self.auth.receive_login_response(&response).await?;
-
-        // This may block login for a while, but the user asked for it!
-        // TODO: (#2763) put this into a background task.
-        #[cfg(feature = "e2e-encryption")]
-        if self.auth.client.encryption().settings().auto_enable_cross_signing {
-            use ruma::api::client::uiaa::{AuthData, Password};
-
-            let auth_data = match login_info {
-                login::v3::LoginInfo::Password(p) => {
-                    Some(AuthData::Password(Password::new(p.identifier, p.password)))
-                }
-                // Other methods can't be immediately translated to an auth.
-                _ => None,
-            };
-
-            if let Err(err) =
-                self.auth.client.encryption().bootstrap_cross_signing_if_needed(auth_data).await
-            {
-                tracing::warn!("cross-signing bootstrapping failed: {err}");
-            }
-        }
+        self.auth
+            .receive_login_response(
+                &response,
+                #[cfg(feature = "e2e-encryption")]
+                Some(login_info),
+            )
+            .await?;
 
         Ok(response)
     }
@@ -212,8 +197,7 @@ impl LoginBuilder {
 
 impl IntoFuture for LoginBuilder {
     type Output = Result<login::v3::Response>;
-    // TODO: Use impl Trait once allowed in this position on stable
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())
@@ -479,8 +463,7 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     type Output = Result<login::v3::Response>;
-    // TODO: Use impl Trait once allowed in this position on stable
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())

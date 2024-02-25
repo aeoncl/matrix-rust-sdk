@@ -17,7 +17,7 @@ use matrix_sdk_crypto::{
     decrypt_room_key_export, encrypt_room_key_export,
     olm::ExportedRoomKey,
     store::{BackupDecryptionKey, Changes},
-    LocalTrust, OlmMachine as InnerMachine, UserIdentities,
+    LocalTrust, OlmMachine as InnerMachine, ToDeviceRequest, UserIdentities,
 };
 use ruma::{
     api::{
@@ -40,6 +40,7 @@ use ruma::{
         AnySyncMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent,
     },
     serde::Raw,
+    to_device::DeviceIdOrAllDevices,
     DeviceKeyAlgorithm, EventId, OwnedTransactionId, OwnedUserId, RoomId, UserId,
 };
 use serde::{Deserialize, Serialize};
@@ -113,14 +114,15 @@ pub struct OlmMachine {
 
 impl Drop for OlmMachine {
     fn drop(&mut self) {
-        // SAFETY: self.inner is never used again, which is the only requirement
-        //         for ManuallyDrop::take to be used safely.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        let _guard = self.runtime.enter();
         // Dropping the inner OlmMachine must happen within a tokio context
         // because deadpool drops sqlite connections in the DB pool on tokio's
         // blocking threadpool to avoid blocking async worker threads.
-        drop(inner);
+        let _guard = self.runtime.enter();
+        // SAFETY: self.inner is never used again, which is the only requirement
+        //         for ManuallyDrop::drop to be used safely.
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
     }
 }
 
@@ -566,7 +568,7 @@ impl OlmMachine {
     ///
     /// *Note*: Only users that aren't already tracked will be considered for an
     /// update. It's safe to call this with already tracked users, it won't
-    /// result in excessive keys query requests.
+    /// result in excessive `/keys/query` requests.
     ///
     /// # Arguments
     ///
@@ -789,14 +791,61 @@ impl OlmMachine {
         content: String,
     ) -> Result<String, CryptoStoreError> {
         let room_id = RoomId::parse(room_id)?;
-        let content: Value = serde_json::from_str(&content)?;
+        let content = serde_json::from_str(&content)?;
 
         let encrypted_content = self
             .runtime
-            .block_on(self.inner.encrypt_room_event_raw(&room_id, content, &event_type))
+            .block_on(self.inner.encrypt_room_event_raw(&room_id, &event_type, &content))
             .expect("Encrypting an event produced an error");
 
         Ok(serde_json::to_string(&encrypted_content)?)
+    }
+
+    /// Encrypt the given event with the given type and content for the given
+    /// device. This method is used to send an event to a specific device.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user who owns the target device.
+    /// * `device_id` - The ID of the device to which the message will be sent.
+    /// * `event_type` - The event type.
+    /// * `content` - The serialized content of the event.
+    ///
+    /// # Returns
+    /// A `Result` containing the request to be sent out if the encryption was
+    /// successful. If the device is not found, the result will be `Ok(None)`.
+    ///
+    /// The caller should ensure that there is an olm session (see
+    /// `get_missing_sessions`) with the target device before calling this
+    /// method.
+    pub fn create_encrypted_to_device_request(
+        &self,
+        user_id: String,
+        device_id: String,
+        event_type: String,
+        content: String,
+    ) -> Result<Option<Request>, CryptoStoreError> {
+        let user_id = parse_user_id(&user_id)?;
+        let device_id = device_id.as_str().into();
+        let content = serde_json::from_str(&content)?;
+
+        let device = self.runtime.block_on(self.inner.get_device(&user_id, device_id, None))?;
+
+        if let Some(device) = device {
+            let encrypted_content =
+                self.runtime.block_on(device.encrypt_event_raw(&event_type, &content))?;
+
+            let request = ToDeviceRequest::new(
+                user_id.as_ref(),
+                DeviceIdOrAllDevices::DeviceId(device_id.to_owned()),
+                "m.room.encrypted",
+                encrypted_content.cast(),
+            );
+
+            Ok(Some(request.into()))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Decrypt the given event that was sent in the given room.
@@ -916,7 +965,7 @@ impl OlmMachine {
         passphrase: String,
         rounds: i32,
     ) -> Result<String, CryptoStoreError> {
-        let keys = self.runtime.block_on(self.inner.export_room_keys(|_| true))?;
+        let keys = self.runtime.block_on(self.inner.store().export_room_keys(|_| true))?;
 
         let encrypted = encrypt_room_key_export(&keys, &passphrase, rounds as u32)
             .map_err(CryptoStoreError::Serialization)?;
@@ -975,7 +1024,7 @@ impl OlmMachine {
     pub fn discard_room_key(&self, room_id: String) -> Result<(), CryptoStoreError> {
         let room_id = RoomId::parse(room_id)?;
 
-        self.runtime.block_on(self.inner.invalidate_group_session(&room_id))?;
+        self.runtime.block_on(self.inner.discard_room_key(&room_id))?;
 
         Ok(())
     }
@@ -1464,6 +1513,7 @@ impl OlmMachine {
             progress_listener.on_progress(progress as i32, total as i32)
         };
 
+        #[allow(deprecated)]
         let result =
             self.runtime.block_on(self.inner.import_room_keys(keys, from_backup, listener))?;
 

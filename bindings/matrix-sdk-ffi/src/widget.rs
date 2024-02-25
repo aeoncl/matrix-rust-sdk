@@ -111,6 +111,34 @@ pub async fn generate_webview_url(
     .map(|url| url.to_string())?)
 }
 
+/// Defines if a call is encrypted and which encryption system should be used.
+///
+/// This controls the url parameters: `perParticipantE2EE`, `password`.
+#[derive(uniffi::Enum, Clone)]
+pub enum EncryptionSystem {
+    /// Equivalent to the element call url parameter: `enableE2EE=false`
+    Unencrypted,
+    /// Equivalent to the element call url parameter:
+    /// `perParticipantE2EE=true`
+    PerParticipantKeys,
+    /// Equivalent to the element call url parameter:
+    /// `password={secret}`
+    SharedSecret {
+        /// The secret/password which is used in the url.
+        secret: String,
+    },
+}
+
+impl From<EncryptionSystem> for matrix_sdk::widget::EncryptionSystem {
+    fn from(value: EncryptionSystem) -> Self {
+        match value {
+            EncryptionSystem::Unencrypted => Self::Unencrypted,
+            EncryptionSystem::PerParticipantKeys => Self::PerParticipantKeys,
+            EncryptionSystem::SharedSecret { secret } => Self::SharedSecret { secret },
+        }
+    }
+}
+
 /// Properties to create a new virtual Element Call widget.
 #[derive(uniffi::Record, Clone)]
 pub struct VirtualElementCallWidgetOptions {
@@ -174,6 +202,11 @@ pub struct VirtualElementCallWidgetOptions {
 
     /// Can be used to pass a PostHog id to element call.
     pub analytics_id: Option<String>,
+
+    /// The encryption system to use.
+    ///
+    /// Use `EncryptionSystem::Unencrypted` to disable encryption.
+    pub encryption: EncryptionSystem,
 }
 
 impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElementCallWidgetOptions {
@@ -190,6 +223,7 @@ impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElemen
             confine_to_room: value.confine_to_room,
             font: value.font,
             analytics_id: value.analytics_id,
+            encryption: value.encryption.into(),
         }
     }
 }
@@ -211,6 +245,46 @@ pub fn new_virtual_element_call_widget(
 ) -> Result<WidgetSettings, ParseError> {
     Ok(matrix_sdk::widget::WidgetSettings::new_virtual_element_call_widget(props.into())
         .map(|w| w.into())?)
+}
+
+/// The Capabilities required to run a element call widget.
+///
+/// This is intended to be used in combination with: `acquire_capabilities` of
+/// the `CapabilitiesProvider`.
+///
+/// `acquire_capabilities` can simply return the `WidgetCapabilities` from this
+/// function. Even if there are non intersecting permissions to what the widget
+/// requested.
+///
+/// Editing and extending the capabilities from this function is also possible,
+/// but should only be done as temporal workarounds until this function is
+/// adjusted
+#[uniffi::export]
+pub fn get_element_call_required_permissions() -> WidgetCapabilities {
+    use ruma::events::StateEventType;
+
+    WidgetCapabilities {
+        read: vec![
+            WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
+            WidgetEventFilter::StateWithType { event_type: StateEventType::RoomMember.to_string() },
+            WidgetEventFilter::MessageLikeWithType {
+                event_type: "org.matrix.rageshake_request".to_owned(),
+            },
+            WidgetEventFilter::MessageLikeWithType {
+                event_type: "io.element.call.encryption_keys".to_owned(),
+            },
+        ],
+        send: vec![
+            WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
+            WidgetEventFilter::StateWithType {
+                event_type: "org.matrix.rageshake_request".to_owned(),
+            },
+            WidgetEventFilter::StateWithType {
+                event_type: "io.element.call.encryption_keys".to_owned(),
+            },
+        ],
+        requires_client: true,
+    }
 }
 
 #[derive(uniffi::Record)]

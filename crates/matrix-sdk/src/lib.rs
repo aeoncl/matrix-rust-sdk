@@ -39,6 +39,7 @@ mod deduplicating_handler;
 #[cfg(feature = "e2e-encryption")]
 pub mod encryption;
 mod error;
+pub mod event_cache;
 pub mod event_handler;
 mod http_client;
 pub mod matrix_auth;
@@ -47,7 +48,12 @@ pub mod notification_settings;
 #[cfg(feature = "experimental-oidc")]
 pub mod oidc;
 pub mod room;
+pub mod utils;
+pub mod futures {
+    //! Named futures returned from methods on types in [the crate root][crate].
 
+    pub use super::client::futures::SendRequest;
+}
 #[cfg(feature = "experimental-sliding-sync")]
 pub mod sliding_sync;
 pub mod sync;
@@ -56,7 +62,7 @@ pub mod widget;
 
 pub use account::Account;
 pub use authentication::{AuthApi, AuthSession, SessionTokens};
-pub use client::{Client, ClientBuildError, ClientBuilder, LoopCtrl, SendRequest, SessionChange};
+pub use client::{Client, ClientBuildError, ClientBuilder, LoopCtrl, SessionChange};
 #[cfg(feature = "image-proc")]
 pub use error::ImageError;
 pub use error::{
@@ -66,6 +72,8 @@ pub use error::{
 pub use http_client::TransmissionProgress;
 #[cfg(all(feature = "e2e-encryption", feature = "sqlite"))]
 pub use matrix_sdk_sqlite::SqliteCryptoStore;
+#[cfg(feature = "sqlite")]
+pub use matrix_sdk_sqlite::SqliteStateStore;
 pub use media::Media;
 pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
@@ -75,51 +83,11 @@ pub use sliding_sync::{
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
 };
 
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[ctor::ctor]
-fn init_logging() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .init();
-}
-
-/// Creates a server name from a user supplied string. The string is first
-/// sanitized by removing whitespace, the http(s) scheme and any trailing
-/// slashes before being parsed.
-pub fn sanitize_server_name(s: &str) -> Result<OwnedServerName, IdParseError> {
-    ServerName::parse(
-        s.trim().trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/'),
-    )
-}
-
 #[cfg(test)]
-mod tests {
-    use assert_matches::assert_matches;
-
-    use crate::sanitize_server_name;
-
-    #[test]
-    fn test_sanitize_server_name() {
-        assert_eq!(sanitize_server_name("matrix.org").unwrap().as_str(), "matrix.org");
-        assert_eq!(sanitize_server_name("https://matrix.org").unwrap().as_str(), "matrix.org");
-        assert_eq!(sanitize_server_name("http://matrix.org").unwrap().as_str(), "matrix.org");
-        assert_eq!(
-            sanitize_server_name("https://matrix.server.org").unwrap().as_str(),
-            "matrix.server.org"
-        );
-        assert_eq!(
-            sanitize_server_name("https://matrix.server.org/").unwrap().as_str(),
-            "matrix.server.org"
-        );
-        assert_eq!(
-            sanitize_server_name("  https://matrix.server.org// ").unwrap().as_str(),
-            "matrix.server.org"
-        );
-        assert_matches!(sanitize_server_name("https://matrix.server.org/something"), Err(_))
-    }
-}
+matrix_sdk_test::init_tracing_for_tests!();

@@ -18,6 +18,7 @@ pub struct RoomInfo {
     is_public: bool,
     is_space: bool,
     is_tombstoned: bool,
+    is_favourite: bool,
     canonical_alias: Option<String>,
     alternative_aliases: Vec<String>,
     membership: Membership,
@@ -31,6 +32,17 @@ pub struct RoomInfo {
     user_defined_notification_mode: Option<RoomNotificationMode>,
     has_room_call: bool,
     active_room_call_participants: Vec<String>,
+    /// Whether this room has been explicitly marked as unread
+    is_marked_unread: bool,
+    /// "Interesting" messages received in that room, independently of the
+    /// notification settings.
+    num_unread_messages: u64,
+    /// Events that will notify the user, according to their
+    /// notification settings.
+    num_unread_notifications: u64,
+    /// Events causing mentions/highlights for the user, according to their
+    /// notification settings.
+    num_unread_mentions: u64,
 }
 
 impl RoomInfo {
@@ -50,6 +62,7 @@ impl RoomInfo {
             is_public: room.is_public(),
             is_space: room.is_space(),
             is_tombstoned: room.is_tombstoned(),
+            is_favourite: room.is_favourite(),
             canonical_alias: room.canonical_alias().map(Into::into),
             alternative_aliases: room.alt_aliases().into_iter().map(Into::into).collect(),
             membership: room.state().into(),
@@ -75,6 +88,10 @@ impl RoomInfo {
                 .iter()
                 .map(|u| u.to_string())
                 .collect(),
+            is_marked_unread: room.is_marked_unread(),
+            num_unread_messages: room.num_unread_messages(),
+            num_unread_notifications: room.num_unread_notifications(),
+            num_unread_mentions: room.num_unread_mentions(),
         })
     }
 }

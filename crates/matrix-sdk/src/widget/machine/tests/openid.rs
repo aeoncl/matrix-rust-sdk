@@ -15,7 +15,10 @@
 use std::time::Duration;
 
 use assert_matches2::assert_let;
-use ruma::{api::client::account::request_openid_token, owned_room_id, ServerName};
+use ruma::{
+    api::client::account::request_openid_token, authentication::TokenType, owned_room_id,
+    ServerName,
+};
 use serde_json::json;
 
 use super::{parse_msg, WIDGET_ID};
@@ -25,8 +28,12 @@ use crate::widget::machine::{
 
 #[test]
 fn openid_request_handling_works() {
-    let (mut machine, _) =
-        WidgetMachine::new(WIDGET_ID.to_owned(), owned_room_id!("!a98sd12bjh:example.org"), true);
+    let (mut machine, _) = WidgetMachine::new(
+        WIDGET_ID.to_owned(),
+        owned_room_id!("!a98sd12bjh:example.org"),
+        true,
+        None,
+    );
 
     // Widget requests an open ID token, since we don't have any caching yet,
     // we reply with a pending response right away.
@@ -72,7 +79,7 @@ fn openid_request_handling_works() {
             response: Ok(MatrixDriverResponse::OpenIdReceived(
                 request_openid_token::v3::Response::new(
                     "access_token".to_owned(),
-                    "Bearer".try_into().unwrap(),
+                    TokenType::Bearer,
                     ServerName::parse("example.org").unwrap().to_owned(),
                     Duration::from_secs(3600),
                 ),
@@ -106,8 +113,12 @@ fn openid_request_handling_works() {
 
 #[test]
 fn openid_fail_results_in_response_blocked() {
-    let (mut machine, _) =
-        WidgetMachine::new(WIDGET_ID.to_owned(), owned_room_id!("!a98sd12bjh:example.org"), true);
+    let (mut machine, _) = WidgetMachine::new(
+        WIDGET_ID.to_owned(),
+        owned_room_id!("!a98sd12bjh:example.org"),
+        true,
+        None,
+    );
 
     // Widget requests an open ID token, since we don't have any caching yet,
     // we reply with a pending response right away.
