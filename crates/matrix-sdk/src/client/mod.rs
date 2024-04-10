@@ -48,8 +48,6 @@ use ruma::{
             },
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             membership::{join_room_by_id, join_room_by_id_or_alias},
-            profile::get_profile,
-            push::{set_pusher, Pusher},
             room::create_room,
             session::login::v3::DiscoveryInfo,
             sync::sync_events,
@@ -85,19 +83,19 @@ use crate::{
     matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
     sync::{RoomUpdate, SyncResponse},
-    Account, AuthApi, AuthSession, Error, Media, RefreshTokenError, Result, Room,
+    Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
     TransmissionProgress,
 };
 #[cfg(feature = "e2e-encryption")]
 use crate::{
-    encryption::{Encryption, EncryptionData, EncryptionSettings},
+    encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
     store_locks::CrossProcessStoreLock,
 };
 
 mod builder;
 pub(crate) mod futures;
 
-pub use self::builder::{ClientBuildError, ClientBuilder};
+pub use self::builder::{sanitize_server_name, ClientBuildError, ClientBuilder};
 
 #[cfg(not(target_arch = "wasm32"))]
 type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -235,6 +233,9 @@ pub(crate) struct ClientInner {
     /// The Matrix versions the server supports (well-known ones only)
     server_versions: OnceCell<Box<[MatrixVersion]>>,
 
+    /// The unstable features and their on/off state on the server
+    unstable_features: OnceCell<BTreeMap<String, bool>>,
+
     /// Collection of locks individual client methods might want to use, either
     /// to ensure that only a single call to a method happens at once or to
     /// deduplicate multiple calls to a method.
@@ -276,6 +277,10 @@ pub(crate) struct ClientInner {
     /// End-to-end encryption related state.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) e2ee: EncryptionData,
+
+    /// The verification state of our own device.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) verification_state: SharedObservable<VerificationState>,
 }
 
 impl ClientInner {
@@ -292,6 +297,7 @@ impl ClientInner {
         http_client: HttpClient,
         base_client: BaseClient,
         server_versions: Option<Box<[MatrixVersion]>>,
+        unstable_features: Option<BTreeMap<String, bool>>,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
@@ -305,6 +311,7 @@ impl ClientInner {
             base_client,
             locks: Default::default(),
             server_versions: OnceCell::new_with(server_versions),
+            unstable_features: OnceCell::new_with(unstable_features),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
@@ -317,6 +324,8 @@ impl ClientInner {
             event_cache,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
+            #[cfg(feature = "e2e-encryption")]
+            verification_state: SharedObservable::new(VerificationState::Unknown),
         };
 
         #[allow(clippy::let_and_return)]
@@ -549,6 +558,11 @@ impl Client {
     /// Get the media manager of the client.
     pub fn media(&self) -> Media {
         Media::new(self.clone())
+    }
+
+    /// Get the pusher manager of the client.
+    pub fn pusher(&self) -> Pusher {
+        Pusher::new(self.clone())
     }
 
     /// Access the OpenID Connect API of the client.
@@ -1170,12 +1184,10 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use matrix_sdk::Client;
-    ///
-    /// # use matrix_sdk::ruma::api::client::room::{
-    /// #     create_room::v3::Request as CreateRoomRequest,
-    /// #     Visibility,
-    /// # };
+    /// use matrix_sdk::{
+    ///     ruma::api::client::room::create_room::v3::Request as CreateRoomRequest,
+    ///     Client,
+    /// };
     /// # use url::Url;
     /// #
     /// # async {
@@ -1401,6 +1413,67 @@ impl Client {
             .await?;
 
         Ok(server_versions)
+    }
+
+    /// Fetch unstable_features from homeserver
+    async fn request_unstable_features(&self) -> HttpResult<BTreeMap<String, bool>> {
+        let unstable_features: BTreeMap<String, bool> = self
+            .inner
+            .http_client
+            .send(
+                get_supported_versions::Request::new(),
+                None,
+                self.homeserver().to_string(),
+                None,
+                &[MatrixVersion::V1_0],
+                Default::default(),
+            )
+            .await?
+            .unstable_features;
+
+        Ok(unstable_features)
+    }
+
+    /// Get unstable features from `request_unstable_features` or cache
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{Client, config::SyncSettings};
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://localhost:8080")?;
+    /// # let mut client = Client::new(homeserver).await?;
+    /// let unstable_features = client.unstable_features().await?;
+    /// let msc_x = unstable_features.get("msc_x").unwrap_or(&false);
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn unstable_features(&self) -> HttpResult<&BTreeMap<String, bool>> {
+        let unstable_features = self
+            .inner
+            .unstable_features
+            .get_or_try_init(|| self.request_unstable_features())
+            .await?;
+
+        Ok(unstable_features)
+    }
+
+    /// Check whether MSC 4028 is enabled on the homeserver.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{Client, config::SyncSettings};
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://localhost:8080")?;
+    /// # let mut client = Client::new(homeserver).await?;
+    /// let msc4028_enabled =
+    ///     client.can_homeserver_push_encrypted_event_to_device().await?;
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn can_homeserver_push_encrypted_event_to_device(&self) -> HttpResult<bool> {
+        Ok(self.unstable_features().await?.get("org.matrix.msc4028").copied().unwrap_or(false))
     }
 
     /// Get information of all our own devices.
@@ -1972,22 +2045,6 @@ impl Client {
         Ok(())
     }
 
-    /// Sets a given pusher
-    pub async fn set_pusher(&self, pusher: Pusher) -> HttpResult<set_pusher::v3::Response> {
-        let request = set_pusher::v3::Request::post(pusher);
-        self.send(request, None).await
-    }
-
-    /// Get the profile for a given user id
-    ///
-    /// # Arguments
-    ///
-    /// * `user_id` the matrix id this function downloads the profile for
-    pub async fn get_profile(&self, user_id: &UserId) -> Result<get_profile::v3::Response> {
-        let request = get_profile::v3::Request::new(user_id.to_owned());
-        Ok(self.send(request, Some(RequestConfig::short_retry())).await?)
-    }
-
     /// Get the notification settings of the current owner of the client.
     pub async fn notification_settings(&self) -> NotificationSettings {
         let ruleset = self.account().push_rules().await.unwrap_or_else(|_| Ruleset::new());
@@ -2008,6 +2065,7 @@ impl Client {
                 self.inner.http_client.clone(),
                 self.inner.base_client.clone_with_in_memory_state_store(),
                 self.inner.server_versions.get().cloned(),
+                self.inner.unstable_features.get().cloned(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
                 #[cfg(feature = "e2e-encryption")]
@@ -2042,6 +2100,7 @@ impl Client {
 pub(crate) mod tests {
     use std::time::Duration;
 
+    use assert_matches::assert_matches;
     use matrix_sdk_base::RoomState;
     use matrix_sdk_test::{
         async_test, test_json, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder,
@@ -2061,6 +2120,7 @@ pub(crate) mod tests {
     use crate::{
         config::{RequestConfig, SyncSettings},
         test_utils::{logged_in_client, no_retry_test_client, test_client_builder},
+        Error,
     };
 
     #[async_test]
@@ -2270,5 +2330,110 @@ pub(crate) mod tests {
         assert_eq!(result.display_name.clone().unwrap(), "Test");
         assert_eq!(result.avatar_url.clone().unwrap().to_string(), "mxc://example.me/someid");
         assert!(!response.limited);
+    }
+
+    #[async_test]
+    async fn test_request_unstable_features() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/versions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&*test_json::api_responses::VERSIONS),
+            )
+            .mount(&server)
+            .await;
+        let unstable_features = client.request_unstable_features().await.unwrap();
+
+        assert_eq!(unstable_features.get("org.matrix.e2e_cross_signing"), Some(&true));
+        assert_eq!(unstable_features, client.unstable_features().await.unwrap().clone());
+    }
+
+    #[async_test]
+    async fn test_can_homeserver_push_encrypted_event_to_device() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/versions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&*test_json::api_responses::VERSIONS),
+            )
+            .mount(&server)
+            .await;
+
+        let msc4028_enabled = client.can_homeserver_push_encrypted_event_to_device().await.unwrap();
+        assert!(msc4028_enabled);
+    }
+
+    #[async_test]
+    async fn test_recently_visited_rooms() {
+        // Tracking recently visited rooms requires authentication
+        let client = no_retry_test_client(Some("http://localhost".to_owned())).await;
+        assert_matches!(
+            client.account().track_recently_visited_room("!alpha:localhost".to_owned()).await,
+            Err(Error::AuthenticationRequired)
+        );
+
+        let client = logged_in_client(None).await;
+        let account = client.account();
+
+        // We should start off with an empty list
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 0);
+
+        // Tracking a valid room id should add it to the list
+        account.track_recently_visited_room("!alpha:localhost".to_owned()).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
+
+        // Trying to track an invalid room id should return an error
+        assert_matches!(
+            account.track_recently_visited_room("this_is_not_a_valid_room_id".to_owned()).await,
+            Err(Error::Identifier { .. })
+        );
+
+        // And the existing list shouldn't be changed
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
+
+        // Tracking the same room again shouldn't change the list
+        account.track_recently_visited_room("!alpha:localhost".to_owned()).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
+
+        // Tracking a second room should add it to the front of the list
+        account.track_recently_visited_room("!beta:localhost".to_owned()).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 2);
+        assert_eq!(
+            account.get_recently_visited_rooms().await.unwrap(),
+            ["!beta:localhost", "!alpha:localhost"]
+        );
+
+        // Tracking the first room yet again should move it to the front of the list
+        account.track_recently_visited_room("!alpha:localhost".to_owned()).await.unwrap();
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 2);
+        assert_eq!(
+            account.get_recently_visited_rooms().await.unwrap(),
+            ["!alpha:localhost", "!beta:localhost"]
+        );
+
+        // Tracking should be capped at 20
+        for n in 0..20 {
+            account
+                .track_recently_visited_room(format!("!{n}:localhost").to_owned())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 20);
+
+        // And the initial rooms should've been pushed out
+        let rooms = account.get_recently_visited_rooms().await.unwrap();
+        assert!(!rooms.contains(&"!alpha:localhost".to_owned()));
+        assert!(!rooms.contains(&"!beta:localhost".to_owned()));
+
+        // And the last tracked room should be the first
+        assert_eq!(rooms.first().unwrap(), "!19:localhost");
     }
 }

@@ -10,17 +10,17 @@ use matrix_sdk::{
         Thumbnail,
     },
     config::SyncSettings,
-    room::{Receipts, ReportedContentScore},
+    room::{Receipts, ReportedContentScore, RoomMemberRole},
 };
 use matrix_sdk_base::RoomState;
 use matrix_sdk_test::{
-    async_test, test_json, EphemeralTestEvent, JoinedRoomBuilder, SyncResponseBuilder,
-    DEFAULT_TEST_ROOM_ID,
+    async_test, test_json, test_json::sync::CUSTOM_ROOM_POWER_LEVELS, EphemeralTestEvent,
+    JoinedRoomBuilder, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
     api::client::{membership::Invite3pidInit, receipt::create_receipt::v3::ReceiptType},
     assign, event_id,
-    events::{receipt::ReceiptThread, room::message::RoomMessageEventContent},
+    events::{receipt::ReceiptThread, room::message::RoomMessageEventContent, TimelineEventType},
     int, mxc_uri, owned_event_id, room_id, thirdparty, uint, user_id, OwnedUserId, TransactionId,
 };
 use serde_json::json;
@@ -418,15 +418,17 @@ async fn room_attachment_send_info() {
 
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
-    let config = AttachmentConfig::new().info(AttachmentInfo::Image(BaseImageInfo {
-        height: Some(uint!(600)),
-        width: Some(uint!(800)),
-        size: None,
-        blurhash: None,
-    }));
+    let config = AttachmentConfig::new()
+        .info(AttachmentInfo::Image(BaseImageInfo {
+            height: Some(uint!(600)),
+            width: Some(uint!(800)),
+            size: None,
+            blurhash: None,
+        }))
+        .caption(Some("image caption".to_owned()));
 
     let response = room
-        .send_attachment("image", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)
+        .send_attachment("image.jpg", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)
         .await
         .unwrap();
 
@@ -470,16 +472,18 @@ async fn room_attachment_send_wrong_info() {
 
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
-    let config = AttachmentConfig::new().info(AttachmentInfo::Video(BaseVideoInfo {
-        height: Some(uint!(600)),
-        width: Some(uint!(800)),
-        duration: Some(Duration::from_millis(3600)),
-        size: None,
-        blurhash: None,
-    }));
+    let config = AttachmentConfig::new()
+        .info(AttachmentInfo::Video(BaseVideoInfo {
+            height: Some(uint!(600)),
+            width: Some(uint!(800)),
+            duration: Some(Duration::from_millis(3600)),
+            size: None,
+            blurhash: None,
+        }))
+        .caption(Some("image caption".to_owned()));
 
     let response =
-        room.send_attachment("image", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config).await;
+        room.send_attachment("image.jpg", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config).await;
 
     response.unwrap_err();
 }
@@ -747,4 +751,108 @@ async fn subscribe_to_typing_notifications() {
 
     join_handle.await.unwrap();
     assert_eq!(typing_sequences.lock().unwrap().to_vec(), asserted_typing_sequences);
+}
+
+#[async_test]
+async fn get_suggested_user_role() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    mock_sync(&server, &*test_json::DEFAULT_SYNC_SUMMARY, None).await;
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let _response = client.sync_once(sync_settings).await.unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
+
+    let role_admin = room.get_suggested_user_role(user_id!("@example:localhost")).await.unwrap();
+    assert_eq!(role_admin, RoomMemberRole::Administrator);
+
+    // This user either does not exist in the room or has no special role
+    let role_unknown =
+        room.get_suggested_user_role(user_id!("@non-existing:localhost")).await.unwrap();
+    assert_eq!(role_unknown, RoomMemberRole::User);
+}
+
+#[async_test]
+async fn get_power_level_for_user() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    mock_sync(&server, &*test_json::DEFAULT_SYNC_SUMMARY, None).await;
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let _response = client.sync_once(sync_settings).await.unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
+
+    let power_level_admin =
+        room.get_user_power_level(user_id!("@example:localhost")).await.unwrap();
+    assert_eq!(power_level_admin, 100);
+
+    // This user either does not exist in the room or has no special power level
+    let power_level_unknown =
+        room.get_user_power_level(user_id!("@non-existing:localhost")).await.unwrap();
+    assert_eq!(power_level_unknown, 0);
+}
+
+#[async_test]
+async fn get_users_with_power_levels() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    mock_sync(&server, &*test_json::sync::SYNC_ADMIN_AND_MOD, None).await;
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let _response = client.sync_once(sync_settings).await.unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
+
+    let users_with_power_levels = room.users_with_power_levels().await;
+    assert_eq!(users_with_power_levels.len(), 2);
+    assert_eq!(users_with_power_levels[user_id!("@admin:localhost")], 100);
+    assert_eq!(users_with_power_levels[user_id!("@mod:localhost")], 50);
+}
+
+#[async_test]
+async fn get_users_with_power_levels_is_empty_if_power_level_info_is_not_available() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    mock_sync(&server, &*test_json::INVITE_SYNC, None).await;
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let _response = client.sync_once(sync_settings).await.unwrap();
+    // The room doesn't have any power level info
+    let room = client.get_room(room_id!("!696r7674:example.com")).unwrap();
+
+    assert!(room.users_with_power_levels().await.is_empty());
+}
+
+#[async_test]
+async fn reset_power_levels() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    mock_sync(&server, &*CUSTOM_ROOM_POWER_LEVELS, None).await;
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let _response = client.sync_once(sync_settings).await.unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
+
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.room.power_levels/$"))
+        .and(header("authorization", "Bearer 1234"))
+        .and(body_partial_json(json!({
+            "events": {
+                // 'm.room.avatar' is 100 here, if we receive a value '50', the reset worked
+                "m.room.avatar": 50,
+                "m.room.canonical_alias": 50,
+                "m.room.history_visibility": 100,
+                "m.room.name": 50,
+                "m.room.power_levels": 100,
+                "m.room.topic": 50
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let initial_power_levels = room.room_power_levels().await.unwrap();
+    assert_eq!(initial_power_levels.events[&TimelineEventType::RoomAvatar], int!(100));
+
+    room.reset_power_levels().await.unwrap();
 }

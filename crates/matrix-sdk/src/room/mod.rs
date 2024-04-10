@@ -1,10 +1,19 @@
 //! High-level room API
 
-use std::{borrow::Borrow, collections::BTreeMap, ops::Deref, time::Duration};
+use std::{
+    borrow::Borrow,
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
 
 use eyeball::SharedObservable;
 use futures_core::Stream;
-use futures_util::stream::FuturesUnordered;
+use futures_util::{
+    future::{try_join, try_join_all},
+    stream::FuturesUnordered,
+};
 use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
@@ -59,14 +68,14 @@ use ruma::{
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
         typing::SyncTypingEvent,
-        AnyRoomAccountDataEvent, AnyStateEvent, EmptyStateKey, MessageLikeEventContent,
+        AnyRoomAccountDataEvent, AnyTimelineEvent, EmptyStateKey, MessageLikeEventContent,
         MessageLikeEventType, RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
         RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
         StaticEventContent, StaticStateEventContent, SyncStateEvent,
     },
     push::{Action, PushConditionRoomCtx},
     serde::Raw,
-    uint, EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
+    EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
     OwnedTransactionId, OwnedUserId, TransactionId, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
@@ -74,10 +83,21 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::{debug, info, instrument, warn};
 
-use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent};
+use self::{
+    futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent},
+    messages::EventWithContextResponse,
+};
+pub use self::{
+    member::{RoomMember, RoomMemberRole},
+    messages::{Messages, MessagesOptions},
+};
+#[cfg(doc)]
+use crate::event_cache::EventCache;
 use crate::{
     attachment::AttachmentConfig,
+    config::RequestConfig,
     error::WrongRoomState,
+    event_cache::{self, EventCacheDropHandles, RoomEventCache},
     event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
     media::{MediaFormat, MediaRequest},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
@@ -91,11 +111,6 @@ pub mod futures;
 mod member;
 mod messages;
 pub mod power_levels;
-
-pub use self::{
-    member::{RoomMember, RoomMemberRole},
-    messages::{Messages, MessagesOptions},
-};
 
 /// A struct containing methods that are common for Joined, Invited and Left
 /// Rooms
@@ -346,12 +361,12 @@ impl Room {
         (drop_guard, receiver)
     }
 
-    /// Fetch the event with the given `EventId` in this room.
-    pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
-        let request =
-            get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
-        let event = self.client.send(request, None).await?.event;
-
+    /// Returns a wrapping `TimelineEvent` for the input `AnyTimelineEvent`,
+    /// decrypted if needs be.
+    ///
+    /// Doesn't return an error `Result` when decryption failed; only logs from
+    /// the crypto crate will indicate so.
+    async fn try_decrypt_event(&self, event: Raw<AnyTimelineEvent>) -> Result<TimelineEvent> {
         #[cfg(feature = "e2e-encryption")]
         if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
             SyncMessageLikeEvent::Original(_),
@@ -367,17 +382,26 @@ impl Room {
         Ok(TimelineEvent { event, encryption_info: None, push_actions })
     }
 
+    /// Fetch the event with the given `EventId` in this room.
+    pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
+        let request =
+            get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
+        let event = self.client.send(request, None).await?.event;
+        self.try_decrypt_event(event).await
+    }
+
     /// Fetch the event with the given `EventId` in this room, using the
     /// `/context` endpoint to get more information.
     pub async fn event_with_context(
         &self,
         event_id: &EventId,
         lazy_load_members: bool,
-    ) -> Result<Option<(TimelineEvent, Vec<Raw<AnyStateEvent>>)>> {
+        context_size: UInt,
+    ) -> Result<EventWithContextResponse> {
         let mut request =
             context::get_context::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
 
-        request.limit = uint!(0);
+        request.limit = context_size;
 
         if lazy_load_members {
             request.filter.lazy_load_options =
@@ -386,23 +410,29 @@ impl Room {
 
         let response = self.client.send(request, None).await?;
 
-        let Some(event) = response.event else {
-            return Ok(None);
+        let target_event = if let Some(event) = response.event {
+            Some(self.try_decrypt_event(event).await?)
+        } else {
+            None
         };
 
-        #[cfg(feature = "e2e-encryption")]
-        if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-            SyncMessageLikeEvent::Original(_),
-        ))) = event.deserialize_as::<AnySyncTimelineEvent>()
-        {
-            if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
-                return Ok(Some((event, response.state)));
-            }
-        }
+        // Note: the joined future will fail if any future failed, but
+        // [`Self::try_decrypt_event`] doesn't hard-fail when there's a
+        // decryption error, so we should prevent against most bad cases here.
+        let (events_before, events_after) = try_join(
+            try_join_all(response.events_before.into_iter().map(|ev| self.try_decrypt_event(ev))),
+            try_join_all(response.events_after.into_iter().map(|ev| self.try_decrypt_event(ev))),
+        )
+        .await?;
 
-        let push_actions = self.event_push_actions(&event).await?;
-
-        Ok(Some((TimelineEvent { event, encryption_info: None, push_actions }, response.state)))
+        Ok(EventWithContextResponse {
+            event: target_event,
+            events_before,
+            events_after,
+            state: response.state,
+            prev_batch_token: response.start,
+            next_batch_token: response.end,
+        })
     }
 
     pub(crate) async fn request_members(&self) -> Result<()> {
@@ -411,11 +441,23 @@ impl Room {
             .members_request_deduplicated_handler
             .run(self.room_id().to_owned(), async move {
                 let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
-                let response = self.client.send(request, None).await?;
+                let response = self
+                    .client
+                    .send(
+                        request.clone(),
+                        // In some cases it can take longer than 30s to load:
+                        // https://github.com/element-hq/synapse/issues/16872
+                        Some(RequestConfig::new().timeout(Duration::from_secs(60)).retry_limit(3)),
+                    )
+                    .await?;
 
                 // That's a large `Future`. Let's `Box::pin` to reduce its size on the stack.
-                Box::pin(self.client.base_client().receive_members(self.room_id(), &response))
-                    .await?;
+                Box::pin(self.client.base_client().receive_all_members(
+                    self.room_id(),
+                    &request,
+                    &response,
+                ))
+                .await?;
 
                 Ok(())
             })
@@ -1082,29 +1124,27 @@ impl Room {
         use ruma::events::room::encrypted::EncryptedEventScheme;
 
         let machine = self.client.olm_machine().await;
-        if let Some(machine) = machine.as_ref() {
-            let mut event =
-                match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
-                    Ok(event) => event,
-                    Err(e) => {
-                        let event = event.deserialize()?;
-                        if let EncryptedEventScheme::MegolmV1AesSha2(c) = event.content.scheme {
-                            self.client
-                                .encryption()
-                                .backups()
-                                .maybe_download_room_key(self.room_id().to_owned(), c.session_id);
-                        }
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-                        return Err(e.into());
+        let mut event =
+            match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
+                Ok(event) => event,
+                Err(e) => {
+                    let event = event.deserialize()?;
+                    if let EncryptedEventScheme::MegolmV1AesSha2(c) = event.content.scheme {
+                        self.client
+                            .encryption()
+                            .backups()
+                            .maybe_download_room_key(self.room_id().to_owned(), c.session_id);
                     }
-                };
 
-            event.push_actions = self.event_push_actions(&event.event).await?;
+                    return Err(e.into());
+                }
+            };
 
-            Ok(event)
-        } else {
-            Err(Error::NoOlmMachine)
-        }
+        event.push_actions = self.event_push_actions(&event.event).await?;
+
+        Ok(event)
     }
 
     /// Forces the currently active room key, which is used to encrypt messages,
@@ -1427,12 +1467,13 @@ impl Room {
     // TODO: expose this publicly so people can pre-share a group session if
     // e.g. a user starts to type a message for a room.
     #[cfg(feature = "e2e-encryption")]
-    #[instrument(skip_all, fields(room_id = ?self.room_id()))]
+    #[instrument(skip_all, fields(room_id = ?self.room_id(), store_generation))]
     async fn preshare_room_key(&self) -> Result<()> {
         self.ensure_room_joined()?;
 
         // Take and release the lock on the store, if needs be.
-        let _guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
+        let guard = self.client.encryption().spin_lock_store(Some(60000)).await?;
+        tracing::Span::current().record("store_generation", guard.map(|guard| guard.generation()));
 
         self.client
             .locks()
@@ -1578,8 +1619,6 @@ impl Room {
     /// Run /keys/query requests for all the non-tracked users.
     #[cfg(feature = "e2e-encryption")]
     async fn query_keys_for_untracked_users(&self) -> Result<()> {
-        use std::collections::HashMap;
-
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().expect("Olm machine wasn't started");
 
@@ -1652,7 +1691,7 @@ impl Room {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, encrypted))]
+    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, encrypted, event_id))]
     pub fn send_raw<'a>(
         &'a self,
         event_type: &'a str,
@@ -1672,8 +1711,7 @@ impl Room {
     /// [`upload()`] and afterwards the [`send()`].
     ///
     /// # Arguments
-    /// * `body` - A textual representation of the media that is going to be
-    /// uploaded. Usually the file name.
+    /// * `filename` - The file name.
     ///
     /// * `content_type` - The type of the media, this will be used as the
     /// content-type header.
@@ -1698,7 +1736,7 @@ impl Room {
     ///
     /// if let Some(room) = client.get_room(&room_id) {
     ///     room.send_attachment(
-    ///         "My favorite cat",
+    ///         "my_favorite_cat.jpg",
     ///         &mime::IMAGE_JPEG,
     ///         image,
     ///         AttachmentConfig::new(),
@@ -1712,12 +1750,12 @@ impl Room {
     #[instrument(skip_all)]
     pub fn send_attachment<'a>(
         &'a self,
-        body: &'a str,
+        filename: &'a str,
         content_type: &'a Mime,
         data: Vec<u8>,
         config: AttachmentConfig,
     ) -> SendAttachment<'a> {
-        SendAttachment::new(self, body, content_type, data, config)
+        SendAttachment::new(self, filename, content_type, data, config)
     }
 
     /// Prepare and send an attachment to this room.
@@ -1732,8 +1770,7 @@ impl Room {
     /// [`send()`](#method.send).
     ///
     /// # Arguments
-    /// * `body` - A textual representation of the media that is going to be
-    /// uploaded. Usually the file name.
+    /// * `filename` - The file name.
     ///
     /// * `content_type` - The type of the media, this will be used as the
     /// content-type header.
@@ -1744,7 +1781,7 @@ impl Room {
     /// * `config` - Metadata and configuration for the attachment.
     pub(super) async fn prepare_and_send_attachment<'a>(
         &'a self,
-        body: &'a str,
+        filename: &'a str,
         content_type: &'a Mime,
         data: Vec<u8>,
         config: AttachmentConfig,
@@ -1752,29 +1789,22 @@ impl Room {
     ) -> Result<send_message_event::v3::Response> {
         self.ensure_room_joined()?;
 
+        let txn_id = config.txn_id.clone();
         #[cfg(feature = "e2e-encryption")]
         let content = if self.is_encrypted().await? {
             self.client
                 .prepare_encrypted_attachment_message(
-                    body,
+                    filename,
                     content_type,
                     data,
-                    config.info,
-                    config.thumbnail,
+                    config,
                     send_progress,
                 )
                 .await?
         } else {
             self.client
                 .media()
-                .prepare_attachment_message(
-                    body,
-                    content_type,
-                    data,
-                    config.info,
-                    config.thumbnail,
-                    send_progress,
-                )
+                .prepare_attachment_message(filename, content_type, data, config, send_progress)
                 .await?
         };
 
@@ -1782,18 +1812,11 @@ impl Room {
         let content = self
             .client
             .media()
-            .prepare_attachment_message(
-                body,
-                content_type,
-                data,
-                config.info,
-                config.thumbnail,
-                send_progress,
-            )
+            .prepare_attachment_message(filename, content_type, data, config, send_progress)
             .await?;
 
         let mut fut = self.send(RoomMessageEventContent::new(content));
-        if let Some(txn_id) = &config.txn_id {
+        if let Some(txn_id) = &txn_id {
             fut = fut.with_transaction_id(txn_id);
         }
         fut.await
@@ -1843,6 +1866,47 @@ impl Room {
             .ok_or(Error::InsufficientData)?
             .deserialize()?
             .power_levels())
+    }
+
+    /// Resets the room's power levels to the default values
+    ///
+    /// [spec]: https://spec.matrix.org/v1.9/client-server-api/#mroompower_levels
+    pub async fn reset_power_levels(&self) -> Result<RoomPowerLevels> {
+        let default_power_levels = RoomPowerLevels::from(RoomPowerLevelsEventContent::new());
+        let changes = RoomPowerLevelChanges::from(default_power_levels);
+        self.apply_power_level_changes(changes).await?;
+        self.room_power_levels().await
+    }
+
+    /// Gets the suggested role for the user with the provided `user_id`.
+    ///
+    /// This method checks the `RoomPowerLevels` events instead of loading the
+    /// member list and looking for the member.
+    pub async fn get_suggested_user_role(&self, user_id: &UserId) -> Result<RoomMemberRole> {
+        let power_level = self.get_user_power_level(user_id).await?;
+        Ok(RoomMemberRole::suggested_role_for_power_level(power_level))
+    }
+
+    /// Gets the power level the user with the provided `user_id`.
+    ///
+    /// This method checks the `RoomPowerLevels` events instead of loading the
+    /// member list and looking for the member.
+    pub async fn get_user_power_level(&self, user_id: &UserId) -> Result<i64> {
+        let event = self.room_power_levels().await?;
+        Ok(event.for_user(user_id).into())
+    }
+
+    /// Gets a map with the `UserId` of users with power levels other than `0`
+    /// and this power level.
+    pub async fn users_with_power_levels(&self) -> HashMap<OwnedUserId, i64> {
+        let power_levels = self.room_power_levels().await.ok();
+        let mut user_power_levels = HashMap::<OwnedUserId, i64>::new();
+        if let Some(power_levels) = power_levels {
+            for (id, level) in power_levels.users.into_iter() {
+                user_power_levels.insert(id, level.into());
+            }
+        }
+        user_power_levels
     }
 
     /// Sets the name of this room.
@@ -2543,6 +2607,20 @@ impl Room {
 
         self.client.send(request, None).await?;
         Ok(())
+    }
+
+    /// Returns the [`RoomEventCache`] associated to this room, assuming the
+    /// global [`EventCache`] has been enabled for subscription.
+    pub async fn event_cache(
+        &self,
+    ) -> event_cache::Result<(RoomEventCache, Arc<EventCacheDropHandles>)> {
+        let global_event_cache = self.client.event_cache();
+
+        global_event_cache.for_room(self.room_id()).await.map(|(maybe_room, drop_handles)| {
+            // SAFETY: the `RoomEventCache` must always been found, since we're constructing
+            // from a `Room`.
+            (maybe_room.unwrap(), drop_handles)
+        })
     }
 }
 

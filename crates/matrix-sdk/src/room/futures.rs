@@ -32,7 +32,7 @@ use ruma::{
     serde::Raw,
     OwnedTransactionId, TransactionId,
 };
-use tracing::{debug, Instrument, Span};
+use tracing::{debug, info, Instrument, Span};
 
 use super::Room;
 use crate::{
@@ -201,6 +201,10 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
             );
 
             let response = room.client.send(request, None).await?;
+
+            tracing::Span::current().record("event_id", tracing::field::debug(&response.event_id));
+            info!("Sent event in room");
+
             Ok(response)
         };
 
@@ -212,7 +216,7 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 #[allow(missing_debug_implementations)]
 pub struct SendAttachment<'a> {
     room: &'a Room,
-    body: &'a str,
+    url: &'a str,
     content_type: &'a Mime,
     data: Vec<u8>,
     config: AttachmentConfig,
@@ -223,14 +227,14 @@ pub struct SendAttachment<'a> {
 impl<'a> SendAttachment<'a> {
     pub(crate) fn new(
         room: &'a Room,
-        body: &'a str,
+        url: &'a str,
         content_type: &'a Mime,
         data: Vec<u8>,
         config: AttachmentConfig,
     ) -> Self {
         Self {
             room,
-            body,
+            url,
             content_type,
             data,
             config,
@@ -256,10 +260,10 @@ impl<'a> IntoFuture for SendAttachment<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, body, content_type, data, config, tracing_span, send_progress } = self;
+        let Self { room, url, content_type, data, config, tracing_span, send_progress } = self;
         let fut = async move {
             if config.thumbnail.is_some() {
-                room.prepare_and_send_attachment(body, content_type, data, config, send_progress)
+                room.prepare_and_send_attachment(url, content_type, data, config, send_progress)
                     .await
             } else {
                 #[cfg(not(feature = "image-proc"))]
@@ -312,13 +316,15 @@ impl<'a> IntoFuture for SendAttachment<'a> {
                     txn_id: config.txn_id,
                     info: config.info,
                     thumbnail,
+                    caption: config.caption,
+                    formatted_caption: config.formatted_caption,
                     #[cfg(feature = "image-proc")]
                     generate_thumbnail: false,
                     #[cfg(feature = "image-proc")]
                     thumbnail_size: None,
                 };
 
-                room.prepare_and_send_attachment(body, content_type, data, config, send_progress)
+                room.prepare_and_send_attachment(url, content_type, data, config, send_progress)
                     .await
             }
         };

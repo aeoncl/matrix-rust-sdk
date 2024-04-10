@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use eyeball::SharedObservable;
+use eyeball::{SharedObservable, Subscriber};
 use futures_core::Stream;
 use futures_util::{
     future::try_join,
@@ -36,7 +36,6 @@ use matrix_sdk_base::crypto::{
 use matrix_sdk_common::executor::spawn;
 use ruma::{
     api::client::{
-        backup::add_backup_keys::v3::Response as KeysBackupResponse,
         keys::{
             get_keys, upload_keys, upload_signing_keys::v3::Request as UploadSigningKeysRequest,
         },
@@ -68,7 +67,7 @@ use self::{
     tasks::{BackupDownloadTask, BackupUploadingTask, ClientTasks},
 };
 use crate::{
-    attachment::{AttachmentInfo, Thumbnail},
+    attachment::{AttachmentConfig, Thumbnail},
     client::ClientInner,
     encryption::{
         identities::{Device, UserDevices},
@@ -186,6 +185,35 @@ pub enum BackupDownloadStrategy {
     Manual,
 }
 
+/// The verification state of our own device
+///
+/// This enum tells us if our own user identity trusts these devices, in other
+/// words it tells us if the user identity has signed the device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationState {
+    /// The verification state is unknown for now.
+    Unknown,
+    /// The device is considered to be verified, it has been signed by its user
+    /// identity.
+    Verified,
+    /// The device is unverified.
+    Unverified,
+}
+
+/// Wraps together a `CrossProcessLockStoreGuard` and a generation number.
+#[derive(Debug)]
+pub struct CrossProcessLockStoreGuardWithGeneration {
+    _guard: CrossProcessStoreLockGuard,
+    generation: u64,
+}
+
+impl CrossProcessLockStoreGuardWithGeneration {
+    /// Return the Crypto Store generation associated with this store lock.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 impl Client {
     pub(crate) async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
         self.base_client().olm_machine().await
@@ -222,7 +250,7 @@ impl Client {
 
         let response = self.send(request, None).await?;
         self.mark_request_as_sent(request_id, &response).await?;
-        self.encryption().recovery().update_state_after_keys_query(&response).await;
+        self.encryption().update_state_after_keys_query(&response).await;
 
         Ok(response)
     }
@@ -269,18 +297,17 @@ impl Client {
     }
 
     /// Encrypt and upload the file to be read from `reader` and construct an
-    /// attachment message with `body`, `content_type`, `info` and `thumbnail`.
+    /// attachment message.
     pub(crate) async fn prepare_encrypted_attachment_message(
         &self,
-        body: &str,
+        filename: &str,
         content_type: &mime::Mime,
         data: Vec<u8>,
-        info: Option<AttachmentInfo>,
-        thumbnail: Option<Thumbnail>,
+        config: AttachmentConfig,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<MessageType> {
         let upload_thumbnail =
-            self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
+            self.upload_encrypted_thumbnail(config.thumbnail, content_type, send_progress.clone());
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
@@ -292,15 +319,25 @@ impl Client {
         let ((thumbnail_source, thumbnail_info), file) =
             try_join(upload_thumbnail, upload_attachment).await?;
 
+        // if config.caption is set, use it as body, and filename as the file name
+        // otherwise, body is the filename, and the filename is not set
+        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
+        let (body, filename) = match config.caption {
+            Some(caption) => (caption, Some(filename.to_owned())),
+            None => (filename.to_owned(), None),
+        };
+
         Ok(match content_type.type_() {
             mime::IMAGE => {
-                let info = assign!(info.map(ImageInfo::from).unwrap_or_default(), {
+                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
                 });
                 let content = assign!(ImageMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info))
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
                 });
                 MessageType::Image(content)
             }
@@ -310,22 +347,24 @@ impl Client {
                 MessageType::Audio(crate::media::update_audio_message_event(
                     audio_message_event_content,
                     content_type,
-                    info,
+                    config.info,
                 ))
             }
             mime::VIDEO => {
-                let info = assign!(info.map(VideoInfo::from).unwrap_or_default(), {
+                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
                 });
                 let content = assign!(VideoMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info))
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
                 });
                 MessageType::Video(content)
             }
             _ => {
-                let info = assign!(info.map(FileInfo::from).unwrap_or_default(), {
+                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
@@ -501,25 +540,9 @@ impl Client {
                 let response = self.send(request.clone(), None).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
-            OutgoingRequests::KeysBackup(request) => {
-                let response = self.send_backup_request(request).await?;
-                self.mark_request_as_sent(r.request_id(), &response).await?;
-            }
         }
 
         Ok(())
-    }
-
-    async fn send_backup_request(
-        &self,
-        request: &matrix_sdk_base::crypto::KeysBackupRequest,
-    ) -> Result<KeysBackupResponse> {
-        let request = ruma::api::client::backup::add_backup_keys::v3::Request::new(
-            request.version.clone(),
-            request.rooms.clone(),
-        );
-
-        Ok(self.send(request, None).await?)
     }
 
     pub(crate) async fn send_outgoing_requests(&self) -> Result<()> {
@@ -609,6 +632,32 @@ impl Encryption {
         } else {
             Ok(HashSet::new())
         }
+    }
+
+    /// Get a [`Subscriber`] for the [`VerificationState`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use matrix_sdk::{encryption, Client};
+    /// use url::Url;
+    ///
+    /// # async {
+    /// let homeserver = Url::parse("http://example.com")?;
+    /// let client = Client::new(homeserver).await?;
+    /// let mut subscriber = client.encryption().verification_state();
+    ///
+    /// let current_value = subscriber.get();
+    ///
+    /// println!("The current verification state is: {current_value:?}");
+    ///
+    /// if let Some(verification_state) = subscriber.next().await {
+    ///     println!("Received verification state update {:?}", verification_state)
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub fn verification_state(&self) -> Subscriber<VerificationState> {
+        self.client.inner.verification_state.subscribe()
     }
 
     /// Get a verification object with the given flow id.
@@ -1171,7 +1220,7 @@ impl Encryption {
             if prev_holder == lock_value {
                 return Ok(());
             }
-            warn!("recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
+            warn!("Recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
@@ -1206,21 +1255,30 @@ impl Encryption {
 
     /// Maybe reload the `OlmMachine` after acquiring the lock for the first
     /// time.
-    async fn on_lock_newly_acquired(&self) -> Result<(), Error> {
+    ///
+    /// Returns the current generation number.
+    async fn on_lock_newly_acquired(&self) -> Result<u64, Error> {
         let olm_machine_guard = self.client.olm_machine().await;
         if let Some(olm_machine) = olm_machine_guard.as_ref() {
-            // If the crypto store generation has changed,
-            if olm_machine
+            let (new_gen, generation_number) = olm_machine
                 .maintain_crypto_store_generation(&self.client.locks().crypto_store_generation)
-                .await?
-            {
+                .await?;
+            // If the crypto store generation has changed,
+            if new_gen {
                 // (get rid of the reference to the current crypto store first)
                 drop(olm_machine_guard);
                 // Recreate the OlmMachine.
                 self.client.base_client().regenerate_olm().await?;
             }
+            Ok(generation_number)
+        } else {
+            // XXX: not sure this is reachable. Seems like the OlmMachine should always have
+            // been initialised by the time we get here. Ideally we'd panic, or return an
+            // error, but for now I'm just adding some logging to check if it
+            // happens, and returning the magic number 0.
+            warn!("Encryption::on_lock_newly_acquired: called before OlmMachine initialised");
+            Ok(0)
         }
-        Ok(())
     }
 
     /// If a lock was created with [`Self::enable_cross_process_store_lock`],
@@ -1231,13 +1289,13 @@ impl Encryption {
     pub async fn spin_lock_store(
         &self,
         max_backoff: Option<u32>,
-    ) -> Result<Option<CrossProcessStoreLockGuard>, Error> {
+    ) -> Result<Option<CrossProcessLockStoreGuardWithGeneration>, Error> {
         if let Some(lock) = self.client.locks().cross_process_crypto_store_lock.get() {
             let guard = lock.spin_lock(max_backoff).await?;
 
-            self.on_lock_newly_acquired().await?;
+            let generation = self.on_lock_newly_acquired().await?;
 
-            Ok(Some(guard))
+            Ok(Some(CrossProcessLockStoreGuardWithGeneration { _guard: guard, generation }))
         } else {
             Ok(None)
         }
@@ -1247,15 +1305,19 @@ impl Encryption {
     /// attempts to lock it once.
     ///
     /// Returns a guard to the lock, if it was obtained.
-    pub async fn try_lock_store_once(&self) -> Result<Option<CrossProcessStoreLockGuard>, Error> {
+    pub async fn try_lock_store_once(
+        &self,
+    ) -> Result<Option<CrossProcessLockStoreGuardWithGeneration>, Error> {
         if let Some(lock) = self.client.locks().cross_process_crypto_store_lock.get() {
             let maybe_guard = lock.try_lock_once().await?;
 
-            if maybe_guard.is_some() {
-                self.on_lock_newly_acquired().await?;
-            }
+            let Some(guard) = maybe_guard else {
+                return Ok(None);
+            };
 
-            Ok(maybe_guard)
+            let generation = self.on_lock_newly_acquired().await?;
+
+            Ok(Some(CrossProcessLockStoreGuardWithGeneration { _guard: guard, generation }))
         } else {
             Ok(None)
         }
@@ -1309,6 +1371,8 @@ impl Encryption {
             if let Err(e) = this.recovery().setup().await {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
+
+            this.update_verification_state().await;
         }));
 
         Ok(())
@@ -1321,7 +1385,43 @@ impl Encryption {
 
         if let Some(task) = task {
             if let Err(err) = task.await {
-                warn!("error when initializing backups: {err}");
+                warn!("Error when initializing backups: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {
+        self.recovery().update_state_after_keys_query(response).await;
+
+        // Only update the verification_state if our own devices changed
+        if let Some(user_id) = self.client.user_id() {
+            let contains_own_device = response.device_keys.contains_key(user_id);
+
+            if contains_own_device {
+                self.update_verification_state().await;
+            }
+        }
+    }
+
+    async fn update_verification_state(&self) {
+        match self.get_own_device().await {
+            Ok(device) => {
+                if let Some(device) = device {
+                    let is_verified = device.is_cross_signed_by_owner();
+
+                    if is_verified {
+                        self.client.inner.verification_state.set(VerificationState::Verified);
+                    } else {
+                        self.client.inner.verification_state.set(VerificationState::Unverified);
+                    }
+                } else {
+                    warn!("Couldn't find out own device in the store.");
+                    self.client.inner.verification_state.set(VerificationState::Unknown);
+                }
+            }
+            Err(error) => {
+                warn!("Failed retrieving own device: {error}");
+                self.client.inner.verification_state.set(VerificationState::Unknown);
             }
         }
     }

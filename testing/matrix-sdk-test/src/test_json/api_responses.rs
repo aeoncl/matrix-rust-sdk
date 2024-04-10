@@ -239,6 +239,7 @@ pub static NOT_FOUND: Lazy<JsonValue> = Lazy::new(|| {
 });
 
 /// `GET /_matrix/client/v3/publicRooms`
+/// `POST /_matrix/client/v3/publicRooms`
 pub static PUBLIC_ROOMS: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "chunk": [
@@ -257,6 +258,28 @@ pub static PUBLIC_ROOMS: Lazy<JsonValue> = Lazy::new(|| {
         ],
         "next_batch": "p190q",
         "prev_batch": "p1902",
+        "total_room_count_estimate": 115
+    })
+});
+
+/// `GET /_matrix/client/v3/publicRooms`
+/// `POST /_matrix/client/v3/publicRooms``
+pub static PUBLIC_ROOMS_FINAL_PAGE: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "chunk": [
+            {
+                "canonical_alias": "#murrays:pear.bar",
+                "avatar_url": "mxc://bleeker.street/pear",
+                "guest_can_join": false,
+                "name": "PEAR",
+                "num_joined_members": 20,
+                "room_id": "!ca18r:bleecker.street",
+                "topic": "Tasty tasty pear",
+                "world_readable": false,
+                "join_rule": "knock"
+            }
+        ],
+        "prev_batch": "p190q",
         "total_room_count_estimate": 115
     })
 });
@@ -324,7 +347,8 @@ pub static VERSIONS: Lazy<JsonValue> = Lazy::new(|| {
         ],
         "unstable_features": {
             "org.matrix.label_based_filtering":true,
-            "org.matrix.e2e_cross_signing":true
+            "org.matrix.e2e_cross_signing":true,
+            "org.matrix.msc4028":true
         }
     })
 });

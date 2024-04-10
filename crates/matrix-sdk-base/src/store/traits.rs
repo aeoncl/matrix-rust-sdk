@@ -302,7 +302,8 @@ pub trait StateStore: AsyncTraitDeps {
     /// * `key` - The key to fetch data for
     async fn get_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Put arbitrary data into the custom store
+    /// Put arbitrary data into the custom store, return the data previously
+    /// stored
     ///
     /// # Arguments
     ///
@@ -314,6 +315,27 @@ pub trait StateStore: AsyncTraitDeps {
         key: &[u8],
         value: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Put arbitrary data into the custom store, do not attempt to read any
+    /// previous data
+    ///
+    /// Optimization option for set_custom_values for stores that would perform
+    /// better withouts the extra read and the caller not needing that data
+    /// returned. Otherwise this just wraps around `set_custom_data` and
+    /// discards the result.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert data into
+    ///
+    /// * `value` - The value to insert
+    async fn set_custom_value_no_read(
+        &self,
+        key: &[u8],
+        value: Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        self.set_custom_value(key, value).await.map(|_| ())
+    }
 
     /// Remove arbitrary data from the custom store and return it if existed
     ///
@@ -783,6 +805,9 @@ pub enum StateStoreDataValue {
 
     /// The user avatar url
     UserAvatarUrl(String),
+
+    /// A list of recently visited room identifiers for the current user
+    RecentlyVisitedRooms(Vec<String>),
 }
 
 impl StateStoreDataValue {
@@ -800,6 +825,11 @@ impl StateStoreDataValue {
     pub fn into_user_avatar_url(self) -> Option<String> {
         as_variant!(self, Self::UserAvatarUrl)
     }
+
+    /// Get this value if it is a list of recently visited rooms.
+    pub fn into_recently_visited_rooms(self) -> Option<Vec<String>> {
+        as_variant!(self, Self::RecentlyVisitedRooms)
+    }
 }
 
 /// A key for key-value data.
@@ -813,6 +843,9 @@ pub enum StateStoreDataKey<'a> {
 
     /// Avatar URL
     UserAvatarUrl(&'a UserId),
+
+    /// Recently visited room identifiers
+    RecentlyVisitedRooms(&'a UserId),
 }
 
 impl StateStoreDataKey<'_> {
@@ -823,4 +856,8 @@ impl StateStoreDataKey<'_> {
     /// Key prefix to use for the [`UserAvatarUrl`][Self::UserAvatarUrl]
     /// variant.
     pub const USER_AVATAR_URL: &'static str = "user_avatar_url";
+
+    /// Key prefix to use for the
+    /// [`RecentlyVisitedRooms`][Self::RecentlyVisitedRooms] variant.
+    pub const RECENTLY_VISITED_ROOMS: &'static str = "recently_visited_rooms";
 }

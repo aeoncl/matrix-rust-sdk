@@ -38,14 +38,15 @@ use ruma::{
         ignored_user_list::IgnoredUserListEvent,
         push_rules::{PushRulesEvent, PushRulesEventContent},
         room::{
-            member::{MembershipState, SyncRoomMemberEvent},
+            member::{MembershipState, RoomMemberEventContent, SyncRoomMemberEvent},
             power_levels::{
                 RoomPowerLevelsEvent, RoomPowerLevelsEventContent, StrippedRoomPowerLevelsEvent,
             },
         },
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
-        AnySyncTimelineEvent, GlobalAccountDataEventType, StateEventType,
+        AnySyncTimelineEvent, GlobalAccountDataEventType, StateEvent, StateEventType,
+        SyncStateEvent,
     },
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
@@ -58,11 +59,11 @@ use tracing::{debug, info, instrument, trace, warn};
 
 #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
 use crate::latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent};
+#[cfg(feature = "e2e-encryption")]
+use crate::RoomMemberships;
 use crate::{
-    deserialized_responses::{
-        AmbiguityChanges, MembersResponse, RawAnySyncOrStrippedTimelineEvent, SyncTimelineEvent,
-    },
-    error::Result,
+    deserialized_responses::{RawAnySyncOrStrippedTimelineEvent, SyncTimelineEvent},
+    error::{Error, Result},
     rooms::{normal::RoomInfoUpdate, Room, RoomInfo, RoomState},
     store::{
         ambiguity_map::AmbiguityCache, DynStateStore, MemoryStore, Result as StoreResult,
@@ -71,8 +72,6 @@ use crate::{
     sync::{JoinedRoomUpdate, LeftRoomUpdate, Notification, RoomUpdates, SyncResponse, Timeline},
     RoomStateFilter, SessionMeta,
 };
-#[cfg(feature = "e2e-encryption")]
-use crate::{error::Error, RoomMemberships};
 
 /// A no IO Client implementation.
 ///
@@ -329,17 +328,11 @@ impl BaseClient {
                                         }
                                     }
 
-                                    // Senders can fake the profile easily so we keep track
-                                    // of profiles that the member set themselves to avoid
-                                    // having confusing profile changes when a member gets
-                                    // kicked/banned.
-                                    if member.state_key() == member.sender() {
-                                        changes
-                                            .profiles
-                                            .entry(room.room_id().to_owned())
-                                            .or_default()
-                                            .insert(member.sender().to_owned(), member.into());
-                                    }
+                                    handle_room_member_event_for_profiles(
+                                        room.room_id(),
+                                        member,
+                                        changes,
+                                    );
                                 }
                                 _ => {
                                     room_info.handle_state_event(s);
@@ -425,7 +418,7 @@ impl BaseClient {
                     }
                 }
                 Err(e) => {
-                    warn!("Error deserializing event {e:?}");
+                    warn!("Error deserializing event: {e}");
                 }
             }
 
@@ -503,7 +496,6 @@ impl BaseClient {
     ) -> StoreResult<BTreeSet<OwnedUserId>> {
         let mut state_events = BTreeMap::new();
         let mut user_ids = BTreeSet::new();
-        let mut profiles = BTreeMap::new();
 
         assert_eq!(raw_events.len(), events.len());
 
@@ -520,13 +512,7 @@ impl BaseClient {
                     _ => (),
                 }
 
-                // Senders can fake the profile easily so we keep track
-                // of profiles that the member set themselves to avoid
-                // having confusing profile changes when a member gets
-                // kicked/banned.
-                if member.state_key() == member.sender() {
-                    profiles.insert(member.sender().to_owned(), member.into());
-                }
+                handle_room_member_event_for_profiles(&room_info.room_id, member, changes);
             }
 
             state_events
@@ -535,7 +521,6 @@ impl BaseClient {
                 .insert(event.state_key().to_owned(), raw_event.clone());
         }
 
-        changes.profiles.insert((*room_info.room_id).to_owned(), profiles);
         changes.state.insert((*room_info.room_id).to_owned(), state_events);
 
         Ok(user_ids)
@@ -720,11 +705,14 @@ impl BaseClient {
                 // We found an event we can decrypt
                 if let Ok(any_sync_event) = decrypted.event.deserialize() {
                     // We can deserialize it to find its type
-                    if let PossibleLatestEvent::YesRoomMessage(_) =
-                        is_suitable_for_latest_event(&any_sync_event)
-                    {
-                        // The event is the right type for us to use as latest_event
-                        return Some((Box::new(LatestEvent::new(decrypted)), i));
+                    match is_suitable_for_latest_event(&any_sync_event) {
+                        PossibleLatestEvent::YesRoomMessage(_)
+                        | PossibleLatestEvent::YesPoll(_)
+                        | PossibleLatestEvent::YesCallInvite(_) => {
+                            // The event is the right type for us to use as latest_event
+                            return Some((Box::new(LatestEvent::new(decrypted)), i));
+                        }
+                        _ => (),
                     }
                 }
             }
@@ -1098,6 +1086,8 @@ impl BaseClient {
     /// Receive a get member events response and convert it to a deserialized
     /// `MembersResponse`
     ///
+    /// This client-server request must be made without filters to make sure all
+    /// members are received. Otherwise, an error is returned.
     ///
     /// # Arguments
     ///
@@ -1105,92 +1095,98 @@ impl BaseClient {
     ///
     /// * `response` - The raw response that was received from the server.
     #[instrument(skip_all, fields(?room_id))]
-    pub async fn receive_members(
+    pub async fn receive_all_members(
         &self,
         room_id: &RoomId,
+        request: &api::membership::get_member_events::v3::Request,
         response: &api::membership::get_member_events::v3::Response,
-    ) -> Result<MembersResponse> {
-        let mut chunk = Vec::with_capacity(response.chunk.len());
-        let mut ambiguity_cache = AmbiguityCache::new(self.store.inner.clone());
-
-        if let Some(room) = self.store.get_room(room_id) {
-            let mut changes = StateChanges::default();
-
-            #[cfg(feature = "e2e-encryption")]
-            let mut user_ids = BTreeSet::new();
-
-            for raw_event in &response.chunk {
-                let member = match raw_event.deserialize() {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        let event_id: Option<String> =
-                            raw_event.get_field("event_id").ok().flatten();
-                        debug!(event_id, "Failed to deserialize member event: {e}");
-                        continue;
-                    }
-                };
-
-                // TODO: All the actions in this loop used to be done only when the membership
-                // event was not in the store before. This was changed with the new room API,
-                // because e.g. leaving a room makes members events outdated and they need to be
-                // fetched by `members`. Therefore, they need to be overwritten here, even
-                // if they exist.
-                // However, this makes a new problem occur where setting the member events here
-                // potentially races with the sync.
-                // See <https://github.com/matrix-org/matrix-rust-sdk/issues/1205>.
-
-                #[cfg(feature = "e2e-encryption")]
-                match member.membership() {
-                    MembershipState::Join | MembershipState::Invite => {
-                        user_ids.insert(member.state_key().to_owned());
-                    }
-                    _ => (),
-                }
-
-                let sync_member: SyncRoomMemberEvent = member.clone().into();
-
-                ambiguity_cache.handle_event(&changes, room_id, &sync_member).await?;
-
-                if member.state_key() == member.sender() {
-                    changes
-                        .profiles
-                        .entry(room_id.to_owned())
-                        .or_default()
-                        .insert(member.sender().to_owned(), sync_member.into());
-                }
-
-                changes
-                    .state
-                    .entry(room_id.to_owned())
-                    .or_default()
-                    .entry(member.event_type())
-                    .or_default()
-                    .insert(member.state_key().to_string(), raw_event.clone().cast());
-                chunk.push(member);
-            }
-
-            #[cfg(feature = "e2e-encryption")]
-            if room.is_encrypted() {
-                if let Some(o) = self.olm_machine().await.as_ref() {
-                    o.update_tracked_users(user_ids.iter().map(Deref::deref)).await?
-                }
-            }
-
-            changes.ambiguity_maps = ambiguity_cache.cache;
-
-            let _sync_lock = self.sync_lock().lock().await;
-            let mut room_info = room.clone_info();
-            room_info.mark_members_synced();
-            changes.add_room(room_info);
-
-            self.store.save_changes(&changes).await?;
-            self.apply_changes(&changes, false);
+    ) -> Result<()> {
+        if request.membership.is_some() || request.not_membership.is_some() || request.at.is_some()
+        {
+            // This function assumes all members are loaded at once to optimise how display
+            // name disambiguation works. Using it with partial member list results
+            // would produce incorrect disambiguated display name entries
+            return Err(Error::InvalidReceiveMembersParameters);
         }
 
-        Ok(MembersResponse {
-            chunk,
-            ambiguity_changes: AmbiguityChanges { changes: ambiguity_cache.changes },
-        })
+        let mut chunk = Vec::with_capacity(response.chunk.len());
+
+        let Some(room) = self.store.get_room(room_id) else {
+            // The room is unknown to us: leave early.
+            return Ok(());
+        };
+
+        let mut changes = StateChanges::default();
+
+        #[cfg(feature = "e2e-encryption")]
+        let mut user_ids = BTreeSet::new();
+
+        let mut ambiguity_map: BTreeMap<String, BTreeSet<OwnedUserId>> = BTreeMap::new();
+
+        for raw_event in &response.chunk {
+            let member = match raw_event.deserialize() {
+                Ok(ev) => ev,
+                Err(e) => {
+                    let event_id: Option<String> = raw_event.get_field("event_id").ok().flatten();
+                    debug!(event_id, "Failed to deserialize member event: {e}");
+                    continue;
+                }
+            };
+
+            // TODO: All the actions in this loop used to be done only when the membership
+            // event was not in the store before. This was changed with the new room API,
+            // because e.g. leaving a room makes members events outdated and they need to be
+            // fetched by `members`. Therefore, they need to be overwritten here, even
+            // if they exist.
+            // However, this makes a new problem occur where setting the member events here
+            // potentially races with the sync.
+            // See <https://github.com/matrix-org/matrix-rust-sdk/issues/1205>.
+
+            #[cfg(feature = "e2e-encryption")]
+            match member.membership() {
+                MembershipState::Join | MembershipState::Invite => {
+                    user_ids.insert(member.state_key().to_owned());
+                }
+                _ => (),
+            }
+
+            if let StateEvent::Original(e) = &member {
+                if let Some(d) = &e.content.displayname {
+                    ambiguity_map.entry(d.clone()).or_default().insert(member.state_key().clone());
+                }
+            }
+
+            let sync_member: SyncRoomMemberEvent = member.clone().into();
+            handle_room_member_event_for_profiles(room_id, &sync_member, &mut changes);
+
+            changes
+                .state
+                .entry(room_id.to_owned())
+                .or_default()
+                .entry(member.event_type())
+                .or_default()
+                .insert(member.state_key().to_string(), raw_event.clone().cast());
+            chunk.push(member);
+        }
+
+        #[cfg(feature = "e2e-encryption")]
+        if room.is_encrypted() {
+            if let Some(o) = self.olm_machine().await.as_ref() {
+                o.update_tracked_users(user_ids.iter().map(Deref::deref)).await?
+            }
+        }
+
+        changes.ambiguity_maps.insert(room_id.to_owned(), ambiguity_map);
+
+        let _sync_lock = self.sync_lock().lock().await;
+        let mut room_info = room.clone_info();
+        room_info.mark_members_synced();
+        changes.add_room(room_info);
+
+        self.store.save_changes(&changes).await?;
+        self.apply_changes(&changes, false);
+
+        Ok(())
     }
 
     /// Receive a successful filter upload response, the filter id will be
@@ -1459,17 +1455,50 @@ impl Default for BaseClient {
     }
 }
 
+fn handle_room_member_event_for_profiles(
+    room_id: &RoomId,
+    event: &SyncStateEvent<RoomMemberEventContent>,
+    changes: &mut StateChanges,
+) {
+    // Senders can fake the profile easily so we keep track of profiles that the
+    // member set themselves to avoid having confusing profile changes when a
+    // member gets kicked/banned.
+    if event.state_key() == event.sender() {
+        changes
+            .profiles
+            .entry(room_id.to_owned())
+            .or_default()
+            .insert(event.sender().to_owned(), event.into());
+    }
+
+    if *event.membership() == MembershipState::Invite {
+        // Remove any profile previously stored for the invited user.
+        //
+        // A room member could have joined the room and left it later; in that case, the
+        // server may return a dummy, empty profile along the `leave` event. We
+        // don't want to reuse that empty profile when the member has been
+        // re-invited, so we remove it from the database.
+        changes
+            .profiles_to_delete
+            .entry(room_id.to_owned())
+            .or_default()
+            .push(event.state_key().clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
         async_test, response_from_file, sync_timeline_event, InvitedRoomBuilder, LeftRoomBuilder,
-        StrippedStateTestEvent, SyncResponseBuilder,
+        StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
     };
     use ruma::{
         api::{client as api, IncomingResponse},
-        room_id, user_id, UserId,
+        room_id,
+        serde::Raw,
+        user_id, UserId,
     };
-    use serde_json::json;
+    use serde_json::{json, value::to_raw_value};
 
     use super::BaseClient;
     use crate::{
@@ -1723,5 +1752,136 @@ mod tests {
             .expect("State event not found")
             .deserialize()
             .expect("Failed to deserialize state event");
+    }
+
+    #[async_test]
+    async fn test_invited_members_arent_ignored() {
+        let user_id = user_id!("@alice:example.org");
+        let inviter_user_id = user_id!("@bob:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = BaseClient::new();
+        client
+            .set_session_meta(SessionMeta {
+                user_id: user_id.to_owned(),
+                device_id: "FOOBAR".into(),
+            })
+            .await
+            .unwrap();
+
+        // Preamble: let the SDK know about the room.
+        let mut ev_builder = SyncResponseBuilder::new();
+        let response = ev_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // When I process the result of a /members request that only contains an invited
+        // member,
+        let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
+
+        let raw_member_event = json!({
+            "content": {
+                "avatar_url": "mxc://localhost/fewjilfewjil42",
+                "displayname": "Invited Alice",
+                "membership": "invite"
+            },
+            "event_id": "$151800140517rfvjc:localhost",
+            "origin_server_ts": 151800140,
+            "room_id": room_id,
+            "sender": inviter_user_id,
+            "state_key": user_id,
+            "type": "m.room.member",
+            "unsigned": {
+                "age": 13374242,
+            }
+        });
+        let response = api::membership::get_member_events::v3::Response::new(vec![Raw::from_json(
+            to_raw_value(&raw_member_event).unwrap(),
+        )]);
+
+        // It's correctly processed,
+        client.receive_all_members(room_id, &request, &response).await.unwrap();
+
+        let room = client.get_room(room_id).unwrap();
+
+        // And I can get the invited member display name and avatar.
+        let member = room.get_member(user_id).await.expect("ok").expect("exists");
+
+        assert_eq!(member.user_id(), user_id);
+        assert_eq!(member.display_name().unwrap(), "Invited Alice");
+        assert_eq!(member.avatar_url().unwrap().to_string(), "mxc://localhost/fewjilfewjil42");
+    }
+
+    #[async_test]
+    async fn test_reinvited_members_get_a_display_name() {
+        let user_id = user_id!("@alice:example.org");
+        let inviter_user_id = user_id!("@bob:example.org");
+        let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
+
+        let client = BaseClient::new();
+        client
+            .set_session_meta(SessionMeta {
+                user_id: user_id.to_owned(),
+                device_id: "FOOBAR".into(),
+            })
+            .await
+            .unwrap();
+
+        // Preamble: let the SDK know about the room, and that the invited user left it.
+        let mut ev_builder = SyncResponseBuilder::new();
+        let response = ev_builder
+            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_state_event(
+                StateTestEvent::Custom(json!({
+                    "content": {
+                        "avatar_url": null,
+                        "displayname": null,
+                        "membership": "leave"
+                    },
+                    "event_id": "$151803140217rkvjc:localhost",
+                    "origin_server_ts": 151800139,
+                    "room_id": room_id,
+                    "sender": user_id,
+                    "state_key": user_id,
+                    "type": "m.room.member",
+                })),
+            ))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // Now, say that the user has been re-invited.
+        let request = api::membership::get_member_events::v3::Request::new(room_id.to_owned());
+
+        let raw_member_event = json!({
+            "content": {
+                "avatar_url": "mxc://localhost/fewjilfewjil42",
+                "displayname": "Invited Alice",
+                "membership": "invite"
+            },
+            "event_id": "$151800140517rfvjc:localhost",
+            "origin_server_ts": 151800140,
+            "room_id": room_id,
+            "sender": inviter_user_id,
+            "state_key": user_id,
+            "type": "m.room.member",
+            "unsigned": {
+                "age": 13374242,
+            }
+        });
+        let response = api::membership::get_member_events::v3::Response::new(vec![Raw::from_json(
+            to_raw_value(&raw_member_event).unwrap(),
+        )]);
+
+        // It's correctly processed,
+        client.receive_all_members(room_id, &request, &response).await.unwrap();
+
+        let room = client.get_room(room_id).unwrap();
+
+        // And I can get the invited member display name and avatar.
+        let member = room.get_member(user_id).await.expect("ok").expect("exists");
+
+        assert_eq!(member.user_id(), user_id);
+        assert_eq!(member.display_name().unwrap(), "Invited Alice");
+        assert_eq!(member.avatar_url().unwrap().to_string(), "mxc://localhost/fewjilfewjil42");
     }
 }
