@@ -110,8 +110,8 @@ struct StatefulList<T> {
 
 #[derive(Default, PartialEq)]
 enum DetailsMode {
-    #[default]
     ReadReceipts,
+    #[default]
     TimelineItems,
     // Events // TODO: Soon™
 }
@@ -343,8 +343,9 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if let Err(err) =
-                sdk_timeline.paginate_backwards(PaginationOptions::until_num_items(20, 10)).await
+            if let Err(err) = sdk_timeline
+                .live_paginate_backwards(PaginationOptions::until_num_items(20, 10))
+                .await
             {
                 // TODO: would be nice to be able to set the status
                 // message remotely?
@@ -792,7 +793,7 @@ async fn configure_client(server_name: String, config_path: String) -> anyhow::R
     let server_name = ServerName::parse(&server_name)?;
 
     let config_path = PathBuf::from(config_path);
-    let client = Client::builder()
+    let mut client_builder = Client::builder()
         .store_config(
             StoreConfig::default()
                 .crypto_store(
@@ -805,9 +806,13 @@ async fn configure_client(server_name: String, config_path: String) -> anyhow::R
             auto_enable_cross_signing: true,
             backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
             auto_enable_backups: true,
-        })
-        .build()
-        .await?;
+        });
+
+    if let Ok(proxy_url) = std::env::var("PROXY") {
+        client_builder = client_builder.proxy(proxy_url).disable_ssl_verification();
+    }
+
+    let client = client_builder.build().await?;
 
     // Try reading a session, otherwise create a new one.
     let session_path = config_path.join("session.json");
