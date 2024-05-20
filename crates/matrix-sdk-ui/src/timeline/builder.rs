@@ -14,7 +14,6 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use eyeball::SharedObservable;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{event_cache::RoomEventCacheUpdate, executor::spawn, Room};
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
@@ -28,10 +27,7 @@ use super::{
     queue::send_queued_messages,
     Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
-use crate::{
-    timeline::{event_item::RemoteEventOrigin, PaginationStatus},
-    unable_to_decrypt_hook::UtdHookManager,
-};
+use crate::{timeline::event_item::RemoteEventOrigin, unable_to_decrypt_hook::UtdHookManager};
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -245,21 +241,6 @@ impl TimelineBuilder {
             .instrument(span)
         });
 
-        let mut ignore_user_list_stream = client.subscribe_to_ignore_user_list_changes();
-        let ignore_user_list_update_join_handle = spawn({
-            let inner = inner.clone();
-
-            let span = info_span!(parent: Span::none(), "ignore_user_list_update_handler", room_id = ?room.room_id());
-            span.follows_from(Span::current());
-
-            async move {
-                while ignore_user_list_stream.next().await.is_some() {
-                    inner.clear().await;
-                }
-            }
-            .instrument(span)
-        });
-
         // Not using room.add_event_handler here because RoomKey events are
         // to-device events that are not received in the context of a room.
 
@@ -314,14 +295,12 @@ impl TimelineBuilder {
 
         let timeline = Timeline {
             inner,
-            back_pagination_status: SharedObservable::new(PaginationStatus::Idle),
             msg_sender,
             event_cache: room_event_cache,
             drop_handle: Arc::new(TimelineDropHandle {
                 client,
                 event_handler_handles: handles,
                 room_update_join_handle,
-                ignore_user_list_update_join_handle,
                 room_key_from_backups_join_handle,
                 _event_cache_drop_handle: event_cache_drop,
             }),

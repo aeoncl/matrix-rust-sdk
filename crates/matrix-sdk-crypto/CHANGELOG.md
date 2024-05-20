@@ -1,5 +1,9 @@
 # UNRELEASED
 
+Security fixes:
+
+- Don't log the private part of the backup key, introduced in [#71136e4](https://github.com/matrix-org/matrix-rust-sdk/commit/71136e44c03c79f80d6d1a2446673bc4d53a2067).
+
 Changed:
 
 - Fallback keys are rotated in a time-based manner, instead of waiting for the
@@ -24,6 +28,9 @@ Breaking changes:
   ([#3164](https://github.com/matrix-org/matrix-rust-sdk/pull/3164))
 
 Additions:
+
+- Add data types to parse the QR code data for the QR code login defined in
+  [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108)
 
 - Expose new method `CryptoStore::clear_caches`.
   ([#3338](https://github.com/matrix-org/matrix-rust-sdk/pull/3338))

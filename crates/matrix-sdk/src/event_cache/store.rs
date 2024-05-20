@@ -17,19 +17,14 @@ use std::{fmt, iter::once};
 use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
 
 use super::linked_chunk::{
-    Chunk, ChunkIdentifier, LinkedChunk, LinkedChunkError, LinkedChunkIter,
-    LinkedChunkIterBackward, Position,
+    Chunk, ChunkIdentifier, Error, Iter, IterBackward, LinkedChunk, Position,
 };
-
-/// A newtype wrapper for a pagination token returned by a /messages response.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PaginationToken(pub String);
 
 #[derive(Clone, Debug)]
 pub struct Gap {
     /// The token to use in the query, extracted from a previous "from" /
     /// "end" field of a `/messages` response.
-    pub prev_token: PaginationToken,
+    pub prev_token: String,
 }
 
 const DEFAULT_CHUNK_CAPACITY: usize = 128;
@@ -82,11 +77,7 @@ impl RoomEvents {
     }
 
     /// Insert events at a specified position.
-    pub fn insert_events_at<I>(
-        &mut self,
-        events: I,
-        position: Position,
-    ) -> Result<(), LinkedChunkError>
+    pub fn insert_events_at<I>(&mut self, events: I, position: Position) -> Result<(), Error>
     where
         I: IntoIterator<Item = SyncTimelineEvent>,
         I::IntoIter: ExactSizeIterator,
@@ -95,7 +86,7 @@ impl RoomEvents {
     }
 
     /// Insert a gap at a specified position.
-    pub fn insert_gap_at(&mut self, gap: Gap, position: Position) -> Result<(), LinkedChunkError> {
+    pub fn insert_gap_at(&mut self, gap: Gap, position: Position) -> Result<(), Error> {
         self.chunks.insert_gap_at(gap, position)
     }
 
@@ -110,7 +101,7 @@ impl RoomEvents {
         &mut self,
         events: I,
         gap_identifier: ChunkIdentifier,
-    ) -> Result<&Chunk<DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap>, LinkedChunkError>
+    ) -> Result<&Chunk<DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap>, Error>
     where
         I: IntoIterator<Item = SyncTimelineEvent>,
         I::IntoIter: ExactSizeIterator,
@@ -137,16 +128,14 @@ impl RoomEvents {
     /// Iterate over the chunks, backward.
     ///
     /// The most recent chunk comes first.
-    pub fn rchunks(
-        &self,
-    ) -> LinkedChunkIterBackward<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap> {
+    pub fn rchunks(&self) -> IterBackward<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap> {
         self.chunks.rchunks()
     }
 
     /// Iterate over the chunks, forward.
     ///
     /// The oldest chunk comes first.
-    pub fn chunks(&self) -> LinkedChunkIter<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap> {
+    pub fn chunks(&self) -> Iter<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap> {
         self.chunks.chunks()
     }
 
@@ -154,10 +143,7 @@ impl RoomEvents {
     pub fn rchunks_from(
         &self,
         identifier: ChunkIdentifier,
-    ) -> Result<
-        LinkedChunkIterBackward<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap>,
-        LinkedChunkError,
-    > {
+    ) -> Result<IterBackward<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap>, Error> {
         self.chunks.rchunks_from(identifier)
     }
 
@@ -166,8 +152,7 @@ impl RoomEvents {
     pub fn chunks_from(
         &self,
         identifier: ChunkIdentifier,
-    ) -> Result<LinkedChunkIter<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap>, LinkedChunkError>
-    {
+    ) -> Result<Iter<'_, DEFAULT_CHUNK_CAPACITY, SyncTimelineEvent, Gap>, Error> {
         self.chunks.chunks_from(identifier)
     }
 
@@ -189,7 +174,7 @@ impl RoomEvents {
     pub fn revents_from(
         &self,
         position: Position,
-    ) -> Result<impl Iterator<Item = (Position, &SyncTimelineEvent)>, LinkedChunkError> {
+    ) -> Result<impl Iterator<Item = (Position, &SyncTimelineEvent)>, Error> {
         self.chunks.ritems_from(position)
     }
 
@@ -198,7 +183,7 @@ impl RoomEvents {
     pub fn events_from(
         &self,
         position: Position,
-    ) -> Result<impl Iterator<Item = (Position, &SyncTimelineEvent)>, LinkedChunkError> {
+    ) -> Result<impl Iterator<Item = (Position, &SyncTimelineEvent)>, Error> {
         self.chunks.items_from(position)
     }
 }
