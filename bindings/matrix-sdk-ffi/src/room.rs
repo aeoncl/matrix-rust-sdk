@@ -3,8 +3,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use matrix_sdk::{
     event_cache::paginator::PaginatorError,
-    room::{power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole},
-    RoomMemberships, RoomState,
+    room::{
+        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+    },
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    RoomHero as SdkRoomHero, RoomMemberships, RoomState,
 };
 use matrix_sdk_ui::timeline::{PaginationError, RoomExt, TimelineFocus};
 use mime::Mime;
@@ -12,8 +15,10 @@ use ruma::{
     api::client::room::report_content,
     assign,
     events::{
+        call::notify,
         room::{
             avatar::ImageInfo as RumaAvatarImageInfo,
+            message::RoomMessageEventContentWithoutRelation,
             power_levels::RoomPowerLevels as RumaPowerLevels, MediaSource,
         },
         TimelineEventType,
@@ -30,13 +35,13 @@ use crate::{
     event::{MessageLikeEventType, StateEventType},
     room_info::RoomInfo,
     room_member::RoomMember,
-    ruma::ImageInfo,
-    timeline::{EventTimelineItem, FocusEventError, ReceiptType, Timeline},
+    ruma::{ImageInfo, Mentions, NotifyType},
+    timeline::{FocusEventError, ReceiptType, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
 
-#[derive(uniffi::Enum)]
+#[derive(Debug, uniffi::Enum)]
 pub enum Membership {
     Invited,
     Joined,
@@ -80,8 +85,8 @@ impl Room {
     /// Returns the room's name from the state event if available, otherwise
     /// compute a room name based on the room's nature (DM or not) and number of
     /// members.
-    pub fn display_name(&self) -> Result<String, ClientError> {
-        Ok(RUNTIME.block_on(self.inner.computed_display_name())?.to_string())
+    pub fn display_name(&self) -> Option<String> {
+        Some(self.inner.cached_display_name()?.to_string())
     }
 
     /// The raw name as present in the room state event.
@@ -125,6 +130,11 @@ impl Room {
         self.inner.state().into()
     }
 
+    /// Returns the room heroes for this room.
+    pub fn heroes(&self) -> Vec<RoomHero> {
+        self.inner.heroes().into_iter().map(Into::into).collect()
+    }
+
     /// Is there a non expired membership with application "m.call" and scope
     /// "m.room" in this room.
     pub fn has_active_room_call(&self) -> bool {
@@ -133,7 +143,7 @@ impl Room {
 
     /// Returns a Vec of userId's that participate in the room call.
     ///
-    /// matrix_rtc memberships with application "m.call" and scope "m.room" are
+    /// MatrixRTC memberships with application "m.call" and scope "m.room" are
     /// considered. A user can occur twice if they join with two devices.
     /// convert to a set depending if the different users are required or the
     /// amount of sessions.
@@ -218,6 +228,25 @@ impl Room {
         Ok(Timeline::new(timeline))
     }
 
+    pub async fn pinned_events_timeline(
+        &self,
+        internal_id_prefix: Option<String>,
+        max_events_to_load: u16,
+    ) -> Result<Arc<Timeline>, ClientError> {
+        let room = &self.inner;
+
+        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(room);
+
+        if let Some(internal_id_prefix) = internal_id_prefix {
+            builder = builder.with_internal_id_prefix(internal_id_prefix);
+        }
+
+        let timeline =
+            builder.with_focus(TimelineFocus::PinnedEvents { max_events_to_load }).build().await?;
+
+        Ok(Timeline::new(timeline))
+    }
+
     pub fn is_encrypted(&self) -> Result<bool, ClientError> {
         Ok(RUNTIME.block_on(self.inner.is_encrypted())?)
     }
@@ -256,38 +285,7 @@ impl Room {
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        // Look for a local event in the `Timeline`.
-        //
-        // First off, let's see if a `Timeline` exists…
-        if let Some(timeline) = self.timeline.read().await.clone() {
-            // If it contains a `latest_event`…
-            if let Some(timeline_last_event) = timeline.inner.latest_event().await {
-                // If it's a local echo…
-                if timeline_last_event.is_local_echo() {
-                    return Ok(RoomInfo::new(
-                        &self.inner,
-                        Some(Arc::new(EventTimelineItem(timeline_last_event))),
-                    )
-                    .await?);
-                }
-            }
-        }
-
-        // Otherwise, create a synthetic [`EventTimelineItem`] using the classical
-        // [`Room`] path.
-        let latest_event = match self.inner.latest_event() {
-            Some(latest_event) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
-                self.inner.client(),
-                self.inner.room_id(),
-                latest_event,
-            )
-            .await
-            .map(EventTimelineItem)
-            .map(Arc::new),
-            None => None,
-        };
-
-        Ok(RoomInfo::new(&self.inner, latest_event).await?)
+        Ok(RoomInfo::new(&self.inner).await?)
     }
 
     pub fn subscribe_to_room_info_updates(
@@ -331,8 +329,8 @@ impl Room {
     ///
     /// * `event_id` - The ID of the event to redact
     ///
-    /// * `reason` - The reason for the event being redacted (optional).
-    /// its transaction ID (optional). If not given one is created.
+    /// * `reason` - The reason for the event being redacted (optional). its
+    ///   transaction ID (optional). If not given one is created.
     pub async fn redact(
         &self,
         event_id: String,
@@ -543,6 +541,11 @@ impl Room {
         Ok(self.inner.can_user_send_message(&user_id, message.into()).await?)
     }
 
+    pub async fn can_user_pin_unpin(&self, user_id: String) -> Result<bool, ClientError> {
+        let user_id = UserId::parse(&user_id)?;
+        Ok(self.inner.can_user_pin_unpin(&user_id).await?)
+    }
+
     pub async fn can_user_trigger_room_notification(
         &self,
         user_id: String,
@@ -644,6 +647,96 @@ impl Room {
         let event_id = EventId::parse(event_id)?;
         Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_string())
     }
+
+    /// This will only send a call notification event if appropriate.
+    ///
+    /// This function is supposed to be called whenever the user creates a room
+    /// call. It will send a `m.call.notify` event if:
+    ///  - there is not yet a running call.
+    ///
+    /// It will configure the notify type: ring or notify based on:
+    ///  - is this a DM room -> ring
+    ///  - is this a group with more than one other member -> notify
+    pub async fn send_call_notification_if_needed(&self) -> Result<(), ClientError> {
+        self.inner.send_call_notification_if_needed().await?;
+        Ok(())
+    }
+
+    /// Send a call notification event in the current room.
+    ///
+    /// This is only supposed to be used in **custom** situations where the user
+    /// explicitly chooses to send a `m.call.notify` event to invite/notify
+    /// someone explicitly in unusual conditions. The default should be to
+    /// use `send_call_notification_if_necessary` just before a new room call is
+    /// created/joined.
+    ///
+    /// One example could be that the UI allows to start a call with a subset of
+    /// users of the room members first. And then later on the user can
+    /// invite more users to the call.
+    pub async fn send_call_notification(
+        &self,
+        call_id: String,
+        application: RtcApplicationType,
+        notify_type: NotifyType,
+        mentions: Mentions,
+    ) -> Result<(), ClientError> {
+        self.inner
+            .send_call_notification(
+                call_id,
+                application.into(),
+                notify_type.into(),
+                mentions.into(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Returns whether the send queue for that particular room is enabled or
+    /// not.
+    pub fn is_send_queue_enabled(&self) -> bool {
+        self.inner.send_queue().is_enabled()
+    }
+
+    /// Enable or disable the send queue for that particular room.
+    pub fn enable_send_queue(&self, enable: bool) {
+        self.inner.send_queue().set_enabled(enable);
+    }
+
+    /// Store the given `ComposerDraft` in the state store using the current
+    /// room id, as identifier.
+    pub async fn save_composer_draft(&self, draft: ComposerDraft) -> Result<(), ClientError> {
+        Ok(self.inner.save_composer_draft(draft.try_into()?).await?)
+    }
+
+    /// Retrieve the `ComposerDraft` stored in the state store for this room.
+    pub async fn load_composer_draft(&self) -> Result<Option<ComposerDraft>, ClientError> {
+        Ok(self.inner.load_composer_draft().await?.map(Into::into))
+    }
+
+    /// Remove the `ComposerDraft` stored in the state store for this room.
+    pub async fn clear_composer_draft(&self) -> Result<(), ClientError> {
+        Ok(self.inner.clear_composer_draft().await?)
+    }
+
+    /// Edit an event given its event id.
+    ///
+    /// Useful outside the context of a timeline, or when a timeline doesn't
+    /// have the full content of an event.
+    pub async fn edit(
+        &self,
+        event_id: String,
+        new_content: Arc<RoomMessageEventContentWithoutRelation>,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+
+        let replacement_event = self
+            .inner
+            .make_edit_event(&event_id, EditedContent::RoomMessage((*new_content).clone()))
+            .await?;
+
+        self.inner.send_queue().send(replacement_event).await?;
+        Ok(())
+    }
 }
 
 /// Generates a `matrix.to` permalink to the given room alias.
@@ -737,6 +830,27 @@ impl RoomMembersIterator {
     }
 }
 
+/// Information about a member considered to be a room hero.
+#[derive(uniffi::Record)]
+pub struct RoomHero {
+    /// The user ID of the hero.
+    user_id: String,
+    /// The display name of the hero.
+    display_name: Option<String>,
+    /// The avatar URL of the hero.
+    avatar_url: Option<String>,
+}
+
+impl From<SdkRoomHero> for RoomHero {
+    fn from(value: SdkRoomHero) -> Self {
+        Self {
+            user_id: value.user_id.to_string(),
+            display_name: value.display_name.clone(),
+            avatar_url: value.avatar_url.as_ref().map(ToString::to_string),
+        }
+    }
+}
+
 /// An update for a particular user's power level within the room.
 #[derive(uniffi::Record)]
 pub struct UserPowerLevelUpdate {
@@ -768,5 +882,86 @@ impl TryFrom<ImageInfo> for RumaAvatarImageInfo {
             thumbnail_url: thumbnail_url,
             blurhash: value.blurhash,
         }))
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum RtcApplicationType {
+    Call,
+}
+impl From<RtcApplicationType> for notify::ApplicationType {
+    fn from(value: RtcApplicationType) -> Self {
+        match value {
+            RtcApplicationType::Call => notify::ApplicationType::Call,
+        }
+    }
+}
+
+/// Current draft of the composer for the room.
+#[derive(uniffi::Record)]
+pub struct ComposerDraft {
+    /// The draft content in plain text.
+    pub plain_text: String,
+    /// If the message is formatted in HTML, the HTML representation of the
+    /// message.
+    pub html_text: Option<String>,
+    /// The type of draft.
+    pub draft_type: ComposerDraftType,
+}
+
+impl From<SdkComposerDraft> for ComposerDraft {
+    fn from(value: SdkComposerDraft) -> Self {
+        let SdkComposerDraft { plain_text, html_text, draft_type } = value;
+        Self { plain_text, html_text, draft_type: draft_type.into() }
+    }
+}
+
+impl TryFrom<ComposerDraft> for SdkComposerDraft {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ComposerDraft) -> std::result::Result<Self, Self::Error> {
+        let ComposerDraft { plain_text, html_text, draft_type } = value;
+        Ok(Self { plain_text, html_text, draft_type: draft_type.try_into()? })
+    }
+}
+
+/// The type of draft of the composer.
+#[derive(uniffi::Enum)]
+pub enum ComposerDraftType {
+    /// The draft is a new message.
+    NewMessage,
+    /// The draft is a reply to an event.
+    Reply {
+        /// The ID of the event being replied to.
+        event_id: String,
+    },
+    /// The draft is an edit of an event.
+    Edit {
+        /// The ID of the event being edited.
+        event_id: String,
+    },
+}
+
+impl From<SdkComposerDraftType> for ComposerDraftType {
+    fn from(value: SdkComposerDraftType) -> Self {
+        match value {
+            SdkComposerDraftType::NewMessage => Self::NewMessage,
+            SdkComposerDraftType::Reply { event_id } => Self::Reply { event_id: event_id.into() },
+            SdkComposerDraftType::Edit { event_id } => Self::Edit { event_id: event_id.into() },
+        }
+    }
+}
+
+impl TryFrom<ComposerDraftType> for SdkComposerDraftType {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ComposerDraftType) -> std::result::Result<Self, Self::Error> {
+        let draft_type = match value {
+            ComposerDraftType::NewMessage => Self::NewMessage,
+            ComposerDraftType::Reply { event_id } => Self::Reply { event_id: event_id.try_into()? },
+            ComposerDraftType::Edit { event_id } => Self::Edit { event_id: event_id.try_into()? },
+        };
+
+        Ok(draft_type)
     }
 }

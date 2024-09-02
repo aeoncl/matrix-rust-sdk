@@ -16,18 +16,11 @@
 
 use std::future::ready;
 
-use async_trait::async_trait;
-use matrix_sdk::{
-    sliding_sync::{Bound, Range},
-    SlidingSync, SlidingSyncList, SlidingSyncMode,
-};
-use once_cell::sync::Lazy;
-use ruma::events::StateEventType;
+use matrix_sdk::{sliding_sync::Range, SlidingSync, SlidingSyncMode};
 
 use super::Error;
 
 pub const ALL_ROOMS_LIST_NAME: &str = "all_rooms";
-pub const VISIBLE_ROOMS_LIST_NAME: &str = "visible_rooms";
 
 /// The state of the [`super::RoomList`]' state machine.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,7 +36,7 @@ pub enum State {
     /// are then slightly different.
     Recovering,
 
-    /// At this state, all rooms are syncing, and the visible rooms list exist.
+    /// At this state, all rooms are syncing.
     Running,
 
     /// At this state, the sync has been stopped because an error happened.
@@ -59,11 +52,16 @@ impl State {
     pub(super) async fn next(&self, sliding_sync: &SlidingSync) -> Result<Self, Error> {
         use State::*;
 
-        let (next_state, actions) = match self {
-            Init => (SettingUp, Actions::none()),
-            SettingUp => (Running, Actions::prepare_for_next_syncs_once_first_rooms_are_loaded()),
-            Recovering => (Running, Actions::prepare_for_next_syncs_once_recovered()),
-            Running => (Running, Actions::none()),
+        let next_state = match self {
+            Init => SettingUp,
+
+            SettingUp | Recovering => {
+                set_all_rooms_to_growing_sync_mode(sliding_sync).await?;
+                Running
+            }
+
+            Running => Running,
+
             Error { from: previous_state } | Terminated { from: previous_state } => {
                 match previous_state.as_ref() {
                     // Unreachable state.
@@ -74,199 +72,52 @@ impl State {
                     }
 
                     // If the previous state was `Running`, we enter the `Recovering` state.
-                    Running => (Recovering, Actions::prepare_to_recover()),
+                    Running => {
+                        set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
+                        Recovering
+                    }
 
                     // Jump back to the previous state that led to this termination.
-                    state => (state.to_owned(), Actions::none()),
+                    state => state.to_owned(),
                 }
             }
         };
-
-        for action in actions.iter() {
-            action.run(sliding_sync).await?;
-        }
 
         Ok(next_state)
     }
 }
 
-/// A trait to define what an `Action` is.
-#[async_trait]
-trait Action {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error>;
+async fn set_all_rooms_to_growing_sync_mode(sliding_sync: &SlidingSync) -> Result<(), Error> {
+    sliding_sync
+        .on_list(ALL_ROOMS_LIST_NAME, |list| {
+            list.set_sync_mode(SlidingSyncMode::new_growing(ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE));
+
+            ready(())
+        })
+        .await
+        .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))
 }
 
-struct AddVisibleRooms;
+async fn set_all_rooms_to_selective_sync_mode(sliding_sync: &SlidingSync) -> Result<(), Error> {
+    sliding_sync
+        .on_list(ALL_ROOMS_LIST_NAME, |list| {
+            list.set_sync_mode(
+                SlidingSyncMode::new_selective().add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
+            );
 
-/// Default timeline for the `VISIBLE_ROOMS_LIST_NAME` list.
-pub const VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT: Bound = 20;
-
-/// Default range for the `VISIBLE_ROOMS_LIST_NAME` list.
-pub const VISIBLE_ROOMS_DEFAULT_RANGE: Range = 0..=19;
-
-#[async_trait]
-impl Action for AddVisibleRooms {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .add_list(super::configure_all_or_visible_rooms_list(
-                SlidingSyncList::builder(VISIBLE_ROOMS_LIST_NAME)
-                    .sync_mode(
-                        SlidingSyncMode::new_selective().add_range(VISIBLE_ROOMS_DEFAULT_RANGE),
-                    )
-                    .timeline_limit(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
-                    .required_state(vec![
-                        (StateEventType::RoomEncryption, "".to_owned()),
-                        (StateEventType::RoomMember, "$LAZY".to_owned()),
-                    ]),
-            ))
-            .await
-            .map_err(Error::SlidingSync)?;
-
-        Ok(())
-    }
+            ready(())
+        })
+        .await
+        .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))
 }
-
-struct SetVisibleRoomsToZeroTimelineLimit;
-
-#[async_trait]
-impl Action for SetVisibleRoomsToZeroTimelineLimit {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(VISIBLE_ROOMS_LIST_NAME, |list| {
-                list.set_timeline_limit(Some(0));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(VISIBLE_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetVisibleRoomsToDefaultTimelineLimit;
-
-#[async_trait]
-impl Action for SetVisibleRoomsToDefaultTimelineLimit {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(VISIBLE_ROOMS_LIST_NAME, |list| {
-                list.set_timeline_limit(Some(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(VISIBLE_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetAllRoomsToSelectiveSyncMode;
 
 /// Default `batch_size` for the selective sync-mode of the
 /// `ALL_ROOMS_LIST_NAME` list.
 pub const ALL_ROOMS_DEFAULT_SELECTIVE_RANGE: Range = 0..=19;
 
-#[async_trait]
-impl Action for SetAllRoomsToSelectiveSyncMode {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(ALL_ROOMS_LIST_NAME, |list| {
-                list.set_sync_mode(
-                    SlidingSyncMode::new_selective().add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
-                );
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetAllRoomsToGrowingSyncMode;
-
 /// Default `batch_size` for the growing sync-mode of the `ALL_ROOMS_LIST_NAME`
 /// list.
 pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 100;
-
-#[async_trait]
-impl Action for SetAllRoomsToGrowingSyncMode {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(ALL_ROOMS_LIST_NAME, |list| {
-                list.set_sync_mode(SlidingSyncMode::new_growing(
-                    ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE,
-                ));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-/// Type alias to represent one action.
-type OneAction = Box<dyn Action + Send + Sync>;
-
-/// Type alias to represent many actions.
-type ManyActions = Vec<OneAction>;
-
-/// A type to represent multiple actions.
-///
-/// It contains helper methods to create pre-configured set of actions.
-struct Actions {
-    actions: &'static Lazy<ManyActions>,
-}
-
-macro_rules! actions {
-    (
-        $(
-            $action_group_name:ident => [
-                $( $action_name:ident ),* $(,)?
-            ]
-        ),*
-        $(,)?
-    ) => {
-        $(
-            fn $action_group_name () -> Self {
-                static ACTIONS: Lazy<ManyActions> = Lazy::new(|| {
-                    vec![
-                        $( Box::new( $action_name ) ),*
-                    ]
-                });
-
-                Self { actions: &ACTIONS }
-            }
-        )*
-    };
-}
-
-impl Actions {
-    actions! {
-        none => [],
-        prepare_for_next_syncs_once_first_rooms_are_loaded => [
-            SetAllRoomsToGrowingSyncMode,
-            AddVisibleRooms
-        ],
-        prepare_for_next_syncs_once_recovered => [
-            SetAllRoomsToGrowingSyncMode,
-            SetVisibleRoomsToDefaultTimelineLimit
-        ],
-        prepare_to_recover => [
-            SetAllRoomsToSelectiveSyncMode,
-            SetVisibleRoomsToZeroTimelineLimit
-        ],
-    }
-
-    fn iter(&self) -> &[OneAction] {
-        self.actions.as_slice()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -373,80 +224,6 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_action_add_visible_rooms_list() -> Result<(), Error> {
-        let room_list = new_room_list().await?;
-        let sliding_sync = room_list.sliding_sync();
-
-        // List is absent.
-        assert_eq!(sliding_sync.on_list(VISIBLE_ROOMS_LIST_NAME, |_list| ready(())).await, None);
-
-        // Run the action!
-        AddVisibleRooms.run(sliding_sync).await?;
-
-        // List is present.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(matches!(
-                    list.sync_mode(),
-                    SlidingSyncMode::Selective { ranges } if ranges == vec![VISIBLE_ROOMS_DEFAULT_RANGE]
-                )))
-                .await,
-            Some(true)
-        );
-
-        Ok(())
-    }
-
-    #[async_test]
-    async fn test_action_set_visible_rooms_list_to_zero_or_default_timeline_limit(
-    ) -> Result<(), Error> {
-        let room_list = new_room_list().await?;
-        let sliding_sync = room_list.sliding_sync();
-
-        // List is absent.
-        assert_eq!(sliding_sync.on_list(VISIBLE_ROOMS_LIST_NAME, |_list| ready(())).await, None);
-
-        // Run the action!
-        AddVisibleRooms.run(sliding_sync).await?;
-
-        // List is present, and has the default `timeline_limit`.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(
-                    list.timeline_limit() == Some(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
-                ))
-                .await,
-            Some(true)
-        );
-
-        // Run the action!
-        SetVisibleRoomsToZeroTimelineLimit.run(sliding_sync).await?;
-
-        // List is present, and has a zero `timeline_limit`.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(list.timeline_limit() == Some(0)))
-                .await,
-            Some(true)
-        );
-
-        // Run the action!
-        SetVisibleRoomsToDefaultTimelineLimit.run(sliding_sync).await?;
-
-        // List is present, and has the default `timeline_limit`.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(
-                    list.timeline_limit() == Some(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
-                ))
-                .await,
-            Some(true)
-        );
-
-        Ok(())
-    }
-
-    #[async_test]
     async fn test_action_set_all_rooms_list_to_growing_and_selective_sync_mode() -> Result<(), Error>
     {
         let room_list = new_room_list().await?;
@@ -464,7 +241,7 @@ mod tests {
         );
 
         // Run the action!
-        SetAllRoomsToGrowingSyncMode.run(sliding_sync).await.unwrap();
+        set_all_rooms_to_growing_sync_mode(sliding_sync).await.unwrap();
 
         // List is still present, in Growing mode.
         assert_eq!(
@@ -480,7 +257,7 @@ mod tests {
         );
 
         // Run the other action!
-        SetAllRoomsToSelectiveSyncMode.run(sliding_sync).await.unwrap();
+        set_all_rooms_to_selective_sync_mode(sliding_sync).await.unwrap();
 
         // List is still present, in Selective mode.
         assert_eq!(

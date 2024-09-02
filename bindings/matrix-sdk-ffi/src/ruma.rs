@@ -21,6 +21,7 @@ use matrix_sdk::attachment::{
 use ruma::{
     assign,
     events::{
+        call::notify::NotifyType as RumaNotifyType,
         location::AssetType as RumaAssetType,
         poll::start::PollKind as RumaPollKind,
         room::{
@@ -55,6 +56,36 @@ use crate::{
     helpers::unwrap_or_clone_arc,
     utils::u64_to_uint,
 };
+
+#[derive(uniffi::Enum)]
+pub enum AuthData {
+    /// Password-based authentication (`m.login.password`).
+    Password { password_details: AuthDataPasswordDetails },
+}
+
+#[derive(uniffi::Record)]
+pub struct AuthDataPasswordDetails {
+    /// One of the user's identifiers.
+    identifier: String,
+
+    /// The plaintext password.
+    password: String,
+}
+
+impl From<AuthData> for ruma::api::client::uiaa::AuthData {
+    fn from(value: AuthData) -> ruma::api::client::uiaa::AuthData {
+        match value {
+            AuthData::Password { password_details } => {
+                let user_id = ruma::UserId::parse(password_details.identifier).unwrap();
+
+                ruma::api::client::uiaa::AuthData::Password(ruma::api::client::uiaa::Password::new(
+                    user_id.into(),
+                    password_details.password,
+                ))
+            }
+        }
+    }
+}
 
 /// Parse a matrix entity from a given URI, be it either
 /// a `matrix.to` link or a `matrix:` URI
@@ -371,6 +402,30 @@ impl From<RumaMessageType> for MessageType {
                 msgtype: value.msgtype().to_owned(),
                 body: value.body().to_owned(),
             },
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum NotifyType {
+    Ring,
+    Notify,
+}
+
+impl From<RumaNotifyType> for NotifyType {
+    fn from(val: RumaNotifyType) -> Self {
+        match val {
+            RumaNotifyType::Ring => Self::Ring,
+            _ => Self::Notify,
+        }
+    }
+}
+
+impl From<NotifyType> for RumaNotifyType {
+    fn from(value: NotifyType) -> Self {
+        match value {
+            NotifyType::Ring => RumaNotifyType::Ring,
+            NotifyType::Notify => RumaNotifyType::Notify,
         }
     }
 }

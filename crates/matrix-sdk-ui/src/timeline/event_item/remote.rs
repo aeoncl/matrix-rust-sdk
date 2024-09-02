@@ -19,10 +19,8 @@ use matrix_sdk::deserialized_responses::EncryptionInfo;
 use ruma::{
     events::{receipt::Receipt, AnySyncTimelineEvent},
     serde::Raw,
-    OwnedEventId, OwnedUserId,
+    OwnedEventId, OwnedTransactionId, OwnedUserId,
 };
-
-use super::BundledReactions;
 
 /// An item for an event that was received from the homeserver.
 #[derive(Clone)]
@@ -30,8 +28,8 @@ pub(in crate::timeline) struct RemoteEventTimelineItem {
     /// The event ID.
     pub event_id: OwnedEventId,
 
-    /// All bundled reactions about the event.
-    pub reactions: BundledReactions,
+    /// If available, the transaction id we've used to send this event.
+    pub transaction_id: Option<OwnedTransactionId>,
 
     /// All read receipts for the event.
     ///
@@ -41,7 +39,7 @@ pub(in crate::timeline) struct RemoteEventTimelineItem {
     /// Note that currently this ignores threads.
     pub read_receipts: IndexMap<OwnedUserId, Receipt>,
 
-    /// Whether the event has been sent by the the logged-in user themselves.
+    /// Whether the event has been sent by the logged-in user themselves.
     pub is_own: bool,
 
     /// Whether the item should be highlighted in the timeline.
@@ -70,20 +68,14 @@ pub(in crate::timeline) struct RemoteEventTimelineItem {
 }
 
 impl RemoteEventTimelineItem {
-    /// Clone the current event item, and update its `reactions`.
-    pub fn with_reactions(&self, reactions: BundledReactions) -> Self {
-        Self { reactions, ..self.clone() }
+    /// Clone the current event item, and update its `encryption_info`.
+    pub fn with_encryption_info(&self, encryption_info: Option<EncryptionInfo>) -> Self {
+        Self { encryption_info, ..self.clone() }
     }
 
-    /// Clone the current event item, and clear its `reactions` as well as the
-    /// JSON representation fields.
+    /// Clone the current event item, and redacts its fields.
     pub fn redact(&self) -> Self {
-        Self {
-            reactions: BundledReactions::default(),
-            original_json: None,
-            latest_edit_json: None,
-            ..self.clone()
-        }
+        Self { original_json: None, latest_edit_json: None, ..self.clone() }
     }
 }
 
@@ -107,7 +99,7 @@ impl fmt::Debug for RemoteEventTimelineItem {
         // skip raw JSON, too noisy
         let Self {
             event_id,
-            reactions,
+            transaction_id,
             read_receipts,
             is_own,
             encryption_info,
@@ -119,7 +111,7 @@ impl fmt::Debug for RemoteEventTimelineItem {
 
         f.debug_struct("RemoteEventTimelineItem")
             .field("event_id", event_id)
-            .field("reactions", reactions)
+            .field("transaction_id", transaction_id)
             .field("read_receipts", read_receipts)
             .field("is_own", is_own)
             .field("is_highlighted", is_highlighted)

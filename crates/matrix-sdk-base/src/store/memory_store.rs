@@ -14,12 +14,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    num::NonZeroUsize,
     sync::RwLock as StdRwLock,
 };
 
 use async_trait::async_trait;
-use matrix_sdk_common::{instant::Instant, ring_buffer::RingBuffer};
+use growable_bloom_filter::GrowableBloom;
 use ruma::{
     canonical_json::{redact, RedactedBecause},
     events::{
@@ -30,28 +29,38 @@ use ruma::{
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId,
-    RoomId, RoomVersionId, UserId,
+    time::Instant,
+    CanonicalJsonObject, EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId,
+    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
-use tracing::{debug, warn};
+use tracing::{debug, instrument, trace, warn};
 
-use super::{Result, RoomInfo, StateChanges, StateStore, StoreError};
+use super::{
+    traits::{
+        ChildTransactionId, ComposerDraft, QueuedEvent, SerializableEventContent,
+        ServerCapabilities,
+    },
+    DependentQueuedEvent, DependentQueuedEventKind, Result, RoomInfo, StateChanges, StateStore,
+    StoreError,
+};
 use crate::{
-    deserialized_responses::RawAnySyncOrStrippedState,
-    media::{MediaRequest, UniqueKey as _},
-    MinimalRoomMemberEvent, RoomMemberships, RoomState, StateStoreDataKey, StateStoreDataValue,
+    deserialized_responses::RawAnySyncOrStrippedState, MinimalRoomMemberEvent, RoomMemberships,
+    RoomState, StateStoreDataKey, StateStoreDataValue,
 };
 
-/// In-Memory, non-persistent implementation of the `StateStore`
+/// In-memory, non-persistent implementation of the `StateStore`.
 ///
 /// Default if no other is configured at startup.
 #[allow(clippy::type_complexity)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MemoryStore {
-    recently_visited_rooms: StdRwLock<HashMap<String, Vec<String>>>,
-    user_avatar_url: StdRwLock<HashMap<String, String>>,
+    recently_visited_rooms: StdRwLock<HashMap<OwnedUserId, Vec<OwnedRoomId>>>,
+    composer_drafts: StdRwLock<HashMap<OwnedRoomId, ComposerDraft>>,
+    user_avatar_url: StdRwLock<HashMap<OwnedUserId, OwnedMxcUri>>,
     sync_token: StdRwLock<Option<String>>,
+    server_capabilities: StdRwLock<Option<ServerCapabilities>>,
     filters: StdRwLock<HashMap<String, String>>,
+    utd_hook_manager_data: StdRwLock<Option<GrowableBloom>>,
     account_data: StdRwLock<HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>>,
     profiles: StdRwLock<HashMap<OwnedRoomId, HashMap<OwnedUserId, MinimalRoomMemberEvent>>>,
     display_names: StdRwLock<HashMap<OwnedRoomId, HashMap<String, BTreeSet<OwnedUserId>>>>,
@@ -80,36 +89,9 @@ pub struct MemoryStore {
             HashMap<(String, Option<String>), HashMap<OwnedEventId, HashMap<OwnedUserId, Receipt>>>,
         >,
     >,
-    media: StdRwLock<RingBuffer<(OwnedMxcUri, String /* unique key */, Vec<u8>)>>,
     custom: StdRwLock<HashMap<Vec<u8>, Vec<u8>>>,
-}
-
-// SAFETY: `new_unchecked` is safe because 20 is not zero.
-const NUMBER_OF_MEDIAS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) };
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self {
-            recently_visited_rooms: Default::default(),
-            user_avatar_url: Default::default(),
-            sync_token: Default::default(),
-            filters: Default::default(),
-            account_data: Default::default(),
-            profiles: Default::default(),
-            display_names: Default::default(),
-            members: Default::default(),
-            room_info: Default::default(),
-            room_state: Default::default(),
-            room_account_data: Default::default(),
-            stripped_room_state: Default::default(),
-            stripped_members: Default::default(),
-            presence: Default::default(),
-            room_user_receipts: Default::default(),
-            room_event_receipts: Default::default(),
-            media: StdRwLock::new(RingBuffer::new(NUMBER_OF_MEDIAS)),
-            custom: Default::default(),
-        }
-    }
+    send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<QueuedEvent>>>,
+    dependent_send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<DependentQueuedEvent>>>,
 }
 
 impl MemoryStore {
@@ -165,6 +147,12 @@ impl StateStore for MemoryStore {
             StateStoreDataKey::SyncToken => {
                 self.sync_token.read().unwrap().clone().map(StateStoreDataValue::SyncToken)
             }
+            StateStoreDataKey::ServerCapabilities => self
+                .server_capabilities
+                .read()
+                .unwrap()
+                .clone()
+                .map(StateStoreDataValue::ServerCapabilities),
             StateStoreDataKey::Filter(filter_name) => self
                 .filters
                 .read()
@@ -176,16 +164,29 @@ impl StateStore for MemoryStore {
                 .user_avatar_url
                 .read()
                 .unwrap()
-                .get(user_id.as_str())
+                .get(user_id)
                 .cloned()
                 .map(StateStoreDataValue::UserAvatarUrl),
             StateStoreDataKey::RecentlyVisitedRooms(user_id) => self
                 .recently_visited_rooms
                 .read()
                 .unwrap()
-                .get(user_id.as_str())
+                .get(user_id)
                 .cloned()
                 .map(StateStoreDataValue::RecentlyVisitedRooms),
+            StateStoreDataKey::UtdHookManagerData => self
+                .utd_hook_manager_data
+                .read()
+                .unwrap()
+                .clone()
+                .map(StateStoreDataValue::UtdHookManagerData),
+            StateStoreDataKey::ComposerDraft(room_id) => self
+                .composer_drafts
+                .read()
+                .unwrap()
+                .get(room_id)
+                .cloned()
+                .map(StateStoreDataValue::ComposerDraft),
         })
     }
 
@@ -207,16 +208,36 @@ impl StateStore for MemoryStore {
             }
             StateStoreDataKey::UserAvatarUrl(user_id) => {
                 self.user_avatar_url.write().unwrap().insert(
-                    user_id.to_string(),
+                    user_id.to_owned(),
                     value.into_user_avatar_url().expect("Session data not a user avatar url"),
                 );
             }
             StateStoreDataKey::RecentlyVisitedRooms(user_id) => {
                 self.recently_visited_rooms.write().unwrap().insert(
-                    user_id.to_string(),
+                    user_id.to_owned(),
                     value
                         .into_recently_visited_rooms()
                         .expect("Session data not a list of recently visited rooms"),
+                );
+            }
+            StateStoreDataKey::UtdHookManagerData => {
+                *self.utd_hook_manager_data.write().unwrap() = Some(
+                    value
+                        .into_utd_hook_manager_data()
+                        .expect("Session data not the hook manager data"),
+                );
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                self.composer_drafts.write().unwrap().insert(
+                    room_id.to_owned(),
+                    value.into_composer_draft().expect("Session data not a composer draft"),
+                );
+            }
+            StateStoreDataKey::ServerCapabilities => {
+                *self.server_capabilities.write().unwrap() = Some(
+                    value
+                        .into_server_capabilities()
+                        .expect("Session data not containing server capabilities"),
                 );
             }
         }
@@ -227,26 +248,40 @@ impl StateStore for MemoryStore {
     async fn remove_kv_data(&self, key: StateStoreDataKey<'_>) -> Result<()> {
         match key {
             StateStoreDataKey::SyncToken => *self.sync_token.write().unwrap() = None,
+            StateStoreDataKey::ServerCapabilities => {
+                *self.server_capabilities.write().unwrap() = None
+            }
             StateStoreDataKey::Filter(filter_name) => {
                 self.filters.write().unwrap().remove(filter_name);
             }
             StateStoreDataKey::UserAvatarUrl(user_id) => {
-                self.user_avatar_url.write().unwrap().remove(user_id.as_str());
+                self.user_avatar_url.write().unwrap().remove(user_id);
             }
             StateStoreDataKey::RecentlyVisitedRooms(user_id) => {
-                self.recently_visited_rooms.write().unwrap().remove(user_id.as_str());
+                self.recently_visited_rooms.write().unwrap().remove(user_id);
+            }
+            StateStoreDataKey::UtdHookManagerData => {
+                *self.utd_hook_manager_data.write().unwrap() = None
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                self.composer_drafts.write().unwrap().remove(room_id);
             }
         }
         Ok(())
     }
 
+    #[instrument(skip(self, changes))]
     async fn save_changes(&self, changes: &StateChanges) -> Result<()> {
         let now = Instant::now();
+        // these trace calls are to debug https://github.com/matrix-org/complement-crypto/issues/77
+        trace!("starting");
 
         if let Some(s) = &changes.sync_token {
             *self.sync_token.write().unwrap() = Some(s.to_owned());
+            trace!("assigned sync token");
         }
 
+        trace!("profiles");
         {
             let mut profiles = self.profiles.write().unwrap();
 
@@ -269,6 +304,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("ambiguity maps");
         for (room, map) in &changes.ambiguity_maps {
             for (display_name, display_names) in map {
                 self.display_names
@@ -280,6 +316,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("account data");
         {
             let mut account_data = self.account_data.write().unwrap();
             for (event_type, event) in &changes.account_data {
@@ -287,6 +324,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("room account data");
         {
             let mut room_account_data = self.room_account_data.write().unwrap();
             for (room, events) in &changes.room_account_data {
@@ -299,11 +337,16 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("room state");
         {
             let mut room_state = self.room_state.write().unwrap();
+            trace!("room state: got room_state lock");
             let mut stripped_room_state = self.stripped_room_state.write().unwrap();
+            trace!("room state: got stripped_room_state lock");
             let mut members = self.members.write().unwrap();
+            trace!("room state: got members lock");
             let mut stripped_members = self.stripped_members.write().unwrap();
+            trace!("room state: got stripped_members lock");
 
             for (room, event_types) in &changes.state {
                 for (event_type, events) in event_types {
@@ -339,6 +382,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("room info");
         {
             let mut room_info = self.room_info.write().unwrap();
             for (room_id, info) in &changes.room_infos {
@@ -346,6 +390,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("presence");
         {
             let mut presence = self.presence.write().unwrap();
             for (sender, event) in &changes.presence {
@@ -353,6 +398,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("stripped state");
         {
             let mut stripped_room_state = self.stripped_room_state.write().unwrap();
             let mut stripped_members = self.stripped_members.write().unwrap();
@@ -392,6 +438,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("receipts");
         {
             let mut room_user_receipts = self.room_user_receipts.write().unwrap();
             let mut room_event_receipts = self.room_event_receipts.write().unwrap();
@@ -436,6 +483,7 @@ impl StateStore for MemoryStore {
             }
         }
 
+        trace!("room info/state");
         {
             let room_info = self.room_info.read().unwrap();
             let mut room_state = self.room_state.write().unwrap();
@@ -519,21 +567,18 @@ impl StateStore for MemoryStore {
             Some(state_events.values().cloned().map(to_enum).collect())
         }
 
-        Ok(get_events(
-            &self.stripped_room_state.read().unwrap(),
-            room_id,
-            &event_type,
-            RawAnySyncOrStrippedState::Stripped,
-        )
-        .or_else(|| {
-            get_events(
-                &self.room_state.read().unwrap(),
-                room_id,
-                &event_type,
-                RawAnySyncOrStrippedState::Sync,
-            )
-        })
-        .unwrap_or_default())
+        let state_map = self.stripped_room_state.read().unwrap();
+        Ok(get_events(&state_map, room_id, &event_type, RawAnySyncOrStrippedState::Stripped)
+            .or_else(|| {
+                drop(state_map); // release the lock on stripped_room_state
+                get_events(
+                    &self.room_state.read().unwrap(),
+                    room_id,
+                    &event_type,
+                    RawAnySyncOrStrippedState::Sync,
+                )
+            })
+            .unwrap_or_default())
     }
 
     async fn get_state_events_for_keys(
@@ -613,6 +658,7 @@ impl StateStore for MemoryStore {
             .collect())
     }
 
+    #[instrument(skip(self, memberships))]
     async fn get_user_ids(
         &self,
         room_id: &RoomId,
@@ -641,11 +687,12 @@ impl StateStore for MemoryStore {
                 })
                 .unwrap_or_default()
         }
-
-        let v = get_user_ids_inner(&self.stripped_members.read().unwrap(), room_id, memberships);
+        let state_map = self.stripped_members.read().unwrap();
+        let v = get_user_ids_inner(&state_map, room_id, memberships);
         if !v.is_empty() {
             return Ok(v);
         }
+        drop(state_map); // release the stripped_members lock
         Ok(get_user_ids_inner(&self.members.read().unwrap(), room_id, memberships))
     }
 
@@ -761,58 +808,6 @@ impl StateStore for MemoryStore {
         Ok(self.custom.write().unwrap().remove(key))
     }
 
-    async fn add_media_content(&self, request: &MediaRequest, data: Vec<u8>) -> Result<()> {
-        // Avoid duplication. Let's try to remove it first.
-        self.remove_media_content(request).await?;
-        // Now, let's add it.
-        self.media.write().unwrap().push((request.uri().to_owned(), request.unique_key(), data));
-
-        Ok(())
-    }
-
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
-        let media = self.media.read().unwrap();
-        let expected_key = request.unique_key();
-
-        Ok(media.iter().find_map(|(_media_uri, media_key, media_content)| {
-            (media_key == &expected_key).then(|| media_content.to_owned())
-        }))
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        let mut media = self.media.write().unwrap();
-        let expected_key = request.unique_key();
-        let Some(index) = media
-            .iter()
-            .position(|(_media_uri, media_key, _media_content)| media_key == &expected_key)
-        else {
-            return Ok(());
-        };
-
-        media.remove(index);
-
-        Ok(())
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<()> {
-        let mut media = self.media.write().unwrap();
-        let expected_key = uri.to_owned();
-        let positions = media
-            .iter()
-            .enumerate()
-            .filter_map(|(position, (media_uri, _media_key, _media_content))| {
-                (media_uri == &expected_key).then_some(position)
-            })
-            .collect::<Vec<_>>();
-
-        // Iterate in reverse-order so that positions stay valid after first removals.
-        for position in positions.into_iter().rev() {
-            media.remove(position);
-        }
-
-        Ok(())
-    }
-
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
         self.profiles.write().unwrap().remove(room_id);
         self.display_names.write().unwrap().remove(room_id);
@@ -827,6 +822,158 @@ impl StateStore for MemoryStore {
 
         Ok(())
     }
+
+    async fn save_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        event: SerializableEventContent,
+    ) -> Result<(), Self::Error> {
+        self.send_queue_events
+            .write()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .push(QueuedEvent { event, transaction_id, is_wedged: false });
+        Ok(())
+    }
+
+    async fn update_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: SerializableEventContent,
+    ) -> Result<bool, Self::Error> {
+        if let Some(entry) = self
+            .send_queue_events
+            .write()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .iter_mut()
+            .find(|item| item.transaction_id == transaction_id)
+        {
+            entry.event = content;
+            entry.is_wedged = false;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn remove_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        let mut q = self.send_queue_events.write().unwrap();
+
+        let entry = q.get_mut(room_id);
+        if let Some(entry) = entry {
+            // Find the event by id in its room queue, and remove it if present.
+            if let Some(pos) = entry.iter().position(|item| item.transaction_id == transaction_id) {
+                entry.remove(pos);
+                // And if this was the last event before removal, remove the entire room entry.
+                if entry.is_empty() {
+                    q.remove(room_id);
+                }
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn load_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedEvent>, Self::Error> {
+        Ok(self.send_queue_events.write().unwrap().entry(room_id.to_owned()).or_default().clone())
+    }
+
+    async fn update_send_queue_event_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        wedged: bool,
+    ) -> Result<(), Self::Error> {
+        if let Some(entry) = self
+            .send_queue_events
+            .write()
+            .unwrap()
+            .entry(room_id.to_owned())
+            .or_default()
+            .iter_mut()
+            .find(|item| item.transaction_id == transaction_id)
+        {
+            entry.is_wedged = wedged;
+        }
+        Ok(())
+    }
+
+    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        Ok(self.send_queue_events.read().unwrap().keys().cloned().collect())
+    }
+
+    async fn save_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        parent_transaction_id: &TransactionId,
+        own_transaction_id: ChildTransactionId,
+        content: DependentQueuedEventKind,
+    ) -> Result<(), Self::Error> {
+        self.dependent_send_queue_events.write().unwrap().entry(room.to_owned()).or_default().push(
+            DependentQueuedEvent {
+                kind: content,
+                parent_transaction_id: parent_transaction_id.to_owned(),
+                own_transaction_id,
+                event_id: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn update_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        parent_txn_id: &TransactionId,
+        event_id: OwnedEventId,
+    ) -> Result<usize, Self::Error> {
+        let mut dependent_send_queue_events = self.dependent_send_queue_events.write().unwrap();
+        let dependents = dependent_send_queue_events.entry(room.to_owned()).or_default();
+        let mut num_updated = 0;
+        for d in dependents.iter_mut().filter(|item| item.parent_transaction_id == parent_txn_id) {
+            d.event_id = Some(event_id.clone());
+            num_updated += 1;
+        }
+        Ok(num_updated)
+    }
+
+    async fn remove_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error> {
+        let mut dependent_send_queue_events = self.dependent_send_queue_events.write().unwrap();
+        let dependents = dependent_send_queue_events.entry(room.to_owned()).or_default();
+        if let Some(pos) = dependents.iter().position(|item| item.own_transaction_id == *txn_id) {
+            dependents.remove(pos);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all the dependent send queue events.
+    ///
+    /// This returns absolutely all the dependent send queue events, whether
+    /// they have an event id or not.
+    async fn list_dependent_send_queue_events(
+        &self,
+        room: &RoomId,
+    ) -> Result<Vec<DependentQueuedEvent>, Self::Error> {
+        Ok(self.dependent_send_queue_events.read().unwrap().get(room).cloned().unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -837,5 +984,5 @@ mod tests {
         Ok(MemoryStore::new())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    statestore_integration_tests!();
 }

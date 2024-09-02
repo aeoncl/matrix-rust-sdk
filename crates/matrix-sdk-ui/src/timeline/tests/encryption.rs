@@ -23,7 +23,10 @@ use std::{
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk::crypto::{decrypt_room_key_export, types::events::UtdCause, OlmMachine};
+use matrix_sdk::{
+    crypto::{decrypt_room_key_export, types::events::UtdCause, OlmMachine},
+    test_utils::test_client_builder,
+};
 use matrix_sdk_test::{async_test, BOB};
 use ruma::{
     assign,
@@ -76,15 +79,16 @@ async fn test_retry_message_decryption() {
     }
 
     let hook = Arc::new(DummyUtdHook::default());
-    let utd_hook = Arc::new(UtdHookManager::new(hook.clone()));
+    let client = test_client_builder(None).build().await.unwrap();
+    let utd_hook = Arc::new(UtdHookManager::new(hook.clone(), client));
 
     let timeline = TestTimeline::with_unable_to_decrypt_hook(utd_hook.clone());
     let mut stream = timeline.subscribe().await;
 
+    let f = &timeline.factory;
     timeline
-        .handle_live_message_event(
-            &BOB,
-            RoomEncryptedEventContent::new(
+        .handle_live_event(
+            f.event(RoomEncryptedEventContent::new(
                 EncryptedEventScheme::MegolmV1AesSha2(
                     MegolmV1AesSha2ContentInit {
                         ciphertext: "\
@@ -102,11 +106,12 @@ async fn test_retry_message_decryption() {
                     .into(),
                 ),
                 None,
-            ),
+            ))
+            .sender(&BOB),
         )
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 2);
+    assert_eq!(timeline.controller.items().await.len(), 2);
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event = item.as_event().unwrap();
@@ -136,7 +141,7 @@ async fn test_retry_message_decryption() {
     olm_machine.store().import_exported_room_keys(exported_keys, |_, _| {}).await.unwrap();
 
     timeline
-        .inner
+        .controller
         .retry_event_decryption_test(
             room_id!("!DovneieKSTkdHKpIXy:morpheus.localhost"),
             olm_machine,
@@ -144,7 +149,7 @@ async fn test_retry_message_decryption() {
         )
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 2);
+    assert_eq!(timeline.controller.items().await.len(), 2);
 
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
     let event = item.as_event().unwrap();
@@ -153,17 +158,14 @@ async fn test_retry_message_decryption() {
     assert_eq!(message.body(), "It's a secret to everybody");
     assert!(!event.is_highlighted());
 
+    // The message should not be re-reported as a late decryption.
     {
         let utds = hook.utds.lock().unwrap();
-        assert_eq!(utds.len(), 2);
+        assert_eq!(utds.len(), 1);
 
         // The previous UTD report is still there.
         assert_eq!(utds[0].event_id, event.event_id().unwrap());
         assert!(utds[0].time_to_decrypt.is_none());
-
-        // The UTD is now *also* reported as a late-decryption event.
-        assert_eq!(utds[1].event_id, event.event_id().unwrap());
-        assert!(utds[1].time_to_decrypt.is_some());
     }
 }
 
@@ -198,6 +200,7 @@ async fn test_retry_edit_decryption() {
         -----END MEGOLM SESSION DATA-----";
 
     let timeline = TestTimeline::new();
+    let f = &timeline.factory;
 
     let encrypted = EncryptedEventScheme::MegolmV1AesSha2(
         MegolmV1AesSha2ContentInit {
@@ -213,10 +216,12 @@ async fn test_retry_edit_decryption() {
         }
         .into(),
     );
-    timeline.handle_live_message_event(&BOB, RoomEncryptedEventContent::new(encrypted, None)).await;
+    timeline
+        .handle_live_event(f.event(RoomEncryptedEventContent::new(encrypted, None)).sender(&BOB))
+        .await;
 
     let event_id =
-        timeline.inner.items().await[1].as_event().unwrap().event_id().unwrap().to_owned();
+        timeline.controller.items().await[1].as_event().unwrap().event_id().unwrap().to_owned();
 
     let encrypted = EncryptedEventScheme::MegolmV1AesSha2(
         MegolmV1AesSha2ContentInit {
@@ -235,15 +240,15 @@ async fn test_retry_edit_decryption() {
         .into(),
     );
     timeline
-        .handle_live_message_event(
-            &BOB,
-            assign!(RoomEncryptedEventContent::new(encrypted, None), {
+        .handle_live_event(
+            f.event(assign!(RoomEncryptedEventContent::new(encrypted, None), {
                 relates_to: Some(Relation::Replacement(Replacement::new(event_id))),
-            }),
+            }))
+            .sender(&BOB),
         )
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
     assert_eq!(items.len(), 3);
 
     let mut keys = decrypt_room_key_export(Cursor::new(SESSION1_KEY), "1234").unwrap();
@@ -254,7 +259,7 @@ async fn test_retry_edit_decryption() {
     olm_machine.store().import_exported_room_keys(keys, |_, _| {}).await.unwrap();
 
     timeline
-        .inner
+        .controller
         .retry_event_decryption_test(
             room_id!("!bdsREiCPHyZAPkpXer:morpheus.localhost"),
             olm_machine,
@@ -262,7 +267,7 @@ async fn test_retry_edit_decryption() {
         )
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
     assert_eq!(items.len(), 2);
 
     let item = items[1].as_event().unwrap();
@@ -308,21 +313,22 @@ async fn test_retry_edit_and_more() {
     }
 
     let timeline = TestTimeline::new();
+    let f = &timeline.factory;
 
     timeline
-        .handle_live_message_event(
-            &BOB,
-            encrypted_message(
+        .handle_live_event(
+            f.event(encrypted_message(
                 "AwgDEoABQsTrPTYDh22PTmfODR9EucX3qLl3buDcahHPjKJA8QIM+wW0s+e08Zi7/JbLdnZL1VL\
                  jO47HcRhxDTyHZPXPg8wd1l0Qb3irjnCnS7LFAc98+ko18CFJUGNeRZZwzGiorKK5VLMv0WQZI8\
                  mBZdKIaqDTUBFvcvbn2gQaWtUipQdJQRKyv2h0AWveVkv75lp5hRb7jolCi08oMX8cM+V3Zzyi7\
                  mlPAzZjDz0PaRbQwfbMTTHkcL7TZybBi4vLX4f5ZR2Iiysc7gw",
-            ),
+            ))
+            .sender(&BOB),
         )
         .await;
 
     let event_id =
-        timeline.inner.items().await[1].as_event().unwrap().event_id().unwrap().to_owned();
+        timeline.controller.items().await[1].as_event().unwrap().event_id().unwrap().to_owned();
 
     let msg2 = encrypted_message(
         "AwgEErABt7svMEHDYJTjCQEHypR21l34f9IZLNyFaAbI+EiCIN7C8X5iKmkzuYSmGUodyGKbFRYrW9l5dLj\
@@ -332,32 +338,31 @@ async fn test_retry_edit_and_more() {
          4uEzsQ0",
     );
     timeline
-        .handle_live_message_event(
-            &BOB,
-            assign!(msg2, { relates_to: Some(Relation::Replacement(Replacement::new(event_id))) }),
+        .handle_live_event(
+            f.event(assign!(msg2, { relates_to: Some(Relation::Replacement(Replacement::new(event_id))) })).sender(&BOB),
         )
         .await;
 
     timeline
-        .handle_live_message_event(
-            &BOB,
-            encrypted_message(
+        .handle_live_event(
+            f.event(encrypted_message(
                 "AwgFEoABUAwzBLYStHEa1RaZtojePQ6sue9terXNMFufeLKci/UcpOpZC9o3lDxp9rxlNjk4Ii+\
                  fkOeSClib/qxt+wLszeQZVa04bRr6byK1dOhlptvAPjUCcEsaHyMMR1AnjT2vmFlJRGviwN6cvQ\
                  2r/fEvAW/9QB+N6fX4g9729bt5ftXRqa5QI7NA351RNUveRHxVvx+2x0WJArQjYGRk7tMS2rUto\
                  IYt2ZY17nE1UJjN7M87STnCF9c9qy4aGNqIpeVIht6XbtgD7gQ",
-            ),
+            ))
+            .sender(&BOB),
         )
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 4);
+    assert_eq!(timeline.controller.items().await.len(), 4);
 
     let olm_machine = OlmMachine::new(user_id!("@jptest:matrix.org"), DEVICE_ID.into()).await;
     let keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "testing").unwrap();
     olm_machine.store().import_exported_room_keys(keys, |_, _| {}).await.unwrap();
 
     timeline
-        .inner
+        .controller
         .retry_event_decryption_test(
             room_id!("!wFnAUSQbxMcfIMgvNX:flipdot.org"),
             olm_machine,
@@ -365,7 +370,7 @@ async fn test_retry_edit_and_more() {
         )
         .await;
 
-    let timeline_items = timeline.inner.items().await;
+    let timeline_items = timeline.controller.items().await;
     assert_eq!(timeline_items.len(), 3);
     assert!(timeline_items[0].is_day_divider());
     assert_eq!(
@@ -396,12 +401,12 @@ async fn test_retry_message_decryption_highlighted() {
         -----END MEGOLM SESSION DATA-----";
 
     let timeline = TestTimeline::new();
+    let f = &timeline.factory;
     let mut stream = timeline.subscribe().await;
 
     timeline
-        .handle_live_message_event(
-            &BOB,
-            RoomEncryptedEventContent::new(
+        .handle_live_event(
+            f.event(RoomEncryptedEventContent::new(
                 EncryptedEventScheme::MegolmV1AesSha2(
                     MegolmV1AesSha2ContentInit {
                         ciphertext: "\
@@ -418,11 +423,12 @@ async fn test_retry_message_decryption_highlighted() {
                     .into(),
                 ),
                 None,
-            ),
+            ))
+            .sender(&BOB),
         )
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 2);
+    assert_eq!(timeline.controller.items().await.len(), 2);
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event = item.as_event().unwrap();
@@ -444,7 +450,7 @@ async fn test_retry_message_decryption_highlighted() {
     olm_machine.store().import_exported_room_keys(exported_keys, |_, _| {}).await.unwrap();
 
     timeline
-        .inner
+        .controller
         .retry_event_decryption_test(
             room_id!("!rYtFvMGENJleNQVJzb:matrix.org"),
             olm_machine,
@@ -452,7 +458,7 @@ async fn test_retry_message_decryption_highlighted() {
         )
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 2);
+    assert_eq!(timeline.controller.items().await.len(), 2);
 
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
     let event = item.as_event().unwrap();

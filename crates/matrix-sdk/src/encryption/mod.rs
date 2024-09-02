@@ -36,14 +36,16 @@ use matrix_sdk_base::crypto::{
 use matrix_sdk_common::executor::spawn;
 use ruma::{
     api::client::{
+        error::{ErrorBody, ErrorKind},
         keys::{
-            get_keys, upload_keys, upload_signing_keys::v3::Request as UploadSigningKeysRequest,
+            get_keys, upload_keys, upload_signatures::v3::Request as UploadSignaturesRequest,
+            upload_signing_keys::v3::Request as UploadSigningKeysRequest,
         },
         message::send_message_event,
         to_device::send_event_to_device::v3::{
             Request as RumaToDeviceRequest, Response as ToDeviceResponse,
         },
-        uiaa::AuthData,
+        uiaa::{AuthData, UiaaInfo},
     },
     assign,
     events::room::{
@@ -55,27 +57,26 @@ use ruma::{
     },
     DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
-use tokio::sync::RwLockReadGuard;
+use tokio::sync::{Mutex, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn};
+use url::Url;
+use vodozemac::Curve25519PublicKey;
 
 use self::{
     backups::{types::BackupClientState, Backups},
     futures::PrepareEncryptedFile,
-    identities::{DeviceUpdates, IdentityUpdates},
+    identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
     secret_storage::SecretStorage,
     tasks::{BackupDownloadTask, BackupUploadingTask, ClientTasks},
+    verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
     attachment::{AttachmentConfig, Thumbnail},
-    client::ClientInner,
-    encryption::{
-        identities::{Device, UserDevices},
-        verification::{SasVerification, Verification, VerificationRequest},
-    },
+    client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
-    Client, Error, Result, Room, TransmissionProgress,
+    Client, Error, HttpError, Result, Room, TransmissionProgress,
 };
 
 pub mod backups;
@@ -126,7 +127,7 @@ impl EncryptionData {
     }
 
     pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
-        let weak_client = Arc::downgrade(client);
+        let weak_client = WeakClient::from_inner(client);
 
         let mut tasks = self.tasks.lock().unwrap();
         tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
@@ -136,6 +137,20 @@ impl EncryptionData {
         {
             tasks.download_room_keys = Some(BackupDownloadTask::new(weak_client));
         }
+    }
+
+    /// Initialize the background task which listens for changes in the
+    /// [`backups::BackupState`] and updataes the [`recovery::RecoveryState`].
+    ///
+    /// This should happen after the usual tasks have been set up and after the
+    /// E2EE initialization tasks have been set up.
+    pub fn initialize_recovery_state_update_task(&self, client: &Client) {
+        let mut guard = self.tasks.lock().unwrap();
+
+        let future = Recovery::update_state_after_backup_state_change(client);
+        let join_handle = spawn(future);
+
+        guard.update_recovery_state_after_backup = Some(join_handle);
     }
 }
 
@@ -212,6 +227,147 @@ impl CrossProcessLockStoreGuardWithGeneration {
     /// Return the Crypto Store generation associated with this store lock.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+}
+
+/// A stateful struct remembering the cross-signing keys we need to upload.
+///
+/// Since the `/_matrix/client/v3/keys/device_signing/upload` might require
+/// additional authentication, this struct will contain information on the type
+/// of authentication the user needs to complete before the upload might be
+/// continued.
+///
+/// More info can be found in the [spec].
+///
+/// [spec]: https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3keysdevice_signingupload
+#[derive(Debug)]
+pub struct CrossSigningResetHandle {
+    client: Client,
+    upload_request: UploadSigningKeysRequest,
+    signatures_request: UploadSignaturesRequest,
+    auth_type: CrossSigningResetAuthType,
+    is_cancelled: Mutex<bool>,
+}
+
+impl CrossSigningResetHandle {
+    /// Set up a new `CrossSigningResetHandle`.
+    pub fn new(
+        client: Client,
+        upload_request: UploadSigningKeysRequest,
+        signatures_request: UploadSignaturesRequest,
+        auth_type: CrossSigningResetAuthType,
+    ) -> Self {
+        Self {
+            client,
+            upload_request,
+            signatures_request,
+            auth_type,
+            is_cancelled: Mutex::new(false),
+        }
+    }
+
+    /// Get the [`CrossSigningResetAuthType`] this cross-signing reset process
+    /// is using.
+    pub fn auth_type(&self) -> &CrossSigningResetAuthType {
+        &self.auth_type
+    }
+
+    /// Continue the cross-signing reset by either waiting for the
+    /// authentication to be done on the side of the OIDC issuer or by
+    /// providing additional [`AuthData`] the homeserver requires.
+    pub async fn auth(&self, auth: Option<AuthData>) -> Result<()> {
+        let mut upload_request = self.upload_request.clone();
+        upload_request.auth = auth;
+
+        // TODO: Do we want to put a limit on this infinite loop? 🤷
+        while let Err(e) = self.client.send(upload_request.clone(), None).await {
+            if *self.is_cancelled.lock().await {
+                return Ok(());
+            }
+
+            if e.client_api_error_kind() != Some(&ErrorKind::Unrecognized) {
+                return Err(e.into());
+            }
+        }
+
+        self.client.send(self.signatures_request.clone(), None).await?;
+
+        Ok(())
+    }
+
+    /// Cancel the ongoing identity reset process
+    pub async fn cancel(&self) {
+        *self.is_cancelled.lock().await = true;
+    }
+}
+
+/// information about the additional authentication that is required before the
+/// cross-signing keys can be uploaded.
+#[derive(Debug, Clone)]
+pub enum CrossSigningResetAuthType {
+    /// The homeserver requires user-interactive authentication.
+    Uiaa(UiaaInfo),
+    /// OIDC is used for authentication and the user needs to open a URL to
+    /// approve the upload of cross-signing keys.
+    Oidc(OidcCrossSigningResetInfo),
+}
+
+impl CrossSigningResetAuthType {
+    async fn new(client: &Client, error: &HttpError) -> Result<Option<Self>> {
+        if let Some(auth_info) = error.as_uiaa_response() {
+            Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
+        } else if let Some(ErrorBody::Standard { kind, message }) =
+            error.as_client_api_error().map(|e| &e.body)
+        {
+            OidcCrossSigningResetInfo::from_matrix_error(client, kind, message)
+                .await
+                .map(|t| t.map(CrossSigningResetAuthType::Oidc))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// OIDC specific information about the required authentication for the upload
+/// of cross-signing keys.
+#[derive(Debug, Clone)]
+pub struct OidcCrossSigningResetInfo {
+    /// The error message we received from the homeserver after we attempted to
+    /// reset the cross-signing keys.
+    pub error: String,
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    pub approval_url: Url,
+}
+
+impl OidcCrossSigningResetInfo {
+    #[allow(clippy::unused_async)]
+    async fn from_matrix_error(
+        // This is used if the OIDC feature is enabled.
+        #[allow(unused_variables)] client: &Client,
+        kind: &ErrorKind,
+        message: &str,
+    ) -> Result<Option<Self>> {
+        #[cfg(feature = "experimental-oidc")]
+        use mas_oidc_client::requests::account_management::AccountManagementActionFull;
+
+        if kind == &ErrorKind::Unrecognized {
+            #[cfg(feature = "experimental-oidc")]
+            let approval_url = client
+                .oidc()
+                .account_management_url(Some(AccountManagementActionFull::CrossSigningReset))
+                .await?;
+
+            #[cfg(not(feature = "experimental-oidc"))]
+            let approval_url = None;
+
+            if let Some(approval_url) = approval_url {
+                Ok(Some(OidcCrossSigningResetInfo { error: message.to_owned(), approval_url }))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -335,7 +491,7 @@ impl Client {
                     thumbnail_source,
                     thumbnail_info
                 });
-                let content = assign!(ImageMessageEventContent::encrypted(body.to_owned(), file), {
+                let content = assign!(ImageMessageEventContent::encrypted(body, file), {
                     info: Some(Box::new(info)),
                     formatted: config.formatted_caption,
                     filename
@@ -343,8 +499,7 @@ impl Client {
                 MessageType::Image(content)
             }
             mime::AUDIO => {
-                let audio_message_event_content =
-                    AudioMessageEventContent::encrypted(body.to_owned(), file);
+                let audio_message_event_content = AudioMessageEventContent::encrypted(body, file);
                 MessageType::Audio(crate::media::update_audio_message_event(
                     audio_message_event_content,
                     content_type,
@@ -357,7 +512,7 @@ impl Client {
                     thumbnail_source,
                     thumbnail_info
                 });
-                let content = assign!(VideoMessageEventContent::encrypted(body.to_owned(), file), {
+                let content = assign!(VideoMessageEventContent::encrypted(body, file), {
                     info: Some(Box::new(info)),
                     formatted: config.formatted_caption,
                     filename
@@ -370,7 +525,7 @@ impl Client {
                     thumbnail_source,
                     thumbnail_info
                 });
-                let content = assign!(FileMessageEventContent::encrypted(body.to_owned(), file), {
+                let content = assign!(FileMessageEventContent::encrypted(body, file), {
                     info: Some(Box::new(info))
                 });
                 MessageType::File(content)
@@ -613,10 +768,21 @@ impl Encryption {
         self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().ed25519.to_base64())
     }
 
-    /// Get the public curve25519 key of our own device in base64. This is
-    /// usually what is called the identity key of the device.
-    pub async fn curve25519_key(&self) -> Option<String> {
-        self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519.to_base64())
+    /// Get the public Curve25519 key of our own device.
+    pub async fn curve25519_key(&self) -> Option<Curve25519PublicKey> {
+        self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519)
+    }
+
+    #[cfg(feature = "experimental-oidc")]
+    pub(crate) async fn import_secrets_bundle(
+        &self,
+        bundle: &matrix_sdk_base::crypto::types::SecretsBundle,
+    ) -> Result<(), SecretImportError> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine =
+            olm_machine.as_ref().expect("This should only be called once we have an OlmMachine");
+
+        olm_machine.store().import_secrets_bundle(bundle).await
     }
 
     /// Get the status of the private cross signing keys.
@@ -793,7 +959,13 @@ impl Encryption {
         Ok(UserDevices { inner: devices, client: self.client.clone() })
     }
 
-    /// Get a E2EE identity of an user.
+    /// Get the E2EE identity of a user from the crypto store.
+    ///
+    /// Usually, we only have the E2EE identity of a user locally if the user
+    /// is tracked, meaning that we are both members of the same encrypted room.
+    ///
+    /// To get the E2EE identity of a user even if it is not available locally
+    /// use [`Encryption::request_user_identity()`].
     ///
     /// # Arguments
     ///
@@ -825,13 +997,59 @@ impl Encryption {
     pub async fn get_user_identity(
         &self,
         user_id: &UserId,
-    ) -> Result<Option<identities::UserIdentity>, CryptoStoreError> {
-        use crate::encryption::identities::UserIdentity;
-
+    ) -> Result<Option<UserIdentity>, CryptoStoreError> {
         let olm = self.client.olm_machine().await;
         let Some(olm) = olm.as_ref() else { return Ok(None) };
         let identity = olm.get_identity(user_id, None).await?;
 
+        Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
+    }
+
+    /// Get the E2EE identity of a user from the homeserver.
+    ///
+    /// The E2EE identity returned is always guaranteed to be up-to-date. If the
+    /// E2EE identity is not found, it should mean that the user did not set
+    /// up cross-signing.
+    ///
+    /// If you want the E2EE identity of a user without making a request to the
+    /// homeserver, use [`Encryption::get_user_identity()`] instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user that the identity belongs to.
+    ///
+    /// Returns a [`UserIdentity`] if one is found. Returns an error if there
+    /// was an issue with the crypto store or with the request to the
+    /// homeserver.
+    ///
+    /// This will always return `None` if the client hasn't been logged in.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{Client, ruma::user_id};
+    /// # use url::Url;
+    /// # async {
+    /// # let alice = user_id!("@alice:example.org");
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// let user = client.encryption().request_user_identity(alice).await?;
+    ///
+    /// if let Some(user) = user {
+    ///     println!("User is verified: {:?}", user.is_verified());
+    ///
+    ///     let verification = user.request_verification().await?;
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn request_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentity>> {
+        let olm = self.client.olm_machine().await;
+        let Some(olm) = olm.as_ref() else { return Ok(None) };
+
+        let (request_id, request) = olm.query_keys_for_users(iter::once(user_id));
+        self.client.keys_query(&request_id, request.device_keys).await?;
+
+        let identity = olm.get_identity(user_id, None).await?;
         Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
     }
 
@@ -919,10 +1137,10 @@ impl Encryption {
     /// # Arguments
     ///
     /// * `auth_data` - This request requires user interactive auth, the first
-    /// request needs to set this to `None` and will always fail with an
-    /// `UiaaResponse`. The response will contain information for the
-    /// interactive auth and the same request needs to be made but this time
-    /// with some `auth_data` provided.
+    ///   request needs to set this to `None` and will always fail with an
+    ///   `UiaaResponse`. The response will contain information for the
+    ///   interactive auth and the same request needs to be made but this time
+    ///   with some `auth_data` provided.
     ///
     /// # Examples
     ///
@@ -978,6 +1196,83 @@ impl Encryption {
         Ok(())
     }
 
+    /// Reset the cross-signing keys.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{ruma::api::client::uiaa, Client, encryption::CrossSigningResetAuthType};
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// # let user_id = unimplemented!();
+    /// let encryption = client.encryption();
+    ///       
+    /// if let Some(handle) = encryption.reset_cross_signing().await? {
+    ///     match handle.auth_type() {
+    ///         CrossSigningResetAuthType::Uiaa(uiaa) => {
+    ///             use matrix_sdk::ruma::api::client::uiaa;
+    ///
+    ///             let password = "1234".to_owned();
+    ///             let mut password = uiaa::Password::new(user_id, password);
+    ///             password.session = uiaa.session;
+    ///
+    ///             handle.auth(Some(uiaa::AuthData::Password(password))).await?;
+    ///         }
+    ///         CrossSigningResetAuthType::Oidc(o) => {
+    ///             println!(
+    ///                 "To reset your end-to-end encryption cross-signing identity, \
+    ///                 you first need to approve it at {}",
+    ///                 o.approval_url
+    ///             );
+    ///             handle.auth(None).await?;
+    ///         }
+    ///     }
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn reset_cross_signing(&self) -> Result<Option<CrossSigningResetHandle>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        let CrossSigningBootstrapRequests {
+            upload_keys_req,
+            upload_signing_keys_req,
+            upload_signatures_req,
+        } = olm.bootstrap_cross_signing(true).await?;
+
+        let upload_signing_keys_req = assign!(UploadSigningKeysRequest::new(), {
+            auth: None,
+            master_key: upload_signing_keys_req.master_key.map(|c| c.to_raw()),
+            self_signing_key: upload_signing_keys_req.self_signing_key.map(|c| c.to_raw()),
+            user_signing_key: upload_signing_keys_req.user_signing_key.map(|c| c.to_raw()),
+        });
+
+        if let Some(req) = upload_keys_req {
+            self.client.send_outgoing_request(req).await?;
+        }
+
+        if let Err(error) = self.client.send(upload_signing_keys_req.clone(), None).await {
+            if let Some(auth_type) = CrossSigningResetAuthType::new(&self.client, &error).await? {
+                let client = self.client.clone();
+
+                Ok(Some(CrossSigningResetHandle::new(
+                    client,
+                    upload_signing_keys_req,
+                    upload_signatures_req,
+                    auth_type,
+                )))
+            } else {
+                Err(error.into())
+            }
+        } else {
+            self.client.send(upload_signatures_req, None).await?;
+
+            Ok(None)
+        }
+    }
+
     /// Query the user's own device keys, if, and only if, we didn't have their
     /// identity in the first place.
     async fn ensure_initial_key_query(&self) -> Result<()> {
@@ -1006,10 +1301,10 @@ impl Encryption {
     /// # Arguments
     ///
     /// * `auth_data` - This request requires user interactive auth, the first
-    /// request needs to set this to `None` and will always fail with an
-    /// `UiaaResponse`. The response will contain information for the
-    /// interactive auth and the same request needs to be made but this time
-    /// with some `auth_data` provided.
+    ///   request needs to set this to `None` and will always fail with an
+    ///   `UiaaResponse`. The response will contain information for the
+    ///   interactive auth and the same request needs to be made but this time
+    ///   with some `auth_data` provided.
     ///
     /// # Examples
     /// ```no_run
@@ -1065,13 +1360,12 @@ impl Encryption {
     /// * `path` - The file path where the exported key file will be saved.
     ///
     /// * `passphrase` - The passphrase that will be used to encrypt the
-    ///   exported
-    /// room keys.
+    ///   exported room keys.
     ///
     /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSessoin` will be included in the export,
-    /// if the closure returns `false` it will not be included.
+    ///   `InboundGroupSession`, which represents a room key. If the closure
+    ///   returns `true` the `InboundGroupSessoin` will be included in the
+    ///   export, if the closure returns `false` it will not be included.
     ///
     /// # Panics
     ///
@@ -1141,7 +1435,7 @@ impl Encryption {
     /// * `path` - The file path where the exported key file will can be found.
     ///
     /// * `passphrase` - The passphrase that should be used to decrypt the
-    /// exported room keys.
+    ///   exported room keys.
     ///
     /// Returns a tuple of numbers that represent the number of sessions that
     /// were imported and the total number of sessions that were found in the
@@ -1275,7 +1569,7 @@ impl Encryption {
                 // (get rid of the reference to the current crypto store first)
                 drop(olm_machine_guard);
                 // Recreate the OlmMachine.
-                self.client.base_client().regenerate_olm().await?;
+                self.client.base_client().regenerate_olm(None).await?;
             }
             Ok(generation_number)
         } else {
@@ -1355,13 +1649,13 @@ impl Encryption {
     /// # Arguments
     ///
     /// * `auth_data` - Some requests may require re-authentication. To prevent
-    /// the user from having to re-enter their password (or use other methods),
-    /// we can provide the authentication data here. This is necessary for
-    /// uploading cross-signing keys. However, please note that there is a
-    /// proposal (MSC3967) to remove this requirement, which would allow for
-    /// the initial upload of cross-signing keys without authentication,
-    /// rendering this parameter obsolete.
-    pub(crate) async fn run_initialization_tasks(&self, auth_data: Option<AuthData>) -> Result<()> {
+    ///   the user from having to re-enter their password (or use other
+    ///   methods), we can provide the authentication data here. This is
+    ///   necessary for uploading cross-signing keys. However, please note that
+    ///   there is a proposal (MSC3967) to remove this requirement, which would
+    ///   allow for the initial upload of cross-signing keys without
+    ///   authentication, rendering this parameter obsolete.
+    pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
         let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
 
         let this = self.clone();
@@ -1381,8 +1675,6 @@ impl Encryption {
 
             this.update_verification_state().await;
         }));
-
-        Ok(())
     }
 
     /// Waits for end-to-end encryption initialization tasks to finish, if any
@@ -1395,6 +1687,30 @@ impl Encryption {
                 warn!("Error when initializing backups: {err}");
             }
         }
+    }
+
+    /// Upload the device keys and initial set of one-tim keys to the server.
+    ///
+    /// This should only be called when the user logs in for the first time,
+    /// the method will ensure that other devices see our own device as an
+    /// end-to-end encryption enabled one.
+    ///
+    /// **Warning**: Do not use this method if we're already calling
+    /// [`Client::send_outgoing_request()`]. This method is intended for
+    /// explicitly uploading the device keys before starting a sync.
+    #[cfg(feature = "experimental-oidc")]
+    pub(crate) async fn ensure_device_keys_upload(&self) -> Result<()> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        if let Some((request_id, request)) = olm.upload_device_keys().await? {
+            self.client.keys_upload(&request_id, &request).await?;
+
+            let (request_id, request) = olm.query_keys_for_users([olm.user_id()]);
+            self.client.keys_query(&request_id, request.device_keys).await?;
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {

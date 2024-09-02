@@ -25,15 +25,14 @@ use bytesize::ByteSize;
 use eyeball::SharedObservable;
 use http::header::CONTENT_LENGTH;
 use reqwest::Certificate;
-use ruma::api::{
-    client::error::{ErrorBody as ClientApiErrorBody, ErrorKind as ClientApiErrorKind, RetryAfter},
-    error::FromHttpResponseError,
-    IncomingResponse, OutgoingRequest,
-};
-use tracing::{info, warn};
+use ruma::api::{error::FromHttpResponseError, IncomingResponse, OutgoingRequest};
+use tracing::{debug, info, warn};
 
 use super::{response_to_http_response, HttpClient, TransmissionProgress, DEFAULT_REQUEST_TIMEOUT};
-use crate::{config::RequestConfig, error::HttpError, RumaApiError};
+use crate::{
+    config::RequestConfig,
+    error::{HttpError, RetryKind},
+};
 
 impl HttpClient {
     pub(super) async fn send_request<R>(
@@ -53,45 +52,37 @@ impl HttpClient {
         let send_request = || {
             let send_progress = send_progress.clone();
             async {
+                debug!(num_attempt = retry_count.load(Ordering::SeqCst), "Sending request");
+
                 let stop = if let Some(retry_limit) = config.retry_limit {
                     retry_count.fetch_add(1, Ordering::Relaxed) >= retry_limit
                 } else {
                     false
                 };
 
-                // Turn errors into permanent errors when the retry limit is reached
-                let error_type = if stop {
-                    RetryError::Permanent
-                } else {
-                    |err: HttpError| {
-                        if let Some(api_error) = err.as_ruma_api_error() {
-                            let status_code = match api_error {
-                                RumaApiError::ClientApi(e) => match e.body {
-                                    ClientApiErrorBody::Standard {
-                                        kind: ClientApiErrorKind::LimitExceeded { retry_after },
-                                        ..
-                                    } => {
-                                        let retry_after =
-                                            retry_after.and_then(|retry_after| match retry_after {
-                                                RetryAfter::Delay(d) => Some(d),
-                                                RetryAfter::DateTime(_) => None,
-                                            });
-                                        return RetryError::Transient { err, retry_after };
-                                    }
-                                    _ => Some(e.status_code),
-                                },
-                                RumaApiError::Uiaa(_) => None,
-                                RumaApiError::Other(e) => Some(e.status_code),
-                            };
-
-                            if let Some(status_code) = status_code {
-                                if status_code.is_server_error() {
-                                    return RetryError::Transient { err, retry_after: None };
+                // Turn errors into permanent errors when the retry limit is reached.
+                let error_type = |err: HttpError| {
+                    if stop {
+                        RetryError::Permanent(err)
+                    } else {
+                        let has_retry_limit = config.retry_limit.is_some();
+                        match err.retry_kind() {
+                            RetryKind::Transient { retry_after } => {
+                                RetryError::Transient { err, retry_after }
+                            }
+                            RetryKind::Permanent => RetryError::Permanent(err),
+                            RetryKind::NetworkFailure => {
+                                // If we ran into a network failure, only retry if there's some
+                                // retry limit associated to this request's configuration;
+                                // otherwise, we would end up running an infinite loop of network
+                                // requests in offline mode.
+                                if has_retry_limit {
+                                    RetryError::Transient { err, retry_after: None }
+                                } else {
+                                    RetryError::Permanent(err)
                                 }
                             }
                         }
-
-                        RetryError::Permanent(err)
                     }
                 };
 
@@ -135,6 +126,7 @@ pub(crate) struct HttpSettings {
     pub(crate) user_agent: Option<String>,
     pub(crate) timeout: Duration,
     pub(crate) additional_root_certificates: Vec<Certificate>,
+    pub(crate) disable_built_in_root_certificates: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -146,6 +138,7 @@ impl Default for HttpSettings {
             user_agent: None,
             timeout: DEFAULT_REQUEST_TIMEOUT,
             additional_root_certificates: Default::default(),
+            disable_built_in_root_certificates: false,
         }
     }
 }
@@ -172,6 +165,11 @@ impl HttpSettings {
             for cert in &self.additional_root_certificates {
                 http_client = http_client.add_root_certificate(cert.clone());
             }
+        }
+
+        if self.disable_built_in_root_certificates {
+            info!("Built-in root certificates disabled in the HTTP client.");
+            http_client = http_client.tls_built_in_root_certs(false);
         }
 
         if let Some(p) = &self.proxy {
@@ -276,7 +274,7 @@ mod tests {
     use super::BytesChunks;
 
     #[test]
-    fn bytes_chunks() {
+    fn test_bytes_chunks() {
         let bytes = Bytes::new();
         assert!(BytesChunks::new(bytes, 1).collect::<Vec<_>>().is_empty());
 

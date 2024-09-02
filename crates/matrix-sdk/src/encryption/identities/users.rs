@@ -86,9 +86,9 @@ impl IdentityUpdates {
 ///
 /// Each key has a separate role:
 /// * Master key, signs only the sub-keys, can be used as a fingerprint of the
-/// identity.
+///   identity.
 /// * Self-signing key, signs devices belonging to the user that owns this
-/// identity.
+///   identity.
 /// * User-signing key, signs Master keys belonging to other users.
 ///
 /// The User-signing key and its signatures of other user's Master keys are
@@ -144,10 +144,10 @@ impl UserIdentity {
     /// someone else's:
     ///
     /// * Our own identity - All our E2EE capable devices will receive the event
-    /// over to-device messaging.
+    ///   over to-device messaging.
     /// * Someone else's identity - The event will be sent to a DM room we share
-    /// with the user, if we don't share a DM with the user, one will be
-    /// created.
+    ///   with the user, if we don't share a DM with the user, one will be
+    ///   created.
     ///
     /// The default methods that are supported are:
     ///
@@ -203,7 +203,7 @@ impl UserIdentity {
     /// # Arguments
     ///
     /// * `methods` - The verification methods that we want to support. Must be
-    /// non-empty.
+    ///   non-empty.
     ///
     /// # Panics
     ///
@@ -315,10 +315,10 @@ impl UserIdentity {
     ///
     /// A user identity is considered to be verified if:
     ///
-    /// * It has been signed by our User-signing key, if the identity belongs
-    /// to another user
+    /// * It has been signed by our User-signing key, if the identity belongs to
+    ///   another user
     /// * If it has been locally marked as verified, if the user identity
-    /// belongs to us.
+    ///   belongs to us.
     ///
     /// If the identity belongs to another user, our own user identity needs to
     /// be verified as well for the identity to be considered to be verified.
@@ -350,10 +350,7 @@ impl UserIdentity {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn is_verified(&self) -> bool {
-        match &self.inner.identity {
-            CryptoUserIdentities::Own(identity) => identity.is_verified(),
-            CryptoUserIdentities::Other(identity) => identity.is_verified(),
-        }
+        self.inner.identity.is_verified()
     }
 
     /// Get the public part of the Master key of this user identity.
@@ -432,7 +429,7 @@ impl UserIdentities {
                 Ok(VerificationRequest { inner: verification, client: self.client.clone() })
             }
             CryptoUserIdentities::Other(i) => {
-                let content = i.verification_request_content(methods.clone()).await;
+                let content = i.verification_request_content(methods.clone());
 
                 let room = if let Some(room) = self.client.get_dm_room(i.user_id()) {
                     // Make sure that the user, to be verified, is still in the room
@@ -454,7 +451,7 @@ impl UserIdentities {
                     .await?;
 
                 let verification =
-                    i.request_verification(room.room_id(), &response.event_id, methods).await;
+                    i.request_verification(room.room_id(), &response.event_id, methods);
 
                 Ok(VerificationRequest { inner: verification, client: self.client.clone() })
             }

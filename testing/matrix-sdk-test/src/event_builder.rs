@@ -22,7 +22,6 @@ use std::{
 use ruma::{
     events::{
         receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
-        relation::Annotation,
         AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEventContent,
         RedactedMessageLikeEventContent, RedactedStateEventContent, StateEventContent,
     },
@@ -55,23 +54,6 @@ impl EventBuilder {
     /// Timestamps will continue to increase by 1 (millisecond) from that value.
     pub fn set_next_ts(&self, value: u64) {
         self.next_ts.store(value, SeqCst);
-    }
-
-    pub fn make_message_event_with_id<C: MessageLikeEventContent>(
-        &self,
-        sender: &UserId,
-        room_id: &RoomId,
-        event_id: &EventId,
-        content: C,
-    ) -> Raw<AnyTimelineEvent> {
-        timeline_event!({
-            "type": content.event_type(),
-            "content": content,
-            "event_id": event_id,
-            "sender": sender,
-            "room_id": room_id,
-            "origin_server_ts": self.next_server_ts(),
-        })
     }
 
     pub fn make_state_event<C: StateEventContent>(
@@ -139,6 +121,22 @@ impl EventBuilder {
         })
     }
 
+    pub fn make_sync_redacted_message_event_with_id<C: RedactedMessageLikeEventContent>(
+        &self,
+        sender: &UserId,
+        event_id: &EventId,
+        content: C,
+    ) -> Raw<AnySyncTimelineEvent> {
+        sync_timeline_event!({
+            "type": content.event_type(),
+            "content": content,
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": self.next_server_ts(),
+            "unsigned": self.make_redacted_unsigned(sender),
+        })
+    }
+
     pub fn make_sync_state_event<C: StateEventContent>(
         &self,
         sender: &UserId,
@@ -180,27 +178,6 @@ impl EventBuilder {
         })
     }
 
-    pub fn make_sync_reaction(
-        &self,
-        sender: &UserId,
-        annotation: &Annotation,
-        timestamp: MilliSecondsSinceUnixEpoch,
-    ) -> Raw<AnySyncTimelineEvent> {
-        sync_timeline_event!({
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "content": {
-                "m.relates_to": {
-                    "event_id": annotation.event_id,
-                    "key": annotation.key,
-                    "rel_type": "m.annotation"
-                }
-            },
-            "sender": sender,
-            "type": "m.reaction",
-            "origin_server_ts": timestamp
-        })
-    }
-
     pub fn make_receipt_event_content(
         &self,
         receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
@@ -217,42 +194,6 @@ impl EventBuilder {
         }
 
         ev_content
-    }
-
-    pub fn make_redaction_event(
-        &self,
-        sender: &UserId,
-        redacts: &EventId,
-    ) -> Raw<AnySyncTimelineEvent> {
-        sync_timeline_event!({
-            "type": "m.room.redaction",
-            "content": {},
-            "redacts": redacts,
-            "event_id": EventId::new(server_name!("dummy.server")),
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-        })
-    }
-
-    pub fn make_reaction_event(
-        &self,
-        sender: &UserId,
-        event_id: &EventId,
-        annotation: &Annotation,
-    ) -> Raw<AnySyncTimelineEvent> {
-        sync_timeline_event!({
-            "type": "m.reaction",
-            "content": {
-                "m.relates_to": {
-                    "rel_type": "m.annotation",
-                    "event_id": annotation.event_id,
-                    "key": annotation.key,
-                },
-            },
-            "event_id": event_id,
-            "sender": sender,
-            "origin_server_ts": self.next_server_ts(),
-        })
     }
 
     fn make_redacted_unsigned(&self, sender: &UserId) -> JsonValue {

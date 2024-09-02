@@ -1,13 +1,18 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     mem::ManuallyDrop,
+    path::Path,
     sync::{Arc, RwLock},
 };
 
 use anyhow::{anyhow, Context as _};
 use matrix_sdk::{
-    media::{MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequest, MediaThumbnailSize},
+    media::{
+        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequest, MediaThumbnailSettings,
+    },
     oidc::{
+        registrations::{ClientId, OidcRegistrations},
         requests::account_management::AccountManagementActionFull,
         types::{
             client_credentials::ClientCredentials,
@@ -15,11 +20,10 @@ use matrix_sdk::{
                 ClientMetadata, ClientMetadataVerificationError, VerifiedClientMetadata,
             },
         },
-        OidcSession,
+        OidcAuthorizationData, OidcSession,
     },
     ruma::{
         api::client::{
-            account::whoami,
             media::get_content_thumbnail::v3::Method,
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
@@ -35,6 +39,7 @@ use matrix_sdk::{
         serde::Raw,
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
     },
+    sliding_sync::Version as SdkSlidingSyncVersion,
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
 use matrix_sdk_ui::notification_client::{
@@ -43,7 +48,10 @@ use matrix_sdk_ui::notification_client::{
 };
 use mime::Mime;
 use ruma::{
-    api::client::{alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo},
+    api::client::{
+        alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo,
+        uiaa::UserIdentifier,
+    },
     events::{
         ignored_user_list::IgnoredUserListEventContent,
         room::power_levels::RoomPowerLevelsEventContent, GlobalAccountDataEventType,
@@ -59,6 +67,7 @@ use url::Url;
 
 use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
 use crate::{
+    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
     encryption::Encryption,
     notification::NotificationClient,
@@ -147,6 +156,14 @@ pub trait ProgressWatcher: Send + Sync {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
+/// A listener to the global (client-wide) error reporter of the send queue.
+#[uniffi::export(callback_interface)]
+pub trait SendQueueRoomErrorListener: Sync + Send {
+    /// Called every time the send queue has ran into an error for a given room,
+    /// which will disable the send queue for that particular room.
+    fn on_error(&self, room_id: String, error: ClientError);
+}
+
 #[derive(Clone, Copy, uniffi::Record)]
 pub struct TransmissionProgress {
     pub current: u64,
@@ -232,9 +249,7 @@ impl Client {
                     let session_delegate = session_delegate.clone();
                     Box::new(move |client| {
                         let session_delegate = session_delegate.clone();
-                        Box::pin(
-                            async move { Ok(Self::save_session(session_delegate, client).await?) },
-                        )
+                        Ok(Self::save_session(session_delegate, client)?)
                     })
                 },
             )?;
@@ -246,6 +261,20 @@ impl Client {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
+    /// Information about login options for the client's homeserver.
+    pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
+        let supports_oidc_login = self.inner.oidc().fetch_authentication_issuer().await.is_ok();
+        let supports_password_login = self.supports_password_login().await.ok().unwrap_or(false);
+        let sliding_sync_version = self.sliding_sync_version();
+
+        Arc::new(HomeserverLoginDetails {
+            url: self.homeserver(),
+            sliding_sync_version,
+            supports_oidc_login,
+            supports_password_login,
+        })
+    }
+
     /// Login using a username and password.
     pub async fn login(
         &self,
@@ -262,6 +291,97 @@ impl Client {
             builder = builder.device_id(device_id);
         }
         builder.send().await?;
+        Ok(())
+    }
+
+    /// Login using an email and password.
+    pub async fn login_with_email(
+        &self,
+        email: String,
+        password: String,
+        initial_device_name: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        let mut builder = self
+            .inner
+            .matrix_auth()
+            .login_identifier(UserIdentifier::Email { address: email }, &password);
+
+        if let Some(initial_device_name) = initial_device_name.as_ref() {
+            builder = builder.initial_device_display_name(initial_device_name);
+        }
+
+        if let Some(device_id) = device_id.as_ref() {
+            builder = builder.device_id(device_id);
+        }
+
+        builder.send().await?;
+
+        Ok(())
+    }
+
+    /// Returns a handler to start the SSO login process.
+    pub(crate) async fn start_sso_login(
+        self: &Arc<Self>,
+        redirect_url: String,
+        idp_id: Option<String>,
+    ) -> Result<Arc<SsoHandler>, SsoError> {
+        let auth = self.inner.matrix_auth();
+        let url = auth
+            .get_sso_login_url(redirect_url.as_str(), idp_id.as_deref())
+            .await
+            .map_err(|e| SsoError::Generic { message: e.to_string() })?;
+        Ok(Arc::new(SsoHandler { client: Arc::clone(self), url }))
+    }
+
+    /// Requests the URL needed for login in a web view using OIDC. Once the web
+    /// view has succeeded, call `login_with_oidc_callback` with the callback it
+    /// returns. If a failure occurs and a callback isn't available, make sure
+    /// to call `abort_oidc_login` to inform the client of this.
+    pub async fn url_for_oidc_login(
+        &self,
+        oidc_configuration: &OidcConfiguration,
+    ) -> Result<Arc<OidcAuthorizationData>, OidcError> {
+        let oidc_metadata: VerifiedClientMetadata = oidc_configuration.try_into()?;
+        let registrations_file = Path::new(&oidc_configuration.dynamic_registrations_file);
+        let static_registrations = oidc_configuration
+            .static_registrations
+            .iter()
+            .filter_map(|(issuer, client_id)| {
+                let Ok(issuer) = Url::parse(issuer) else {
+                    tracing::error!("Failed to parse {:?}", issuer);
+                    return None;
+                };
+                Some((issuer, ClientId(client_id.clone())))
+            })
+            .collect::<HashMap<_, _>>();
+        let registrations = OidcRegistrations::new(
+            registrations_file,
+            oidc_metadata.clone(),
+            static_registrations,
+        )?;
+
+        let data = self.inner.oidc().url_for_oidc_login(oidc_metadata, registrations).await?;
+
+        Ok(Arc::new(data))
+    }
+
+    /// Aborts an existing OIDC login operation that might have been cancelled,
+    /// failed etc.
+    pub async fn abort_oidc_login(&self, authorization_data: Arc<OidcAuthorizationData>) {
+        self.inner.oidc().abort_authorization(&authorization_data.state).await;
+    }
+
+    /// Completes the OIDC login process.
+    pub async fn login_with_oidc_callback(
+        &self,
+        authorization_data: Arc<OidcAuthorizationData>,
+        callback_url: String,
+    ) -> Result<(), OidcError> {
+        let url = Url::parse(&callback_url).or(Err(OidcError::CallbackUrlInvalid))?;
+
+        self.inner.oidc().login_with_oidc_callback(&authorization_data, url).await?;
+
         Ok(())
     }
 
@@ -293,19 +413,69 @@ impl Client {
 
     /// Restores the client from a `Session`.
     pub async fn restore_session(&self, session: Session) -> Result<(), ClientError> {
-        let sliding_sync_proxy = session.sliding_sync_proxy.clone();
+        let sliding_sync_version = session.sliding_sync_version.clone();
         let auth_session: AuthSession = session.try_into()?;
 
         self.restore_session_inner(auth_session).await?;
-
-        if let Some(sliding_sync_proxy) = sliding_sync_proxy {
-            let sliding_sync_proxy = Url::parse(&sliding_sync_proxy)
-                .map_err(|error| ClientError::Generic { msg: error.to_string() })?;
-
-            self.inner.set_sliding_sync_proxy(Some(sliding_sync_proxy));
-        }
+        self.inner.set_sliding_sync_version(sliding_sync_version.try_into()?);
 
         Ok(())
+    }
+
+    /// Enables or disables all the room send queues at once.
+    ///
+    /// When connectivity is lost on a device, it is recommended to disable the
+    /// room sending queues.
+    ///
+    /// This can be controlled for individual rooms, using
+    /// [`Room::enable_send_queue`].
+    pub async fn enable_all_send_queues(&self, enable: bool) {
+        self.inner.send_queue().set_enabled(enable).await;
+    }
+
+    /// Subscribe to the global enablement status of the send queue, at the
+    /// client-wide level.
+    ///
+    /// The given listener will be immediately called with the initial value of
+    /// the enablement status.
+    pub fn subscribe_to_send_queue_status(
+        &self,
+        listener: Box<dyn SendQueueRoomErrorListener>,
+    ) -> Arc<TaskHandle> {
+        let q = self.inner.send_queue();
+        let mut subscriber = q.subscribe_errors();
+
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            // Respawn tasks for rooms that had unsent events. At this point we've just
+            // created the subscriber, so it'll be notified about errors.
+            q.respawn_tasks_for_rooms_with_unsent_events().await;
+
+            loop {
+                match subscriber.recv().await {
+                    Ok(report) => listener
+                        .on_error(report.room_id.to_string(), ClientError::new(report.error)),
+                    Err(err) => {
+                        error!("error when listening to the send queue error reporter: {err}");
+                    }
+                }
+            }
+        })))
+    }
+
+    /// Allows generic GET requests to be made through the SDKs internal HTTP
+    /// client
+    pub async fn get_url(&self, url: String) -> Result<String, ClientError> {
+        let http_client = self.inner.http_client();
+        Ok(http_client.get(url).send().await?.text().await?)
+    }
+
+    /// Empty the server version and unstable features cache.
+    ///
+    /// Since the SDK caches server capabilities (versions and unstable
+    /// features), it's possible to have a stale entry in the cache. This
+    /// functions makes it possible to force reset it.
+    pub async fn reset_server_capabilities(&self) -> Result<(), ClientError> {
+        Ok(self.inner.reset_server_capabilities().await?)
     }
 }
 
@@ -319,13 +489,6 @@ impl Client {
         Ok(())
     }
 
-    /// The sliding sync proxy of the homeserver. It is either set automatically
-    /// during discovery or manually via `set_sliding_sync_proxy` or `None`
-    /// when not configured.
-    pub fn sliding_sync_proxy(&self) -> Option<Url> {
-        self.inner.sliding_sync_proxy()
-    }
-
     /// Whether or not the client's homeserver supports the password login flow.
     pub(crate) async fn supports_password_login(&self) -> anyhow::Result<bool> {
         let login_types = self.inner.matrix_auth().get_login_types().await?;
@@ -335,15 +498,26 @@ impl Client {
             .any(|login_type| matches!(login_type, get_login_types::v3::LoginType::Password(_)));
         Ok(supports_password)
     }
-
-    /// Gets information about the owner of a given access token.
-    pub(crate) async fn whoami(&self) -> anyhow::Result<whoami::v3::Response> {
-        Ok(self.inner.whoami().await?)
-    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
+    /// The sliding sync version.
+    pub fn sliding_sync_version(&self) -> SlidingSyncVersion {
+        self.inner.sliding_sync_version().into()
+    }
+
+    /// Find all sliding sync versions that are available.
+    ///
+    /// Be careful: This method may hit the store and will send new requests for
+    /// each call. It can be costly to call it repeatedly.
+    ///
+    /// If `.well-known` or `/versions` is unreachable, it will simply move
+    /// potential sliding sync versions aside. No error will be reported.
+    pub async fn available_sliding_sync_versions(&self) -> Vec<SlidingSyncVersion> {
+        self.inner.available_sliding_sync_versions().await.into_iter().map(Into::into).collect()
+    }
+
     pub fn set_delegate(
         self: Arc<Self>,
         delegate: Option<Box<dyn ClientDelegate>>,
@@ -369,8 +543,8 @@ impl Client {
         })
     }
 
-    pub async fn session(&self) -> Result<Session, ClientError> {
-        Self::session_inner((*self.inner).clone()).await
+    pub fn session(&self) -> Result<Session, ClientError> {
+        Self::session_inner((*self.inner).clone())
     }
 
     pub async fn account_url(
@@ -389,6 +563,12 @@ impl Client {
     pub fn user_id(&self) -> Result<String, ClientError> {
         let user_id = self.inner.user_id().context("No User ID found")?;
         Ok(user_id.to_string())
+    }
+
+    /// The server name part of the current user ID
+    pub fn user_id_server_name(&self) -> Result<String, ClientError> {
+        let user_id = self.inner.user_id().context("No User ID found")?;
+        Ok(user_id.server_name().to_string())
     }
 
     pub async fn display_name(&self) -> Result<String, ClientError> {
@@ -427,7 +607,7 @@ impl Client {
 
     /// Retrieves an avatar cached from a previous call to [`Self::avatar_url`].
     pub fn cached_avatar_url(&self) -> Result<Option<String>, ClientError> {
-        Ok(RUNTIME.block_on(self.inner.account().get_cached_avatar_url())?)
+        Ok(RUNTIME.block_on(self.inner.account().get_cached_avatar_url())?.map(Into::into))
     }
 
     pub fn device_id(&self) -> Result<String, ClientError> {
@@ -512,11 +692,11 @@ impl Client {
             .get_media_content(
                 &MediaRequest {
                     source,
-                    format: MediaFormat::Thumbnail(MediaThumbnailSize {
-                        method: Method::Scale,
-                        width: UInt::new(width).unwrap(),
-                        height: UInt::new(height).unwrap(),
-                    }),
+                    format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
+                        Method::Scale,
+                        UInt::new(width).unwrap(),
+                        UInt::new(height).unwrap(),
+                    )),
                 },
                 true,
             )
@@ -666,8 +846,8 @@ impl Client {
         Arc::new(NotificationSettings::new((*self.inner).clone(), inner))
     }
 
-    pub fn encryption(&self) -> Arc<Encryption> {
-        Arc::new(self.inner.encryption().into())
+    pub fn encryption(self: Arc<Self>) -> Arc<Encryption> {
+        Arc::new(Encryption { inner: self.inner.encryption(), _client: self.clone() })
     }
 
     // Ignored users
@@ -752,11 +932,19 @@ impl Client {
     }
 
     pub async fn get_recently_visited_rooms(&self) -> Result<Vec<String>, ClientError> {
-        Ok(self.inner.account().get_recently_visited_rooms().await?)
+        Ok(self
+            .inner
+            .account()
+            .get_recently_visited_rooms()
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     pub async fn track_recently_visited_room(&self, room: String) -> Result<(), ClientError> {
-        self.inner.account().track_recently_visited_room(room).await?;
+        let room_id = RoomId::parse(room)?;
+        self.inner.account().track_recently_visited_room(room_id).await?;
         Ok(())
     }
 
@@ -922,20 +1110,20 @@ impl Client {
         }
     }
 
-    async fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
+    fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
         let auth_api = client.auth_api().context("Missing authentication API")?;
 
         let homeserver_url = client.homeserver().into();
-        let sliding_sync_proxy = client.sliding_sync_proxy().map(|url| url.to_string());
+        let sliding_sync_version = client.sliding_sync_version();
 
-        Session::new(auth_api, homeserver_url, sliding_sync_proxy)
+        Session::new(auth_api, homeserver_url, sliding_sync_version.into())
     }
 
-    async fn save_session(
+    fn save_session(
         session_delegate: Arc<dyn ClientSessionDelegate>,
         client: matrix_sdk::Client,
     ) -> anyhow::Result<()> {
-        let session = Self::session_inner(client).await?;
+        let session = Self::session_inner(client)?;
         session_delegate.save_session_in_keychain(session);
         Ok(())
     }
@@ -1155,15 +1343,15 @@ pub struct Session {
     /// Additional data for this session if OpenID Connect was used for
     /// authentication.
     pub oidc_data: Option<String>,
-    /// The URL for the sliding sync proxy used for this session.
-    pub sliding_sync_proxy: Option<String>,
+    /// The sliding sync version used for this session.
+    pub sliding_sync_version: SlidingSyncVersion,
 }
 
 impl Session {
     fn new(
         auth_api: AuthApi,
         homeserver_url: String,
-        sliding_sync_proxy: Option<String>,
+        sliding_sync_version: SlidingSyncVersion,
     ) -> Result<Session, ClientError> {
         match auth_api {
             // Build the session from the regular Matrix Auth Session.
@@ -1181,7 +1369,7 @@ impl Session {
                     device_id: device_id.to_string(),
                     homeserver_url,
                     oidc_data: None,
-                    sliding_sync_proxy,
+                    sliding_sync_version,
                 })
             }
             // Build the session from the OIDC UserSession.
@@ -1218,7 +1406,7 @@ impl Session {
                     device_id: device_id.to_string(),
                     homeserver_url,
                     oidc_data,
-                    sliding_sync_proxy,
+                    sliding_sync_version,
                 })
             }
             _ => Err(anyhow!("Unknown authentication API").into()),
@@ -1236,7 +1424,7 @@ impl TryFrom<Session> for AuthSession {
             device_id,
             homeserver_url: _,
             oidc_data,
-            sliding_sync_proxy: _,
+            sliding_sync_version: _,
         } = value;
 
         if let Some(oidc_data) = oidc_data {
@@ -1422,5 +1610,36 @@ impl MediaFileHandle {
                 }
             },
         )
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum SlidingSyncVersion {
+    None,
+    Proxy { url: String },
+    Native,
+}
+
+impl From<SdkSlidingSyncVersion> for SlidingSyncVersion {
+    fn from(value: SdkSlidingSyncVersion) -> Self {
+        match value {
+            SdkSlidingSyncVersion::None => Self::None,
+            SdkSlidingSyncVersion::Proxy { url } => Self::Proxy { url: url.to_string() },
+            SdkSlidingSyncVersion::Native => Self::Native,
+        }
+    }
+}
+
+impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
+    type Error = ClientError;
+
+    fn try_from(value: SlidingSyncVersion) -> Result<Self, Self::Error> {
+        Ok(match value {
+            SlidingSyncVersion::None => Self::None,
+            SlidingSyncVersion::Proxy { url } => Self::Proxy {
+                url: Url::parse(&url).map_err(|e| ClientError::Generic { msg: e.to_string() })?,
+            },
+            SlidingSyncVersion::Native => Self::Native,
+        })
     }
 }

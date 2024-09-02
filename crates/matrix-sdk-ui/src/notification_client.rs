@@ -22,12 +22,10 @@ use matrix_sdk::{room::Room, Client, ClientBuildError, SlidingSyncList, SlidingS
 use matrix_sdk_base::{
     crypto::{vodozemac, MegolmError},
     deserialized_responses::TimelineEvent,
+    sliding_sync::http,
     RoomState, StoreError,
 };
 use ruma::{
-    api::client::sync::sync_events::v4::{
-        AccountDataConfig, RoomSubscription, SyncRequestListFilters,
-    },
     assign,
     events::{
         room::{member::StrippedRoomMemberEvent, message::SyncRoomMessageEvent},
@@ -358,12 +356,10 @@ impl NotificationClient {
             .sync_mode(SlidingSyncMode::new_selective().add_range(0..=16))
             .timeline_limit(8)
             .required_state(required_state.clone())
-            .filters(Some(assign!(SyncRequestListFilters::default(), {
+            .filters(Some(assign!(http::request::ListFilters::default(), {
                 is_invite: Some(true),
-                is_tombstoned: Some(false),
                 not_room_types: vec!["m.space".to_owned()],
-            })))
-            .sort(vec!["by_recency".to_owned(), "by_name".to_owned()]);
+            })));
 
         let sync = self
             .client
@@ -371,15 +367,15 @@ impl NotificationClient {
             .poll_timeout(Duration::from_secs(1))
             .network_timeout(Duration::from_secs(3))
             .with_account_data_extension(
-                assign!(AccountDataConfig::default(), { enabled: Some(true) }),
+                assign!(http::request::AccountData::default(), { enabled: Some(true) }),
             )
             .add_list(invites)
             .build()
             .await?;
 
-        sync.subscribe_to_room(
-            room_id.to_owned(),
-            Some(assign!(RoomSubscription::default(), {
+        sync.subscribe_to_rooms(
+            &[room_id],
+            Some(assign!(http::request::RoomSubscription::default(), {
                 required_state,
                 timeline_limit: Some(uint!(16))
             })),
@@ -482,7 +478,7 @@ impl NotificationClient {
             return Err(Error::UnknownRoom);
         };
 
-        let response = room.event_with_context(event_id, true, uint!(0)).await?;
+        let response = room.event_with_context(event_id, true, uint!(0), None).await?;
 
         let mut timeline_event = response.event.ok_or(Error::ContextMissingEvent)?;
         let state_events = response.state;
@@ -668,7 +664,7 @@ impl NotificationItem {
             sender_display_name,
             sender_avatar_url,
             is_sender_name_ambiguous,
-            room_computed_display_name: room.computed_display_name().await?.to_string(),
+            room_computed_display_name: room.compute_display_name().await?.to_string(),
             room_avatar_url: room.avatar_url().map(|s| s.to_string()),
             room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
             is_direct_message_room: room.is_direct().await?,

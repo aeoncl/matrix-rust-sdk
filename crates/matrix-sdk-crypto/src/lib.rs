@@ -71,7 +71,8 @@ impl RoomKeyImportResult {
 }
 
 pub use error::{
-    EventError, MegolmError, OlmError, SessionCreationError, SetRoomSettingsError, SignatureError,
+    EventError, MegolmError, OlmError, SessionCreationError, SessionRecipientCollectionError,
+    SetRoomSettingsError, SignatureError,
 };
 pub use file_encryption::{
     decrypt_room_key_export, encrypt_room_key_export, AttachmentDecryptor, AttachmentEncryptor,
@@ -79,8 +80,8 @@ pub use file_encryption::{
 };
 pub use gossiping::{GossipRequest, GossippedSecret};
 pub use identities::{
-    Device, LocalTrust, OwnUserIdentity, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
-    ReadOnlyUserIdentities, ReadOnlyUserIdentity, UserDevices, UserIdentities, UserIdentity,
+    Device, DeviceData, LocalTrust, OtherUserIdentityData, OwnUserIdentity, OwnUserIdentityData,
+    UserDevices, UserIdentities, UserIdentity, UserIdentityData,
 };
 pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
 #[cfg(feature = "qrcode")]
@@ -90,6 +91,7 @@ pub use requests::{
     IncomingResponse, KeysBackupRequest, KeysQueryRequest, OutgoingRequest, OutgoingRequests,
     OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest, UploadSigningKeysRequest,
 };
+pub use session_manager::CollectStrategy;
 pub use store::{
     CrossSigningKeyExport, CryptoStoreError, SecretImportError, SecretInfo, TrackedUser,
 };

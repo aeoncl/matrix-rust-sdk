@@ -16,29 +16,35 @@ use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    ops::Deref,
     sync::Arc,
 };
 
 use as_variant::as_variant;
 use async_trait::async_trait;
+use growable_bloom_filter::GrowableBloom;
 use matrix_sdk_common::AsyncTraitDeps;
 use ruma::{
+    api::MatrixVersion,
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, EmptyStateKey, GlobalAccountDataEvent,
-        GlobalAccountDataEventContent, GlobalAccountDataEventType, RedactContent,
-        RedactedStateEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
-        RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
+        AnyGlobalAccountDataEvent, AnyMessageLikeEventContent, AnyRoomAccountDataEvent,
+        EmptyStateKey, EventContent as _, GlobalAccountDataEvent, GlobalAccountDataEventContent,
+        GlobalAccountDataEventType, RawExt as _, RedactContent, RedactedStateEventContent,
+        RoomAccountDataEvent, RoomAccountDataEventContent, RoomAccountDataEventType,
+        StateEventType, StaticEventContent, StaticStateEventContent,
     },
     serde::Raw,
-    EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, UserId,
+    time::SystemTime,
+    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId,
+    TransactionId, UserId,
 };
+use serde::{Deserialize, Serialize};
 
 use super::{StateChanges, StoreError};
 use crate::{
     deserialized_responses::{RawAnySyncOrStrippedState, RawMemberEvent, RawSyncOrStrippedState},
-    media::MediaRequest,
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships,
 };
 
@@ -344,50 +350,111 @@ pub trait StateStore: AsyncTraitDeps {
     /// * `key` - The key to remove data from
     async fn remove_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Add a media file's content in the media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The `MediaRequest` of the file.
-    ///
-    /// * `content` - The content of the file.
-    async fn add_media_content(
-        &self,
-        request: &MediaRequest,
-        content: Vec<u8>,
-    ) -> Result<(), Self::Error>;
-
-    /// Get a media file's content out of the media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The `MediaRequest` of the file.
-    async fn get_media_content(
-        &self,
-        request: &MediaRequest,
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
-
-    /// Removes a media file's content from the media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The `MediaRequest` of the file.
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<(), Self::Error>;
-
-    /// Removes all the media files' content associated to an `MxcUri` from the
-    /// media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `uri` - The `MxcUri` of the media files.
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<(), Self::Error>;
-
-    /// Removes a room and all elements associated from the state store.
+    /// Remove a room and all elements associated from the state store.
     ///
     /// # Arguments
     ///
     /// * `room_id` - The `RoomId` of the room to delete.
     async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error>;
+
+    /// Save an event to be sent by a send queue later.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The `RoomId` of the send queue's room.
+    /// * `transaction_id` - The unique key identifying the event to be sent
+    ///   (and its transaction). Note: this is expected to be randomly generated
+    ///   and thus unique.
+    /// * `content` - Serializable event content to be sent.
+    async fn save_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        content: SerializableEventContent,
+    ) -> Result<(), Self::Error>;
+
+    /// Updates a send queue event with the given content, and resets its wedged
+    /// status to false.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The `RoomId` of the send queue's room.
+    /// * `transaction_id` - The unique key identifying the event to be sent
+    ///   (and its transaction).
+    /// * `content` - Serializable event content to replace the original one.
+    ///
+    /// Returns true if an event has been updated, or false otherwise.
+    async fn update_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: SerializableEventContent,
+    ) -> Result<bool, Self::Error>;
+
+    /// Remove an event previously inserted with [`Self::save_send_queue_event`]
+    /// from the database, based on its transaction id.
+    ///
+    /// Returns true if an event has been removed, or false otherwise.
+    async fn remove_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error>;
+
+    /// Loads all the send queue events for the given room.
+    async fn load_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedEvent>, Self::Error>;
+
+    /// Updates the send queue wedged status for a given send queue event.
+    async fn update_send_queue_event_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        wedged: bool,
+    ) -> Result<(), Self::Error>;
+
+    /// Loads all the rooms which have any pending events in their send queue.
+    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error>;
+
+    /// Add a new entry to the list of dependent send queue event for an event.
+    async fn save_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        content: DependentQueuedEventKind,
+    ) -> Result<(), Self::Error>;
+
+    /// Update a set of dependent send queue events with an event id,
+    /// effectively marking them as ready.
+    ///
+    /// Returns the number of updated events.
+    async fn update_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        event_id: OwnedEventId,
+    ) -> Result<usize, Self::Error>;
+
+    /// Remove a specific dependent send queue event by id.
+    ///
+    /// Returns true if the dependent send queue event has been indeed removed.
+    async fn remove_dependent_send_queue_event(
+        &self,
+        room: &RoomId,
+        own_txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error>;
+
+    /// List all the dependent send queue events.
+    ///
+    /// This returns absolutely all the dependent send queue events, whether
+    /// they have an event id or not. They must be returned in insertion order.
+    async fn list_dependent_send_queue_events(
+        &self,
+        room: &RoomId,
+    ) -> Result<Vec<DependentQueuedEvent>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -585,31 +652,97 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         self.0.remove_custom_value(key).await.map_err(Into::into)
     }
 
-    async fn add_media_content(
-        &self,
-        request: &MediaRequest,
-        content: Vec<u8>,
-    ) -> Result<(), Self::Error> {
-        self.0.add_media_content(request, content).await.map_err(Into::into)
-    }
-
-    async fn get_media_content(
-        &self,
-        request: &MediaRequest,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.0.get_media_content(request).await.map_err(Into::into)
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<(), Self::Error> {
-        self.0.remove_media_content(request).await.map_err(Into::into)
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<(), Self::Error> {
-        self.0.remove_media_content_for_uri(uri).await.map_err(Into::into)
-    }
-
     async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error> {
         self.0.remove_room(room_id).await.map_err(Into::into)
+    }
+
+    async fn save_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        content: SerializableEventContent,
+    ) -> Result<(), Self::Error> {
+        self.0.save_send_queue_event(room_id, transaction_id, content).await.map_err(Into::into)
+    }
+
+    async fn update_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: SerializableEventContent,
+    ) -> Result<bool, Self::Error> {
+        self.0.update_send_queue_event(room_id, transaction_id, content).await.map_err(Into::into)
+    }
+
+    async fn remove_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        self.0.remove_send_queue_event(room_id, transaction_id).await.map_err(Into::into)
+    }
+
+    async fn load_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedEvent>, Self::Error> {
+        self.0.load_send_queue_events(room_id).await.map_err(Into::into)
+    }
+
+    async fn update_send_queue_event_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        wedged: bool,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .update_send_queue_event_status(room_id, transaction_id, wedged)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        self.0.load_rooms_with_unsent_events().await.map_err(Into::into)
+    }
+
+    async fn save_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        content: DependentQueuedEventKind,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .save_dependent_send_queue_event(room_id, parent_txn_id, own_txn_id, content)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn update_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        event_id: OwnedEventId,
+    ) -> Result<usize, Self::Error> {
+        self.0
+            .update_dependent_send_queue_event(room_id, parent_txn_id, event_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        own_txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error> {
+        self.0.remove_dependent_send_queue_event(room_id, own_txn_id).await.map_err(Into::into)
+    }
+
+    async fn list_dependent_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<DependentQueuedEvent>, Self::Error> {
+        self.0.list_dependent_send_queue_events(room_id).await.map_err(Into::into)
     }
 }
 
@@ -794,20 +927,117 @@ where
     }
 }
 
+/// Server capabilities returned by the /client/versions endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerCapabilities {
+    /// Versions supported by the remote server.
+    ///
+    /// This contains [`MatrixVersion`]s converted to strings.
+    pub versions: Vec<String>,
+
+    /// List of unstable features and their enablement status.
+    pub unstable_features: BTreeMap<String, bool>,
+
+    /// Last time we fetched this data from the server, in milliseconds since
+    /// epoch.
+    last_fetch_ts: f64,
+}
+
+impl ServerCapabilities {
+    /// The number of milliseconds after which the data is considered stale.
+    pub const STALE_THRESHOLD: f64 = (1000 * 60 * 60 * 24 * 7) as _; // seven days
+
+    /// Encode server capabilities into this serializable struct.
+    pub fn new(versions: &[MatrixVersion], unstable_features: BTreeMap<String, bool>) -> Self {
+        Self {
+            versions: versions.iter().map(|item| item.to_string()).collect(),
+            unstable_features,
+            last_fetch_ts: now_timestamp_ms(),
+        }
+    }
+
+    /// Decode server capabilities from this serializable struct.
+    ///
+    /// May return `None` if the data is considered stale, after
+    /// [`Self::STALE_THRESHOLD`] milliseconds since the last time we stored
+    /// it.
+    pub fn maybe_decode(&self) -> Option<(Vec<MatrixVersion>, BTreeMap<String, bool>)> {
+        if now_timestamp_ms() - self.last_fetch_ts >= Self::STALE_THRESHOLD {
+            None
+        } else {
+            Some((
+                self.versions.iter().filter_map(|item| item.parse().ok()).collect(),
+                self.unstable_features.clone(),
+            ))
+        }
+    }
+}
+
+/// Get the current timestamp as the number of milliseconds since Unix Epoch.
+fn now_timestamp_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("System clock was before 1970.")
+        .as_secs_f64()
+        * 1000.0
+}
+
 /// A value for key-value data that should be persisted into the store.
 #[derive(Debug, Clone)]
 pub enum StateStoreDataValue {
     /// The sync token.
     SyncToken(String),
 
+    /// The server capabilities.
+    ServerCapabilities(ServerCapabilities),
+
     /// A filter with the given ID.
     Filter(String),
 
     /// The user avatar url
-    UserAvatarUrl(String),
+    UserAvatarUrl(OwnedMxcUri),
 
     /// A list of recently visited room identifiers for the current user
-    RecentlyVisitedRooms(Vec<String>),
+    RecentlyVisitedRooms(Vec<OwnedRoomId>),
+
+    /// Persistent data for
+    /// `matrix_sdk_ui::unable_to_decrypt_hook::UtdHookManager`.
+    UtdHookManagerData(GrowableBloom),
+
+    /// A composer draft for the room.
+    /// To learn more, see [`ComposerDraft`].
+    ///
+    /// [`ComposerDraft`]: Self::ComposerDraft
+    ComposerDraft(ComposerDraft),
+}
+
+/// Current draft of the composer for the room.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComposerDraft {
+    /// The draft content in plain text.
+    pub plain_text: String,
+    /// If the message is formatted in HTML, the HTML representation of the
+    /// message.
+    pub html_text: Option<String>,
+    /// The type of draft.
+    pub draft_type: ComposerDraftType,
+}
+
+/// The type of draft of the composer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ComposerDraftType {
+    /// The draft is a new message.
+    NewMessage,
+    /// The draft is a reply to an event.
+    Reply {
+        /// The ID of the event being replied to.
+        event_id: OwnedEventId,
+    },
+    /// The draft is an edit of an event.
+    Edit {
+        /// The ID of the event being edited.
+        event_id: OwnedEventId,
+    },
 }
 
 impl StateStoreDataValue {
@@ -822,13 +1052,28 @@ impl StateStoreDataValue {
     }
 
     /// Get this value if it is a user avatar url.
-    pub fn into_user_avatar_url(self) -> Option<String> {
+    pub fn into_user_avatar_url(self) -> Option<OwnedMxcUri> {
         as_variant!(self, Self::UserAvatarUrl)
     }
 
     /// Get this value if it is a list of recently visited rooms.
-    pub fn into_recently_visited_rooms(self) -> Option<Vec<String>> {
+    pub fn into_recently_visited_rooms(self) -> Option<Vec<OwnedRoomId>> {
         as_variant!(self, Self::RecentlyVisitedRooms)
+    }
+
+    /// Get this value if it is the data for the `UtdHookManager`.
+    pub fn into_utd_hook_manager_data(self) -> Option<GrowableBloom> {
+        as_variant!(self, Self::UtdHookManagerData)
+    }
+
+    /// Get this value if it is a composer draft.
+    pub fn into_composer_draft(self) -> Option<ComposerDraft> {
+        as_variant!(self, Self::ComposerDraft)
+    }
+
+    /// Get this value if it is the server capabilities metadata.
+    pub fn into_server_capabilities(self) -> Option<ServerCapabilities> {
+        as_variant!(self, Self::ServerCapabilities)
     }
 }
 
@@ -838,6 +1083,9 @@ pub enum StateStoreDataKey<'a> {
     /// The sync token.
     SyncToken,
 
+    /// The server capabilities,
+    ServerCapabilities,
+
     /// A filter with the given name.
     Filter(&'a str),
 
@@ -846,11 +1094,24 @@ pub enum StateStoreDataKey<'a> {
 
     /// Recently visited room identifiers
     RecentlyVisitedRooms(&'a UserId),
+
+    /// Persistent data for
+    /// `matrix_sdk_ui::unable_to_decrypt_hook::UtdHookManager`.
+    UtdHookManagerData,
+
+    /// A composer draft for the room.
+    /// To learn more, see [`ComposerDraft`].
+    ///
+    /// [`ComposerDraft`]: Self::ComposerDraft
+    ComposerDraft(&'a RoomId),
 }
 
 impl StateStoreDataKey<'_> {
     /// Key to use for the [`SyncToken`][Self::SyncToken] variant.
     pub const SYNC_TOKEN: &'static str = "sync_token";
+    /// Key to use for the [`ServerCapabilities`][Self::ServerCapabilities]
+    /// variant.
+    pub const SERVER_CAPABILITIES: &'static str = "server_capabilities";
     /// Key prefix to use for the [`Filter`][Self::Filter] variant.
     pub const FILTER: &'static str = "filter";
     /// Key prefix to use for the [`UserAvatarUrl`][Self::UserAvatarUrl]
@@ -860,4 +1121,192 @@ impl StateStoreDataKey<'_> {
     /// Key prefix to use for the
     /// [`RecentlyVisitedRooms`][Self::RecentlyVisitedRooms] variant.
     pub const RECENTLY_VISITED_ROOMS: &'static str = "recently_visited_rooms";
+
+    /// Key to use for the [`UtdHookManagerData`][Self::UtdHookManagerData]
+    /// variant.
+    pub const UTD_HOOK_MANAGER_DATA: &'static str = "utd_hook_manager_data";
+
+    /// Key prefix to use for the [`ComposerDraft`][Self::ComposerDraft]
+    /// variant.
+    pub const COMPOSER_DRAFT: &'static str = "composer_draft";
+}
+
+/// A thin wrapper to serialize a `AnyMessageLikeEventContent`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SerializableEventContent {
+    event: Raw<AnyMessageLikeEventContent>,
+    event_type: String,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for SerializableEventContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Don't include the event in the debug display.
+        f.debug_struct("SerializedEventContent")
+            .field("event_type", &self.event_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SerializableEventContent {
+    /// Create a [`SerializableEventContent`] from a raw
+    /// [`AnyMessageLikeEventContent`] along with its type.
+    pub fn from_raw(event: Raw<AnyMessageLikeEventContent>, event_type: String) -> Self {
+        Self { event_type, event }
+    }
+
+    /// Create a [`SerializableEventContent`] from an
+    /// [`AnyMessageLikeEventContent`].
+    pub fn new(event: &AnyMessageLikeEventContent) -> Result<Self, serde_json::Error> {
+        Ok(Self::from_raw(Raw::new(event)?, event.event_type().to_string()))
+    }
+
+    /// Convert a [`SerializableEventContent`] back into a
+    /// [`AnyMessageLikeEventContent`].
+    pub fn deserialize(&self) -> Result<AnyMessageLikeEventContent, serde_json::Error> {
+        self.event.deserialize_with_type(self.event_type.clone().into())
+    }
+
+    /// Returns the raw event content along with its type.
+    ///
+    /// Useful for callers manipulating custom events.
+    pub fn raw(self) -> (Raw<AnyMessageLikeEventContent>, String) {
+        (self.event, self.event_type)
+    }
+}
+
+/// An event to be sent with a send queue.
+#[derive(Clone)]
+pub struct QueuedEvent {
+    /// The content of the message-like event we'd like to send.
+    pub event: SerializableEventContent,
+
+    /// Unique transaction id for the queued event, acting as a key.
+    pub transaction_id: OwnedTransactionId,
+
+    /// If the event couldn't be sent because of an API error, it's marked as
+    /// wedged, and won't ever be peeked for sending. The only option is to
+    /// remove it.
+    pub is_wedged: bool,
+}
+
+/// The specific user intent that characterizes a [`DependentQueuedEvent`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum DependentQueuedEventKind {
+    /// The event should be edited.
+    Edit {
+        /// The new event for the content.
+        new_content: SerializableEventContent,
+    },
+
+    /// The event should be redacted/aborted/removed.
+    Redact,
+
+    /// The event should be reacted to, with the given key.
+    React {
+        /// Key used for the reaction.
+        key: String,
+    },
+}
+
+/// A transaction id identifying a [`DependentQueuedEvent`] rather than its
+/// parent [`QueuedEvent`].
+///
+/// This thin wrapper adds some safety to some APIs, making it possible to
+/// distinguish between the parent's `TransactionId` and the dependent event's
+/// own `TransactionId`.
+#[repr(transparent)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChildTransactionId(OwnedTransactionId);
+
+impl ChildTransactionId {
+    /// Returns a new [`ChildTransactionId`].
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(TransactionId::new())
+    }
+}
+
+impl Deref for ChildTransactionId {
+    type Target = TransactionId;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<String> for ChildTransactionId {
+    fn from(val: String) -> Self {
+        Self(val.into())
+    }
+}
+
+impl From<ChildTransactionId> for OwnedTransactionId {
+    fn from(val: ChildTransactionId) -> Self {
+        val.0
+    }
+}
+
+/// An event to be sent, depending on a [`QueuedEvent`] to be sent first.
+///
+/// Depending on whether the event has been sent or not, this will either update
+/// the local echo in the storage, or send an event equivalent to the user
+/// intent to the homeserver.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DependentQueuedEvent {
+    /// Unique identifier for this dependent queued event.
+    ///
+    /// Useful for deletion.
+    pub own_transaction_id: ChildTransactionId,
+
+    /// The kind of user intent.
+    pub kind: DependentQueuedEventKind,
+
+    /// Transaction id for the parent's local echo / used in the server request.
+    ///
+    /// Note: this is the transaction id used for the depended-on event, i.e.
+    /// the one that was originally sent and that's being modified with this
+    /// dependent event.
+    pub parent_transaction_id: OwnedTransactionId,
+
+    /// If the parent event has been sent, the parent's event identifier
+    /// returned by the server once the local echo has been sent out.
+    ///
+    /// Note: this is the event id used for the depended-on event after it's
+    /// been sent, not for a possible event that could have been sent
+    /// because of this [`DependentQueuedEvent`].
+    pub event_id: Option<OwnedEventId>,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for QueuedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Hide the content from the debug log.
+        f.debug_struct("QueuedEvent")
+            .field("transaction_id", &self.transaction_id)
+            .field("is_wedged", &self.is_wedged)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{now_timestamp_ms, ServerCapabilities};
+
+    #[test]
+    fn test_stale_server_capabilities() {
+        let mut caps = ServerCapabilities {
+            versions: Default::default(),
+            unstable_features: Default::default(),
+            last_fetch_ts: now_timestamp_ms() - ServerCapabilities::STALE_THRESHOLD - 1.0,
+        };
+
+        // Definitely stale.
+        assert!(caps.maybe_decode().is_none());
+
+        // Definitely not stale.
+        caps.last_fetch_ts = now_timestamp_ms() - 1.0;
+        assert!(caps.maybe_decode().is_some());
+    }
 }

@@ -17,18 +17,22 @@ use std::{collections::BTreeMap, fmt};
 use ruma::{
     events::{AnySyncTimelineEvent, AnyTimelineEvent},
     push::Action,
-    serde::Raw,
+    serde::{JsonObject, Raw},
     DeviceKeyAlgorithm, OwnedDeviceId, OwnedEventId, OwnedUserId,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 
 use crate::debug::{DebugRawEvent, DebugStructExt};
 
 const AUTHENTICITY_NOT_GUARANTEED: &str =
     "The authenticity of this encrypted message can't be guaranteed on this device.";
 const UNVERIFIED_IDENTITY: &str = "Encrypted by an unverified user.";
+const PREVIOUSLY_VERIFIED: &str = "Encrypted by a previously-verified user.";
 const UNSIGNED_DEVICE: &str = "Encrypted by a device not verified by its owner.";
 const UNKNOWN_DEVICE: &str = "Encrypted by an unknown or deleted device.";
+pub const SENT_IN_CLEAR: &str = "Not encrypted.";
 
 /// Represents the state of verification for a decrypted message sent by a
 /// device.
@@ -86,19 +90,24 @@ impl VerificationState {
     pub fn to_shield_state_strict(&self) -> ShieldState {
         match self {
             VerificationState::Verified => ShieldState::None,
-            VerificationState::Unverified(level) => {
-                let message = match level {
-                    VerificationLevel::UnverifiedIdentity | VerificationLevel::UnsignedDevice => {
-                        UNVERIFIED_IDENTITY
-                    }
-                    VerificationLevel::None(link) => match link {
-                        DeviceLinkProblem::MissingDevice => UNKNOWN_DEVICE,
-                        DeviceLinkProblem::InsecureSource => AUTHENTICITY_NOT_GUARANTEED,
+            VerificationState::Unverified(level) => match level {
+                VerificationLevel::UnverifiedIdentity
+                | VerificationLevel::PreviouslyVerified
+                | VerificationLevel::UnsignedDevice => ShieldState::Red {
+                    code: ShieldStateCode::UnverifiedIdentity,
+                    message: UNVERIFIED_IDENTITY,
+                },
+                VerificationLevel::None(link) => match link {
+                    DeviceLinkProblem::MissingDevice => ShieldState::Red {
+                        code: ShieldStateCode::UnknownDevice,
+                        message: UNKNOWN_DEVICE,
                     },
-                };
-
-                ShieldState::Red { message }
-            }
+                    DeviceLinkProblem::InsecureSource => ShieldState::Red {
+                        code: ShieldStateCode::AuthenticityNotGuaranteed,
+                        message: AUTHENTICITY_NOT_GUARANTEED,
+                    },
+                },
+            },
         }
     }
 
@@ -116,25 +125,40 @@ impl VerificationState {
                 VerificationLevel::UnverifiedIdentity => {
                     // If you didn't show interest in verifying that user we don't
                     // nag you with an error message.
-                    // TODO: We should detect identity rotation of a previously trusted identity and
-                    // then warn see https://github.com/matrix-org/matrix-rust-sdk/issues/1129
                     ShieldState::None
+                }
+                VerificationLevel::PreviouslyVerified => {
+                    // This is a high warning. The sender was previously
+                    // verified, but changed their identity.
+                    ShieldState::Red {
+                        code: ShieldStateCode::PreviouslyVerified,
+                        message: PREVIOUSLY_VERIFIED,
+                    }
                 }
                 VerificationLevel::UnsignedDevice => {
                     // This is a high warning. The sender hasn't verified his own device.
-                    ShieldState::Red { message: UNSIGNED_DEVICE }
+                    ShieldState::Red {
+                        code: ShieldStateCode::UnsignedDevice,
+                        message: UNSIGNED_DEVICE,
+                    }
                 }
                 VerificationLevel::None(link) => match link {
                     DeviceLinkProblem::MissingDevice => {
                         // Have to warn as it could have been a temporary injected device.
                         // Notice that the device might just not be known at this time, so callers
                         // should retry when there is a device change for that user.
-                        ShieldState::Red { message: UNKNOWN_DEVICE }
+                        ShieldState::Red {
+                            code: ShieldStateCode::UnknownDevice,
+                            message: UNKNOWN_DEVICE,
+                        }
                     }
                     DeviceLinkProblem::InsecureSource => {
                         // In legacy mode, we tone down this warning as it is quite common and
                         // mostly noise (due to legacy backup and lack of trusted forwards).
-                        ShieldState::Grey { message: AUTHENTICITY_NOT_GUARANTEED }
+                        ShieldState::Grey {
+                            code: ShieldStateCode::AuthenticityNotGuaranteed,
+                            message: AUTHENTICITY_NOT_GUARANTEED,
+                        }
                     }
                 },
             },
@@ -148,6 +172,10 @@ impl VerificationState {
 pub enum VerificationLevel {
     /// The message was sent by a user identity we have not verified.
     UnverifiedIdentity,
+
+    /// The message was sent by a user identity we have not verified, but the
+    /// user was previously verified.
+    PreviouslyVerified,
 
     /// The message was sent by a device not linked to (signed by) any user
     /// identity.
@@ -180,12 +208,41 @@ pub enum DeviceLinkProblem {
 pub enum ShieldState {
     /// A red shield with a tooltip containing the associated message should be
     /// presented.
-    Red { message: &'static str },
+    Red {
+        /// A machine-readable representation.
+        code: ShieldStateCode,
+        /// A human readable description.
+        message: &'static str,
+    },
     /// A grey shield with a tooltip containing the associated message should be
     /// presented.
-    Grey { message: &'static str },
+    Grey {
+        /// A machine-readable representation.
+        code: ShieldStateCode,
+        /// A human readable description.
+        message: &'static str,
+    },
     /// No shield should be presented.
     None,
+}
+
+/// A machine-readable representation of the authenticity for a `ShieldState`.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+pub enum ShieldStateCode {
+    /// Not enough information available to check the authenticity.
+    AuthenticityNotGuaranteed,
+    /// The sending device isn't yet known by the Client.
+    UnknownDevice,
+    /// The sending device hasn't been verified by the sender.
+    UnsignedDevice,
+    /// The sender hasn't been verified by the Client's user.
+    UnverifiedIdentity,
+    /// An unencrypted event in an encrypted room.
+    SentInClear,
+    /// The sender was previously verified but changed their identity.
+    PreviouslyVerified,
 }
 
 /// The algorithm specific information of a decrypted event.
@@ -235,6 +292,11 @@ pub struct SyncTimelineEvent {
     /// The push actions associated with this event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub push_actions: Vec<Action>,
+    /// The encryption info about the events bundled in the `unsigned` object.
+    ///
+    /// Will be `None` if no bundled event was encrypted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsigned_encryption_info: Option<BTreeMap<UnsignedEventLocation, UnsignedDecryptionResult>>,
 }
 
 impl SyncTimelineEvent {
@@ -243,7 +305,19 @@ impl SyncTimelineEvent {
     /// This is a convenience constructor for when you don't need to set
     /// `encryption_info` or `push_action`, for example inside a test.
     pub fn new(event: Raw<AnySyncTimelineEvent>) -> Self {
-        Self { event, encryption_info: None, push_actions: vec![] }
+        Self { event, encryption_info: None, push_actions: vec![], unsigned_encryption_info: None }
+    }
+
+    /// Create a new `SyncTimelineEvent` from the given raw event and push
+    /// actions.
+    ///
+    /// This is a convenience constructor for when you don't need to set
+    /// `encryption_info`, for example inside a test.
+    pub fn new_with_push_actions(
+        event: Raw<AnySyncTimelineEvent>,
+        push_actions: Vec<Action>,
+    ) -> Self {
+        Self { event, encryption_info: None, push_actions, unsigned_encryption_info: None }
     }
 
     /// Get the event id of this `SyncTimelineEvent` if the event has any valid
@@ -256,20 +330,22 @@ impl SyncTimelineEvent {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for SyncTimelineEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let SyncTimelineEvent { event, encryption_info, push_actions } = self;
+        let SyncTimelineEvent { event, encryption_info, push_actions, unsigned_encryption_info } =
+            self;
         let mut s = f.debug_struct("SyncTimelineEvent");
         s.field("event", &DebugRawEvent(event));
         s.maybe_field("encryption_info", encryption_info);
         if !push_actions.is_empty() {
             s.field("push_actions", push_actions);
         }
+        s.maybe_field("unsigned_encryption_info", unsigned_encryption_info);
         s.finish()
     }
 }
 
 impl From<Raw<AnySyncTimelineEvent>> for SyncTimelineEvent {
     fn from(inner: Raw<AnySyncTimelineEvent>) -> Self {
-        Self { encryption_info: None, event: inner, push_actions: Vec::default() }
+        Self::new(inner)
     }
 }
 
@@ -283,6 +359,7 @@ impl From<TimelineEvent> for SyncTimelineEvent {
             event: o.event.cast(),
             encryption_info: o.encryption_info,
             push_actions: o.push_actions.unwrap_or_default(),
+            unsigned_encryption_info: o.unsigned_encryption_info,
         }
     }
 }
@@ -297,6 +374,10 @@ pub struct TimelineEvent {
     /// The push actions associated with this event, if we had sufficient
     /// context to compute them.
     pub push_actions: Option<Vec<Action>>,
+    /// The encryption info about the events bundled in the `unsigned` object.
+    ///
+    /// Will be `None` if no bundled event was encrypted.
+    pub unsigned_encryption_info: Option<BTreeMap<UnsignedEventLocation, UnsignedDecryptionResult>>,
 }
 
 impl TimelineEvent {
@@ -305,14 +386,14 @@ impl TimelineEvent {
     /// This is a convenience constructor for when you don't need to set
     /// `encryption_info` or `push_action`, for example inside a test.
     pub fn new(event: Raw<AnyTimelineEvent>) -> Self {
-        Self { event, encryption_info: None, push_actions: None }
+        Self { event, encryption_info: None, push_actions: None, unsigned_encryption_info: None }
     }
 }
 
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for TimelineEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let TimelineEvent { event, encryption_info, push_actions } = self;
+        let TimelineEvent { event, encryption_info, push_actions, unsigned_encryption_info } = self;
         let mut s = f.debug_struct("TimelineEvent");
         s.field("event", &DebugRawEvent(event));
         s.maybe_field("encryption_info", encryption_info);
@@ -321,8 +402,57 @@ impl fmt::Debug for TimelineEvent {
                 s.field("push_actions", push_actions);
             }
         }
+        s.maybe_field("unsigned_encryption_info", unsigned_encryption_info);
         s.finish()
     }
+}
+
+/// The location of an event bundled in an `unsigned` object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum UnsignedEventLocation {
+    /// An event at the `m.replace` key of the `m.relations` object, that is a
+    /// bundled replacement.
+    RelationsReplace,
+    /// An event at the `latest_event` key of the `m.thread` object of the
+    /// `m.relations` object, that is the latest event of a thread.
+    RelationsThreadLatestEvent,
+}
+
+impl UnsignedEventLocation {
+    /// Find the mutable JSON value at this location in the given unsigned
+    /// object.
+    ///
+    /// # Arguments
+    ///
+    /// * `unsigned` - The `unsigned` property of an event as a JSON object.
+    pub fn find_mut<'a>(&self, unsigned: &'a mut JsonObject) -> Option<&'a mut serde_json::Value> {
+        let relations = unsigned.get_mut("m.relations")?.as_object_mut()?;
+
+        match self {
+            Self::RelationsReplace => relations.get_mut("m.replace"),
+            Self::RelationsThreadLatestEvent => {
+                relations.get_mut("m.thread")?.as_object_mut()?.get_mut("latest_event")
+            }
+        }
+    }
+}
+
+/// The result of the decryption of an event bundled in an `unsigned` object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UnsignedDecryptionResult {
+    /// The event was successfully decrypted.
+    Decrypted(EncryptionInfo),
+    /// The event failed to be decrypted.
+    UnableToDecrypt(UnableToDecryptInfo),
+}
+
+/// Metadata about an event that could not be decrypted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnableToDecryptInfo {
+    /// The ID of the session used to encrypt the message, if it used the
+    /// `m.megolm.v1.aes-sha2` algorithm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]

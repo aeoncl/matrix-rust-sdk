@@ -20,7 +20,7 @@ use matrix_sdk::crypto::types::events::UtdCause;
 use matrix_sdk_base::latest_event::{is_suitable_for_latest_event, PossibleLatestEvent};
 use ruma::{
     events::{
-        call::invite::SyncCallInviteEvent,
+        call::{invite::SyncCallInviteEvent, notify::SyncCallNotifyEvent},
         policy::rule::{
             room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
             user::PolicyRuleUserEventContent,
@@ -47,7 +47,7 @@ use ruma::{
             topic::RoomTopicEventContent,
         },
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
-        sticker::StickerEventContent,
+        sticker::{StickerEventContent, SyncStickerEvent},
         AnyFullStateEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         BundledMessageLikeRelations, FullStateEventContent, MessageLikeEventType, StateEventType,
     },
@@ -58,6 +58,9 @@ use tracing::warn;
 use crate::timeline::{polls::PollState, TimelineItem};
 
 mod message;
+pub(crate) mod pinned_events;
+
+pub use pinned_events::RoomPinnedEventsChange;
 
 pub use self::message::{InReplyToDetails, Message, RepliedToEvent};
 
@@ -111,6 +114,9 @@ pub enum TimelineItemContent {
 
     /// An `m.call.invite` event
     CallInvite,
+
+    /// An `m.call.notify` event
+    CallNotify,
 }
 
 impl TimelineItemContent {
@@ -124,11 +130,17 @@ impl TimelineItemContent {
             PossibleLatestEvent::YesRoomMessage(m) => {
                 Some(Self::from_suitable_latest_event_content(m))
             }
+            PossibleLatestEvent::YesSticker(s) => {
+                Some(Self::from_suitable_latest_sticker_content(s))
+            }
             PossibleLatestEvent::YesPoll(poll) => {
                 Some(Self::from_suitable_latest_poll_event_content(poll))
             }
             PossibleLatestEvent::YesCallInvite(call_invite) => {
                 Some(Self::from_suitable_latest_call_invite_content(call_invite))
+            }
+            PossibleLatestEvent::YesCallNotify(call_notify) => {
+                Some(Self::from_suitable_latest_call_notify_content(call_notify))
             }
             PossibleLatestEvent::NoUnsupportedEventType => {
                 // TODO: when we support state events in message previews, this will need change
@@ -182,6 +194,20 @@ impl TimelineItemContent {
         }
     }
 
+    /// Given some sticker content that is from an event that we have already
+    /// determined is suitable for use as a latest event in a message preview,
+    /// extract its contents and wrap it as a `TimelineItemContent`.
+    fn from_suitable_latest_sticker_content(event: &SyncStickerEvent) -> TimelineItemContent {
+        match event {
+            SyncStickerEvent::Original(event) => {
+                // Grab the content of this event
+                let event_content = event.content.clone();
+                TimelineItemContent::Sticker(Sticker { content: event_content })
+            }
+            SyncStickerEvent::Redacted(_) => TimelineItemContent::RedactedMessage,
+        }
+    }
+
     /// Extracts a `TimelineItemContent` from a poll start event for use as a
     /// latest event in a message preview.
     fn from_suitable_latest_poll_event_content(
@@ -203,6 +229,15 @@ impl TimelineItemContent {
         match event {
             SyncCallInviteEvent::Original(_) => TimelineItemContent::CallInvite,
             SyncCallInviteEvent::Redacted(_) => TimelineItemContent::RedactedMessage,
+        }
+    }
+
+    fn from_suitable_latest_call_notify_content(
+        event: &SyncCallNotifyEvent,
+    ) -> TimelineItemContent {
+        match event {
+            SyncCallNotifyEvent::Original(_) => TimelineItemContent::CallNotify,
+            SyncCallNotifyEvent::Redacted(_) => TimelineItemContent::RedactedMessage,
         }
     }
 
@@ -246,6 +281,7 @@ impl TimelineItemContent {
             | TimelineItemContent::FailedToParseState { .. } => "an event that couldn't be parsed",
             TimelineItemContent::Poll(_) => "a poll",
             TimelineItemContent::CallInvite => "a call invite",
+            TimelineItemContent::CallNotify => "a call notification",
         }
     }
 
@@ -325,6 +361,7 @@ impl TimelineItemContent {
             | Self::Sticker(_)
             | Self::Poll(_)
             | Self::CallInvite
+            | Self::CallNotify
             | Self::UnableToDecrypt(_) => Self::RedactedMessage,
             Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(room_version)),
             Self::ProfileChange(ev) => Self::ProfileChange(ev.redact()),
@@ -413,6 +450,38 @@ impl RoomMembershipChange {
     /// The full content of the event.
     pub fn content(&self) -> &FullStateEventContent<RoomMemberEventContent> {
         &self.content
+    }
+
+    /// Retrieve the member's display name from the current event, or, if
+    /// missing, from the one it replaced.
+    pub fn display_name(&self) -> Option<String> {
+        if let FullStateEventContent::Original { content, prev_content } = &self.content {
+            content
+                .displayname
+                .as_ref()
+                .or_else(|| {
+                    prev_content.as_ref().and_then(|prev_content| prev_content.displayname.as_ref())
+                })
+                .cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve the avatar URL from the current event, or, if missing, from the
+    /// one it replaced.
+    pub fn avatar_url(&self) -> Option<OwnedMxcUri> {
+        if let FullStateEventContent::Original { content, prev_content } = &self.content {
+            content
+                .avatar_url
+                .as_ref()
+                .or_else(|| {
+                    prev_content.as_ref().and_then(|prev_content| prev_content.avatar_url.as_ref())
+                })
+                .cloned()
+        } else {
+            None
+        }
     }
 
     /// The membership change induced by this event.

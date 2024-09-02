@@ -27,14 +27,16 @@ mod client;
 pub mod debug;
 pub mod deserialized_responses;
 mod error;
+pub mod event_cache_store;
 pub mod latest_event;
 pub mod media;
+pub mod notification_settings;
 mod rooms;
 
 pub mod read_receipts;
 pub use read_receipts::PreviousEventsProvider;
 #[cfg(feature = "experimental-sliding-sync")]
-mod sliding_sync;
+pub mod sliding_sync;
 
 pub mod store;
 pub mod sync;
@@ -52,10 +54,14 @@ pub use http;
 pub use matrix_sdk_crypto as crypto;
 pub use once_cell;
 pub use rooms::{
-    DisplayName, Room, RoomCreateWithCreatorEventContent, RoomInfo, RoomInfoUpdate, RoomMember,
-    RoomMemberships, RoomState, RoomStateFilter,
+    DisplayName, Room, RoomCreateWithCreatorEventContent, RoomHero, RoomInfo,
+    RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMember, RoomMemberships, RoomState,
+    RoomStateFilter,
 };
-pub use store::{StateChanges, StateStore, StateStoreDataKey, StateStoreDataValue, StoreError};
+pub use store::{
+    ComposerDraft, ComposerDraftType, StateChanges, StateStore, StateStoreDataKey,
+    StateStoreDataValue, StoreError,
+};
 pub use utils::{
     MinimalRoomMemberEvent, MinimalStateEvent, OriginalMinimalStateEvent, RedactedMinimalStateEvent,
 };

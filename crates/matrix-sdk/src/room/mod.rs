@@ -18,11 +18,11 @@ use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
-    instant::Instant,
     store::StateStoreExt,
-    RoomMemberships, StateChanges,
+    ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
+    StateStoreDataValue,
 };
-use matrix_sdk_common::timeout::timeout;
+use matrix_sdk_common::{deserialized_responses::SyncTimelineEvent, timeout::timeout};
 use mime::Mime;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
@@ -51,6 +51,9 @@ use ruma::{
     },
     assign,
     events::{
+        beacon::BeaconEventContent,
+        beacon_info::BeaconInfoEventContent,
+        call::notify::{ApplicationType, CallNotifyEventContent, NotifyType},
         direct::DirectEventContent,
         marked_unread::MarkedUnreadEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
@@ -68,15 +71,17 @@ use ruma::{
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
         typing::SyncTypingEvent,
-        AnyRoomAccountDataEvent, AnyTimelineEvent, EmptyStateKey, MessageLikeEventContent,
-        MessageLikeEventType, RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
+        AnyRoomAccountDataEvent, AnyRoomAccountDataEventContent, AnyTimelineEvent, EmptyStateKey,
+        Mentions, MessageLikeEventContent, MessageLikeEventType, OriginalSyncStateEvent,
+        RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
         RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
         StaticEventContent, StaticStateEventContent, SyncStateEvent,
     },
     push::{Action, PushConditionRoomCtx},
     serde::Raw,
+    time::Instant,
     EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
-    OwnedTransactionId, OwnedUserId, TransactionId, UInt, UserId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -92,8 +97,9 @@ pub use self::{
 use crate::event_cache::EventCache;
 use crate::{
     attachment::AttachmentConfig,
+    client::WeakClient,
     config::RequestConfig,
-    error::WrongRoomState,
+    error::{BeaconError, WrongRoomState},
     event_cache::{self, EventCacheDropHandles, RoomEventCache},
     event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
     media::{MediaFormat, MediaRequest},
@@ -101,9 +107,10 @@ use crate::{
     room::power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt},
     sync::RoomUpdate,
     utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
-    BaseRoom, Client, Error, HttpError, HttpResult, Result, RoomState, TransmissionProgress,
+    BaseRoom, Client, Error, HttpResult, Result, RoomState, TransmissionProgress,
 };
 
+pub mod edit;
 pub mod futures;
 mod member;
 mod messages;
@@ -374,17 +381,33 @@ impl Room {
             }
         }
 
-        let push_actions = self.event_push_actions(&event).await?;
+        let mut event = TimelineEvent::new(event);
+        event.push_actions = self.event_push_actions(&event.event).await?;
 
-        Ok(TimelineEvent { event, encryption_info: None, push_actions })
+        Ok(event)
     }
 
     /// Fetch the event with the given `EventId` in this room.
-    pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
+    ///
+    /// It uses the given [`RequestConfig`] if provided, or the client's default
+    /// one otherwise.
+    pub async fn event(
+        &self,
+        event_id: &EventId,
+        request_config: Option<RequestConfig>,
+    ) -> Result<TimelineEvent> {
         let request =
             get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
-        let event = self.client.send(request, None).await?.event;
-        self.try_decrypt_event(event).await
+
+        let raw_event = self.client.send(request, request_config).await?.event;
+        let event = self.try_decrypt_event(raw_event).await?;
+
+        // Save the event into the event cache, if it's set up.
+        if let Ok((cache, _handles)) = self.event_cache().await {
+            cache.save_event(event.clone().into()).await;
+        }
+
+        Ok(event)
     }
 
     /// Fetch the event with the given `EventId` in this room, using the
@@ -394,6 +417,7 @@ impl Room {
         event_id: &EventId,
         lazy_load_members: bool,
         context_size: UInt,
+        request_config: Option<RequestConfig>,
     ) -> Result<EventWithContextResponse> {
         let mut request =
             context::get_context::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
@@ -405,7 +429,7 @@ impl Room {
                 LazyLoadOptions::Enabled { include_redundant_members: false };
         }
 
-        let response = self.client.send(request, None).await?;
+        let response = self.client.send(request, request_config).await?;
 
         let target_event = if let Some(event) = response.event {
             Some(self.try_decrypt_event(event).await?)
@@ -421,6 +445,24 @@ impl Room {
             try_join_all(response.events_after.into_iter().map(|ev| self.try_decrypt_event(ev))),
         )
         .await?;
+
+        // Save the loaded events into the event cache, if it's set up.
+        if let Ok((cache, _handles)) = self.event_cache().await {
+            let mut events_to_save: Vec<SyncTimelineEvent> = Vec::new();
+            if let Some(event) = &target_event {
+                events_to_save.push(event.clone().into());
+            }
+
+            for event in &events_before {
+                events_to_save.push(event.clone().into());
+            }
+
+            for event in &events_after {
+                events_to_save.push(event.clone().into());
+            }
+
+            cache.save_events(events_to_save).await;
+        }
 
         Ok(EventWithContextResponse {
             event: target_event,
@@ -491,7 +533,7 @@ impl Room {
                 changes.add_room(room_info.clone());
 
                 self.client.store().save_changes(&changes).await?;
-                self.set_room_info(room_info, false);
+                self.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
 
                 Ok(())
             })
@@ -604,7 +646,7 @@ impl Room {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user that should be fetched out of the
-    /// store.
+    ///   store.
     pub async fn get_member(&self, user_id: &UserId) -> Result<Option<RoomMember>> {
         self.sync_members().await?;
         self.get_member_no_sync(user_id).await
@@ -622,7 +664,7 @@ impl Room {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user that should be fetched out of the
-    /// store.
+    ///   store.
     pub async fn get_member_no_sync(&self, user_id: &UserId) -> Result<Option<RoomMember>> {
         Ok(self
             .inner
@@ -946,6 +988,79 @@ impl Room {
         Ok(true)
     }
 
+    /// Set the given account data event for this room.
+    ///
+    /// # Example
+    /// ```
+    /// # async {
+    /// # let room: matrix_sdk::Room = todo!();
+    /// # let event_id: ruma::OwnedEventId = todo!();
+    /// use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
+    /// let content = FullyReadEventContent::new(event_id);
+    ///
+    /// room.set_account_data(content).await?;
+    /// # anyhow::Ok(())
+    /// # };
+    /// ```
+    pub async fn set_account_data<T>(
+        &self,
+        content: T,
+    ) -> Result<set_room_account_data::v3::Response>
+    where
+        T: RoomAccountDataEventContent,
+    {
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+
+        let request = set_room_account_data::v3::Request::new(
+            own_user.to_owned(),
+            self.room_id().to_owned(),
+            &content,
+        )?;
+
+        Ok(self.client.send(request, None).await?)
+    }
+
+    /// Set the given raw account data event in this room.
+    ///
+    /// # Example
+    /// ```
+    /// # async {
+    /// # let room: matrix_sdk::Room = todo!();
+    /// use matrix_sdk::ruma::{
+    ///     events::{
+    ///         marked_unread::MarkedUnreadEventContent,
+    ///         AnyRoomAccountDataEventContent, EventContent,
+    ///     },
+    ///     serde::Raw,
+    /// };
+    /// let marked_unread_content = MarkedUnreadEventContent::new(true);
+    /// let full_event: AnyRoomAccountDataEventContent =
+    ///     marked_unread_content.clone().into();
+    /// room.set_account_data_raw(
+    ///     marked_unread_content.event_type(),
+    ///     Raw::new(&full_event).unwrap(),
+    /// )
+    /// .await?;
+    /// # anyhow::Ok(())
+    /// # };
+    /// ```
+    pub async fn set_account_data_raw(
+        &self,
+        event_type: RoomAccountDataEventType,
+        content: Raw<AnyRoomAccountDataEventContent>,
+    ) -> Result<set_room_account_data::v3::Response> {
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+
+        let request = set_room_account_data::v3::Request::new_raw(
+            own_user.to_owned(),
+            self.room_id().to_owned(),
+            event_type,
+            content,
+        );
+
+        Ok(self.client.send(request, None).await?)
+    }
+
     /// Adds a tag to the room, or updates it if it already exists.
     ///
     /// Returns the [`create_tag::v3::Response`] from the server.
@@ -980,15 +1095,15 @@ impl Room {
         &self,
         tag: TagName,
         tag_info: TagInfo,
-    ) -> HttpResult<create_tag::v3::Response> {
-        let user_id = self.client.user_id().ok_or(HttpError::AuthenticationRequired)?;
+    ) -> Result<create_tag::v3::Response> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request = create_tag::v3::Request::new(
             user_id.to_owned(),
             self.inner.room_id().to_owned(),
             tag.to_string(),
             tag_info,
         );
-        self.client.send(request, None).await
+        Ok(self.client.send(request, None).await?)
     }
 
     /// Removes a tag from the room.
@@ -997,14 +1112,14 @@ impl Room {
     ///
     /// # Arguments
     /// * `tag` - The tag to remove.
-    pub async fn remove_tag(&self, tag: TagName) -> HttpResult<delete_tag::v3::Response> {
-        let user_id = self.client.user_id().ok_or(HttpError::AuthenticationRequired)?;
+    pub async fn remove_tag(&self, tag: TagName) -> Result<delete_tag::v3::Response> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request = delete_tag::v3::Request::new(
             user_id.to_owned(),
             self.inner.room_id().to_owned(),
             tag.to_string(),
         );
-        self.client.send(request, None).await
+        Ok(self.client.send(request, None).await?)
     }
 
     /// Add or remove the `m.favourite` flag for this room.
@@ -1068,8 +1183,7 @@ impl Room {
     /// # Arguments
     /// * `is_direct` - Whether to mark this room as direct.
     pub async fn set_is_direct(&self, is_direct: bool) -> Result<()> {
-        let user_id =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let mut content = self
             .client
@@ -1118,8 +1232,6 @@ impl Room {
         &self,
         event: &Raw<OriginalSyncRoomEncryptedEvent>,
     ) -> Result<TimelineEvent> {
-        use ruma::events::room::encrypted::EncryptedEventScheme;
-
         let machine = self.client.olm_machine().await;
         let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
@@ -1127,13 +1239,10 @@ impl Room {
             match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
                 Ok(event) => event,
                 Err(e) => {
-                    let event = event.deserialize()?;
-                    if let EncryptedEventScheme::MegolmV1AesSha2(c) = event.content.scheme {
-                        self.client
-                            .encryption()
-                            .backups()
-                            .maybe_download_room_key(self.room_id().to_owned(), c.session_id);
-                    }
+                    self.client
+                        .encryption()
+                        .backups()
+                        .maybe_download_room_key(self.room_id().to_owned(), event.clone());
 
                     return Err(e.into());
                 }
@@ -1230,6 +1339,11 @@ impl Room {
         let request = invite_user::v3::Request::new(self.room_id().to_owned(), recipient);
         self.client.send(request, None).await?;
 
+        // Force a future room members reload before sending any event to prevent UTDs
+        // that can happen when some event is sent after a room member has been invited
+        // but before the /sync request could fetch the membership change event.
+        self.mark_members_missing();
+
         Ok(())
     }
 
@@ -1243,6 +1357,11 @@ impl Room {
         let recipient = InvitationRecipient::ThirdPartyId(invite_id);
         let request = invite_user::v3::Request::new(self.room_id().to_owned(), recipient);
         self.client.send(request, None).await?;
+
+        // Force a future room members reload before sending any event to prevent UTDs
+        // that can happen when some event is sent after a room member has been invited
+        // but before the /sync request could fetch the membership change event.
+        self.mark_members_missing();
 
         Ok(())
     }
@@ -1688,12 +1807,14 @@ impl Room {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, encrypted, event_id))]
+    #[instrument(skip_all, fields(event_type, room_id = ?self.room_id(), transaction_id, is_room_encrypted, event_id))]
     pub fn send_raw<'a>(
         &'a self,
         event_type: &'a str,
         content: impl IntoRawMessageLikeEventContent,
     ) -> SendRawMessageLikeEvent<'a> {
+        // Note: the recorded instrument fields are saved in
+        // `SendRawMessageLikeEvent::into_future`.
         SendRawMessageLikeEvent::new(self, event_type, content)
     }
 
@@ -1770,10 +1891,10 @@ impl Room {
     /// * `filename` - The file name.
     ///
     /// * `content_type` - The type of the media, this will be used as the
-    /// content-type header.
+    ///   content-type header.
     ///
     /// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
-    /// media.
+    ///   media.
     ///
     /// * `config` - Metadata and configuration for the attachment.
     pub(super) async fn prepare_and_send_attachment<'a>(
@@ -1953,8 +2074,8 @@ impl Room {
     /// # Arguments
     /// * `mime` - The mime type describing the data
     /// * `data` - The data representation of the avatar
-    /// * `info` - The optional image info provided for the avatar,
-    /// the blurhash and the mimetype will always be updated
+    /// * `info` - The optional image info provided for the avatar, the blurhash
+    ///   and the mimetype will always be updated
     pub async fn upload_avatar(
         &self,
         mime: &Mime,
@@ -2246,6 +2367,17 @@ impl Room {
         Ok(self.room_power_levels().await?.user_can_send_message(user_id, message))
     }
 
+    /// Returns true if the user with the given user_id is able to pin or unpin
+    /// events in the room.
+    ///
+    /// The call may fail if there is an error in getting the power levels.
+    pub async fn can_user_pin_unpin(&self, user_id: &UserId) -> Result<bool> {
+        Ok(self
+            .room_power_levels()
+            .await?
+            .user_can_send_state(user_id, StateEventType::RoomPinnedEvents))
+    }
+
     /// Returns true if the user with the given user_id is able to trigger a
     /// notification in the room.
     ///
@@ -2526,16 +2658,18 @@ impl Room {
         }
     }
 
-    /// Get the notification mode
+    /// Get the notification mode.
     pub async fn notification_mode(&self) -> Option<RoomNotificationMode> {
         if !matches!(self.state(), RoomState::Joined) {
             return None;
         }
+
         let notification_settings = self.client().notification_settings().await;
 
         // Get the user-defined mode if available
         let notification_mode =
             notification_settings.get_user_defined_room_notification_mode(self.room_id()).await;
+
         if notification_mode.is_some() {
             notification_mode
         } else if let Ok(is_encrypted) = self.is_encrypted().await {
@@ -2553,15 +2687,32 @@ impl Room {
         }
     }
 
-    /// Get the user-defined notification mode
+    /// Get the user-defined notification mode.
+    ///
+    /// The result is cached for fast and non-async call. To read the cached
+    /// result, use
+    /// [`matrix_sdk_base::Room::cached_user_defined_notification_mode`].
+    //
+    // Note for maintainers:
+    //
+    // The fact the result is cached is an important property. If you change that in
+    // the future, please review all calls to this method.
     pub async fn user_defined_notification_mode(&self) -> Option<RoomNotificationMode> {
         if !matches!(self.state(), RoomState::Joined) {
             return None;
         }
+
         let notification_settings = self.client().notification_settings().await;
 
         // Get the user-defined mode if available
-        notification_settings.get_user_defined_room_notification_mode(self.room_id()).await
+        let mode =
+            notification_settings.get_user_defined_room_notification_mode(self.room_id()).await;
+
+        if let Some(mode) = mode {
+            self.update_cached_user_defined_notification_mode(mode);
+        }
+
+        mode
     }
 
     /// Report an event as inappropriate to the homeserver's administrator.
@@ -2599,8 +2750,7 @@ impl Room {
     /// Set a flag on the room to indicate that the user has explicitly marked
     /// it as (un)read.
     pub async fn set_unread_flag(&self, unread: bool) -> Result<()> {
-        let user_id =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let content = MarkedUnreadEventContent::new(unread);
 
@@ -2626,6 +2776,211 @@ impl Room {
             // from a `Room`.
             (maybe_room.unwrap(), drop_handles)
         })
+    }
+
+    /// This will only send a call notification event if appropriate.
+    ///
+    /// This function is supposed to be called whenever the user creates a room
+    /// call. It will send a `m.call.notify` event if:
+    ///  - there is not yet a running call.
+    ///
+    /// It will configure the notify type: ring or notify based on:
+    ///  - is this a DM room -> ring
+    ///  - is this a group with more than one other member -> notify
+    pub async fn send_call_notification_if_needed(&self) -> Result<()> {
+        if self.has_active_room_call() {
+            return Ok(());
+        }
+
+        self.send_call_notification(
+            self.room_id().to_string().to_owned(),
+            ApplicationType::Call,
+            if self.is_direct().await.unwrap_or(false) {
+                NotifyType::Ring
+            } else {
+                NotifyType::Notify
+            },
+            Mentions::with_room_mention(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get the beacon information event in the room for the current user.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event is redacted, stripped, not found or could
+    /// not be deserialized.
+    async fn get_user_beacon_info(
+        &self,
+    ) -> Result<OriginalSyncStateEvent<BeaconInfoEventContent>, BeaconError> {
+        let raw_event = self
+            .get_state_event_static_for_key::<BeaconInfoEventContent, _>(self.own_user_id())
+            .await?
+            .ok_or(BeaconError::NotFound)?;
+
+        match raw_event.deserialize()? {
+            SyncOrStrippedState::Sync(SyncStateEvent::Original(beacon_info)) => Ok(beacon_info),
+            SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_)) => Err(BeaconError::Redacted),
+            SyncOrStrippedState::Stripped(_) => Err(BeaconError::Stripped),
+        }
+    }
+
+    /// Start sharing live location in the room.
+    ///
+    /// # Arguments
+    ///
+    /// * `duration_millis` - The duration for which the live location is
+    ///   shared, in milliseconds.
+    /// * `description` - An optional description for the live location share.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not joined or if the state event could
+    /// not be sent.
+    pub async fn start_live_location_share(
+        &self,
+        duration_millis: u64,
+        description: Option<String>,
+    ) -> Result<send_state_event::v3::Response> {
+        self.ensure_room_joined()?;
+
+        self.send_state_event_for_key(
+            self.own_user_id(),
+            BeaconInfoEventContent::new(
+                description,
+                Duration::from_millis(duration_millis),
+                true,
+                None,
+            ),
+        )
+        .await
+    }
+
+    /// Stop sharing live location in the room.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not joined, if the beacon information
+    /// is redacted or stripped, or if the state event is not found.
+    pub async fn stop_live_location_share(
+        &self,
+    ) -> Result<send_state_event::v3::Response, BeaconError> {
+        self.ensure_room_joined()?;
+
+        let mut beacon_info_event = self.get_user_beacon_info().await?;
+        beacon_info_event.content.stop();
+        Ok(self.send_state_event_for_key(self.own_user_id(), beacon_info_event.content).await?)
+    }
+
+    /// Send a location beacon event in the current room.
+    ///
+    /// # Arguments
+    ///
+    /// * `geo_uri` - The geo URI of the location beacon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not joined, if the beacon information
+    /// is redacted or stripped, if the location share is no longer live,
+    /// or if the state event is not found.
+    pub async fn send_location_beacon(
+        &self,
+        geo_uri: String,
+    ) -> Result<send_message_event::v3::Response, BeaconError> {
+        self.ensure_room_joined()?;
+
+        let beacon_info_event = self.get_user_beacon_info().await?;
+
+        if beacon_info_event.content.is_live() {
+            let content = BeaconEventContent::new(beacon_info_event.event_id, geo_uri, None);
+            Ok(self.send(content).await?)
+        } else {
+            Err(BeaconError::NotLive)
+        }
+    }
+
+    /// Send a call notification event in the current room.
+    ///
+    /// This is only supposed to be used in **custom** situations where the user
+    /// explicitly chooses to send a `m.call.notify` event to invite/notify
+    /// someone explicitly in unusual conditions. The default should be to
+    /// use `send_call_notification_if_needed` just before a new room call is
+    /// created/joined.
+    ///
+    /// One example could be that the UI allows to start a call with a subset of
+    /// users of the room members first. And then later on the user can
+    /// invite more users to the call.
+    pub async fn send_call_notification(
+        &self,
+        call_id: String,
+        application: ApplicationType,
+        notify_type: NotifyType,
+        mentions: Mentions,
+    ) -> Result<()> {
+        let call_notify_event_content =
+            CallNotifyEventContent::new(call_id, application, notify_type, mentions);
+        self.send(call_notify_event_content).await?;
+        Ok(())
+    }
+
+    /// Store the given `ComposerDraft` in the state store using the current
+    /// room id, as identifier.
+    pub async fn save_composer_draft(&self, draft: ComposerDraft) -> Result<()> {
+        self.client
+            .store()
+            .set_kv_data(
+                StateStoreDataKey::ComposerDraft(self.room_id()),
+                StateStoreDataValue::ComposerDraft(draft),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Retrieve the `ComposerDraft` stored in the state store for this room.
+    pub async fn load_composer_draft(&self) -> Result<Option<ComposerDraft>> {
+        let data = self
+            .client
+            .store()
+            .get_kv_data(StateStoreDataKey::ComposerDraft(self.room_id()))
+            .await?;
+        Ok(data.and_then(|d| d.into_composer_draft()))
+    }
+
+    /// Remove the `ComposerDraft` stored in the state store for this room.
+    pub async fn clear_composer_draft(&self) -> Result<()> {
+        self.client
+            .store()
+            .remove_kv_data(StateStoreDataKey::ComposerDraft(self.room_id()))
+            .await?;
+        Ok(())
+    }
+}
+
+/// A wrapper for a weak client and a room id that allows to lazily retrieve a
+/// room, only when needed.
+#[derive(Clone)]
+pub(crate) struct WeakRoom {
+    client: WeakClient,
+    room_id: OwnedRoomId,
+}
+
+impl WeakRoom {
+    /// Create a new `WeakRoom` given its weak components.
+    pub fn new(client: WeakClient, room_id: OwnedRoomId) -> Self {
+        Self { client, room_id }
+    }
+
+    /// Attempts to reconstruct the room.
+    pub fn get(&self) -> Option<Room> {
+        self.client.get().and_then(|client| client.get_room(&self.room_id))
+    }
+
+    /// The room id for that room.
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
     }
 }
 
@@ -2857,7 +3212,7 @@ pub struct TryFromReportedContentScoreError(());
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use matrix_sdk_base::SessionMeta;
+    use matrix_sdk_base::{store::ComposerDraftType, ComposerDraft, SessionMeta};
     use matrix_sdk_test::{
         async_test, test_json, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder,
     };
@@ -2871,6 +3226,7 @@ mod tests {
     use crate::{
         config::RequestConfig,
         matrix_auth::{MatrixSession, MatrixSessionTokens},
+        test_utils::logged_in_client,
         Client,
     };
 
@@ -3018,5 +3374,31 @@ mod tests {
         assert_eq!(score.value(), -100);
         ReportedContentScore::try_from(int!(10)).unwrap_err();
         ReportedContentScore::try_from(int!(-110)).unwrap_err();
+    }
+
+    #[async_test]
+    async fn test_composer_draft() {
+        use matrix_sdk_test::DEFAULT_TEST_ROOM_ID;
+
+        let client = logged_in_client(None).await;
+
+        let response = SyncResponseBuilder::default()
+            .add_joined_room(JoinedRoomBuilder::default())
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
+
+        assert_eq!(room.load_composer_draft().await.unwrap(), None);
+
+        let draft = ComposerDraft {
+            plain_text: "Hello, world!".to_owned(),
+            html_text: Some("<strong>Hello</strong>, world!".to_owned()),
+            draft_type: ComposerDraftType::NewMessage,
+        };
+        room.save_composer_draft(draft.clone()).await.unwrap();
+        assert_eq!(room.load_composer_draft().await.unwrap(), Some(draft));
+
+        room.clear_composer_draft().await.unwrap();
+        assert_eq!(room.load_composer_draft().await.unwrap(), None);
     }
 }

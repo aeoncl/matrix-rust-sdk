@@ -11,10 +11,14 @@ use std::{
 
 use bitflags::bitflags;
 pub use members::RoomMember;
-pub use normal::{Room, RoomInfo, RoomInfoUpdate, RoomState, RoomStateFilter};
+pub use normal::{
+    Room, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
+    RoomStateFilter,
+};
 use ruma::{
     assign,
     events::{
+        beacon_info::BeaconInfoEventContent,
         call::member::CallMemberEventContent,
         macros::EventContent,
         room::{
@@ -27,6 +31,7 @@ use ruma::{
             join_rules::RoomJoinRulesEventContent,
             member::MembershipState,
             name::RoomNameEventContent,
+            pinned_events::RoomPinnedEventsEventContent,
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
         },
@@ -35,7 +40,7 @@ use ruma::{
         RedactedStateEventContent, StaticStateEventContent, SyncStateEvent,
     },
     room::RoomType,
-    EventId, OwnedUserId, RoomVersionId,
+    EventId, OwnedUserId, RoomVersionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +83,9 @@ impl fmt::Display for DisplayName {
 pub struct BaseRoomInfo {
     /// The avatar URL of this room.
     pub(crate) avatar: Option<MinimalStateEvent<RoomAvatarEventContent>>,
+    /// All shared live location beacons of this room.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub(crate) beacons: BTreeMap<OwnedUserId, MinimalStateEvent<BeaconInfoEventContent>>,
     /// The canonical alias of this room.
     pub(crate) canonical_alias: Option<MinimalStateEvent<RoomCanonicalAliasEventContent>>,
     /// The `m.room.create` event content of this room.
@@ -114,25 +122,14 @@ pub struct BaseRoomInfo {
     /// others, and this field collects them.
     #[serde(skip_serializing_if = "RoomNotableTags::is_empty", default)]
     pub(crate) notable_tags: RoomNotableTags,
+    /// The `m.room.pinned_events` of this room.
+    pub(crate) pinned_events: Option<RoomPinnedEventsEventContent>,
 }
 
 impl BaseRoomInfo {
     /// Create a new, empty base room info.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn calculate_room_name(
-        &self,
-        joined_member_count: u64,
-        invited_member_count: u64,
-        heroes: Vec<RoomMember>,
-    ) -> DisplayName {
-        calculate_room_name(
-            joined_member_count,
-            invited_member_count,
-            heroes.iter().map(|mem| mem.name()).collect::<Vec<&str>>(),
-        )
     }
 
     /// Get the room version of this room.
@@ -151,6 +148,9 @@ impl BaseRoomInfo {
     /// Returns true if the event modified the info, false otherwise.
     pub fn handle_state_event(&mut self, ev: &AnySyncStateEvent) -> bool {
         match ev {
+            AnySyncStateEvent::BeaconInfo(b) => {
+                self.beacons.insert(b.state_key().clone(), b.into());
+            }
             // No redacted branch - enabling encryption cannot be undone.
             AnySyncStateEvent::RoomEncryption(SyncStateEvent::Original(encryption)) => {
                 self.encryption = Some(encryption.content.clone());
@@ -195,14 +195,20 @@ impl BaseRoomInfo {
                 let mut o_ev = o_ev.clone();
                 o_ev.content.set_created_ts_if_none(o_ev.origin_server_ts);
 
+                let Some(owned_user_id) = get_user_id_for_state_key(m.state_key()) else {
+                    return false;
+                };
+
                 // add the new event.
-                self.rtc_member
-                    .insert(m.state_key().clone(), SyncStateEvent::Original(o_ev).into());
+                self.rtc_member.insert(owned_user_id, SyncStateEvent::Original(o_ev).into());
 
                 // Remove all events that don't contain any memberships anymore.
                 self.rtc_member.retain(|_, ev| {
                     ev.as_original().is_some_and(|o| !o.content.active_memberships(None).is_empty())
                 });
+            }
+            AnySyncStateEvent::RoomPinnedEvents(p) => {
+                self.pinned_events = p.as_original().map(|p| p.content.clone());
             }
             _ => return false,
         }
@@ -263,6 +269,11 @@ impl BaseRoomInfo {
                 // wont have call information.
                 return false;
             }
+            AnyStrippedStateEvent::RoomPinnedEvents(p) => {
+                if let Some(pinned) = p.content.pinned.clone() {
+                    self.pinned_events = Some(RoomPinnedEventsEventContent::new(pinned));
+                }
+            }
             _ => return false,
         }
 
@@ -311,6 +322,33 @@ impl BaseRoomInfo {
     }
 }
 
+/// Extract a user ID from a state key that matches one of these formats:
+/// - `<user ID>`
+/// - `<user ID>_<string>`
+/// - `_<user ID>_<string>`
+fn get_user_id_for_state_key(state_key: &str) -> Option<OwnedUserId> {
+    if let Ok(user_id) = UserId::parse(state_key) {
+        return Some(user_id);
+    }
+
+    // Ignore leading underscore if present
+    // (used for avoiding auth rules on @-prefixed state keys)
+    let state_key = state_key.strip_prefix('_').unwrap_or(state_key);
+    if state_key.starts_with('@') {
+        if let Some(colon_idx) = state_key.find(':') {
+            let state_key_user_id = match state_key[colon_idx + 1..].find('_') {
+                None => state_key,
+                Some(suffix_idx) => &state_key[..colon_idx + 1 + suffix_idx],
+            };
+            if let Ok(user_id) = UserId::parse(state_key_user_id) {
+                return Some(user_id);
+            }
+        }
+    }
+
+    None
+}
+
 bitflags! {
     /// Notable tags, i.e. subset of tags that we are more interested by.
     ///
@@ -345,6 +383,7 @@ impl Default for BaseRoomInfo {
     fn default() -> Self {
         Self {
             avatar: None,
+            beacons: BTreeMap::new(),
             canonical_alias: None,
             create: None,
             dm_targets: Default::default(),
@@ -359,44 +398,8 @@ impl Default for BaseRoomInfo {
             rtc_member: BTreeMap::new(),
             is_marked_unread: false,
             notable_tags: RoomNotableTags::empty(),
+            pinned_events: None,
         }
-    }
-}
-
-/// Calculate room name according to step 3 of the [naming algorithm.]
-///
-/// [naming algorithm]: https://spec.matrix.org/latest/client-server-api/#calculating-the-display-name-for-a-room
-fn calculate_room_name(
-    joined_member_count: u64,
-    invited_member_count: u64,
-    mut heroes: Vec<&str>,
-) -> DisplayName {
-    let heroes_count = heroes.len() as u64;
-    let invited_joined = invited_member_count + joined_member_count;
-    let invited_joined_minus_one = invited_joined.saturating_sub(1);
-
-    // Stabilize ordering.
-    heroes.sort_unstable();
-
-    let names = if heroes_count >= invited_joined_minus_one {
-        heroes.join(", ")
-    } else if heroes_count < invited_joined_minus_one && invited_joined > 1 {
-        // TODO: What length does the spec want us to use here and in
-        // the `else`?
-        format!("{}, and {} others", heroes.join(", "), (invited_joined - heroes_count))
-    } else {
-        "".to_owned()
-    };
-
-    // User is alone.
-    if invited_joined <= 1 {
-        if names.is_empty() {
-            DisplayName::Empty
-        } else {
-            DisplayName::EmptyWas(names)
-        }
-    } else {
-        DisplayName::Calculated(names)
     }
 }
 
@@ -563,42 +566,12 @@ impl RoomMemberships {
 mod tests {
     use std::ops::Not;
 
-    use ruma::events::tag::{TagInfo, TagName, Tags};
+    use ruma::{
+        events::tag::{TagInfo, TagName, Tags},
+        user_id,
+    };
 
-    use super::{calculate_room_name, BaseRoomInfo, DisplayName, RoomNotableTags};
-
-    #[test]
-    fn test_calculate_room_name() {
-        let mut actual = calculate_room_name(2, 0, vec!["a"]);
-        assert_eq!(DisplayName::Calculated("a".to_owned()), actual);
-
-        actual = calculate_room_name(3, 0, vec!["a", "b"]);
-        assert_eq!(DisplayName::Calculated("a, b".to_owned()), actual);
-
-        actual = calculate_room_name(4, 0, vec!["a", "b", "c"]);
-        assert_eq!(DisplayName::Calculated("a, b, c".to_owned()), actual);
-
-        actual = calculate_room_name(5, 0, vec!["a", "b", "c"]);
-        assert_eq!(DisplayName::Calculated("a, b, c, and 2 others".to_owned()), actual);
-
-        actual = calculate_room_name(0, 0, vec![]);
-        assert_eq!(DisplayName::Empty, actual);
-
-        actual = calculate_room_name(1, 0, vec![]);
-        assert_eq!(DisplayName::Empty, actual);
-
-        actual = calculate_room_name(0, 1, vec![]);
-        assert_eq!(DisplayName::Empty, actual);
-
-        actual = calculate_room_name(1, 0, vec!["a"]);
-        assert_eq!(DisplayName::EmptyWas("a".to_owned()), actual);
-
-        actual = calculate_room_name(1, 0, vec!["a", "b"]);
-        assert_eq!(DisplayName::EmptyWas("a, b".to_owned()), actual);
-
-        actual = calculate_room_name(1, 0, vec!["a", "b", "c"]);
-        assert_eq!(DisplayName::EmptyWas("a, b, c".to_owned()), actual);
-    }
+    use super::{get_user_id_for_state_key, BaseRoomInfo, RoomNotableTags};
 
     #[test]
     fn test_handle_notable_tags_favourite() {
@@ -628,5 +601,33 @@ mod tests {
         tags.clear();
         base_room_info.handle_notable_tags(&tags);
         assert!(base_room_info.notable_tags.contains(RoomNotableTags::LOW_PRIORITY).not());
+    }
+
+    #[test]
+    fn test_get_user_id_for_state_key() {
+        assert!(get_user_id_for_state_key("").is_none());
+        assert!(get_user_id_for_state_key("abc").is_none());
+        assert!(get_user_id_for_state_key("@nocolon").is_none());
+        assert!(get_user_id_for_state_key("@noserverpart:").is_none());
+        assert!(get_user_id_for_state_key("@noserverpart:_suffix").is_none());
+
+        let user_id = user_id!("@username:example.org");
+
+        assert_eq!(get_user_id_for_state_key(user_id.as_str()).as_deref(), Some(user_id));
+        assert_eq!(
+            get_user_id_for_state_key(format!("{user_id}_valid_suffix").as_str()).as_deref(),
+            Some(user_id)
+        );
+        assert!(get_user_id_for_state_key(format!("{user_id}:invalid_suffix").as_str()).is_none());
+
+        assert_eq!(
+            get_user_id_for_state_key(format!("_{user_id}").as_str()).as_deref(),
+            Some(user_id)
+        );
+        assert_eq!(
+            get_user_id_for_state_key(format!("_{user_id}_valid_suffix").as_str()).as_deref(),
+            Some(user_id)
+        );
+        assert!(get_user_id_for_state_key(format!("_{user_id}:invalid_suffix").as_str()).is_none());
     }
 }

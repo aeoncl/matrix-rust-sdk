@@ -1,11 +1,12 @@
 // The http mocking library is not supported for wasm32
 #![cfg(not(target_arch = "wasm32"))]
 
-use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server, Client};
-use matrix_sdk_test::test_json;
+use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server, Client, Room};
+use matrix_sdk_test::{test_json, SyncResponseBuilder};
+use ruma::RoomId;
 use serde::Serialize;
 use wiremock::{
-    matchers::{header, method, path, path_regex, query_param, query_param_is_missing},
+    matchers::{header, method, path, query_param, query_param_is_missing},
     Mock, MockGuard, MockServer, ResponseTemplate,
 };
 
@@ -14,9 +15,11 @@ mod client;
 mod encryption;
 mod event_cache;
 mod matrix_auth;
+mod media;
 mod notification;
 mod refresh_token;
 mod room;
+mod send_queue;
 #[cfg(feature = "experimental-widgets")]
 mod widget;
 
@@ -75,26 +78,27 @@ async fn mock_sync_scoped(
         .await
 }
 
-/// Mount a Mock on the given server to handle the `GET
-/// /rooms/.../state/m.room.encryption` endpoint with an option whether it
-/// should return an encryption event or not.
-async fn mock_encryption_state(server: &MockServer, is_encrypted: bool) {
-    let builder = Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
-        .and(header("authorization", "Bearer 1234"));
+/// Does a sync for a given room, and returns its `Room` object.
+///
+/// Note this sync is token-less.
+async fn mock_sync_with_new_room<F: Fn(&mut SyncResponseBuilder)>(
+    func: F,
+    client: &Client,
+    server: &MockServer,
+    room_id: &RoomId,
+) -> Room {
+    let mut sync_response_builder = SyncResponseBuilder::default();
+    func(&mut sync_response_builder);
+    let json_response = sync_response_builder.build_json_sync_response();
 
-    if is_encrypted {
-        builder
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&*test_json::sync_events::ENCRYPTION_CONTENT),
-            )
-            .mount(server)
-            .await;
-    } else {
-        builder
-            .respond_with(ResponseTemplate::new(404).set_body_json(&*test_json::NOT_FOUND))
-            .mount(server)
-            .await;
-    }
+    let _scope = Mock::given(method("GET"))
+        .and(path("/_matrix/client/r0/sync"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json_response))
+        .mount_as_scoped(server)
+        .await;
+
+    let _response = client.sync_once(Default::default()).await.unwrap();
+
+    client.get_room(room_id).expect("we should find the room we just sync'd from")
 }

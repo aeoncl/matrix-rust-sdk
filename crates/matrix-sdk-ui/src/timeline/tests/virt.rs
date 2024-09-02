@@ -31,11 +31,10 @@ async fn test_day_divider() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
+    let f = &timeline.factory;
+
     timeline
-        .handle_live_message_event(
-            *ALICE,
-            RoomMessageEventContent::text_plain("This is a first message on the first day"),
-        )
+        .handle_live_event(f.text_msg("This is a first message on the first day").sender(*ALICE))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -49,23 +48,17 @@ async fn test_day_divider() {
     assert_eq!(date.day(), 1);
 
     timeline
-        .handle_live_message_event(
-            *ALICE,
-            RoomMessageEventContent::text_plain("This is a second message on the first day"),
-        )
+        .handle_live_event(f.text_msg("This is a second message on the first day").sender(*ALICE))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     item.as_event().unwrap();
 
     // Timestamps start at unix epoch, advance to one day later
-    timeline.event_builder.set_next_ts(24 * 60 * 60 * 1000);
+    f.set_next_ts(24 * 60 * 60 * 1000);
 
     timeline
-        .handle_live_message_event(
-            *ALICE,
-            RoomMessageEventContent::text_plain("This is a first message on the next day"),
-        )
+        .handle_live_event(f.text_msg("This is a first message on the next day").sender(*ALICE))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -98,7 +91,9 @@ async fn test_update_read_marker() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
-    timeline.handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("A")).await;
+    let f = &timeline.factory;
+
+    timeline.handle_live_event(f.text_msg("A").sender(&ALICE)).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event_id = item.as_event().unwrap().event_id().unwrap().to_owned();
@@ -106,11 +101,11 @@ async fn test_update_read_marker() {
     let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert!(day_divider.is_day_divider());
 
-    timeline.inner.set_fully_read_event(first_event_id.clone()).await;
+    timeline.controller.handle_fully_read_marker(first_event_id.clone()).await;
 
     // Nothing should happen, the marker cannot be added at the end.
 
-    timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("B")).await;
+    timeline.handle_live_event(f.text_msg("B").sender(&BOB)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let second_event_id = item.as_event().unwrap().event_id().unwrap().to_owned();
 
@@ -118,13 +113,13 @@ async fn test_update_read_marker() {
     let item = assert_next_matches!(stream, VectorDiff::Insert { index: 2, value } => value);
     assert_matches!(item.as_virtual(), Some(VirtualTimelineItem::ReadMarker));
 
-    timeline.inner.set_fully_read_event(second_event_id.clone()).await;
+    timeline.controller.handle_fully_read_marker(second_event_id.clone()).await;
 
     // The read marker is removed but not reinserted, because it cannot be added at
     // the end.
     assert_next_matches!(stream, VectorDiff::Remove { index: 2 });
 
-    timeline.handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("C")).await;
+    timeline.handle_live_event(f.text_msg("C").sender(&ALICE)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let third_event_id = item.as_event().unwrap().event_id().unwrap().to_owned();
 
@@ -133,20 +128,20 @@ async fn test_update_read_marker() {
     assert_matches!(marker.kind, TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker));
 
     // Nothing should happen if the fully read event is set back to an older event.
-    timeline.inner.set_fully_read_event(first_event_id).await;
+    timeline.controller.handle_fully_read_marker(first_event_id).await;
 
     // Nothing should happen if the fully read event isn't found.
-    timeline.inner.set_fully_read_event(event_id!("$fake_event_id").to_owned()).await;
+    timeline.controller.handle_fully_read_marker(event_id!("$fake_event_id").to_owned()).await;
 
     // Nothing should happen if the fully read event is referring to an event
     // that has already been marked as fully read.
-    timeline.inner.set_fully_read_event(second_event_id).await;
+    timeline.controller.handle_fully_read_marker(second_event_id).await;
 
-    timeline.handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("D")).await;
+    timeline.handle_live_event(f.text_msg("D").sender(&ALICE)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     item.as_event().unwrap();
 
-    timeline.inner.set_fully_read_event(third_event_id).await;
+    timeline.controller.handle_fully_read_marker(third_event_id).await;
 
     // The read marker is moved after the third event.
     assert_next_matches!(stream, VectorDiff::Remove { index: 3 });

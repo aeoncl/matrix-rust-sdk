@@ -24,22 +24,27 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     ops::Deref,
-    pin::Pin,
     result::Result as StdResult,
     str::Utf8Error,
     sync::{Arc, RwLock as StdRwLock},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use eyeball_im::{Vector, VectorDiff};
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::Stream;
 use once_cell::sync::OnceCell;
 
 #[cfg(any(test, feature = "testing"))]
 #[macro_use]
 pub mod integration_tests;
+mod observable_map;
 mod traits;
 
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::store::{DynCryptoStore, IntoCryptoStore};
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
+use observable_map::ObservableMap;
 use ruma::{
     events::{
         presence::PresenceEvent,
@@ -53,11 +58,9 @@ use ruma::{
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 
-/// BoxStream of owned Types
-pub type BoxStream<T> = Pin<Box<dyn futures_util::Stream<Item = T> + Send>>;
-
 use crate::{
-    rooms::{normal::RoomInfoUpdate, RoomInfo, RoomState},
+    event_cache_store::{DynEventCacheStore, IntoEventCacheStore},
+    rooms::{normal::RoomInfoNotableUpdate, RoomInfo, RoomState},
     MinimalRoomMemberEvent, Room, RoomStateFilter, SessionMeta,
 };
 
@@ -70,8 +73,10 @@ pub use self::integration_tests::StateStoreIntegrationTests;
 pub use self::{
     memory_store::MemoryStore,
     traits::{
-        DynStateStore, IntoStateStore, StateStore, StateStoreDataKey, StateStoreDataValue,
-        StateStoreExt,
+        ChildTransactionId, ComposerDraft, ComposerDraftType, DependentQueuedEvent,
+        DependentQueuedEventKind, DynStateStore, IntoStateStore, QueuedEvent,
+        SerializableEventContent, ServerCapabilities, StateStore, StateStoreDataKey,
+        StateStoreDataValue, StateStoreExt,
     },
 };
 
@@ -142,7 +147,8 @@ pub(crate) struct Store {
     session_meta: Arc<OnceCell<SessionMeta>>,
     /// The current sync token that should be used for the next sync call.
     pub(super) sync_token: Arc<RwLock<Option<String>>>,
-    rooms: Arc<StdRwLock<BTreeMap<OwnedRoomId, Room>>>,
+    /// All rooms the store knows about.
+    rooms: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
     /// A lock to synchronize access to the store, such that data by the sync is
     /// never overwritten.
     sync_lock: Arc<Mutex<()>>,
@@ -155,7 +161,7 @@ impl Store {
             inner,
             session_meta: Default::default(),
             sync_token: Default::default(),
-            rooms: Default::default(),
+            rooms: Arc::new(StdRwLock::new(ObservableMap::new())),
             sync_lock: Default::default(),
         }
     }
@@ -174,16 +180,24 @@ impl Store {
     pub async fn set_session_meta(
         &self,
         session_meta: SessionMeta,
-        roominfo_update_sender: &broadcast::Sender<RoomInfoUpdate>,
+        room_info_notable_update_sender: &broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Result<()> {
-        for info in self.inner.get_room_infos().await? {
-            let room = Room::restore(
-                &session_meta.user_id,
-                self.inner.clone(),
-                info,
-                roominfo_update_sender.clone(),
-            );
-            self.rooms.write().unwrap().insert(room.room_id().to_owned(), room);
+        {
+            let room_infos = self.inner.get_room_infos().await?;
+
+            let mut rooms = self.rooms.write().unwrap();
+
+            for room_info in room_infos {
+                let new_room = Room::restore(
+                    &session_meta.user_id,
+                    self.inner.clone(),
+                    room_info,
+                    room_info_notable_update_sender.clone(),
+                );
+                let new_room_id = new_room.room_id().to_owned();
+
+                rooms.insert(new_room_id, new_room);
+            }
         }
 
         let token =
@@ -201,33 +215,46 @@ impl Store {
     }
 
     /// Get all the rooms this store knows about.
-    pub fn get_rooms(&self) -> Vec<Room> {
-        self.rooms.read().unwrap().keys().filter_map(|id| self.get_room(id)).collect()
+    pub fn rooms(&self) -> Vec<Room> {
+        self.rooms.read().unwrap().iter().cloned().collect()
     }
 
     /// Get all the rooms this store knows about, filtered by state.
-    pub fn get_rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
+    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
         self.rooms
             .read()
             .unwrap()
             .iter()
-            .filter(|(_, r)| filter.matches(r.state()))
-            .filter_map(|(id, _)| self.get_room(id))
+            .filter(|room| filter.matches(room.state()))
+            .cloned()
             .collect()
     }
 
+    /// Get a stream of all the rooms changes, in addition to the existing
+    /// rooms.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
+        self.rooms.read().unwrap().stream()
+    }
+
     /// Get the room with the given room id.
-    pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
+    pub fn room(&self, room_id: &RoomId) -> Option<Room> {
         self.rooms.read().unwrap().get(room_id).cloned()
     }
 
-    /// Lookup the Room for the given RoomId, or create one, if it didn't exist
-    /// yet in the store
+    /// Check if a room exists.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub(crate) fn room_exists(&self, room_id: &RoomId) -> bool {
+        self.rooms.read().unwrap().get(room_id).is_some()
+    }
+
+    /// Lookup the `Room` for the given `RoomId`, or create one, if it didn't
+    /// exist yet in the store
     pub fn get_or_create_room(
         &self,
         room_id: &RoomId,
         room_type: RoomState,
-        roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
+        room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Room {
         let user_id =
             &self.session_meta.get().expect("Creating room while not being logged in").user_id;
@@ -235,9 +262,14 @@ impl Store {
         self.rooms
             .write()
             .unwrap()
-            .entry(room_id.to_owned())
-            .or_insert_with(|| {
-                Room::new(user_id, self.inner.clone(), room_id, room_type, roominfo_update_sender)
+            .get_or_create(room_id, || {
+                Room::new(
+                    user_id,
+                    self.inner.clone(),
+                    room_id,
+                    room_type,
+                    room_info_notable_update_sender,
+                )
             })
             .clone()
     }
@@ -289,8 +321,10 @@ pub struct StateChanges {
     /// A mapping of `RoomId` to a map of event type string to `AnyBasicEvent`.
     pub room_account_data:
         BTreeMap<OwnedRoomId, BTreeMap<RoomAccountDataEventType, Raw<AnyRoomAccountDataEvent>>>,
-    /// A map of `RoomId` to `RoomInfo`.
+
+    /// A map of `OwnedRoomId` to `RoomInfo`.
     pub room_infos: BTreeMap<OwnedRoomId, RoomInfo>,
+
     /// A map of `RoomId` to `ReceiptEventContent`.
     pub receipts: BTreeMap<OwnedRoomId, ReceiptEventContent>,
 
@@ -401,8 +435,11 @@ impl StateChanges {
     }
 }
 
-/// Configuration for the state store and, when `encryption` is enabled, for the
-/// crypto store.
+/// Configuration for the various stores.
+///
+/// By default, this always includes a state store and an event cache store.
+/// When the `e2e-encryption` feature is enabled, this also includes a crypto
+/// store.
 ///
 /// # Examples
 ///
@@ -416,6 +453,7 @@ pub struct StoreConfig {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store: Arc<DynCryptoStore>,
     pub(crate) state_store: Arc<DynStateStore>,
+    pub(crate) event_cache_store: Arc<DynEventCacheStore>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -433,6 +471,8 @@ impl StoreConfig {
             #[cfg(feature = "e2e-encryption")]
             crypto_store: matrix_sdk_crypto::store::MemoryStore::new().into_crypto_store(),
             state_store: Arc::new(MemoryStore::new()),
+            event_cache_store: crate::event_cache_store::MemoryStore::new()
+                .into_event_cache_store(),
         }
     }
 
@@ -448,6 +488,12 @@ impl StoreConfig {
     /// Set a custom implementation of a `StateStore`.
     pub fn state_store(mut self, store: impl IntoStateStore) -> Self {
         self.state_store = store.into_state_store();
+        self
+    }
+
+    /// Set a custom implementation of an `EventCacheStore`.
+    pub fn event_cache_store(mut self, event_cache_store: impl IntoEventCacheStore) -> Self {
+        self.event_cache_store = event_cache_store.into_event_cache_store();
         self
     }
 }

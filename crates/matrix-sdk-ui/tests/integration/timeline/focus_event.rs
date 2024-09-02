@@ -20,15 +20,17 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    assert_next_matches_with_timeout,
     config::SyncSettings,
     test_utils::{events::EventFactory, logged_in_client_with_server},
 };
 use matrix_sdk_test::{
-    async_test, sync_timeline_event, JoinedRoomBuilder, SyncResponseBuilder, ALICE, BOB,
+    async_test, mocks::mock_encryption_state, JoinedRoomBuilder, SyncResponseBuilder, ALICE, BOB,
 };
 use matrix_sdk_ui::{timeline::TimelineFocus, Timeline};
-use ruma::{event_id, room_id};
+use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id};
 use stream_assert::assert_pending;
+use tokio::time::sleep;
 
 use crate::{mock_context, mock_messages, mock_sync};
 
@@ -68,6 +70,8 @@ async fn test_new_focused() {
     )
     .await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = Timeline::builder(&room)
         .with_focus(TimelineFocus::Event {
@@ -77,6 +81,11 @@ async fn test_new_focused() {
         .build()
         .await
         .unwrap();
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
 
     server.reset().await;
 
@@ -202,6 +211,8 @@ async fn test_focused_timeline_reacts() {
     )
     .await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = Timeline::builder(&room)
         .with_focus(TimelineFocus::Event {
@@ -231,22 +242,7 @@ async fn test_focused_timeline_reacts() {
         // This event must be ignored.
         f.text_msg("this is a sync event").sender(*ALICE).into(),
         // This event must not be ignored.
-        sync_timeline_event!({
-            "content": {
-                "m.relates_to": {
-                    "event_id": "$1",
-                    "key": "👍",
-                    "rel_type": "m.annotation"
-                }
-            },
-            "event_id": "$15275047031IXQRi:localhost",
-            "origin_server_ts": 159027581000000_u64,
-            "sender": *BOB,
-            "type": "m.reaction",
-            "unsigned": {
-                "age": 85
-            }
-        }),
+        f.reaction(target_event, "👍".to_owned()).sender(*BOB).into(),
     ]));
 
     // Sync the room.
@@ -254,13 +250,155 @@ async fn test_focused_timeline_reacts() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+    let item = assert_next_matches_with_timeout!(timeline_stream, VectorDiff::Set { index: 1, value: item } => item);
 
     let event_item = item.as_event().unwrap();
     // Text hasn't changed.
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
     // But now there's one reaction to the event.
     assert_eq!(event_item.reactions().len(), 1);
+
+    // And nothing more.
+    assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_focused_timeline_local_echoes() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_response_builder = SyncResponseBuilder::new();
+    sync_response_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    // Mark the room as joined.
+    mock_sync(&server, sync_response_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // Start a focused timeline.
+    let f = EventFactory::new().room(room_id);
+    let target_event = event_id!("$1");
+
+    mock_context(
+        &server,
+        room_id,
+        target_event,
+        None,
+        vec![],
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        vec![],
+        None,
+        vec![],
+    )
+    .await;
+
+    mock_encryption_state(&server, false).await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = Timeline::builder(&room)
+        .with_focus(TimelineFocus::Event {
+            target: target_event.to_owned(),
+            num_context_events: 20,
+        })
+        .build()
+        .await
+        .unwrap();
+
+    server.reset().await;
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+
+    assert_eq!(items.len(), 1 + 1); // event items + a day divider
+    assert!(items[0].is_day_divider());
+
+    let event_item = items[1].as_event().unwrap();
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    assert_eq!(event_item.reactions().len(), 0);
+
+    sleep(Duration::from_millis(100)).await;
+    assert_pending!(timeline_stream);
+
+    // Add a reaction to the focused event, which will cause a local echo to happen.
+    timeline.toggle_reaction(items[1].unique_id(), "✨").await.unwrap();
+
+    // We immediately get the local echo for the reaction.
+    let item = assert_next_matches_with_timeout!(timeline_stream, VectorDiff::Set { index: 1, value: item } => item);
+
+    let event_item = item.as_event().unwrap();
+    // Text hasn't changed.
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    // But now there's one reaction to the event.
+    let reactions = event_item.reactions();
+    assert_eq!(reactions.len(), 1);
+    assert!(reactions.get("✨").unwrap().get(client.user_id().unwrap()).is_some());
+
+    // And nothing more.
+    sleep(Duration::from_millis(100)).await;
+    assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_focused_timeline_doesnt_show_local_echoes() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_response_builder = SyncResponseBuilder::new();
+    sync_response_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    // Mark the room as joined.
+    mock_sync(&server, sync_response_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // Start a focused timeline.
+    let f = EventFactory::new().room(room_id);
+    let target_event = event_id!("$1");
+
+    mock_context(
+        &server,
+        room_id,
+        target_event,
+        None,
+        vec![],
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        vec![],
+        None,
+        vec![],
+    )
+    .await;
+
+    mock_encryption_state(&server, false).await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = Timeline::builder(&room)
+        .with_focus(TimelineFocus::Event {
+            target: target_event.to_owned(),
+            num_context_events: 20,
+        })
+        .build()
+        .await
+        .unwrap();
+
+    server.reset().await;
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+
+    assert_eq!(items.len(), 1 + 1); // event items + a day divider
+    assert!(items[0].is_day_divider());
+
+    let event_item = items[1].as_event().unwrap();
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    assert_eq!(event_item.reactions().len(), 0);
+
+    assert_pending!(timeline_stream);
+
+    // Send a message in the room, expect no local echo.
+    timeline.send(RoomMessageEventContent::text_plain("h4xx0r").into()).await.unwrap();
+
+    // Let a bit of time for the send queue to process the event.
+    sleep(Duration::from_millis(300)).await;
 
     // And nothing more.
     assert_pending!(timeline_stream);

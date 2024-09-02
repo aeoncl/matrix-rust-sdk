@@ -47,7 +47,7 @@ pub(crate) struct PartialSlidingSyncRequest {
 
 impl Match for SlidingSyncMatcher {
     fn matches(&self, request: &Request) -> bool {
-        request.url.path() == "/_matrix/client/unstable/org.matrix.msc3575/sync"
+        request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
             && request.method == Method::POST
     }
 }
@@ -122,7 +122,10 @@ macro_rules! sliding_sync_then_assert_request_and_fake_response {
                         &json!({ $( $request_json )* }),
                         $crate::sliding_sync_then_assert_request_and_fake_response!(@assertion_config $sign)
                     ) {
-                        dbg!(json_value);
+                        #[allow(clippy::dbg_macro)]
+                        {
+                            dbg!(json_value);
+                        }
                         panic!("{error}");
                     }
 

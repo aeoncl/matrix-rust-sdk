@@ -1,14 +1,19 @@
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_core::Subscriber;
 use tracing_subscriber::{
-    fmt::{self, time::FormatTime, FormatEvent, FormatFields, FormattedFields},
+    field::RecordFields,
+    fmt::{
+        self,
+        format::{DefaultFields, Writer},
+        time::FormatTime,
+        FormatEvent, FormatFields, FormattedFields,
+    },
     layer::SubscriberExt,
     registry::LookupSpan,
     util::SubscriberInitExt,
     EnvFilter, Layer,
 };
 
-#[cfg(target_os = "android")]
 pub fn log_panics() {
     std::env::set_var("RUST_BACKTRACE", "1");
     log_panics::init();
@@ -98,17 +103,19 @@ where
 
             if let Some(scope) = ctx.event_scope() {
                 writer.write_str(" | spans: ")?;
+
                 let mut first = true;
 
                 for span in scope.from_root() {
                     if !first {
                         writer.write_str(" > ")?;
                     }
-                    first = false;
-                    write!(writer, "{}", span.metadata().name())?;
 
-                    let ext = span.extensions();
-                    if let Some(fields) = &ext.get::<FormattedFields<N>>() {
+                    first = false;
+
+                    write!(writer, "{}", span.name())?;
+
+                    if let Some(fields) = &span.extensions().get::<FormattedFields<N>>() {
                         if !fields.is_empty() {
                             write!(writer, "{{{fields}}}")?;
                         }
@@ -134,7 +141,25 @@ where
 
         let writer = builder.build(&c.path).expect("Failed to create a rolling file appender.");
 
+        // Another fields formatter is necessary because of this bug
+        // https://github.com/tokio-rs/tracing/issues/1372. Using a new
+        // formatter for the fields forces to record them in different span
+        // extensions, and thus remove the duplicated fields in the span.
+        #[derive(Default)]
+        struct FieldsFormatterForFiles(DefaultFields);
+
+        impl<'writer> FormatFields<'writer> for FieldsFormatterForFiles {
+            fn format_fields<R: RecordFields>(
+                &self,
+                writer: Writer<'writer>,
+                fields: R,
+            ) -> std::fmt::Result {
+                self.0.format_fields(writer, fields)
+            }
+        }
+
         fmt::layer()
+            .fmt_fields(FieldsFormatterForFiles::default())
             .event_format(EventFormatter::new())
             // EventFormatter doesn't support ANSI colors anyways, but the
             // default field formatter does, which is unhelpful for iOS +
@@ -146,8 +171,26 @@ where
     Layer::and_then(
         file_layer,
         config.write_to_stdout_or_system.then(|| {
+            // Another fields formatter is necessary because of this bug
+            // https://github.com/tokio-rs/tracing/issues/1372. Using a new
+            // formatter for the fields forces to record them in different span
+            // extensions, and thus remove the duplicated fields in the span.
+            #[derive(Default)]
+            struct FieldsFormatterFormStdoutOrSystem(DefaultFields);
+
+            impl<'writer> FormatFields<'writer> for FieldsFormatterFormStdoutOrSystem {
+                fn format_fields<R: RecordFields>(
+                    &self,
+                    writer: Writer<'writer>,
+                    fields: R,
+                ) -> std::fmt::Result {
+                    self.0.format_fields(writer, fields)
+                }
+            }
+
             #[cfg(not(target_os = "android"))]
             return fmt::layer()
+                .fmt_fields(FieldsFormatterFormStdoutOrSystem::default())
                 .event_format(EventFormatter::new())
                 // See comment above.
                 .with_ansi(false)
@@ -155,6 +198,7 @@ where
 
             #[cfg(target_os = "android")]
             return fmt::layer()
+                .fmt_fields(FieldsFormatterFormStdoutOrSystem::default())
                 .event_format(EventFormatter::for_logcat())
                 // See comment above.
                 .with_ansi(false)
@@ -165,26 +209,41 @@ where
     )
 }
 
+/// Configuration to save logs to (rotated) log-files.
 #[derive(uniffi::Record)]
 pub struct TracingFileConfiguration {
+    /// Base location for all the log files.
     path: String,
+
+    /// Prefix for the log files' names.
     file_prefix: String,
+
+    /// Optional suffix for the log file's names.
     file_suffix: Option<String>,
+
+    /// Maximum number of rotated files.
+    ///
+    /// If not set, there's no max limit, i.e. the number of log files is
+    /// unlimited.
     max_files: Option<u64>,
 }
 
 #[derive(uniffi::Record)]
 pub struct TracingConfiguration {
+    /// A filter line following the [RUST_LOG format].
+    ///
+    /// [RUST_LOG format]: https://rust-lang-nursery.github.io/rust-cookbook/development_tools/debugging/config_log.html
     filter: String,
-    /// Controls whether to print to stdout or, equivalent, the system logs on
-    /// Android.
+
+    /// Whether to log to stdout, or in the logcat on Android.
     write_to_stdout_or_system: bool,
+
+    /// If set, configures rotated log files where to write additional logs.
     write_to_files: Option<TracingFileConfiguration>,
 }
 
 #[uniffi::export]
 pub fn setup_tracing(config: TracingConfiguration) {
-    #[cfg(target_os = "android")]
     log_panics();
 
     tracing_subscriber::registry()

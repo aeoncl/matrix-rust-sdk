@@ -23,16 +23,16 @@ pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
     store::{DynStateStore, MemoryStore, StateStoreExt},
-    DisplayName, Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomInfo,
-    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
-    StateStore, StoreError,
+    ComposerDraft, ComposerDraftType, DisplayName, Room as BaseRoom,
+    RoomCreateWithCreatorEventContent, RoomHero, RoomInfo, RoomMember as BaseRoomMember,
+    RoomMemberships, RoomState, SessionMeta, StateChanges, StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
 
 mod account;
 pub mod attachment;
-mod authentication;
+pub mod authentication;
 mod client;
 pub mod config;
 mod deduplicating_handler;
@@ -51,6 +51,7 @@ pub mod pusher;
 pub mod room;
 pub mod room_directory_search;
 pub mod room_preview;
+pub mod send_queue;
 pub mod utils;
 pub mod futures {
     //! Named futures returned from methods on types in [the crate root][crate].
@@ -85,7 +86,7 @@ pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
 #[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
-    RoomListEntry, SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
+    SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
 };
 

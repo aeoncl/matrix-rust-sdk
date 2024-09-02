@@ -19,20 +19,26 @@ use std::{
     fmt::{self, Debug},
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
 };
 
 use eyeball::{SharedObservable, Subscriber};
+#[cfg(not(target_arch = "wasm32"))]
+use eyeball_im::VectorDiff;
 use futures_core::Stream;
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::StreamExt;
+#[cfg(not(target_arch = "wasm32"))]
+use imbl::Vector;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
-    store::DynStateStore,
+    event_cache_store::DynEventCacheStore,
+    store::{DynStateStore, ServerCapabilities},
     sync::{Notification, RoomUpdates},
-    BaseClient, RoomInfoUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
-    SyncOutsideWasm,
+    BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
+    StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
-use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -59,17 +65,20 @@ use ruma::{
     },
     assign,
     push::Ruleset,
+    time::Instant,
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
     RoomOrAliasId, ServerName, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
-use tracing::{debug, error, instrument, trace, Instrument, Span};
+use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
 
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
+#[cfg(feature = "experimental-sliding-sync")]
+use crate::sliding_sync::Version as SlidingSyncVersion;
 use crate::{
     authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
     config::RequestConfig,
@@ -83,6 +92,7 @@ use crate::{
     matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
     room_preview::RoomPreview,
+    send_queue::SendQueueData,
     sync::{RoomUpdate, SyncResponse},
     Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
     TransmissionProgress,
@@ -218,12 +228,26 @@ pub(crate) struct ClientInner {
     /// All the data related to authentication and authorization.
     pub(crate) auth_ctx: Arc<AuthCtx>,
 
+    /// The URL of the server.
+    ///
+    /// Not to be confused with the `Self::homeserver`. `server` is usually
+    /// the server part in a user ID, e.g. with `@mnt_io:matrix.org`, here
+    /// `matrix.org` is the server, whilst `matrix-client.matrix.org` is the
+    /// homeserver (at the time of writing — 2024-08-28).
+    ///
+    /// This value is optional depending on how the `Client` has been built.
+    /// If it's been built from a homeserver URL directly, we don't know the
+    /// server. However, if the `Client` has been built from a server URL or
+    /// name, then the homeserver has been discovered, and we know both.
+    server: Option<Url>,
+
     /// The URL of the homeserver to connect to.
+    ///
+    /// This is the URL for the client-server Matrix API.
     homeserver: StdRwLock<Url>,
 
-    /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
-    sliding_sync_proxy: StdRwLock<Option<Url>>,
+    sliding_sync_version: StdRwLock<SlidingSyncVersion>,
 
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
@@ -231,11 +255,9 @@ pub(crate) struct ClientInner {
     /// User session data.
     base_client: BaseClient,
 
-    /// The Matrix versions the server supports (well-known ones only)
-    server_versions: OnceCell<Box<[MatrixVersion]>>,
-
-    /// The unstable features and their on/off state on the server
-    unstable_features: OnceCell<BTreeMap<String, bool>>,
+    /// Server capabilities, either prefilled during building or fetched from
+    /// the server.
+    server_capabilities: RwLock<ClientServerCapabilities>,
 
     /// Collection of locks individual client methods might want to use, either
     /// to ensure that only a single call to a method happens at once or to
@@ -282,6 +304,11 @@ pub(crate) struct ClientInner {
     /// The verification state of our own device.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) verification_state: SharedObservable<VerificationState>,
+
+    /// Data related to the [`SendQueue`].
+    ///
+    /// [`SendQueue`]: crate::send_queue::SendQueue
+    pub(crate) send_queue_data: Arc<SendQueueData>,
 }
 
 impl ClientInner {
@@ -293,26 +320,27 @@ impl ClientInner {
     #[allow(clippy::too_many_arguments)]
     async fn new(
         auth_ctx: Arc<AuthCtx>,
+        server: Option<Url>,
         homeserver: Url,
-        #[cfg(feature = "experimental-sliding-sync")] sliding_sync_proxy: Option<Url>,
+        #[cfg(feature = "experimental-sliding-sync")] sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
         base_client: BaseClient,
-        server_versions: Option<Box<[MatrixVersion]>>,
-        unstable_features: Option<BTreeMap<String, bool>>,
+        server_capabilities: ClientServerCapabilities,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
+        send_queue: Arc<SendQueueData>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
     ) -> Arc<Self> {
         let client = Self {
+            server,
             homeserver: StdRwLock::new(homeserver),
             auth_ctx,
             #[cfg(feature = "experimental-sliding-sync")]
-            sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
+            sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
             base_client,
             locks: Default::default(),
-            server_versions: OnceCell::new_with(server_versions),
-            unstable_features: OnceCell::new_with(unstable_features),
+            server_capabilities: RwLock::new(server_capabilities),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
@@ -323,6 +351,7 @@ impl ClientInner {
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
+            send_queue_data: send_queue,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
             #[cfg(feature = "e2e-encryption")]
@@ -335,7 +364,10 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")]
         client.e2ee.initialize_room_key_tasks(&client);
 
-        let _ = client.event_cache.get_or_init(|| async { EventCache::new(&client) }).await;
+        let _ = client
+            .event_cache
+            .get_or_init(|| async { EventCache::new(WeakClient::from_inner(&client)) })
+            .await;
 
         client
     }
@@ -375,6 +407,11 @@ impl Client {
 
     pub(crate) fn base_client(&self) -> &BaseClient {
         &self.inner.base_client
+    }
+
+    /// The underlying HTTP client.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.inner.http_client.inner
     }
 
     pub(crate) fn locks(&self) -> &ClientLocks {
@@ -434,23 +471,29 @@ impl Client {
         self.inner.base_client.logged_in()
     }
 
-    /// The Homeserver of the client.
+    /// The server used by the client.
+    ///
+    /// See `Self::server` to learn more.
+    pub fn server(&self) -> Option<&Url> {
+        self.inner.server.as_ref()
+    }
+
+    /// The homeserver of the client.
     pub fn homeserver(&self) -> Url {
         self.inner.homeserver.read().unwrap().clone()
     }
 
-    /// The sliding sync proxy that is trusted by the homeserver.
+    /// Get the sliding sync version.
     #[cfg(feature = "experimental-sliding-sync")]
-    pub fn sliding_sync_proxy(&self) -> Option<Url> {
-        let server = self.inner.sliding_sync_proxy.read().unwrap();
-        Some(server.as_ref()?.clone())
+    pub fn sliding_sync_version(&self) -> SlidingSyncVersion {
+        self.inner.sliding_sync_version.read().unwrap().clone()
     }
 
-    /// Force to set the sliding sync proxy URL.
+    /// Override the sliding sync version.
     #[cfg(feature = "experimental-sliding-sync")]
-    pub fn set_sliding_sync_proxy(&self, sliding_sync_proxy: Option<Url>) {
-        let mut lock = self.inner.sliding_sync_proxy.write().unwrap();
-        *lock = sliding_sync_proxy;
+    pub fn set_sliding_sync_version(&self, version: SlidingSyncVersion) {
+        let mut lock = self.inner.sliding_sync_version.write().unwrap();
+        *lock = version;
     }
 
     /// Get the Matrix user session meta information.
@@ -465,8 +508,8 @@ impl Client {
     /// Returns a receiver that gets events for each room info update. To watch
     /// for new events, use `receiver.resubscribe()`. Each event contains the
     /// room and a boolean whether this event should trigger a room list update.
-    pub fn roominfo_update_receiver(&self) -> broadcast::Receiver<RoomInfoUpdate> {
-        self.base_client().roominfo_update_receiver()
+    pub fn room_info_notable_update_receiver(&self) -> broadcast::Receiver<RoomInfoNotableUpdate> {
+        self.base_client().room_info_notable_update_receiver()
     }
 
     /// Performs a search for users.
@@ -538,6 +581,11 @@ impl Client {
     /// Get a reference to the state store.
     pub fn store(&self) -> &DynStateStore {
         self.base_client().store()
+    }
+
+    /// Get a reference to the event cache store.
+    pub(crate) fn event_cache_store(&self) -> &DynEventCacheStore {
+        self.base_client().event_cache_store()
     }
 
     /// Access the native Matrix authentication API with this client.
@@ -890,26 +938,35 @@ impl Client {
     ///
     /// This will return the list of joined, invited, and left rooms.
     pub fn rooms(&self) -> Vec<Room> {
-        self.base_client()
-            .get_rooms()
-            .into_iter()
-            .map(|room| Room::new(self.clone(), room))
-            .collect()
+        self.base_client().rooms().into_iter().map(|room| Room::new(self.clone(), room)).collect()
     }
 
     /// Get all the rooms the client knows about, filtered by room state.
     pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(filter)
+            .rooms_filtered(filter)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
     }
 
+    /// Get a stream of all the rooms, in addition to the existing rooms.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
+        let (rooms, stream) = self.base_client().rooms_stream();
+
+        let map_room = |room| Room::new(self.clone(), room);
+
+        (
+            rooms.into_iter().map(map_room).collect(),
+            stream.map(move |diffs| diffs.into_iter().map(|diff| diff.map(map_room)).collect()),
+        )
+    }
+
     /// Returns the joined rooms this client knows about.
     pub fn joined_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::JOINED)
+            .rooms_filtered(RoomStateFilter::JOINED)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -918,7 +975,7 @@ impl Client {
     /// Returns the invited rooms this client knows about.
     pub fn invited_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::INVITED)
+            .rooms_filtered(RoomStateFilter::INVITED)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -927,7 +984,7 @@ impl Client {
     /// Returns the left rooms this client knows about.
     pub fn left_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::LEFT)
+            .rooms_filtered(RoomStateFilter::LEFT)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -1010,8 +1067,19 @@ impl Client {
         }
     }
 
-    pub(crate) async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
-        self.base_client().set_session_meta(session_meta).await?;
+    pub(crate) async fn set_session_meta(
+        &self,
+        session_meta: SessionMeta,
+        #[cfg(feature = "e2e-encryption")] custom_account: Option<vodozemac::olm::Account>,
+    ) -> Result<()> {
+        self.base_client()
+            .set_session_meta(
+                session_meta,
+                #[cfg(feature = "e2e-encryption")]
+                custom_account,
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -1128,8 +1196,8 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// * `alias` - The `RoomId` or `RoomAliasId` of the room to be joined.
-    /// An alias looks like `#name:example.com`.
+    /// * `alias` - The `RoomId` or `RoomAliasId` of the room to be joined. An
+    ///   alias looks like `#name:example.com`.
     pub async fn join_room_by_id_or_alias(
         &self,
         alias: &RoomOrAliasId,
@@ -1274,7 +1342,7 @@ impl Client {
     /// # Arguments
     ///
     /// * `room_search` - The easiest way to create this request is using the
-    /// `get_public_rooms_filtered::Request` itself.
+    ///   `get_public_rooms_filtered::Request` itself.
     ///
     /// # Examples
     ///
@@ -1320,7 +1388,7 @@ impl Client {
     /// * `request` - A filled out and valid request for the endpoint to be hit
     ///
     /// * `timeout` - An optional request timeout setting, this overrides the
-    /// default request setting if one was set.
+    ///   default request setting if one was set.
     ///
     /// # Examples
     ///
@@ -1388,7 +1456,7 @@ impl Client {
                 config,
                 homeserver,
                 access_token.as_deref(),
-                self.server_versions().await?,
+                &self.server_versions().await?,
                 send_progress,
             )
             .await
@@ -1402,8 +1470,11 @@ impl Client {
             .send(SessionChange::UnknownToken { soft_logout: *soft_logout });
     }
 
-    async fn request_server_versions(&self) -> HttpResult<Box<[MatrixVersion]>> {
-        let server_versions: Box<[MatrixVersion]> = self
+    /// Fetches server capabilities from network; no caching.
+    async fn fetch_server_capabilities(
+        &self,
+    ) -> HttpResult<(Box<[MatrixVersion]>, BTreeMap<String, bool>)> {
+        let resp = self
             .inner
             .http_client
             .send(
@@ -1414,47 +1485,90 @@ impl Client {
                 &[MatrixVersion::V1_0],
                 Default::default(),
             )
-            .await?
-            .known_versions()
-            .collect();
-
-        if server_versions.is_empty() {
-            Ok(vec![MatrixVersion::V1_0].into())
-        } else {
-            Ok(server_versions)
-        }
-    }
-
-    pub(crate) async fn server_versions(&self) -> HttpResult<&[MatrixVersion]> {
-        let server_versions = self
-            .inner
-            .server_versions
-            .get_or_try_init(|| Box::pin(self.request_server_versions()))
             .await?;
 
-        Ok(server_versions)
+        // Fill both unstable features and server versions at once.
+        let mut versions = resp.known_versions().collect::<Vec<_>>();
+        if versions.is_empty() {
+            versions.push(MatrixVersion::V1_0);
+        }
+
+        Ok((versions.into(), resp.unstable_features))
     }
 
-    /// Fetch unstable_features from homeserver
-    async fn request_unstable_features(&self) -> HttpResult<BTreeMap<String, bool>> {
-        let unstable_features: BTreeMap<String, bool> = self
-            .inner
-            .http_client
-            .send(
-                get_supported_versions::Request::new(),
-                None,
-                self.homeserver().to_string(),
-                None,
-                &[MatrixVersion::V1_0],
-                Default::default(),
-            )
-            .await?
-            .unstable_features;
+    /// Load server capabilities from storage, or fetch them from network and
+    /// cache them.
+    async fn load_or_fetch_server_capabilities(
+        &self,
+    ) -> HttpResult<(Box<[MatrixVersion]>, BTreeMap<String, bool>)> {
+        match self.store().get_kv_data(StateStoreDataKey::ServerCapabilities).await {
+            Ok(Some(stored)) => {
+                if let Some((versions, unstable_features)) =
+                    stored.into_server_capabilities().and_then(|cap| cap.maybe_decode())
+                {
+                    return Ok((versions.into(), unstable_features));
+                }
+            }
+            Ok(None) => {
+                // fallthrough: cache is empty
+            }
+            Err(err) => {
+                warn!("error when loading cached server capabilities: {err}");
+                // fallthrough to network.
+            }
+        }
 
-        Ok(unstable_features)
+        let (versions, unstable_features) = self.fetch_server_capabilities().await?;
+
+        // Attempt to cache the result in storage.
+        {
+            let encoded = ServerCapabilities::new(&versions, unstable_features.clone());
+            if let Err(err) = self
+                .store()
+                .set_kv_data(
+                    StateStoreDataKey::ServerCapabilities,
+                    StateStoreDataValue::ServerCapabilities(encoded),
+                )
+                .await
+            {
+                warn!("error when caching server capabilities: {err}");
+            }
+        }
+
+        Ok((versions, unstable_features))
     }
 
-    /// Get unstable features from `request_unstable_features` or cache
+    async fn get_or_load_and_cache_server_capabilities<
+        T,
+        F: Fn(&ClientServerCapabilities) -> Option<T>,
+    >(
+        &self,
+        f: F,
+    ) -> HttpResult<T> {
+        let caps = &self.inner.server_capabilities;
+        if let Some(val) = f(&*caps.read().await) {
+            return Ok(val);
+        }
+
+        let mut guard = caps.write().await;
+        if let Some(val) = f(&guard) {
+            return Ok(val);
+        }
+
+        let (versions, unstable_features) = self.load_or_fetch_server_capabilities().await?;
+
+        guard.server_versions = Some(versions);
+        guard.unstable_features = Some(unstable_features);
+
+        // SAFETY: both fields were set above, so the function will always return some.
+        Ok(f(&guard).unwrap())
+    }
+
+    pub(crate) async fn server_versions(&self) -> HttpResult<Box<[MatrixVersion]>> {
+        self.get_or_load_and_cache_server_capabilities(|caps| caps.server_versions.clone()).await
+    }
+
+    /// Get unstable features from by fetching from the server or the cache.
     ///
     /// # Examples
     ///
@@ -1468,14 +1582,23 @@ impl Client {
     /// let msc_x = unstable_features.get("msc_x").unwrap_or(&false);
     /// # anyhow::Ok(()) };
     /// ```
-    pub async fn unstable_features(&self) -> HttpResult<&BTreeMap<String, bool>> {
-        let unstable_features = self
-            .inner
-            .unstable_features
-            .get_or_try_init(|| self.request_unstable_features())
-            .await?;
+    pub async fn unstable_features(&self) -> HttpResult<BTreeMap<String, bool>> {
+        self.get_or_load_and_cache_server_capabilities(|caps| caps.unstable_features.clone()).await
+    }
 
-        Ok(unstable_features)
+    /// Empty the server version and unstable features cache.
+    ///
+    /// Since the SDK caches server capabilities (versions and unstable
+    /// features), it's possible to have a stale entry in the cache. This
+    /// functions makes it possible to force reset it.
+    pub async fn reset_server_capabilities(&self) -> Result<()> {
+        // Empty the in-memory caches.
+        let mut guard = self.inner.server_capabilities.write().await;
+        guard.server_versions = None;
+        guard.unstable_features = None;
+
+        // Empty the store cache.
+        Ok(self.store().remove_kv_data(StateStoreDataKey::ServerCapabilities).await?)
     }
 
     /// Check whether MSC 4028 is enabled on the homeserver.
@@ -1528,13 +1651,13 @@ impl Client {
     /// # Arguments
     ///
     /// * `devices` - The list of devices that should be deleted from the
-    /// server.
+    ///   server.
     ///
     /// * `auth_data` - This request requires user interactive auth, the first
-    /// request needs to set this to `None` and will always fail with an
-    /// `UiaaResponse`. The response will contain information for the
-    /// interactive auth and the same request needs to be made but this time
-    /// with some `auth_data` provided.
+    ///   request needs to set this to `None` and will always fail with an
+    ///   `UiaaResponse`. The response will contain information for the
+    ///   interactive auth and the same request needs to be made but this time
+    ///   with some `auth_data` provided.
     ///
     /// ```no_run
     /// # use matrix_sdk::{
@@ -2073,21 +2196,19 @@ impl Client {
 
     /// Create a new specialized `Client` that can process notifications.
     pub async fn notification_client(&self) -> Result<Client> {
-        #[cfg(feature = "experimental-sliding-sync")]
-        let sliding_sync_proxy = self.inner.sliding_sync_proxy.read().unwrap().clone();
-
         let client = Client {
             inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
+                self.server().cloned(),
                 self.homeserver(),
                 #[cfg(feature = "experimental-sliding-sync")]
-                sliding_sync_proxy,
+                self.sliding_sync_version(),
                 self.inner.http_client.clone(),
                 self.inner.base_client.clone_with_in_memory_state_store(),
-                self.inner.server_versions.get().cloned(),
-                self.inner.unstable_features.get().cloned(),
+                self.inner.server_capabilities.read().await.clone(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
+                self.inner.send_queue_data.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,
             )
@@ -2102,7 +2223,13 @@ impl Client {
         // overwrite the session information shared with the parent too, and it
         // must be initialized at most once.
         if let Some(session) = self.session() {
-            client.set_session_meta(session.into_meta()).await?;
+            client
+                .set_session_meta(
+                    session.into_meta(),
+                    #[cfg(feature = "e2e-encryption")]
+                    None,
+                )
+                .await?;
         }
 
         Ok(client)
@@ -2115,13 +2242,56 @@ impl Client {
     }
 }
 
+/// A weak reference to the inner client, useful when trying to get a handle
+/// on the owning client.
+#[derive(Clone)]
+pub(crate) struct WeakClient {
+    client: Weak<ClientInner>,
+}
+
+impl WeakClient {
+    /// Construct a [`WeakClient`] from a `Arc<ClientInner>`.
+    pub fn from_inner(client: &Arc<ClientInner>) -> Self {
+        Self { client: Arc::downgrade(client) }
+    }
+
+    /// Construct a [`WeakClient`] from a [`Client`].
+    pub fn from_client(client: &Client) -> Self {
+        Self::from_inner(&client.inner)
+    }
+
+    /// Attempts to get a [`Client`] from this [`WeakClient`].
+    pub fn get(&self) -> Option<Client> {
+        self.client.upgrade().map(|inner| Client { inner })
+    }
+
+    /// Gets the number of strong (`Arc`) pointers still pointing to this
+    /// client.
+    #[allow(dead_code)]
+    pub fn strong_count(&self) -> usize {
+        self.client.strong_count()
+    }
+}
+
+#[derive(Clone)]
+struct ClientServerCapabilities {
+    /// The Matrix versions the server supports (well-known ones only).
+    server_versions: Option<Box<[MatrixVersion]>>,
+
+    /// The unstable features and their on/off state on the server.
+    unstable_features: Option<BTreeMap<String, bool>>,
+}
+
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use assert_matches::assert_matches;
-    use matrix_sdk_base::RoomState;
+    use matrix_sdk_base::{
+        store::{MemoryStore, StoreConfig},
+        RoomState,
+    };
     use matrix_sdk_test::{
         async_test, test_json, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder,
         DEFAULT_TEST_ROOM_ID,
@@ -2129,7 +2299,10 @@ pub(crate) mod tests {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    use ruma::{events::ignored_user_list::IgnoredUserListEventContent, UserId};
+    use ruma::{
+        api::MatrixVersion, events::ignored_user_list::IgnoredUserListEventContent, owned_room_id,
+        room_id, RoomId, ServerName, UserId,
+    };
     use url::Url;
     use wiremock::{
         matchers::{body_json, header, method, path},
@@ -2138,8 +2311,11 @@ pub(crate) mod tests {
 
     use super::Client;
     use crate::{
+        client::WeakClient,
         config::{RequestConfig, SyncSettings},
-        test_utils::{logged_in_client, no_retry_test_client, test_client_builder},
+        test_utils::{
+            logged_in_client, no_retry_test_client, set_client_session, test_client_builder,
+        },
         Error,
     };
 
@@ -2172,32 +2348,42 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_successful_discovery() {
+        // Imagine this is `matrix.org`.
         let server = MockServer::start().await;
+
+        // Imagine this is `matrix-client.matrix.org`.
+        let homeserver = MockServer::start().await;
+
+        // Imagine Alice has the user ID `@alice:matrix.org`.
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let alice = UserId::parse("@alice:".to_owned() + domain).unwrap();
 
+        // The `.well-known` is on the server (e.g. `matrix.org`).
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
+                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", &homeserver.uri()),
                 "application/json",
             ))
             .mount(&server)
             .await;
 
+        // The `/versions` is on the homeserver (e.g. `matrix-client.matrix.org`).
         Mock::given(method("GET"))
             .and(path("/_matrix/client/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .mount(&server)
+            .mount(&homeserver)
             .await;
+
         let client = Client::builder()
             .insecure_server_name_no_tls(alice.server_name())
             .build()
             .await
             .unwrap();
 
-        assert_eq!(client.homeserver(), Url::parse(server_url.as_ref()).unwrap());
+        assert_eq!(client.server().unwrap(), &Url::parse(&server.uri()).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(&homeserver.uri()).unwrap());
     }
 
     #[async_test]
@@ -2364,10 +2550,10 @@ pub(crate) mod tests {
             )
             .mount(&server)
             .await;
-        let unstable_features = client.request_unstable_features().await.unwrap();
 
+        let unstable_features = client.unstable_features().await.unwrap();
         assert_eq!(unstable_features.get("org.matrix.e2e_cross_signing"), Some(&true));
-        assert_eq!(unstable_features, client.unstable_features().await.unwrap().clone());
+        assert_eq!(unstable_features.get("you.shall.pass"), None);
     }
 
     #[async_test]
@@ -2392,7 +2578,7 @@ pub(crate) mod tests {
         // Tracking recently visited rooms requires authentication
         let client = no_retry_test_client(Some("http://localhost".to_owned())).await;
         assert_matches!(
-            client.account().track_recently_visited_room("!alpha:localhost".to_owned()).await,
+            client.account().track_recently_visited_room(owned_room_id!("!alpha:localhost")).await,
             Err(Error::AuthenticationRequired)
         );
 
@@ -2403,45 +2589,39 @@ pub(crate) mod tests {
         assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 0);
 
         // Tracking a valid room id should add it to the list
-        account.track_recently_visited_room("!alpha:localhost".to_owned()).await.unwrap();
+        account.track_recently_visited_room(owned_room_id!("!alpha:localhost")).await.unwrap();
         assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
         assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
-
-        // Trying to track an invalid room id should return an error
-        assert_matches!(
-            account.track_recently_visited_room("this_is_not_a_valid_room_id".to_owned()).await,
-            Err(Error::Identifier { .. })
-        );
 
         // And the existing list shouldn't be changed
         assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
         assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
 
         // Tracking the same room again shouldn't change the list
-        account.track_recently_visited_room("!alpha:localhost".to_owned()).await.unwrap();
+        account.track_recently_visited_room(owned_room_id!("!alpha:localhost")).await.unwrap();
         assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 1);
         assert_eq!(account.get_recently_visited_rooms().await.unwrap(), ["!alpha:localhost"]);
 
         // Tracking a second room should add it to the front of the list
-        account.track_recently_visited_room("!beta:localhost".to_owned()).await.unwrap();
+        account.track_recently_visited_room(owned_room_id!("!beta:localhost")).await.unwrap();
         assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 2);
         assert_eq!(
             account.get_recently_visited_rooms().await.unwrap(),
-            ["!beta:localhost", "!alpha:localhost"]
+            [room_id!("!beta:localhost"), room_id!("!alpha:localhost")]
         );
 
         // Tracking the first room yet again should move it to the front of the list
-        account.track_recently_visited_room("!alpha:localhost".to_owned()).await.unwrap();
+        account.track_recently_visited_room(owned_room_id!("!alpha:localhost")).await.unwrap();
         assert_eq!(account.get_recently_visited_rooms().await.unwrap().len(), 2);
         assert_eq!(
             account.get_recently_visited_rooms().await.unwrap(),
-            ["!alpha:localhost", "!beta:localhost"]
+            [room_id!("!alpha:localhost"), room_id!("!beta:localhost")]
         );
 
         // Tracking should be capped at 20
         for n in 0..20 {
             account
-                .track_recently_visited_room(format!("!{n}:localhost").to_owned())
+                .track_recently_visited_room(RoomId::parse(format!("!{n}:localhost")).unwrap())
                 .await
                 .unwrap();
         }
@@ -2450,10 +2630,147 @@ pub(crate) mod tests {
 
         // And the initial rooms should've been pushed out
         let rooms = account.get_recently_visited_rooms().await.unwrap();
-        assert!(!rooms.contains(&"!alpha:localhost".to_owned()));
-        assert!(!rooms.contains(&"!beta:localhost".to_owned()));
+        assert!(!rooms.contains(&owned_room_id!("!alpha:localhost")));
+        assert!(!rooms.contains(&owned_room_id!("!beta:localhost")));
 
         // And the last tracked room should be the first
-        assert_eq!(rooms.first().unwrap(), "!19:localhost");
+        assert_eq!(rooms.first().unwrap(), room_id!("!19:localhost"));
+    }
+
+    #[async_test]
+    async fn test_client_no_cycle_with_event_cache() {
+        let client = logged_in_client(None).await;
+
+        // Wait for the init tasks to die.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let weak_client = WeakClient::from_client(&client);
+        assert_eq!(weak_client.strong_count(), 1);
+
+        {
+            let room_id = room_id!("!room:example.org");
+
+            // Have the client know the room.
+            let response = SyncResponseBuilder::default()
+                .add_joined_room(JoinedRoomBuilder::new(room_id))
+                .build_sync_response();
+            client.inner.base_client.receive_sync_response(response).await.unwrap();
+
+            client.event_cache().subscribe().unwrap();
+
+            let (_room_event_cache, _drop_handles) =
+                client.get_room(room_id).unwrap().event_cache().await.unwrap();
+        }
+
+        drop(client);
+
+        // Give a bit of time for background tasks to die.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // The weak client must be the last reference to the client now.
+        assert_eq!(weak_client.strong_count(), 0);
+        let client = weak_client.get();
+        assert!(
+            client.is_none(),
+            "too many strong references to the client: {}",
+            Arc::strong_count(&client.unwrap().inner)
+        );
+    }
+
+    #[async_test]
+    async fn test_server_capabilities_caching() {
+        let server = MockServer::start().await;
+        let server_url = server.uri();
+        let domain = server_url.strip_prefix("http://").unwrap();
+        let server_name = <&ServerName>::try_from(domain).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
+                "application/json",
+            ))
+            .named("well known mock")
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let versions_mock = Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .named("first versions mock")
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let memory_store = Arc::new(MemoryStore::new());
+        let client = Client::builder()
+            .insecure_server_name_no_tls(server_name)
+            .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(client.server_versions().await.unwrap().len(), 1);
+
+        // This second call hits the in-memory cache.
+        assert!(client
+            .server_versions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|version| *version == MatrixVersion::V1_0));
+
+        drop(client);
+
+        let client = Client::builder()
+            .insecure_server_name_no_tls(server_name)
+            .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            .build()
+            .await
+            .unwrap();
+
+        // This third call hits the on-disk cache.
+        assert_eq!(
+            client.unstable_features().await.unwrap().get("org.matrix.e2e_cross_signing"),
+            Some(&true)
+        );
+
+        drop(versions_mock);
+        server.verify().await;
+
+        // Now, reset the cache, and observe the endpoint being called again once.
+        client.reset_server_capabilities().await.unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .expect(1)
+            .named("second versions mock")
+            .mount(&server)
+            .await;
+
+        // Hits network again.
+        assert_eq!(client.server_versions().await.unwrap().len(), 1);
+        // Hits in-memory cache again.
+        assert!(client
+            .server_versions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|version| *version == MatrixVersion::V1_0));
+    }
+
+    #[async_test]
+    async fn test_no_network_doesnt_cause_infinite_retries() {
+        // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
+        // since we want infinite retries for transient errors.
+        let client =
+            test_client_builder(None).request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        // We don't define a mock server on purpose here, so that the error is really a
+        // network error.
+        client.whoami().await.unwrap_err();
     }
 }

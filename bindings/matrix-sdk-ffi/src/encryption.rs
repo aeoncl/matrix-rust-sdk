@@ -9,17 +9,18 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use super::RUNTIME;
-use crate::{error::ClientError, task_handle::TaskHandle};
+use crate::{client::Client, error::ClientError, ruma::AuthData, task_handle::TaskHandle};
 
 #[derive(uniffi::Object)]
 pub struct Encryption {
-    inner: matrix_sdk::encryption::Encryption,
-}
+    pub(crate) inner: matrix_sdk::encryption::Encryption,
 
-impl From<matrix_sdk::encryption::Encryption> for Encryption {
-    fn from(value: matrix_sdk::encryption::Encryption) -> Self {
-        Self { inner: value }
-    }
+    /// A reference to the FFI client.
+    ///
+    /// Note: we do this to make it so that the FFI `NotificationClient` keeps
+    /// the FFI `Client` and thus the SDK `Client` alive. Otherwise, we
+    /// would need to repeat the hack done in the FFI `Client::drop` method.
+    pub(crate) _client: Arc<Client>,
 }
 
 #[uniffi::export(callback_interface)]
@@ -222,7 +223,7 @@ impl Encryption {
     /// Get the public curve25519 key of our own device in base64. This is
     /// usually what is called the identity key of the device.
     pub async fn curve25519_key(&self) -> Option<String> {
-        self.inner.curve25519_key().await
+        self.inner.curve25519_key().await.map(|k| k.to_base64())
     }
 
     pub fn backup_state_listener(&self, listener: Box<dyn BackupStateListener>) -> Arc<TaskHandle> {
@@ -356,6 +357,22 @@ impl Encryption {
         Ok(result?)
     }
 
+    /// Completely reset the current user's crypto identity: reset the cross
+    /// signing keys, delete the existing backup and recovery key.
+    pub async fn reset_identity(&self) -> Result<Option<Arc<IdentityResetHandle>>, ClientError> {
+        if let Some(reset_handle) = self
+            .inner
+            .recovery()
+            .reset_identity()
+            .await
+            .map_err(|e| ClientError::Generic { msg: e.to_string() })?
+        {
+            return Ok(Some(Arc::new(IdentityResetHandle { inner: reset_handle })));
+        }
+
+        Ok(None)
+    }
+
     pub async fn recover(&self, mut recovery_key: String) -> Result<()> {
         let result = self.inner.recovery().recover(&recovery_key).await;
 
@@ -384,5 +401,76 @@ impl Encryption {
     /// was running in the background.
     pub async fn wait_for_e2ee_initialization_tasks(&self) {
         self.inner.wait_for_e2ee_initialization_tasks().await;
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct IdentityResetHandle {
+    pub(crate) inner: matrix_sdk::encryption::recovery::IdentityResetHandle,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl IdentityResetHandle {
+    /// Get the underlying [`CrossSigningResetAuthType`] this identity reset
+    /// process is using.
+    pub fn auth_type(&self) -> CrossSigningResetAuthType {
+        self.inner.auth_type().into()
+    }
+
+    /// This method starts the identity reset process and
+    /// will go through the following steps:
+    ///
+    /// 1. Disable backing up room keys and delete the active backup
+    /// 2. Disable recovery and delete secret storage
+    /// 3. Go through the cross-signing key reset flow
+    /// 4. Finally, re-enable key backups only if they were enabled before
+    pub async fn reset(&self, auth: Option<AuthData>) -> Result<(), ClientError> {
+        if let Some(auth) = auth {
+            self.inner
+                .reset(Some(auth.into()))
+                .await
+                .map_err(|e| ClientError::Generic { msg: e.to_string() })
+        } else {
+            self.inner.reset(None).await.map_err(|e| ClientError::Generic { msg: e.to_string() })
+        }
+    }
+
+    pub async fn cancel(&self) {
+        self.inner.cancel().await;
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum CrossSigningResetAuthType {
+    /// The homeserver requires user-interactive authentication.
+    Uiaa,
+    // /// OIDC is used for authentication and the user needs to open a URL to
+    // /// approve the upload of cross-signing keys.
+    Oidc {
+        info: OidcCrossSigningResetInfo,
+    },
+}
+
+impl From<&matrix_sdk::encryption::CrossSigningResetAuthType> for CrossSigningResetAuthType {
+    fn from(value: &matrix_sdk::encryption::CrossSigningResetAuthType) -> Self {
+        match value {
+            encryption::CrossSigningResetAuthType::Uiaa(_) => Self::Uiaa,
+            encryption::CrossSigningResetAuthType::Oidc(info) => Self::Oidc { info: info.into() },
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct OidcCrossSigningResetInfo {
+    /// The error message we received from the homeserver after we attempted to
+    /// reset the cross-signing keys.
+    pub error: String,
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    pub approval_url: String,
+}
+
+impl From<&matrix_sdk::encryption::OidcCrossSigningResetInfo> for OidcCrossSigningResetInfo {
+    fn from(value: &matrix_sdk::encryption::OidcCrossSigningResetInfo) -> Self {
+        Self { error: value.error.to_owned(), approval_url: value.approval_url.to_string() }
     }
 }

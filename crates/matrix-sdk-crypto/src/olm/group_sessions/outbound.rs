@@ -46,6 +46,8 @@ use super::SessionCreationError;
 #[cfg(feature = "experimental-algorithms")]
 use crate::types::events::room::encrypted::MegolmV2AesSha2Content;
 use crate::{
+    session_manager::CollectStrategy,
+    store::caches::SequenceNumber,
     types::{
         events::{
             room::encrypted::{
@@ -56,7 +58,7 @@ use crate::{
         },
         EventEncryptionAlgorithm,
     },
-    ReadOnlyDevice, ToDeviceRequest,
+    DeviceData, ToDeviceRequest,
 };
 
 const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
@@ -66,10 +68,19 @@ const ROTATION_PERIOD: Duration = ONE_WEEK;
 const ROTATION_MESSAGES: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Information about whether a session was shared with a device.
 pub(crate) enum ShareState {
+    /// The session was not shared with the device.
     NotShared,
+    /// The session was shared with the device with the given device ID, but
+    /// with a different curve25519 key.
     SharedButChangedSenderKey,
-    Shared(u32),
+    /// The session was shared with the device, at the given message index. The
+    /// `olm_wedging_index` is the value of the `olm_wedging_index` from the
+    /// [`DeviceData`] at the time that we last shared the session with the
+    /// device, and indicates whether we need to re-share the session with the
+    /// device.
+    Shared { message_index: u32, olm_wedging_index: SequenceNumber },
 }
 
 /// Settings for an encrypted room.
@@ -85,10 +96,10 @@ pub struct EncryptionSettings {
     pub rotation_period_msgs: u64,
     /// The history visibility of the room when the session was created.
     pub history_visibility: HistoryVisibility,
-    /// Should untrusted devices receive the room key, or should they be
-    /// excluded from the conversation.
+    /// The strategy used to distribute the room keys to participant.
+    /// Default will send to all devices.
     #[serde(default)]
-    pub only_allow_trusted_devices: bool,
+    pub sharing_strategy: CollectStrategy,
 }
 
 impl Default for EncryptionSettings {
@@ -98,19 +109,18 @@ impl Default for EncryptionSettings {
             rotation_period: ROTATION_PERIOD,
             rotation_period_msgs: ROTATION_MESSAGES,
             history_visibility: HistoryVisibility::Shared,
-            only_allow_trusted_devices: false,
+            sharing_strategy: CollectStrategy::default(),
         }
     }
 }
 
 impl EncryptionSettings {
     /// Create new encryption settings using an `RoomEncryptionEventContent`,
-    /// a history visibility, and setting if only trusted devices should receive
-    /// a room key.
+    /// a history visibility, and key sharing strategy.
     pub fn new(
         content: RoomEncryptionEventContent,
         history_visibility: HistoryVisibility,
-        only_allow_trusted_devices: bool,
+        sharing_strategy: CollectStrategy,
     ) -> Self {
         let rotation_period: Duration =
             content.rotation_period_ms.map_or(ROTATION_PERIOD, |r| Duration::from_millis(r.into()));
@@ -122,7 +132,7 @@ impl EncryptionSettings {
             rotation_period,
             rotation_period_msgs,
             history_visibility,
-            only_allow_trusted_devices,
+            sharing_strategy,
         }
     }
 }
@@ -168,8 +178,12 @@ pub enum ShareInfo {
 
 impl ShareInfo {
     /// Helper to create a SharedWith info
-    pub fn new_shared(sender_key: Curve25519PublicKey, message_index: u32) -> Self {
-        ShareInfo::Shared(SharedWith { sender_key, message_index })
+    pub fn new_shared(
+        sender_key: Curve25519PublicKey,
+        message_index: u32,
+        olm_wedging_index: SequenceNumber,
+    ) -> Self {
+        ShareInfo::Shared(SharedWith { sender_key, message_index, olm_wedging_index })
     }
 
     /// Helper to create a Withheld info
@@ -184,6 +198,9 @@ pub struct SharedWith {
     pub sender_key: Curve25519PublicKey,
     /// The message index that the device received.
     pub message_index: u32,
+    /// The Olm wedging index of the device at the time the session was shared.
+    #[serde(default)]
+    pub olm_wedging_index: SequenceNumber,
 }
 
 impl OutboundGroupSession {
@@ -207,12 +224,12 @@ impl OutboundGroupSession {
     /// * `device_id` - The id of the device that created this session.
     ///
     /// * `identity_keys` - The identity keys of the account that created this
-    /// session.
+    ///   session.
     ///
     /// * `room_id` - The id of the room that the session is used in.
     ///
     /// * `settings` - Settings determining the algorithm and rotation period of
-    /// the outbound group session.
+    ///   the outbound group session.
     pub fn new(
         device_id: OwnedDeviceId,
         identity_keys: Arc<IdentityKeys>,
@@ -362,10 +379,10 @@ impl OutboundGroupSession {
     /// # Arguments
     ///
     /// * `event_type` - The plaintext type of the event, the outer type of the
-    /// event will become `m.room.encrypted`.
+    ///   event will become `m.room.encrypted`.
     ///
     /// * `content` - The plaintext content of the message that should be
-    /// encrypted in raw JSON form.
+    ///   encrypted in raw JSON form.
     ///
     /// # Panics
     ///
@@ -519,14 +536,17 @@ impl OutboundGroupSession {
     }
 
     /// Has or will the session be shared with the given user/device pair.
-    pub(crate) fn is_shared_with(&self, device: &ReadOnlyDevice) -> ShareState {
+    pub(crate) fn is_shared_with(&self, device: &DeviceData) -> ShareState {
         // Check if we shared the session.
         let shared_state =
             self.shared_with_set.read().unwrap().get(device.user_id()).and_then(|d| {
                 d.get(device.device_id()).map(|s| match s {
                     ShareInfo::Shared(s) => {
                         if device.curve25519_key() == Some(s.sender_key) {
-                            ShareState::Shared(s.message_index)
+                            ShareState::Shared {
+                                message_index: s.message_index,
+                                olm_wedging_index: s.olm_wedging_index,
+                            }
                         } else {
                             ShareState::SharedButChangedSenderKey
                         }
@@ -550,7 +570,10 @@ impl OutboundGroupSession {
                     Some(match info {
                         ShareInfo::Shared(info) => {
                             if device.curve25519_key() == Some(info.sender_key) {
-                                ShareState::Shared(info.message_index)
+                                ShareState::Shared {
+                                    message_index: info.message_index,
+                                    olm_wedging_index: info.olm_wedging_index,
+                                }
                             } else {
                                 ShareState::SharedButChangedSenderKey
                             }
@@ -563,7 +586,7 @@ impl OutboundGroupSession {
         }
     }
 
-    pub(crate) fn is_withheld_to(&self, device: &ReadOnlyDevice, code: &WithheldCode) -> bool {
+    pub(crate) fn is_withheld_to(&self, device: &DeviceData, code: &WithheldCode) -> bool {
         self.shared_with_set
             .read()
             .unwrap()
@@ -597,12 +620,10 @@ impl OutboundGroupSession {
         sender_key: Curve25519PublicKey,
         index: u32,
     ) {
-        self.shared_with_set
-            .write()
-            .unwrap()
-            .entry(user_id.to_owned())
-            .or_default()
-            .insert(device_id.to_owned(), ShareInfo::new_shared(sender_key, index));
+        self.shared_with_set.write().unwrap().entry(user_id.to_owned()).or_default().insert(
+            device_id.to_owned(),
+            ShareInfo::new_shared(sender_key, index, Default::default()),
+        );
     }
 
     /// Mark the session as shared with the given user/device pair, starting
@@ -614,7 +635,8 @@ impl OutboundGroupSession {
         device_id: &DeviceId,
         sender_key: Curve25519PublicKey,
     ) {
-        let share_info = ShareInfo::new_shared(sender_key, self.message_index().await);
+        let share_info =
+            ShareInfo::new_shared(sender_key, self.message_index().await, Default::default());
         self.shared_with_set
             .write()
             .unwrap()
@@ -650,7 +672,7 @@ impl OutboundGroupSession {
     /// * `pickle` - The pickled version of the `OutboundGroupSession`.
     ///
     /// * `pickle_mode` - The mode that was used to pickle the session, either
-    /// an unencrypted mode or an encrypted using passphrase.
+    ///   an unencrypted mode or an encrypted using passphrase.
     pub fn from_pickle(
         device_id: OwnedDeviceId,
         identity_keys: Arc<IdentityKeys>,
@@ -681,8 +703,7 @@ impl OutboundGroupSession {
     /// # Arguments
     ///
     /// * `pickle_mode` - The mode that should be used to pickle the group
-    ///   session,
-    /// either an unencrypted mode or an encrypted using passphrase.
+    ///   session, either an unencrypted mode or an encrypted using passphrase.
     pub async fn pickle(&self) -> PickledOutboundGroupSession {
         let pickle = self.inner.read().await.pickle();
 
@@ -760,12 +781,20 @@ mod tests {
     };
 
     use super::{EncryptionSettings, ROTATION_MESSAGES, ROTATION_PERIOD};
+    use crate::CollectStrategy;
 
     #[test]
     fn test_encryption_settings_conversion() {
         let mut content =
             RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-        let settings = EncryptionSettings::new(content.clone(), HistoryVisibility::Joined, false);
+        let settings = EncryptionSettings::new(
+            content.clone(),
+            HistoryVisibility::Joined,
+            CollectStrategy::DeviceBasedStrategy {
+                only_allow_trusted_devices: false,
+                error_on_verified_user_problem: false,
+            },
+        );
 
         assert_eq!(settings.rotation_period, ROTATION_PERIOD);
         assert_eq!(settings.rotation_period_msgs, ROTATION_MESSAGES);
@@ -773,7 +802,14 @@ mod tests {
         content.rotation_period_ms = Some(uint!(3600));
         content.rotation_period_msgs = Some(uint!(500));
 
-        let settings = EncryptionSettings::new(content, HistoryVisibility::Shared, false);
+        let settings = EncryptionSettings::new(
+            content,
+            HistoryVisibility::Shared,
+            CollectStrategy::DeviceBasedStrategy {
+                only_allow_trusted_devices: false,
+                error_on_verified_user_problem: false,
+            },
+        );
 
         assert_eq!(settings.rotation_period, Duration::from_millis(3600));
         assert_eq!(settings.rotation_period_msgs, 500);
@@ -789,12 +825,15 @@ mod tests {
             user_id, SecondsSinceUnixEpoch,
         };
 
-        use crate::{olm::OutboundGroupSession, Account, EncryptionSettings, MegolmError};
+        use crate::{
+            olm::{OutboundGroupSession, SenderData},
+            Account, EncryptionSettings, MegolmError,
+        };
 
         const TWO_HOURS: Duration = Duration::from_secs(60 * 60 * 2);
 
         #[async_test]
-        async fn session_is_not_expired_if_no_messages_sent_and_no_time_passed() {
+        async fn test_session_is_not_expired_if_no_messages_sent_and_no_time_passed() {
             // Given a session that expires after one message
             let session = create_session(EncryptionSettings {
                 rotation_period_msgs: 1,
@@ -809,7 +848,7 @@ mod tests {
         }
 
         #[async_test]
-        async fn session_is_expired_if_we_rotate_every_message_and_one_was_sent(
+        async fn test_session_is_expired_if_we_rotate_every_message_and_one_was_sent(
         ) -> Result<(), MegolmError> {
             // Given a session that expires after one message
             let session = create_session(EncryptionSettings {
@@ -833,7 +872,7 @@ mod tests {
         }
 
         #[async_test]
-        async fn session_with_rotation_period_is_not_expired_after_no_time() {
+        async fn test_session_with_rotation_period_is_not_expired_after_no_time() {
             // Given a session with a 2h expiration
             let session = create_session(EncryptionSettings {
                 rotation_period: TWO_HOURS,
@@ -848,7 +887,7 @@ mod tests {
         }
 
         #[async_test]
-        async fn session_is_expired_after_rotation_period() {
+        async fn test_session_is_expired_after_rotation_period() {
             // Given a session with a 2h expiration
             let mut session = create_session(EncryptionSettings {
                 rotation_period: TWO_HOURS,
@@ -866,7 +905,7 @@ mod tests {
 
         #[async_test]
         #[cfg(not(feature = "_disable-minimum-rotation-period-ms"))]
-        async fn session_does_not_expire_under_one_hour_even_if_we_ask_for_shorter() {
+        async fn test_session_does_not_expire_under_one_hour_even_if_we_ask_for_shorter() {
             // Given a session with a 100ms expiration
             let mut session = create_session(EncryptionSettings {
                 rotation_period: Duration::from_millis(100),
@@ -890,7 +929,7 @@ mod tests {
 
         #[async_test]
         #[cfg(feature = "_disable-minimum-rotation-period-ms")]
-        async fn with_disable_minrotperiod_feature_sessions_can_expire_quickly() {
+        async fn test_with_disable_minrotperiod_feature_sessions_can_expire_quickly() {
             // Given a session with a 100ms expiration
             let mut session = create_session(EncryptionSettings {
                 rotation_period: Duration::from_millis(100),
@@ -908,7 +947,7 @@ mod tests {
         }
 
         #[async_test]
-        async fn session_with_zero_msgs_rotation_is_not_expired_initially() {
+        async fn test_session_with_zero_msgs_rotation_is_not_expired_initially() {
             // Given a session that is supposed to expire after zero messages
             let session = create_session(EncryptionSettings {
                 rotation_period_msgs: 0,
@@ -924,7 +963,7 @@ mod tests {
         }
 
         #[async_test]
-        async fn session_with_zero_msgs_rotation_expires_after_one_message(
+        async fn test_session_with_zero_msgs_rotation_expires_after_one_message(
         ) -> Result<(), MegolmError> {
             // Given a session that is supposed to expire after zero messages
             let session = create_session(EncryptionSettings {
@@ -949,7 +988,7 @@ mod tests {
         }
 
         #[async_test]
-        async fn session_expires_after_10k_messages_even_if_we_ask_for_more() {
+        async fn test_session_expires_after_10k_messages_even_if_we_ask_for_more() {
             // Given we asked to expire after 100K messages
             let session = create_session(EncryptionSettings {
                 rotation_period_msgs: 100_000,
@@ -977,7 +1016,11 @@ mod tests {
                 Account::with_device_id(user_id!("@alice:example.org"), device_id!("DEVICEID"))
                     .static_data;
             let (session, _) = account
-                .create_group_session_pair(room_id!("!test_room:example.org"), settings)
+                .create_group_session_pair(
+                    room_id!("!test_room:example.org"),
+                    settings,
+                    SenderData::unknown(),
+                )
                 .await
                 .unwrap();
             session

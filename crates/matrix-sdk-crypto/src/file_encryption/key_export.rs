@@ -74,7 +74,7 @@ pub enum KeyExportError {
 /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
 /// # let export = Cursor::new("".to_owned());
 /// let exported_keys = decrypt_room_key_export(export, "1234").unwrap();
-/// machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
+/// machine.store().import_room_keys(exported_keys, None, |_, _| {}).await.unwrap();
 /// # };
 /// ```
 pub fn decrypt_room_key_export(
@@ -108,13 +108,13 @@ pub fn decrypt_room_key_export(
 /// * `keys` - A list of sessions that should be encrypted.
 ///
 /// * `passphrase` - The passphrase that will be used to encrypt the exported
-/// room keys.
+///   room keys.
 ///
-/// * `rounds` - The number of rounds that should be used for the key
-/// derivation when the passphrase gets turned into an AES key. More rounds are
-/// increasingly computationally intensive and as such help against brute-force
-/// attacks. Should be at least `10_000`, while values in the `100_000` ranges
-/// should be preferred.
+/// * `rounds` - The number of rounds that should be used for the key derivation
+///   when the passphrase gets turned into an AES key. More rounds are
+///   increasingly computationally intensive and as such help against
+///   brute-force attacks. Should be at least `10_000`, while values in the
+///   `100_000` ranges should be preferred.
 ///
 /// # Panics
 ///
@@ -243,7 +243,8 @@ mod tests {
         encrypt_room_key_export,
     };
     use crate::{
-        error::OlmResult, machine::tests::get_prepared_machine_test_helper, RoomKeyImportResult,
+        error::OlmResult, machine::test_helpers::get_prepared_machine_test_helper,
+        RoomKeyImportResult,
     };
 
     const PASSPHRASE: &str = "1234";

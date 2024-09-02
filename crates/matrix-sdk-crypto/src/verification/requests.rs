@@ -18,7 +18,6 @@ use as_variant::as_variant;
 use eyeball::{ObservableWriteGuard, SharedObservable, WeakObservable};
 use futures_core::Stream;
 use futures_util::StreamExt;
-use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "qrcode")]
 use matrix_sdk_qrcode::QrVerificationData;
 use ruma::{
@@ -34,6 +33,7 @@ use ruma::{
         room::message::KeyVerificationRequestEventContent,
         AnyMessageLikeEventContent, AnyToDeviceEventContent,
     },
+    time::Instant,
     to_device::DeviceIdOrAllDevices,
     DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId, TransactionId,
     UserId,
@@ -1197,7 +1197,7 @@ async fn generate_qr_code<T: Clone>(
     we_started: bool,
     request_handle: RequestHandle,
 ) -> Result<Option<(RequestState<Transitioned>, QrVerification)>, CryptoStoreError> {
-    use crate::ReadOnlyUserIdentities;
+    use crate::UserIdentityData;
 
     // If we didn't state that we support showing QR codes or if the other
     // side doesn't support scanning QR codes bail early.
@@ -1225,7 +1225,7 @@ async fn generate_qr_code<T: Clone>(
 
     let verification = if let Some(identity) = &identities.identity_being_verified {
         match &identity {
-            ReadOnlyUserIdentities::Own(i) => {
+            UserIdentityData::Own(i) => {
                 if let Some(master_key) = i.master_key().get_first_key() {
                     if identities.can_sign_devices().await {
                         if let Some(device_key) = identities.other_device().ed25519_key() {
@@ -1266,7 +1266,7 @@ async fn generate_qr_code<T: Clone>(
                     None
                 }
             }
-            ReadOnlyUserIdentities::Other(i) => {
+            UserIdentityData::Other(i) => {
                 if let Some(other_master) = i.master_key().get_first_key() {
                     // TODO we can get the master key from the public
                     // identity if we don't have the private one and we
@@ -1643,7 +1643,7 @@ mod tests {
             tests::{alice_id, bob_id, setup_stores},
             FlowId, Verification, VerificationStore,
         },
-        OutgoingVerificationRequest, ReadOnlyDevice, VerificationRequestState,
+        DeviceData, OutgoingVerificationRequest, VerificationRequestState,
     };
 
     #[async_test]
@@ -1702,7 +1702,7 @@ mod tests {
         // test what happens when we cancel() a request that we have just received over
         // to-device messages.
         let (_alice, alice_store, bob, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), None);
@@ -1740,7 +1740,7 @@ mod tests {
         let room_id = room_id!("!test:localhost");
 
         let (_alice, alice_store, bob, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
         let content = VerificationRequest::request(
             &bob_store.account.user_id,
@@ -1795,7 +1795,7 @@ mod tests {
     #[async_test]
     async fn test_requesting_until_sas_to_device() {
         let (_alice, alice_store, bob, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), None);
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn can_scan_another_qr_after_creating_mine() {
+    async fn test_can_scan_another_qr_after_creating_mine() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
@@ -1879,7 +1879,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn can_start_sas_after_generating_qr_code() {
+    async fn test_can_start_sas_after_generating_qr_code() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
@@ -1924,7 +1924,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn start_sas_after_scan_cancels_request() {
+    async fn test_start_sas_after_scan_cancels_request() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests

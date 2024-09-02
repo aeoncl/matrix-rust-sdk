@@ -6,8 +6,12 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::{
         api::client::room::create_room::v3::Request as CreateRoomRequest,
-        assign, event_id,
-        events::{room::message::RoomMessageEventContent, AnyStateEvent, AnyTimelineEvent},
+        assign, event_id, events,
+        events::{
+            room::message::RoomMessageEventContent, AnyRoomAccountDataEventContent, AnyStateEvent,
+            AnyTimelineEvent, EventContent,
+        },
+        serde::Raw,
         uint,
     },
     test_utils::assert_event_matches_msg,
@@ -16,12 +20,11 @@ use matrix_sdk::{
 use tokio::{spawn, time::sleep};
 use tracing::error;
 
-use crate::helpers::TestClientBuilder;
+use crate::helpers::{wait_for_room, TestClientBuilder};
 
 #[tokio::test]
 async fn test_event_with_context() -> Result<()> {
-    let bob =
-        TestClientBuilder::new("bob".to_owned()).randomize_username().use_sqlite().build().await?;
+    let bob = TestClientBuilder::new("bob").use_sqlite().build().await?;
 
     // Spawn sync for bob.
     let b = bob.clone();
@@ -34,11 +37,7 @@ async fn test_event_with_context() -> Result<()> {
         }
     });
 
-    let alice = TestClientBuilder::new("alice".to_owned())
-        .randomize_username()
-        .use_sqlite()
-        .build()
-        .await?;
+    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
 
     // Spawn sync for alice too.
     let a = alice.clone();
@@ -61,28 +60,20 @@ async fn test_event_with_context() -> Result<()> {
         .room_id()
         .to_owned();
 
-    let mut alice_room = None;
-    for i in 1..=4 {
-        alice_room = alice.get_room(&room_id);
-        if alice_room.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(30 * i)).await;
-    }
+    let alice_room = wait_for_room(&alice, &room_id).await;
 
     // Bob joins it.
     let mut bob_joined = false;
-    for i in 1..=4 {
+    for i in 1..=5 {
         if let Some(room) = bob.get_room(&room_id) {
             room.join().await?;
             bob_joined = true;
             break;
         }
-        sleep(Duration::from_millis(30 * i)).await;
+        sleep(Duration::from_millis(500 * i)).await;
     }
-    anyhow::ensure!(bob_joined, "bob couldn't join after 3 seconds");
+    anyhow::ensure!(bob_joined, "bob couldn't join after ~8 seconds");
 
-    let alice_room = alice_room.unwrap();
     assert_eq!(alice_room.state(), RoomState::Joined);
 
     alice_room.enable_encryption().await?;
@@ -103,7 +94,7 @@ async fn test_event_with_context() -> Result<()> {
 
     {
         // First /context query: only the target event, no context around it.
-        let response = room.event_with_context(&event_id, false, uint!(0)).await?;
+        let response = room.event_with_context(&event_id, false, uint!(0), None).await?;
 
         let target = response
             .event
@@ -122,7 +113,8 @@ async fn test_event_with_context() -> Result<()> {
 
     {
         // Next query: an event that doesn't exist (hopefully!).
-        let response = room.event_with_context(event_id!("$lolololol"), false, uint!(0)).await;
+        let response =
+            room.event_with_context(event_id!("$lolololol"), false, uint!(0), None).await;
 
         // Servers answers with 404.
         assert_let!(Err(err) = response);
@@ -132,7 +124,7 @@ async fn test_event_with_context() -> Result<()> {
     {
         // Next query: target event with a context of 3 events. There
         // should be some previous and next tokens.
-        let response = room.event_with_context(&event_id, false, uint!(3)).await?;
+        let response = room.event_with_context(&event_id, false, uint!(3), None).await?;
 
         let target = response
             .event
@@ -193,6 +185,78 @@ async fn test_event_with_context() -> Result<()> {
         // There are other events before that (room creation, alice joining).
         assert!(prev_messages.end.is_some());
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_room_account_data() -> Result<()> {
+    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
+
+    // Spawn sync for alice too.
+    let a = alice.clone();
+    spawn(async move {
+        let alice = a;
+        loop {
+            if let Err(err) = alice.sync(Default::default()).await {
+                error!("alice sync error: {err}");
+            }
+        }
+    });
+
+    // alice creates a room and invites bob.
+    let room_id = alice.create_room(CreateRoomRequest::new()).await?.room_id().to_owned();
+
+    let alice_room = wait_for_room(&alice, &room_id).await;
+
+    // ensure clean
+
+    let tag =
+        alice_room.account_data_static::<events::marked_unread::MarkedUnreadEventContent>().await?;
+    assert!(tag.is_none());
+
+    let tag = alice_room.account_data_static::<events::tag::TagEventContent>().await?;
+    assert!(tag.is_none());
+
+    // set a raw one
+    let marked_unread_content = events::marked_unread::MarkedUnreadEventContent::new(true);
+    let full_event: AnyRoomAccountDataEventContent = marked_unread_content.clone().into();
+    alice_room
+        .set_account_data_raw(marked_unread_content.event_type(), Raw::new(&full_event).unwrap())
+        .await?;
+
+    let mut tags = events::tag::Tags::new();
+    tags.insert(events::tag::TagName::from("u.custom_name"), events::tag::TagInfo::new());
+
+    let new_tag = events::tag::TagEventContent::new(tags);
+
+    // let's set this
+    alice_room.set_account_data(new_tag.clone()).await?;
+
+    let mut countdown = 30;
+    let mut found = false;
+    while countdown > 0 {
+        if let Some(tag) = alice_room.account_data_static::<events::tag::TagEventContent>().await? {
+            let _content = tag.deserialize().unwrap().content;
+            assert_matches!(new_tag.clone(), _content);
+            found = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+        countdown -= 1;
+    }
+
+    assert!(found, "Even after 3 seconds the tag was not found");
+
+    // test the non-static method works, too
+    let tag = alice_room.account_data(new_tag.event_type()).await?.unwrap();
+    let _content = tag.deserialize().unwrap().content();
+    assert_matches!(new_tag, _content);
+
+    let new_marked_unread_content =
+        alice_room.account_data(marked_unread_content.event_type()).await?.unwrap();
+    let _content = new_marked_unread_content.deserialize().unwrap().content();
+    assert_matches!(marked_unread_content, _content);
 
     Ok(())
 }

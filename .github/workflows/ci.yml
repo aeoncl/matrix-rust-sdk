@@ -26,7 +26,6 @@ jobs:
   test-matrix-sdk-features:
     name: 🐧 [m], ${{ matrix.name }}
     needs: xtask
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     runs-on: ubuntu-latest
     strategy:
@@ -79,7 +78,6 @@ jobs:
     name: 🐧 [m]-examples
     needs: xtask
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout the repo
@@ -111,7 +109,6 @@ jobs:
     name: 🐧 [m]-crypto
     needs: xtask
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout the repo
@@ -141,7 +138,6 @@ jobs:
 
   test-all-crates:
     name: ${{ matrix.name }}
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     runs-on: ${{ matrix.os }}
     strategy:
@@ -194,7 +190,6 @@ jobs:
   test-wasm:
     name: 🕸️ ${{ matrix.name }}
     needs: xtask
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     runs-on: ubuntu-latest
 
@@ -270,7 +265,6 @@ jobs:
   formatting:
     name: Check Formatting
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout the repo
@@ -279,7 +273,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2024-05-09
+          toolchain: nightly-2024-06-25
           components: rustfmt
 
       - name: Cargo fmt
@@ -289,7 +283,6 @@ jobs:
   typos:
     name: Spell Check with Typos
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout Actions Repository
@@ -302,7 +295,6 @@ jobs:
     name: Run clippy
     needs: xtask
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout the repo
@@ -316,7 +308,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2024-05-09
+          toolchain: nightly-2024-06-25
           components: clippy
 
       - name: Load cache
@@ -337,7 +329,6 @@ jobs:
 
   integration-tests:
     name: Integration test
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     runs-on: ubuntu-latest
 

@@ -15,16 +15,19 @@
 use std::fmt;
 
 use ruma::{
+    api::client::delayed_events::{
+        delayed_message_event, delayed_state_event, update_delayed_event,
+    },
     events::{AnyTimelineEvent, MessageLikeEventType, StateEventType},
     serde::Raw,
-    OwnedEventId, RoomId,
+    OwnedEventId, OwnedRoomId,
 };
 use serde::{Deserialize, Serialize};
 
-use super::SendEventRequest;
+use super::{SendEventRequest, UpdateDelayedEventRequest};
 use crate::widget::StateKeySelector;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(tag = "action", rename_all = "snake_case", content = "data")]
 pub(super) enum FromWidgetRequest {
     SupportedApiVersions {},
@@ -34,6 +37,8 @@ pub(super) enum FromWidgetRequest {
     #[serde(rename = "org.matrix.msc2876.read_events")]
     ReadEvent(ReadEventRequest),
     SendEvent(SendEventRequest),
+    #[serde(rename = "org.matrix.msc4157.update_delayed_event")]
+    DelayedEventUpdate(UpdateDelayedEventRequest),
 }
 
 #[derive(Serialize)]
@@ -111,7 +116,7 @@ pub(super) enum ApiVersion {
     MSC3846,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub(super) enum ReadEventRequest {
     ReadStateEvent {
@@ -132,8 +137,47 @@ pub(super) struct ReadEventResponse {
     pub(super) events: Vec<Raw<AnyTimelineEvent>>,
 }
 
-#[derive(Serialize)]
-pub(super) struct SendEventResponse<'a> {
-    pub(super) room_id: &'a RoomId,
-    pub(super) event_id: OwnedEventId,
+#[derive(Serialize, Debug)]
+pub(crate) struct SendEventResponse {
+    /// The room id for the send event.
+    pub(crate) room_id: Option<OwnedRoomId>,
+    /// The event id of the send event. It's optional because if it's a delayed
+    /// event, it does not get the event_id at this point.
+    pub(crate) event_id: Option<OwnedEventId>,
+    /// The `delay_id` generated for this delayed event. Used to interact with
+    /// the delayed event.
+    pub(crate) delay_id: Option<String>,
+}
+
+impl SendEventResponse {
+    pub(crate) fn from_event_id(event_id: OwnedEventId) -> Self {
+        SendEventResponse { room_id: None, event_id: Some(event_id), delay_id: None }
+    }
+    pub(crate) fn set_room_id(&mut self, room_id: OwnedRoomId) {
+        self.room_id = Some(room_id);
+    }
+}
+
+impl From<delayed_message_event::unstable::Response> for SendEventResponse {
+    fn from(val: delayed_message_event::unstable::Response) -> Self {
+        SendEventResponse { room_id: None, event_id: None, delay_id: Some(val.delay_id) }
+    }
+}
+
+impl From<delayed_state_event::unstable::Response> for SendEventResponse {
+    fn from(val: delayed_state_event::unstable::Response) -> Self {
+        SendEventResponse { room_id: None, event_id: None, delay_id: Some(val.delay_id) }
+    }
+}
+
+/// A wrapper type for the empty okay response from
+/// [`update_delayed_event`](update_delayed_event::unstable::Response)
+/// which derives Serialize. (The response struct from Ruma does not derive
+/// serialize)
+#[derive(Serialize, Debug)]
+pub(crate) struct UpdateDelayedEventResponse {}
+impl From<update_delayed_event::unstable::Response> for UpdateDelayedEventResponse {
+    fn from(_: update_delayed_event::unstable::Response) -> Self {
+        Self {}
+    }
 }

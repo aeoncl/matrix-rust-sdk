@@ -31,6 +31,7 @@ use axum::{
 use futures_util::StreamExt;
 use matrix_sdk::{
     config::SyncSettings,
+    encryption::{recovery::RecoveryState, CrossSigningResetAuthType},
     oidc::{
         requests::account_management::AccountManagementActionFull,
         types::{
@@ -97,6 +98,7 @@ fn help() {
     println!("  watch [sliding?]       Watch new incoming messages until an error occurs");
     println!("  authorize [scope…]     Authorize the given scope");
     println!("  refresh                Refresh the access token");
+    println!("  recover                Recover the E2EE secrets from secret storage");
     println!("  logout                 Log out of this account");
     println!("  exit                   Exit this program");
     println!("  help                   Show this message\n");
@@ -354,6 +356,12 @@ impl OidcCli {
                 Some("refresh") => {
                     self.refresh_token().await?;
                 }
+                Some("recover") => {
+                    self.recover().await?;
+                }
+                Some("reset-cross-signing") => {
+                    self.reset_cross_signing().await?;
+                }
                 Some("logout") => {
                     self.logout().await?;
                     break;
@@ -374,6 +382,52 @@ impl OidcCli {
                 }
             };
         }
+
+        Ok(())
+    }
+
+    async fn recover(&self) -> anyhow::Result<()> {
+        let recovery = self.client.encryption().recovery();
+
+        println!("Please enter your recovery key:");
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).expect("error: unable to read user input");
+
+        let input = input.trim();
+
+        recovery.recover(input).await?;
+
+        match recovery.state() {
+            RecoveryState::Enabled => println!("Successfully recovered all the E2EE secrets."),
+            RecoveryState::Disabled => println!("Error recovering, recovery is disabled."),
+            RecoveryState::Incomplete => println!("Couldn't recover all E2EE secrets."),
+            _ => unreachable!("We should know our recovery state by now"),
+        }
+
+        Ok(())
+    }
+
+    async fn reset_cross_signing(&self) -> Result<()> {
+        let encryption = self.client.encryption();
+
+        if let Some(handle) = encryption.reset_cross_signing().await? {
+            match handle.auth_type() {
+                CrossSigningResetAuthType::Uiaa(_) => {
+                    unimplemented!("This should never happen, this is after all the OIDC example.")
+                }
+                CrossSigningResetAuthType::Oidc(o) => {
+                    println!(
+                        "To reset your end-to-end encryption cross-signing identity, \
+                        you first need to approve it at {}",
+                        o.approval_url
+                    );
+                    handle.auth(None).await?;
+                }
+            }
+        }
+
+        print!("Successfully reset cross-signing");
 
         Ok(())
     }
@@ -881,7 +935,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
     }
     let MessageType::Text(text_content) = &event.content.msgtype else { return };
 
-    let room_name = match room.computed_display_name().await {
+    let room_name = match room.compute_display_name().await {
         Ok(room_name) => room_name.to_string(),
         Err(error) => {
             println!("Error getting room display name: {error}");

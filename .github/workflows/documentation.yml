@@ -23,7 +23,6 @@ jobs:
   docs:
     name: All crates
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || !github.event.pull_request.draft
 
     steps:
       - name: Checkout repository
@@ -37,7 +36,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2024-05-09
+          toolchain: nightly-2024-06-25
 
       - name: Install Node.js
         uses: actions/setup-node@v4

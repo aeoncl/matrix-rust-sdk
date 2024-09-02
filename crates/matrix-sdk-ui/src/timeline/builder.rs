@@ -15,19 +15,25 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{event_cache::RoomEventCacheUpdate, executor::spawn, Room};
+use matrix_sdk::{
+    event_cache::{EventsOrigin, RoomEventCacheUpdate},
+    executor::spawn,
+    Room,
+};
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, info_span, trace, warn, Instrument, Span};
 
 #[cfg(feature = "e2e-encryption")]
 use super::to_device::{handle_forwarded_room_key_event, handle_room_key_event};
 use super::{
-    inner::{TimelineInner, TimelineInnerSettings},
-    queue::send_queued_messages,
+    controller::{TimelineController, TimelineSettings},
     Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
-use crate::{timeline::event_item::RemoteEventOrigin, unable_to_decrypt_hook::UtdHookManager};
+use crate::{
+    timeline::{controller::TimelineEnd, event_item::RemoteEventOrigin},
+    unable_to_decrypt_hook::UtdHookManager,
+};
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -35,7 +41,7 @@ use crate::{timeline::event_item::RemoteEventOrigin, unable_to_decrypt_hook::Utd
 #[derive(Debug)]
 pub struct TimelineBuilder {
     room: Room,
-    settings: TimelineInnerSettings,
+    settings: TimelineSettings,
     focus: TimelineFocus,
 
     /// An optional hook to call whenever we run into an unable-to-decrypt or a
@@ -50,7 +56,7 @@ impl TimelineBuilder {
     pub(super) fn new(room: &Room) -> Self {
         Self {
             room: room.clone(),
-            settings: TimelineInnerSettings::default(),
+            settings: TimelineSettings::default(),
             unable_to_decrypt_hook: None,
             focus: TimelineFocus::Live,
             internal_id_prefix: None,
@@ -151,17 +157,48 @@ impl TimelineBuilder {
         let (room_event_cache, event_cache_drop) = room.event_cache().await?;
         let (_, mut event_subscriber) = room_event_cache.subscribe().await?;
 
-        let inner = TimelineInner::new(room, focus, internal_id_prefix, unable_to_decrypt_hook)
-            .with_settings(settings);
+        let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
+        let is_room_encrypted =
+            room.is_encrypted().await.map_err(|_| Error::UnknownEncryptionState)?;
 
-        let has_events = inner.init_focus(&room_event_cache).await?;
+        let controller = TimelineController::new(
+            room,
+            focus.clone(),
+            internal_id_prefix,
+            unable_to_decrypt_hook,
+            is_room_encrypted,
+        )
+        .with_settings(settings);
 
-        let room = inner.room();
+        let has_events = controller.init_focus(&room_event_cache).await?;
+
+        let room = controller.room();
         let client = room.client();
+
+        let pinned_events_join_handle = if is_pinned_events {
+            let mut pinned_event_ids_stream = room.pinned_event_ids_stream();
+            Some(spawn({
+                let inner = controller.clone();
+                async move {
+                    while pinned_event_ids_stream.next().await.is_some() {
+                        if let Ok(events) = inner.reload_pinned_events().await {
+                            inner
+                                .replace_with_initial_remote_events(
+                                    events,
+                                    RemoteEventOrigin::Pagination,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
         let room_update_join_handle = spawn({
             let room_event_cache = room_event_cache.clone();
-            let inner = inner.clone();
+            let inner = controller.clone();
 
             let span =
                 info_span!(parent: Span::none(), "room_update_handler", room_id = ?room.room_id());
@@ -175,8 +212,8 @@ impl TimelineBuilder {
 
                     let update = match event_subscriber.recv().await {
                         Ok(up) => up,
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(num_skipped)) => {
+                        Err(RecvError::Closed) => break,
+                        Err(RecvError::Lagged(num_skipped)) => {
                             warn!(
                                 num_skipped,
                                 "Lagged behind event cache updates, resetting timeline"
@@ -190,7 +227,7 @@ impl TimelineBuilder {
                             // current timeline.
                             match room_event_cache.subscribe().await {
                                 Ok((events, _)) => {
-                                    inner.replace_with_initial_events(events, RemoteEventOrigin::Sync).await;
+                                    inner.replace_with_initial_remote_events(events, RemoteEventOrigin::Sync).await;
                                 }
                                 Err(err) => {
                                     warn!("Error when re-inserting initial events into the timeline: {err}");
@@ -203,7 +240,7 @@ impl TimelineBuilder {
                     };
 
                     match update {
-                        RoomEventCacheUpdate::UpdateReadMarker { event_id } => {
+                        RoomEventCacheUpdate::MoveReadMarkerTo { event_id } => {
                             trace!(target = %event_id, "Handling fully read marker.");
                             inner.handle_fully_read_marker(event_id).await;
                         }
@@ -220,13 +257,26 @@ impl TimelineBuilder {
                             inner.clear().await;
                         }
 
-                        RoomEventCacheUpdate::Append { events, ephemeral, ambiguity_changes } => {
-                            trace!("Received new events from sync.");
+                        RoomEventCacheUpdate::AddTimelineEvents { events, origin } => {
+                            trace!("Received new timeline events.");
 
-                            // TODO: (bnjbvr) ephemeral should be handled by the event cache, and
-                            // we should replace this with a simple `add_events_at`.
-                            inner.handle_sync_events(events, ephemeral).await;
+                            inner.add_events_at(
+                                events,
+                                TimelineEnd::Back,
+                                match origin {
+                                    EventsOrigin::Sync => RemoteEventOrigin::Sync,
+                                }
+                            ).await;
+                        }
 
+                        RoomEventCacheUpdate::AddEphemeralEvents { events } => {
+                            trace!("Received new ephemeral events from sync.");
+
+                            // TODO: (bnjbvr) ephemeral should be handled by the event cache.
+                            inner.handle_ephemeral_events(events).await;
+                        }
+
+                        RoomEventCacheUpdate::UpdateMembers { ambiguity_changes } => {
                             if !ambiguity_changes.is_empty() {
                                 let member_ambiguity_changes = ambiguity_changes
                                     .values()
@@ -241,15 +291,53 @@ impl TimelineBuilder {
             .instrument(span)
         });
 
+        let local_echo_listener_handle = {
+            let timeline = controller.clone();
+            let (local_echoes, mut listener) = room.send_queue().subscribe().await?;
+
+            spawn({
+                // Handles existing local echoes first.
+                for echo in local_echoes {
+                    timeline.handle_local_echo(echo).await;
+                }
+
+                let span = info_span!(parent: Span::none(), "local_echo_handler", room_id = ?room.room_id());
+                span.follows_from(Span::current());
+
+                // React to future local echoes too.
+                async move {
+                    info!("spawned the local echo handler!");
+
+                    loop {
+                        match listener.recv().await {
+                            Ok(update) => timeline.handle_room_send_queue_update(update).await,
+
+                            Err(RecvError::Lagged(num_missed)) => {
+                                warn!("missed {num_missed} local echoes, ignoring those missed");
+                            }
+
+                            Err(RecvError::Closed) => {
+                                info!("channel closed, exiting the local echo handler");
+                                break;
+                            }
+                        }
+                    }
+                }
+                .instrument(span)
+            })
+        };
+
         // Not using room.add_event_handler here because RoomKey events are
         // to-device events that are not received in the context of a room.
 
         #[cfg(feature = "e2e-encryption")]
-        let room_key_handle = client
-            .add_event_handler(handle_room_key_event(inner.clone(), room.room_id().to_owned()));
+        let room_key_handle = client.add_event_handler(handle_room_key_event(
+            controller.clone(),
+            room.room_id().to_owned(),
+        ));
         #[cfg(feature = "e2e-encryption")]
         let forwarded_room_key_handle = client.add_event_handler(handle_forwarded_room_key_event(
-            inner.clone(),
+            controller.clone(),
             room.room_id().to_owned(),
         ));
 
@@ -261,7 +349,7 @@ impl TimelineBuilder {
         ];
 
         let room_key_from_backups_join_handle = {
-            let inner = inner.clone();
+            let inner = controller.clone();
             let room_id = inner.room().room_id();
 
             let stream = client.encryption().backups().room_keys_for_room_stream(room_id);
@@ -289,19 +377,16 @@ impl TimelineBuilder {
             })
         };
 
-        let (msg_sender, msg_receiver) = mpsc::channel(1);
-        info!("Starting message-sending loop");
-        spawn(send_queued_messages(inner.clone(), room.clone(), msg_receiver));
-
         let timeline = Timeline {
-            inner,
-            msg_sender,
+            controller,
             event_cache: room_event_cache,
             drop_handle: Arc::new(TimelineDropHandle {
                 client,
                 event_handler_handles: handles,
                 room_update_join_handle,
+                pinned_events_join_handle,
                 room_key_from_backups_join_handle,
+                local_echo_listener_handle,
                 _event_cache_drop_handle: event_cache_drop,
             }),
         };

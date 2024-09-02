@@ -52,12 +52,8 @@ pub async fn no_retry_test_client(homeserver_url: Option<String>) -> Client {
         .unwrap()
 }
 
-/// A [`Client`] using the given `homeserver_url` (or localhost:1234), that will
-/// never retry any failed requests, and already logged in with an hardcoded
-/// Matrix authentication session (the user id and device id are hardcoded too).
-pub async fn logged_in_client(homeserver_url: Option<String>) -> Client {
-    let client = no_retry_test_client(homeserver_url).await;
-
+/// Restore the common (Matrix-auth) user session for a client.
+pub async fn set_client_session(client: &Client) {
     client
         .matrix_auth()
         .restore_session(MatrixSession {
@@ -69,7 +65,14 @@ pub async fn logged_in_client(homeserver_url: Option<String>) -> Client {
         })
         .await
         .unwrap();
+}
 
+/// A [`Client`] using the given `homeserver_url` (or localhost:1234), that will
+/// never retry any failed requests, and already logged in with an hardcoded
+/// Matrix authentication session (the user id and device id are hardcoded too).
+pub async fn logged_in_client(homeserver_url: Option<String>) -> Client {
+    let client = no_retry_test_client(homeserver_url).await;
+    set_client_session(&client).await;
     client
 }
 
@@ -77,7 +80,7 @@ pub async fn logged_in_client(homeserver_url: Option<String>) -> Client {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn test_client_builder_with_server() -> (ClientBuilder, wiremock::MockServer) {
     let server = wiremock::MockServer::start().await;
-    let builder = test_client_builder(Some(server.uri().to_string()));
+    let builder = test_client_builder(Some(server.uri()));
     (builder, server)
 }
 
@@ -95,4 +98,56 @@ pub async fn logged_in_client_with_server() -> (Client, wiremock::MockServer) {
     let server = wiremock::MockServer::start().await;
     let client = logged_in_client(Some(server.uri().to_string())).await;
     (client, server)
+}
+
+/// Asserts the next item in a [`Stream`] can be loaded in the given timeout in
+/// the given timeout in milliseconds.
+#[macro_export]
+macro_rules! assert_next_with_timeout {
+    ($stream:expr, $timeout_ms:expr) => {{
+        use futures_util::StreamExt as _;
+        tokio::time::timeout(std::time::Duration::from_millis($timeout_ms), $stream.next())
+            .await
+            .expect("Next event timed out")
+            .expect("No next event received")
+    }};
+}
+
+/// Assert the next item in a [`Stream`] matches the provided pattern in the
+/// given timeout in milliseconds.
+///
+/// If no timeout is provided, a default `100ms` value will be used.
+#[macro_export]
+macro_rules! assert_next_matches_with_timeout {
+    ($stream:expr, $pat:pat) => {
+        $crate::assert_next_matches_with_timeout!($stream, $pat => {})
+    };
+    ($stream:expr, $pat:pat => $arm:expr) => {
+        $crate::assert_next_matches_with_timeout!($stream, 100, $pat => $arm)
+    };
+    ($stream:expr, $timeout_ms:expr, $pat:pat => $arm:expr) => {
+        match $crate::assert_next_with_timeout!(&mut $stream, $timeout_ms) {
+            $pat => $arm,
+            val => {
+                ::core::panic!(
+                    "assertion failed: `{:?}` does not match `{}`",
+                    val, ::core::stringify!($pat)
+                );
+            }
+        }
+    };
+}
+
+/// Like `assert_let`, but with the possibility to add an optional timeout.
+///
+/// If not provided, a timeout value of 100 milliseconds is used.
+#[macro_export]
+macro_rules! assert_let_timeout {
+    ($timeout:expr, $pat:pat = $future:expr) => {
+        assert_matches2::assert_let!(Ok($pat) = tokio::time::timeout($timeout, $future).await);
+    };
+
+    ($pat:pat = $future:expr) => {
+        assert_let_timeout!(std::time::Duration::from_millis(100), $pat = $future);
+    };
 }

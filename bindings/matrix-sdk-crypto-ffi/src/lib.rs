@@ -16,7 +16,11 @@ mod responses;
 mod users;
 mod verification;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context as _;
 pub use backup_recovery_key::{
@@ -29,12 +33,14 @@ pub use error::{
 use js_int::UInt;
 pub use logger::{set_logger, Logger};
 pub use machine::{KeyRequestPair, OlmMachine, SignatureVerification};
-use matrix_sdk_common::deserialized_responses::ShieldState as RustShieldState;
+use matrix_sdk_common::deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode};
 use matrix_sdk_crypto::{
-    olm::{IdentityKeys, InboundGroupSession, Session},
+    olm::{IdentityKeys, InboundGroupSession, SenderData, Session},
     store::{Changes, CryptoStore, PendingChanges, RoomSettings as RustRoomSettings},
-    types::{EventEncryptionAlgorithm as RustEventEncryptionAlgorithm, SigningKey},
-    EncryptionSettings as RustEncryptionSettings,
+    types::{
+        DeviceKey, DeviceKeys, EventEncryptionAlgorithm as RustEventEncryptionAlgorithm, SigningKey,
+    },
+    CollectStrategy, EncryptionSettings as RustEncryptionSettings,
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
 pub use responses::{
@@ -43,8 +49,8 @@ pub use responses::{
 };
 use ruma::{
     events::room::history_visibility::HistoryVisibility as RustHistoryVisibility,
-    DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId,
-    SecondsSinceUnixEpoch, UserId,
+    DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId,
+    RoomId, SecondsSinceUnixEpoch, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
@@ -185,11 +191,11 @@ impl From<anyhow::Error> for MigrationError {
 /// * `path` - The path where the SQLite store should be created.
 ///
 /// * `passphrase` - The passphrase that should be used to encrypt the data at
-/// rest in the SQLite store. **Warning**, if no passphrase is given, the store
-/// and all its data will remain unencrypted.
+///   rest in the SQLite store. **Warning**, if no passphrase is given, the
+///   store and all its data will remain unencrypted.
 ///
 /// * `progress_listener` - A callback that can be used to introspect the
-/// progress of the migration.
+///   progress of the migration.
 #[uniffi::export]
 pub fn migrate(
     data: MigrationData,
@@ -348,11 +354,11 @@ async fn save_changes(
 /// * `path` - The path where the SQLite store should be created.
 ///
 /// * `passphrase` - The passphrase that should be used to encrypt the data at
-/// rest in the SQLite store. **Warning**, if no passphrase is given, the store
-/// and all its data will remain unencrypted.
+///   rest in the SQLite store. **Warning**, if no passphrase is given, the
+///   store and all its data will remain unencrypted.
 ///
 /// * `progress_listener` - A callback that can be used to introspect the
-/// progress of the migration.
+///   progress of the migration.
 #[uniffi::export]
 pub fn migrate_sessions(
     data: SessionMigrationData,
@@ -419,6 +425,27 @@ fn collect_sessions(
 ) -> anyhow::Result<(Vec<Session>, Vec<InboundGroupSession>)> {
     let mut sessions = Vec::new();
 
+    // Create a DeviceKeys struct with enough information to get a working
+    // Session, but we will won't actually use the Sessions (and we'll clear
+    // the session cache after migration) so we don't need to worry about
+    // signatures.
+    let device_keys = DeviceKeys::new(
+        user_id,
+        device_id.clone(),
+        Default::default(),
+        BTreeMap::from([
+            (
+                DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, &device_id),
+                DeviceKey::Ed25519(identity_keys.ed25519),
+            ),
+            (
+                DeviceKeyId::from_parts(DeviceKeyAlgorithm::Curve25519, &device_id),
+                DeviceKey::Curve25519(identity_keys.curve25519),
+            ),
+        ]),
+        Default::default(),
+    );
+
     for session_pickle in session_pickles {
         let pickle =
             vodozemac::olm::Session::from_libolm_pickle(&session_pickle.pickle, pickle_key)?
@@ -439,8 +466,7 @@ fn collect_sessions(
             last_use_time,
         };
 
-        let session =
-            Session::from_pickle(user_id.clone(), device_id.clone(), identity_keys.clone(), pickle);
+        let session = Session::from_pickle(device_keys.clone(), pickle)?;
 
         sessions.push(session);
         processed_steps += 1;
@@ -471,6 +497,7 @@ fn collect_sessions(
                     Ok((algorithm, key))
                 })
                 .collect::<anyhow::Result<_>>()?,
+            sender_data: SenderData::legacy(),
             room_id: RoomId::parse(session.room_id)?,
             imported: session.imported,
             backed_up: session.backed_up,
@@ -503,8 +530,8 @@ fn collect_sessions(
 /// * `path` - The path where the Sqlite store should be created.
 ///
 /// * `passphrase` - The passphrase that should be used to encrypt the data at
-/// rest in the Sqlite store. **Warning**, if no passphrase is given, the store
-/// and all its data will remain unencrypted.
+///   rest in the Sqlite store. **Warning**, if no passphrase is given, the
+///   store and all its data will remain unencrypted.
 #[uniffi::export]
 pub fn migrate_room_settings(
     room_settings: HashMap<String, RoomSettings>,
@@ -641,6 +668,9 @@ pub struct EncryptionSettings {
     /// Should untrusted devices receive the room key, or should they be
     /// excluded from the conversation.
     pub only_allow_trusted_devices: bool,
+    /// Should fail to send when a verified user has unverified devices, or when
+    /// a previously verified user replaces their identity.
+    pub error_on_verified_user_problem: bool,
 }
 
 impl From<EncryptionSettings> for RustEncryptionSettings {
@@ -650,7 +680,10 @@ impl From<EncryptionSettings> for RustEncryptionSettings {
             rotation_period: Duration::from_secs(v.rotation_period),
             rotation_period_msgs: v.rotation_period_msgs,
             history_visibility: v.history_visibility.into(),
-            only_allow_trusted_devices: v.only_allow_trusted_devices,
+            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
+                only_allow_trusted_devices: v.only_allow_trusted_devices,
+                error_on_verified_user_problem: v.error_on_verified_user_problem,
+            },
         }
     }
 }
@@ -695,19 +728,24 @@ pub enum ShieldColor {
 #[allow(missing_docs)]
 pub struct ShieldState {
     color: ShieldColor,
+    code: Option<ShieldStateCode>,
     message: Option<String>,
 }
 
 impl From<RustShieldState> for ShieldState {
     fn from(value: RustShieldState) -> Self {
         match value {
-            RustShieldState::Red { message } => {
-                Self { color: ShieldColor::Red, message: Some(message.to_owned()) }
-            }
-            RustShieldState::Grey { message } => {
-                Self { color: ShieldColor::Grey, message: Some(message.to_owned()) }
-            }
-            RustShieldState::None => Self { color: ShieldColor::None, message: None },
+            RustShieldState::Red { code, message } => Self {
+                color: ShieldColor::Red,
+                code: Some(code),
+                message: Some(message.to_owned()),
+            },
+            RustShieldState::Grey { code, message } => Self {
+                color: ShieldColor::Grey,
+                code: Some(code),
+                message: Some(message.to_owned()),
+            },
+            RustShieldState::None => Self { color: ShieldColor::None, code: None, message: None },
         }
     }
 }
