@@ -1,3 +1,7 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
 # unreleased
 
 Breaking changes:
@@ -12,6 +16,8 @@ Bug fixes:
 
 - `UtdHookManager` no longer re-reports UTD events as late decryptions.
   ([#3480](https://github.com/matrix-org/matrix-rust-sdk/pull/3480))
+- Messages that we were unable to decrypt no longer display a red padlock.
+  ([#3956](https://github.com/matrix-org/matrix-rust-sdk/issues/3956))
 
 Other changes:
 

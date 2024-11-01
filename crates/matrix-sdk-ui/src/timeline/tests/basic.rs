@@ -15,6 +15,8 @@
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
+use futures_util::StreamExt;
+use matrix_sdk::deserialized_responses::SyncTimelineEvent;
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB, CAROL};
 use ruma::{
     events::{
@@ -111,7 +113,7 @@ async fn test_sticker() {
     let mut stream = timeline.subscribe_events().await;
 
     timeline
-        .handle_live_event(sync_timeline_event!({
+        .handle_live_event(SyncTimelineEvent::new(sync_timeline_event!({
             "content": {
                 "body": "Happy sticker",
                 "info": {
@@ -126,7 +128,7 @@ async fn test_sticker() {
             "origin_server_ts": 143273582,
             "sender": "@alice:server.name",
             "type": "m.sticker",
-        }))
+        })))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -277,7 +279,7 @@ async fn test_dedup_pagination() {
     let event = timeline
         .event_builder
         .make_sync_message_event(*ALICE, RoomMessageEventContent::text_plain("o/"));
-    timeline.handle_live_event(event.clone()).await;
+    timeline.handle_live_event(SyncTimelineEvent::new(event.clone())).await;
     // This cast is not actually correct, sync events aren't valid
     // back-paginated events, as they are missing `room_id`. However, the
     // timeline doesn't care about that `room_id` and casts back to
@@ -329,16 +331,16 @@ async fn test_dedup_initial() {
     let event2 = &timeline_items[2];
     let event3 = &timeline_items[3];
 
-    // Make sure the order is right
+    // Make sure the order is right.
     assert_eq!(event1.as_event().unwrap().sender(), *ALICE);
     assert_eq!(event2.as_event().unwrap().sender(), *BOB);
     assert_eq!(event3.as_event().unwrap().sender(), *CAROL);
 
-    // Make sure we reused IDs when deduplicating events
-    assert_eq!(event1.unique_id(), "0");
-    assert_eq!(event2.unique_id(), "1");
-    assert_eq!(event3.unique_id(), "2");
-    assert_eq!(timeline_items[0].unique_id(), "3");
+    // Make sure we reused IDs when deduplicating events.
+    assert_eq!(event1.unique_id().0, "0");
+    assert_eq!(event2.unique_id().0, "1");
+    assert_eq!(event3.unique_id().0, "2");
+    assert_eq!(timeline_items[0].unique_id().0, "3");
 }
 
 #[async_test]
@@ -359,19 +361,19 @@ async fn test_internal_id_prefix() {
     assert_eq!(timeline_items.len(), 4);
 
     assert!(timeline_items[0].is_day_divider());
-    assert_eq!(timeline_items[0].unique_id(), "le_prefix_3");
+    assert_eq!(timeline_items[0].unique_id().0, "le_prefix_3");
 
     let event1 = &timeline_items[1];
     assert_eq!(event1.as_event().unwrap().sender(), *ALICE);
-    assert_eq!(event1.unique_id(), "le_prefix_0");
+    assert_eq!(event1.unique_id().0, "le_prefix_0");
 
     let event2 = &timeline_items[2];
     assert_eq!(event2.as_event().unwrap().sender(), *BOB);
-    assert_eq!(event2.unique_id(), "le_prefix_1");
+    assert_eq!(event2.unique_id().0, "le_prefix_1");
 
     let event3 = &timeline_items[3];
     assert_eq!(event3.as_event().unwrap().sender(), *CAROL);
-    assert_eq!(event3.unique_id(), "le_prefix_2");
+    assert_eq!(event3.unique_id().0, "le_prefix_2");
 }
 
 #[async_test]
@@ -504,4 +506,35 @@ async fn test_thread() {
     assert_eq!(in_reply_to.event_id, first_event_id);
     assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
     assert_eq!(replied_to_event.sender(), *ALICE);
+}
+
+#[async_test]
+async fn test_replace_with_initial_events_when_batched() {
+    let timeline = TestTimeline::with_room_data_provider(TestRoomDataProvider::default())
+        .with_settings(TimelineSettings::default());
+
+    let f = &timeline.factory;
+    let ev = f.text_msg("hey").sender(*ALICE).into_sync();
+
+    timeline.controller.add_events_at(vec![ev], TimelineEnd::Back, RemoteEventOrigin::Sync).await;
+
+    let (items, mut stream) = timeline.controller.subscribe_batched().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_day_divider());
+    assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "hey");
+
+    let ev = f.text_msg("yo").sender(*BOB).into_sync();
+    timeline.controller.replace_with_initial_remote_events(vec![ev], RemoteEventOrigin::Sync).await;
+
+    // Assert there are more than a single Clear diff in the next batch:
+    // Clear + PushBack (event) + PushFront (day divider)
+    let batched_diffs = stream.next().await.unwrap();
+    assert_eq!(batched_diffs.len(), 3);
+    assert_matches!(batched_diffs[0], VectorDiff::Clear);
+    assert_matches!(&batched_diffs[1], VectorDiff::PushBack { value } => {
+        assert!(value.as_event().is_some());
+    });
+    assert_matches!(&batched_diffs[2], VectorDiff::PushFront { value } => {
+        assert_matches!(value.as_virtual(), Some(VirtualTimelineItem::DayDivider(_)));
+    });
 }

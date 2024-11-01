@@ -36,7 +36,6 @@ use matrix_sdk_base::crypto::{
 use matrix_sdk_common::executor::spawn;
 use ruma::{
     api::client::{
-        error::{ErrorBody, ErrorKind},
         keys::{
             get_keys, upload_keys, upload_signatures::v3::Request as UploadSignaturesRequest,
             upload_signing_keys::v3::Request as UploadSigningKeysRequest,
@@ -48,15 +47,10 @@ use ruma::{
         uiaa::{AuthData, UiaaInfo},
     },
     assign,
-    events::room::{
-        message::{
-            AudioMessageEventContent, FileInfo, FileMessageEventContent, ImageMessageEventContent,
-            MessageType, VideoInfo, VideoMessageEventContent,
-        },
-        ImageInfo, MediaSource, ThumbnailInfo,
-    },
+    events::room::{MediaSource, ThumbnailInfo},
     DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
+use serde::Deserialize;
 use tokio::sync::{Mutex, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn};
 use url::Url;
@@ -64,7 +58,7 @@ use vodozemac::Curve25519PublicKey;
 
 use self::{
     backups::{types::BackupClientState, Backups},
-    futures::PrepareEncryptedFile,
+    futures::UploadEncryptedFile,
     identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
     secret_storage::SecretStorage,
@@ -72,7 +66,7 @@ use self::{
     verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
-    attachment::{AttachmentConfig, Thumbnail},
+    attachment::Thumbnail,
     client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
@@ -279,13 +273,12 @@ impl CrossSigningResetHandle {
         let mut upload_request = self.upload_request.clone();
         upload_request.auth = auth;
 
-        // TODO: Do we want to put a limit on this infinite loop? 🤷
         while let Err(e) = self.client.send(upload_request.clone(), None).await {
             if *self.is_cancelled.lock().await {
                 return Ok(());
             }
 
-            if e.client_api_error_kind() != Some(&ErrorKind::Unrecognized) {
+            if e.as_uiaa_response().is_none() {
                 return Err(e.into());
             }
         }
@@ -313,15 +306,22 @@ pub enum CrossSigningResetAuthType {
 }
 
 impl CrossSigningResetAuthType {
-    async fn new(client: &Client, error: &HttpError) -> Result<Option<Self>> {
+    #[allow(clippy::unused_async)]
+    async fn new(
+        #[allow(unused_variables)] client: &Client,
+        error: &HttpError,
+    ) -> Result<Option<Self>> {
         if let Some(auth_info) = error.as_uiaa_response() {
+            #[cfg(feature = "experimental-oidc")]
+            if client.oidc().issuer().is_some() {
+                OidcCrossSigningResetInfo::from_auth_info(client, auth_info)
+                    .map(|t| Some(CrossSigningResetAuthType::Oidc(t)))
+            } else {
+                Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
+            }
+
+            #[cfg(not(feature = "experimental-oidc"))]
             Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
-        } else if let Some(ErrorBody::Standard { kind, message }) =
-            error.as_client_api_error().map(|e| &e.body)
-        {
-            OidcCrossSigningResetInfo::from_matrix_error(client, kind, message)
-                .await
-                .map(|t| t.map(CrossSigningResetAuthType::Oidc))
         } else {
             Ok(None)
         }
@@ -330,45 +330,43 @@ impl CrossSigningResetAuthType {
 
 /// OIDC specific information about the required authentication for the upload
 /// of cross-signing keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OidcCrossSigningResetInfo {
-    /// The error message we received from the homeserver after we attempted to
-    /// reset the cross-signing keys.
-    pub error: String,
     /// The URL where the user can approve the reset of the cross-signing keys.
     pub approval_url: Url,
 }
 
 impl OidcCrossSigningResetInfo {
-    #[allow(clippy::unused_async)]
-    async fn from_matrix_error(
+    #[cfg(feature = "experimental-oidc")]
+    fn from_auth_info(
         // This is used if the OIDC feature is enabled.
         #[allow(unused_variables)] client: &Client,
-        kind: &ErrorKind,
-        message: &str,
-    ) -> Result<Option<Self>> {
-        #[cfg(feature = "experimental-oidc")]
-        use mas_oidc_client::requests::account_management::AccountManagementActionFull;
+        auth_info: &UiaaInfo,
+    ) -> Result<Self> {
+        let parameters =
+            serde_json::from_str::<OidcCrossSigningResetUiaaParameters>(auth_info.params.get())?;
 
-        if kind == &ErrorKind::Unrecognized {
-            #[cfg(feature = "experimental-oidc")]
-            let approval_url = client
-                .oidc()
-                .account_management_url(Some(AccountManagementActionFull::CrossSigningReset))
-                .await?;
-
-            #[cfg(not(feature = "experimental-oidc"))]
-            let approval_url = None;
-
-            if let Some(approval_url) = approval_url {
-                Ok(Some(OidcCrossSigningResetInfo { error: message.to_owned(), approval_url }))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
+        Ok(OidcCrossSigningResetInfo { approval_url: parameters.reset.url })
     }
+}
+
+/// The parsed `parameters` part of a [`ruma::api::client::uiaa::UiaaInfo`]
+/// response
+#[cfg(feature = "experimental-oidc")]
+#[derive(Debug, Deserialize)]
+struct OidcCrossSigningResetUiaaParameters {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    #[serde(rename = "org.matrix.cross_signing_reset")]
+    reset: OidcCrossSigningResetUiaaResetParameter,
+}
+
+/// The `org.matrix.cross_signing_reset` part of the Uiaa response `parameters``
+/// dictionary.
+#[cfg(feature = "experimental-oidc")]
+#[derive(Debug, Deserialize)]
+struct OidcCrossSigningResetUiaaResetParameter {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    url: Url,
 }
 
 impl Client {
@@ -440,35 +438,34 @@ impl Client {
     /// # let client = Client::new(homeserver).await?;
     /// # let room = client.get_room(&room_id!("!test:example.com")).unwrap();
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
-    /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
+    /// let encrypted_file = client.upload_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
     /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
+    pub fn upload_encrypted_file<'a, R: Read + ?Sized + 'a>(
         &'a self,
         content_type: &'a mime::Mime,
         reader: &'a mut R,
-    ) -> PrepareEncryptedFile<'a, R> {
-        PrepareEncryptedFile::new(self, content_type, reader)
+    ) -> UploadEncryptedFile<'a, R> {
+        UploadEncryptedFile::new(self, content_type, reader)
     }
 
-    /// Encrypt and upload the file to be read from `reader` and construct an
-    /// attachment message.
-    pub(crate) async fn prepare_encrypted_attachment_message(
+    /// Encrypt and upload the file and thumbnails, and return the source
+    /// information.
+    pub(crate) async fn upload_encrypted_media_and_thumbnail(
         &self,
-        filename: &str,
         content_type: &mime::Mime,
-        data: Vec<u8>,
-        config: AttachmentConfig,
+        data: &[u8],
+        thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<MessageType> {
+    ) -> Result<(MediaSource, Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
         let upload_thumbnail =
-            self.upload_encrypted_thumbnail(config.thumbnail, content_type, send_progress.clone());
+            self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
-            self.prepare_encrypted_file(content_type, &mut cursor)
+            self.upload_encrypted_file(content_type, &mut cursor)
                 .with_send_progress_observable(send_progress)
                 .await
         };
@@ -476,87 +473,35 @@ impl Client {
         let ((thumbnail_source, thumbnail_info), file) =
             try_join(upload_thumbnail, upload_attachment).await?;
 
-        // if config.caption is set, use it as body, and filename as the file name
-        // otherwise, body is the filename, and the filename is not set
-        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
-        let (body, filename) = match config.caption {
-            Some(caption) => (caption, Some(filename.to_owned())),
-            None => (filename.to_owned(), None),
-        };
-
-        Ok(match content_type.type_() {
-            mime::IMAGE => {
-                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(ImageMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Image(content)
-            }
-            mime::AUDIO => {
-                let audio_message_event_content = AudioMessageEventContent::encrypted(body, file);
-                MessageType::Audio(crate::media::update_audio_message_event(
-                    audio_message_event_content,
-                    content_type,
-                    config.info,
-                ))
-            }
-            mime::VIDEO => {
-                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(VideoMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Video(content)
-            }
-            _ => {
-                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(FileMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info))
-                });
-                MessageType::File(content)
-            }
-        })
+        Ok((MediaSource::Encrypted(Box::new(file)), thumbnail_source, thumbnail_info))
     }
 
+    /// Uploads an encrypted thumbnail to the media repository, and returns
+    /// its source and extra information.
     async fn upload_encrypted_thumbnail(
         &self,
         thumbnail: Option<Thumbnail>,
         content_type: &mime::Mime,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
-        if let Some(thumbnail) = thumbnail {
-            let mut cursor = Cursor::new(thumbnail.data);
+        let Some(thumbnail) = thumbnail else {
+            return Ok((None, None));
+        };
 
-            let file = self
-                .prepare_encrypted_file(content_type, &mut cursor)
-                .with_send_progress_observable(send_progress)
-                .await?;
+        let mut cursor = Cursor::new(thumbnail.data);
 
-            #[rustfmt::skip]
+        let file = self
+            .upload_encrypted_file(content_type, &mut cursor)
+            .with_send_progress_observable(send_progress)
+            .await?;
+
+        #[rustfmt::skip]
             let thumbnail_info =
                 assign!(thumbnail.info.map(ThumbnailInfo::from).unwrap_or_default(), {
                     mimetype: Some(thumbnail.content_type.as_ref().to_owned())
                 });
 
-            Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
-        } else {
-            Ok((None, None))
-        }
+        Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
     }
 
     /// Claim one-time keys creating new Olm sessions.
@@ -617,7 +562,7 @@ impl Client {
         request: &RoomMessageRequest,
     ) -> Result<send_message_event::v3::Response> {
         let content = request.content.clone();
-        let txn_id = &request.txn_id;
+        let txn_id = request.txn_id.clone();
         let room_id = &request.room_id;
 
         self.get_room(room_id)

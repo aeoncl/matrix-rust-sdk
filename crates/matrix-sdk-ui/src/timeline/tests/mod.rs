@@ -20,6 +20,7 @@ use std::{
     sync::Arc,
 };
 
+use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::FutureExt as _;
@@ -33,14 +34,14 @@ use matrix_sdk::{
     test_utils::events::EventFactory,
     BoxFuture,
 };
-use matrix_sdk_base::latest_event::LatestEvent;
-use matrix_sdk_test::{EventBuilder, ALICE, BOB};
+use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo, RoomState};
+use matrix_sdk_test::{EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID};
 use ruma::{
     event_id,
     events::{
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        relation::Annotation,
+        relation::{Annotation, RelationType},
         AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey,
         RedactedMessageLikeEventContent, RedactedStateEventContent, StaticStateEventContent,
     },
@@ -59,7 +60,9 @@ use super::{
     event_handler::TimelineEventKind,
     event_item::RemoteEventOrigin,
     traits::RoomDataProvider,
-    EventTimelineItem, Profile, TimelineController, TimelineFocus, TimelineItem,
+    util::rfind_event_by_item_id,
+    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
+    TimelineItem,
 };
 use crate::{
     timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
@@ -68,7 +71,6 @@ use crate::{
 mod basic;
 mod echo;
 mod edit;
-#[cfg(feature = "e2e-encryption")]
 mod encryption;
 mod event_filter;
 mod invalid;
@@ -104,7 +106,7 @@ impl TestTimeline {
                 TimelineFocus::Live,
                 Some(prefix),
                 None,
-                false,
+                Some(false),
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -118,7 +120,7 @@ impl TestTimeline {
                 TimelineFocus::Live,
                 None,
                 None,
-                false,
+                Some(false),
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -132,7 +134,7 @@ impl TestTimeline {
                 TimelineFocus::Live,
                 None,
                 Some(hook),
-                true,
+                Some(true),
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -147,7 +149,7 @@ impl TestTimeline {
                 TimelineFocus::Live,
                 None,
                 None,
-                encrypted,
+                Some(encrypted),
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -181,7 +183,7 @@ impl TestTimeline {
         C: RedactedMessageLikeEventContent,
     {
         let ev = self.event_builder.make_sync_redacted_message_event(sender, content);
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
     }
 
     async fn handle_live_state_event<C>(&self, sender: &UserId, content: C, prev_content: Option<C>)
@@ -189,7 +191,7 @@ impl TestTimeline {
         C: StaticStateEventContent<StateKey = EmptyStateKey>,
     {
         let ev = self.event_builder.make_sync_state_event(sender, "", content, prev_content);
-        self.handle_live_event(ev).await;
+        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
     }
 
     async fn handle_live_state_event_with_state_key<C>(
@@ -207,7 +209,7 @@ impl TestTimeline {
             content,
             prev_content,
         );
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
     }
 
     async fn handle_live_redacted_state_event<C>(&self, sender: &UserId, content: C)
@@ -215,7 +217,7 @@ impl TestTimeline {
         C: RedactedStateEventContent<StateKey = EmptyStateKey>,
     {
         let ev = self.event_builder.make_sync_redacted_state_event(sender, "", content);
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
     }
 
     async fn handle_live_redacted_state_event_with_state_key<C>(
@@ -228,7 +230,7 @@ impl TestTimeline {
     {
         let ev =
             self.event_builder.make_sync_redacted_state_event(sender, state_key.as_ref(), content);
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
+        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
     }
 
     async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
@@ -265,17 +267,16 @@ impl TestTimeline {
         self.controller.handle_read_receipts(ev_content).await;
     }
 
-    async fn toggle_reaction_local(&self, unique_id: &str, key: &str) -> Result<(), super::Error> {
-        if self.controller.toggle_reaction_local(unique_id, key).await? {
+    async fn toggle_reaction_local(
+        &self,
+        item_id: &TimelineEventItemId,
+        key: &str,
+    ) -> Result<(), super::Error> {
+        if self.controller.toggle_reaction_local(item_id, key).await? {
             // TODO(bnjbvr): hacky?
-            if let Some(event_id) = self
-                .controller
-                .items()
-                .await
-                .iter()
-                .rfind(|item| item.unique_id() == unique_id)
-                .and_then(|item| item.as_event()?.as_remote())
-                .map(|event_item| event_item.event_id.clone())
+            let items = self.controller.items().await;
+            if let Some(event_id) = rfind_event_by_item_id(&items, item_id)
+                .and_then(|(_pos, item)| item.event_id().map(ToOwned::to_owned))
             {
                 // Fake a local echo, for new reactions.
                 self.handle_local_event(
@@ -345,6 +346,7 @@ impl PinnedEventsRoom for TestRoomDataProvider {
         &'a self,
         _event_id: &'a EventId,
         _request_config: Option<RequestConfig>,
+        _related_event_filters: Option<Vec<RelationType>>,
     ) -> BoxFuture<'a, Result<(SyncTimelineEvent, Vec<SyncTimelineEvent>), PaginatorError>> {
         unimplemented!();
     }
@@ -444,5 +446,10 @@ impl RoomDataProvider for TestRoomDataProvider {
             Ok(())
         }
         .boxed()
+    }
+
+    fn room_info(&self) -> Subscriber<RoomInfo> {
+        let info = RoomInfo::new(*DEFAULT_TEST_ROOM_ID, RoomState::Joined);
+        SharedObservable::new(info).subscribe()
     }
 }

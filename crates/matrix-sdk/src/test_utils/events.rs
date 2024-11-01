@@ -16,44 +16,70 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
+use as_variant::as_variant;
 use matrix_sdk_base::deserialized_responses::{SyncTimelineEvent, TimelineEvent};
+use matrix_sdk_common::deserialized_responses::UnableToDecryptReason;
 use ruma::{
     events::{
         message::TextContentBlock,
         poll::{
             end::PollEndEventContent,
             response::{PollResponseEventContent, SelectionsContentBlock},
-            start::{PollAnswer, PollContentBlock, PollStartEventContent},
+            unstable_start::{
+                NewUnstablePollStartEventContent, ReplacementUnstablePollStartEventContent,
+                UnstablePollAnswer, UnstablePollStartContentBlock, UnstablePollStartEventContent,
+            },
         },
         reaction::ReactionEventContent,
         relation::{Annotation, InReplyTo, Replacement, Thread},
         room::{
+            encrypted::{EncryptedEventScheme, RoomEncryptedEventContent},
             message::{Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
             redaction::RoomRedactionEventContent,
         },
-        AnySyncTimelineEvent, AnyTimelineEvent, EventContent,
+        AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
     },
     serde::Raw,
     server_name, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde::Serialize;
 use serde_json::json;
 
+pub trait TimestampArg {
+    fn to_milliseconds_since_unix_epoch(self) -> MilliSecondsSinceUnixEpoch;
+}
+
+impl TimestampArg for MilliSecondsSinceUnixEpoch {
+    fn to_milliseconds_since_unix_epoch(self) -> MilliSecondsSinceUnixEpoch {
+        self
+    }
+}
+
+impl TimestampArg for u64 {
+    fn to_milliseconds_since_unix_epoch(self) -> MilliSecondsSinceUnixEpoch {
+        MilliSecondsSinceUnixEpoch(UInt::try_from(self).unwrap())
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 struct Unsigned {
+    #[serde(skip_serializing_if = "Option::is_none")]
     transaction_id: Option<OwnedTransactionId>,
+    #[serde(rename = "m.relations", skip_serializing_if = "Option::is_none")]
+    relations: Option<BundledMessageLikeRelations<Raw<AnySyncTimelineEvent>>>,
 }
 
 #[derive(Debug)]
-pub struct EventBuilder<E: EventContent> {
+pub struct EventBuilder<C: EventContent> {
     sender: Option<OwnedUserId>,
     room: Option<OwnedRoomId>,
     event_id: Option<OwnedEventId>,
     redacts: Option<OwnedEventId>,
-    content: E,
+    content: C,
     server_ts: MilliSecondsSinceUnixEpoch,
     unsigned: Option<Unsigned>,
+    state_key: Option<String>,
 }
 
 impl<E: EventContent> EventBuilder<E>
@@ -75,14 +101,34 @@ where
         self
     }
 
-    pub fn server_ts(mut self, ts: MilliSecondsSinceUnixEpoch) -> Self {
-        self.server_ts = ts;
+    pub fn server_ts(mut self, ts: impl TimestampArg) -> Self {
+        self.server_ts = ts.to_milliseconds_since_unix_epoch();
         self
     }
 
     pub fn unsigned_transaction_id(mut self, transaction_id: &TransactionId) -> Self {
         self.unsigned.get_or_insert_with(Default::default).transaction_id =
             Some(transaction_id.to_owned());
+        self
+    }
+
+    /// Adds bundled relations to this event.
+    ///
+    /// Ideally, we'd type-check that an event passed as a relation is the same
+    /// type as this one, but it's not trivial to do so because this builder
+    /// is only generic on the event's *content*, not the event type itself;
+    /// doing so would require many changes, and this is testing code after
+    /// all.
+    pub fn bundled_relations(
+        mut self,
+        relations: BundledMessageLikeRelations<Raw<AnySyncTimelineEvent>>,
+    ) -> Self {
+        self.unsigned.get_or_insert_with(Default::default).relations = Some(relations);
+        self
+    }
+
+    pub fn state_key(mut self, state_key: impl Into<String>) -> Self {
+        self.state_key = Some(state_key.into());
         self
     }
 
@@ -113,8 +159,13 @@ where
         if let Some(redacts) = self.redacts {
             map.insert("redacts".to_owned(), json!(redacts));
         }
+
         if let Some(unsigned) = self.unsigned {
             map.insert("unsigned".to_owned(), json!(unsigned));
+        }
+
+        if let Some(state_key) = self.state_key {
+            map.insert("state_key".to_owned(), json!(state_key));
         }
 
         Raw::new(map).unwrap().cast()
@@ -134,6 +185,23 @@ where
 
     pub fn into_sync(self) -> SyncTimelineEvent {
         SyncTimelineEvent::new(self.into_raw_sync())
+    }
+}
+
+impl EventBuilder<RoomEncryptedEventContent> {
+    /// Turn this event into a SyncTimelineEvent representing a decryption
+    /// failure
+    pub fn into_utd_sync_timeline_event(self) -> SyncTimelineEvent {
+        let session_id = as_variant!(&self.content.scheme, EncryptedEventScheme::MegolmV1AesSha2)
+            .map(|content| content.session_id.clone());
+
+        SyncTimelineEvent::new_utd_event(
+            self.into(),
+            crate::deserialized_responses::UnableToDecryptInfo {
+                session_id,
+                reason: UnableToDecryptReason::MissingMegolmSession,
+            },
+        )
     }
 }
 
@@ -234,6 +302,7 @@ impl EventFactory {
             redacts: None,
             content,
             unsigned: None,
+            state_key: None,
         }
     }
 
@@ -279,21 +348,42 @@ impl EventFactory {
         content: impl Into<String>,
         poll_question: impl Into<String>,
         answers: Vec<impl Into<String>>,
-    ) -> EventBuilder<PollStartEventContent> {
+    ) -> EventBuilder<UnstablePollStartEventContent> {
         // PollAnswers 'constructor' is not public, so we need to deserialize them
-        let answers: Vec<PollAnswer> = answers
+        let answers: Vec<UnstablePollAnswer> = answers
             .into_iter()
             .enumerate()
-            .map(|(idx, answer)| {
-                PollAnswer::new(idx.to_string(), TextContentBlock::plain(answer.into()))
-            })
+            .map(|(idx, answer)| UnstablePollAnswer::new(idx.to_string(), answer))
             .collect();
         let poll_answers = answers.try_into().unwrap();
-        let poll_start_content = PollStartEventContent::new(
-            TextContentBlock::plain(content.into()),
-            PollContentBlock::new(TextContentBlock::plain(poll_question.into()), poll_answers),
-        );
+        let poll_start_content =
+            UnstablePollStartEventContent::New(NewUnstablePollStartEventContent::plain_text(
+                content,
+                UnstablePollStartContentBlock::new(poll_question, poll_answers),
+            ));
         self.event(poll_start_content)
+    }
+
+    /// Create a poll edit event given the new question and possible answers.
+    pub fn poll_edit(
+        &self,
+        edited_event_id: &EventId,
+        poll_question: impl Into<String>,
+        answers: Vec<impl Into<String>>,
+    ) -> EventBuilder<ReplacementUnstablePollStartEventContent> {
+        // PollAnswers 'constructor' is not public, so we need to deserialize them
+        let answers: Vec<UnstablePollAnswer> = answers
+            .into_iter()
+            .enumerate()
+            .map(|(idx, answer)| UnstablePollAnswer::new(idx.to_string(), answer))
+            .collect();
+        let poll_answers = answers.try_into().unwrap();
+        let poll_start_content_block =
+            UnstablePollStartContentBlock::new(poll_question, poll_answers);
+        self.event(ReplacementUnstablePollStartEventContent::new(
+            poll_start_content_block,
+            edited_event_id.to_owned(),
+        ))
     }
 
     /// Create a poll response with the given answer id and the associated poll

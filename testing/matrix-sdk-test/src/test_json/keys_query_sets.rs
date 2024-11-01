@@ -4,7 +4,11 @@ use ruma::{
 };
 use serde_json::{json, Value};
 
-use crate::ruma_response_from_json;
+use super::keys_query::{keys_query, master_keys, KeysQueryUser};
+use crate::{
+    ruma_response_from_json,
+    test_json::keys_query::{device_keys_payload, self_signing_keys},
+};
 
 /// This set of keys/query response was generated using a local synapse.
 /// Each users was created, device added according to needs and the payload
@@ -447,216 +451,74 @@ impl KeyDistributionTestData {
 /// For user @bob, several payloads with no identities then identity A and B.
 pub struct IdentityChangeDataSet {}
 
-#[allow(dead_code)]
 impl IdentityChangeDataSet {
     pub fn user_id() -> &'static UserId {
-        user_id!("@bob:localhost")
+        // All 3 bobs have the same user id
+        assert_eq!(KeysQueryUser::bob_a().user_id, KeysQueryUser::bob_b().user_id);
+        assert_eq!(KeysQueryUser::bob_a().user_id, KeysQueryUser::bob_c().user_id);
+
+        KeysQueryUser::bob_a().user_id
     }
 
-    pub fn first_device_id() -> &'static DeviceId {
-        device_id!("GYKSNAWLVK")
+    pub fn device_a() -> &'static DeviceId {
+        KeysQueryUser::bob_a().device_id
     }
 
-    pub fn second_device_id() -> &'static DeviceId {
-        device_id!("ATWKQFSFRN")
+    pub fn device_b() -> &'static DeviceId {
+        KeysQueryUser::bob_b().device_id
     }
 
-    pub fn third_device_id() -> &'static DeviceId {
-        device_id!("OPABMDDXGX")
+    pub fn device_c() -> &'static DeviceId {
+        KeysQueryUser::bob_c().device_id
     }
 
-    fn device_keys_payload_1_signed_by_a() -> Value {
-        json!({
-            "algorithms": [
-                "m.olm.v1.curve25519-aes-sha2",
-                "m.megolm.v1.aes-sha2"
-            ],
-            "device_id": "GYKSNAWLVK",
-            "keys": {
-                "curve25519:GYKSNAWLVK": "dBcZBzQaiQYWf6rBPh2QypIOB/dxSoTeyaFaxNNbeHs",
-                "ed25519:GYKSNAWLVK": "6melQNnhoI9sT2b4VzNPAwa8aB179ym45fON8Yo7kVk"
-            },
-            "signatures": {
-                "@bob:localhost": {
-                    "ed25519:GYKSNAWLVK": "Fk45zHAbrd+1j9wZXLjL2Y/+DU/Mnz9yuvlfYBOOT7qExN2Jdud+5BAuNs8nZ/caS4wTF39Kg3zQpzaGERoCBg",
-                    "ed25519:dO4gmBNW7WC0bXBK81j8uh4me6085fP+keoOm0pH3gw": "md0Pa1MYlneFb1fp6KCsvZpi2ySb6/G+ULoCbQDWBeDxNEcoNMzf7PEKY04UToCZKUU4LifvRWmiWFDanOlkCQ"
-                }
-            },
-            "user_id": "@bob:localhost",
-        })
+    pub fn master_signing_keys_a() -> Value {
+        master_keys(&KeysQueryUser::bob_a())
     }
 
-    fn msk_a() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY": "/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY": "6vGDbPO5XzlcwbU3aV+kcck+iHHEBtX85ow2gW5U05/DZdtda/JNVa5Nn7B9lQHNnnrMqt1sX00y/JrIkSS1Aw",
-                        "ed25519:GYKSNAWLVK": "jLxmUPr0Ny2Ai9+NGKGhed9BAuKikOc7r6gr7MQVawePYS95w8NJ8Tzaq9zFFOmIiojACNdQ/ksy3QAdwD6vBQ"
-                    }
-                },
-                "usage": [
-                    "master"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
+    pub fn self_signing_keys_a() -> Value {
+        self_signing_keys(&KeysQueryUser::bob_a())
     }
-    fn ssk_a() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:dO4gmBNW7WC0bXBK81j8uh4me6085fP+keoOm0pH3gw": "dO4gmBNW7WC0bXBK81j8uh4me6085fP+keoOm0pH3gw"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY": "7md6mwjUK8zjintmffJ0+kImC59/Y8PdySy99EZz5Neu+VMX3LT7txhKO2gC/hmDduRw+JGfGXIiDxR7GmQqDw"
-                    }
-                },
-                "usage": [
-                    "self_signing"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
-    }
+
     /// A key query with an identity (Ia), and a first device `GYKSNAWLVK`
     /// signed by Ia.
     pub fn key_query_with_identity_a() -> KeyQueryResponse {
-        let data = json!({
-            "device_keys": {
-                "@bob:localhost": {
-                    "GYKSNAWLVK": Self::device_keys_payload_1_signed_by_a()
-                }
-            },
-            "failures": {},
-            "master_keys": Self::msk_a(),
-            "self_signing_keys": Self::ssk_a(),
-            "user_signing_keys": {}
-        });
-        ruma_response_from_json(&data)
+        keys_query(&KeysQueryUser::bob_a(), &[])
     }
 
-    pub fn msk_b() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4": "NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:ATWKQFSFRN": "MBOzCKYPQLQMpBY2lFZJ4c8451xJfQCdhPBb1AHlTUSxKFiWi6V+k1oRRnhQein/PjkIY7ZO+HoOrIeOtbRMAw",
-                        "ed25519:NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4": "xqLhC3sIUci1W2CNVW7HZWXreQApgjv2RDwB0WPiMd1P4vbZ/qJM0KWqK2piGPWliPi8YVREMrg216KXM3IhCA"
-                    }
-                },
-                "usage": [
-                    "master"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
+    pub fn master_signing_keys_b() -> Value {
+        master_keys(&KeysQueryUser::bob_b())
     }
 
-    pub fn ssk_b() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:At1ai1VUZrCncCI7V7fEAJmBShfpqZ30xRzqcEjTjdc": "At1ai1VUZrCncCI7V7fEAJmBShfpqZ30xRzqcEjTjdc"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4": "Ls6CeoA4LoPCHuSwG96kbhd1dEV09TgdMROIZi6vFz/MT9Wtik6joQi/tQ3zCwIZCSR53ksLO4jG1DD31AiBAA"
-                    }
-                },
-                "usage": [
-                    "self_signing"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
+    pub fn self_signing_keys_b() -> Value {
+        self_signing_keys(&KeysQueryUser::bob_b())
     }
 
     pub fn device_keys_payload_2_signed_by_b() -> Value {
-        json!({
-            "algorithms": [
-                "m.olm.v1.curve25519-aes-sha2",
-                "m.megolm.v1.aes-sha2"
-            ],
-            "device_id": "ATWKQFSFRN",
-            "keys": {
-                "curve25519:ATWKQFSFRN": "CY0TWVK1/Kj3ZADuBcGe3UKvpT+IKAPMUsMeJhSDqno",
-                "ed25519:ATWKQFSFRN": "TyTQqd6j2JlWZh97r+kTYuCbvqnPoNwO6EGovYsjY00"
-            },
-            "signatures": {
-                "@bob:localhost": {
-                    "ed25519:ATWKQFSFRN": "BQ9Gp0p+6srF+c8OyruqKKd9R4yaub3THYAyyBB/7X/rG8BwcAqFynzl1aGyFYun4Q+087a5OSiglCXI+/kQAA",
-                    "ed25519:At1ai1VUZrCncCI7V7fEAJmBShfpqZ30xRzqcEjTjdc": "TWmDPaG7t0rZ6luauonELD3dmBDTIRryqXhgsIQRiGint2rJdic8RVyZ6a61bgu6mtBjfvU3prqMNp6sVi16Cg"
-                }
-            },
-            "user_id": "@bob:localhost",
-        })
+        device_keys_payload(&KeysQueryUser::bob_b())
     }
+
     /// A key query with a new identity (Ib) and a new device `ATWKQFSFRN`.
     /// `ATWKQFSFRN` is signed with the new identity but `GYKSNAWLVK` is still
     /// signed by the old identity (Ia).
     pub fn key_query_with_identity_b() -> KeyQueryResponse {
-        let data = json!({
-            "device_keys": {
-                "@bob:localhost": {
-                    "ATWKQFSFRN": Self::device_keys_payload_2_signed_by_b(),
-                    "GYKSNAWLVK": Self::device_keys_payload_1_signed_by_a(),
-                }
-            },
-            "failures": {},
-            "master_keys": Self::msk_b(),
-            "self_signing_keys": Self::ssk_b(),
-        });
-        ruma_response_from_json(&data)
+        keys_query(&KeysQueryUser::bob_b(), &[KeysQueryUser::bob_a()])
     }
 
     /// A key query with no identity and a new device `OPABMDDXGX` (not
     /// cross-signed).
     pub fn key_query_with_identity_no_identity() -> KeyQueryResponse {
-        let data = json!({
-            "device_keys": {
-                "@bob:localhost": {
-                    "ATWKQFSFRN": Self::device_keys_payload_2_signed_by_b(),
-                    "GYKSNAWLVK": Self::device_keys_payload_1_signed_by_a(),
-                    "OPABMDDXGX": {
-                        "algorithms": [
-                            "m.olm.v1.curve25519-aes-sha2",
-                            "m.megolm.v1.aes-sha2"
-                        ],
-                        "device_id": "OPABMDDXGX",
-                        "keys": {
-                            "curve25519:OPABMDDXGX": "O6bwa9Op0E+PQPCrbTOfdYwU+j95RRPhXIHuNpe94ns",
-                            "ed25519:OPABMDDXGX": "DvjkSNOM9XrR1gWrr2YSDvTnwnLIgKDMRr5v8HgMKak"
-                        },
-                        "signatures": {
-                            "@bob:localhost": {
-                                "ed25519:OPABMDDXGX": "o+BBnw/SIJWxSf799Adq6jEl9X3lwCg5MJkS8GlfId+pW3ReEETK0l+9bhCAgBsNSKRtB/fmZQBhjMx4FJr+BA"
-                            }
-                        },
-                        "user_id": "@bob:localhost",
-                    }
-                }
-            },
-            "failures": {},
-        });
-        ruma_response_from_json(&data)
+        keys_query(&KeysQueryUser::bob_c(), &[KeysQueryUser::bob_a(), KeysQueryUser::bob_b()])
     }
 }
 
 /// A set of `/keys/query` responses that were initially created to simulate
 /// when a user that was verified reset his keys and became unverified.
 ///
-/// The local user (as returned by [`PreviouslyVerifiedTestData::own_id`]) is
+/// The local user (as returned by [`VerificationViolationTestData::own_id`]) is
 /// `@alice:localhost`. There are 2 other users: `@bob:localhost` (returned by
-/// [`PreviouslyVerifiedTestData::bob_id`]), and `@carol:localhost` (returned by
-/// [`PreviouslyVerifiedTestData::carol_id`]).
+/// [`VerificationViolationTestData::bob_id`]), and `@carol:localhost` (returned
+/// by [`VerificationViolationTestData::carol_id`]).
 ///
 /// We provide two `/keys/query` responses for each of Bob and Carol: one signed
 /// by Alice, and one not signed.
@@ -665,10 +527,10 @@ impl IdentityChangeDataSet {
 /// another one not cross-signed.
 ///
 /// The `/keys/query` responses were generated using a local synapse.
-pub struct PreviouslyVerifiedTestData {}
+pub struct VerificationViolationTestData {}
 
 #[allow(dead_code)]
-impl PreviouslyVerifiedTestData {
+impl VerificationViolationTestData {
     /// Secret part of Alice's master cross-signing key.
     ///
     /// Exported from Element-Web with the following console snippet:
@@ -1257,6 +1119,154 @@ impl PreviouslyVerifiedTestData {
                 }
             },
             "self_signing_keys": Self::ssk_payload_carol(),
+            "user_signing_keys": {}
+        });
+
+        ruma_response_from_json(&data)
+    }
+}
+
+/// A set of keys query to test identity changes,
+/// For user @malo, that performed an identity change with the same device.
+pub struct MaloIdentityChangeDataSet {}
+
+#[allow(dead_code)]
+impl MaloIdentityChangeDataSet {
+    pub fn user_id() -> &'static UserId {
+        user_id!("@malo:localhost")
+    }
+
+    pub fn device_id() -> &'static DeviceId {
+        device_id!("NZFSPBRLDO")
+    }
+
+    /// @malo's keys before their identity change
+    pub fn initial_key_query() -> KeyQueryResponse {
+        let data = json!({
+            "device_keys": {
+                "@malo:localhost": {
+                    "NZFSPBRLDO": {
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2"
+                        ],
+                        "device_id": "NZFSPBRLDO",
+                        "keys": {
+                            "curve25519:NZFSPBRLDO": "L3jdbw42+9i+K7LPjAY+kmqG9nr2n/U0ow8hEbLCoCs",
+                            "ed25519:NZFSPBRLDO": "VDJt3xI4SzrgQkuE3sEIauluaXawx3wWoWOynPI8Zko"
+                        },
+                        "signatures": {
+                            "@malo:localhost": {
+                                "ed25519:NZFSPBRLDO": "lmtbdrJ5xBweo677Fg2qrSHsRi4R3x2WNlvSNJY6Zbg0R5lJS9syN2HZw/irL9PA644GYm4QM/t+DX0grnn+BQ",
+                                "ed25519:+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8": "Ql1fq+SvVDx+8mjNMzSaR0hBCEkdPirbs2+BK0gwsIH1zkuMADnBoNWP7LJiKo/EO9gnpiCzyQQgI4e9pIVPDA"
+                            }
+                        },
+                        "user_id": "@malo:localhost",
+                        "unsigned": {}
+                    }
+                }
+            },
+            "failures": {},
+            "master_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE": "WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:NZFSPBRLDO": "crJcXqFpEHRM8KNUw419XrVFaHoM8/kV4ebgpuuIiD9wfX0AhHE2iGRGpKzsrVCqne9k181/uN0sgDMpK2y4Aw",
+                            "ed25519:WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE": "/xwFF5AC3GhkpvJ449Srh8kNQS6CXAxQMmBpQvPEHx5BHPXJ08u2ZDd1EPYY4zk4QsePk+tEYu8gDnB0bggHCA"
+                        }
+                    },
+                    "usage": [
+                        "master"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "self_signing_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8": "+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE": "sSGQ6ny6aXtIvgKPGOYJzcmnNDSkbaJFVRe9wekOry7EaiWf2l28MkGTUBt4cPoRiMkNjuRBupNEARqHF72sAQ"
+                        }
+                    },
+                    "usage": [
+                        "self_signing"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "user_signing_keys": {},
+        });
+
+        ruma_response_from_json(&data)
+    }
+
+    /// @malo's keys after their identity change
+    pub fn updated_key_query() -> KeyQueryResponse {
+        let data = json!({
+            "device_keys": {
+                "@malo:localhost": {
+                    "NZFSPBRLDO": {
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2"
+                        ],
+                        "device_id": "NZFSPBRLDO",
+                        "keys": {
+                            "curve25519:NZFSPBRLDO": "L3jdbw42+9i+K7LPjAY+kmqG9nr2n/U0ow8hEbLCoCs",
+                            "ed25519:NZFSPBRLDO": "VDJt3xI4SzrgQkuE3sEIauluaXawx3wWoWOynPI8Zko"
+                        },
+                        "signatures": {
+                            "@malo:localhost": {
+                                "ed25519:NZFSPBRLDO": "lmtbdrJ5xBweo677Fg2qrSHsRi4R3x2WNlvSNJY6Zbg0R5lJS9syN2HZw/irL9PA644GYm4QM/t+DX0grnn+BQ",
+                                "ed25519:+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8": "Ql1fq+SvVDx+8mjNMzSaR0hBCEkdPirbs2+BK0gwsIH1zkuMADnBoNWP7LJiKo/EO9gnpiCzyQQgI4e9pIVPDA",
+                                "ed25519:8my6+zgnzEP0ZqmQFyvscJh7isHlf8lxBmHg+fzdJkE": "OvqDE7C2mrHxjwNyMIEz+m/AO6I6lM5HoPYY2bvLjrJJDOF5sJOtw4JoYiCWyt90ZIWsbEqmfbazrblLD50tCg"
+                            }
+                        },
+                        "user_id": "@malo:localhost",
+                        "unsigned": {}
+                    }
+                }
+            },
+            "failures": {},
+            "master_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU": "dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:NZFSPBRLDO": "2Ye96l4srBSWskNQszuMpea1r97rFoUyfNqegvu/hGeP47w0OVvqYuNtZRNwqb7TMS7aPEn6l9lhWEk7v06wCg",
+                            "ed25519:dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU": "btkxAJpJeVtc9wgBmeHUI9QDpojd6ddLxK11E3403KoTQtP6Mnr5GsVdQr1HJToG7PG4k4eEZGWxVZr1GPndAA"
+                        }
+                    },
+                    "usage": [
+                        "master"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "self_signing_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:8my6+zgnzEP0ZqmQFyvscJh7isHlf8lxBmHg+fzdJkE": "8my6+zgnzEP0ZqmQFyvscJh7isHlf8lxBmHg+fzdJkE"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU": "KJt0y1p8v8RGLGk2wUyCMbX1irXJqup/mdRuG/cxJxs24BZhDMyIzyGrGXnWq2gx3I4fKIMtFPi/ecxf92ePAQ"
+                        }
+                    },
+                    "usage": [
+                        "self_signing"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
             "user_signing_keys": {}
         });
 

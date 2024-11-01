@@ -34,7 +34,7 @@ use ruma::{
     events::secret::request::{
         RequestAction, SecretName, ToDeviceSecretRequestEvent as SecretRequestEvent,
     },
-    DeviceId, DeviceKeyAlgorithm, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomId,
+    DeviceId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomId,
     TransactionId, UserId,
 };
 use tracing::{debug, field::debug, info, instrument, trace, warn, Span};
@@ -178,7 +178,7 @@ impl GossipMachine {
             .map(|(key, value)| {
                 let device_map = value
                     .iter()
-                    .map(|d| (d.to_owned(), DeviceKeyAlgorithm::SignedCurve25519))
+                    .map(|d| (d.to_owned(), OneTimeKeyAlgorithm::SignedCurve25519))
                     .collect();
 
                 (key.to_owned(), device_map)
@@ -510,7 +510,8 @@ impl GossipMachine {
                     }
                     #[cfg(feature = "experimental-algorithms")]
                     RequestedKeyInfo::MegolmV2AesSha2(i) => {
-                        self.handle_supported_key_request(event, &i.room_id, &i.session_id).await
+                        self.handle_supported_key_request(cache, event, &i.room_id, &i.session_id)
+                            .await
                     }
                     RequestedKeyInfo::Unknown(i) => {
                         debug!(

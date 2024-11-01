@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{io, sync::Arc};
+use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{
     assert_next_matches_with_timeout, send_queue::RoomSendQueueUpdate,
-    test_utils::events::EventFactory, Error,
+    test_utils::events::EventFactory,
 };
+use matrix_sdk_base::store::QueueWedgeError;
 use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     event_id,
     events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
-    uint, user_id, MilliSecondsSinceUnixEpoch,
+    user_id, MilliSecondsSinceUnixEpoch,
 };
 use stream_assert::assert_next_matches;
 
@@ -66,15 +67,15 @@ async fn test_remote_echo_full_trip() {
     // Scenario 2: The local event has not been sent to the server successfully, it
     // has failed. In this case, there is no event ID.
     {
-        let some_io_error = Error::Io(io::Error::new(io::ErrorKind::Other, "this is a test"));
+        let error =
+            Arc::new(matrix_sdk::Error::SendQueueWedgeError(QueueWedgeError::GenericApiError {
+                msg: "this is a test".to_owned(),
+            }));
         timeline
             .controller
             .update_event_send_state(
                 &txn_id,
-                EventSendState::SendingFailed {
-                    error: Arc::new(some_io_error),
-                    is_recoverable: true,
-                },
+                EventSendState::SendingFailed { error, is_recoverable: true },
             )
             .await;
 
@@ -85,7 +86,7 @@ async fn test_remote_echo_full_trip() {
             event_item.send_state(),
             Some(EventSendState::SendingFailed { is_recoverable: true, .. })
         );
-        assert_eq!(item.unique_id(), id);
+        assert_eq!(*item.unique_id(), id);
     }
 
     // Scenario 3: The local event has been sent successfully to the server and an
@@ -104,7 +105,7 @@ async fn test_remote_echo_full_trip() {
         let event_item = item.as_event().unwrap();
         assert!(event_item.is_local_echo());
         assert_matches!(event_item.send_state(), Some(EventSendState::Sent { .. }));
-        assert_eq!(item.unique_id(), id);
+        assert_eq!(*item.unique_id(), id);
 
         event_item.timestamp()
     };
@@ -125,7 +126,7 @@ async fn test_remote_echo_full_trip() {
     // The local echo is replaced with the remote echo.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
     assert!(!item.as_event().unwrap().is_local_echo());
-    assert_eq!(item.unique_id(), id);
+    assert_eq!(*item.unique_id(), id);
 }
 
 #[async_test]
@@ -164,7 +165,7 @@ async fn test_remote_echo_new_position() {
             f.text_msg("echo")
                 .sender(*ALICE)
                 .event_id(event_id!("$eeG0HA0FAZ37wP8kXlNkxx3I"))
-                .server_ts(MilliSecondsSinceUnixEpoch(uint!(6)))
+                .server_ts(6)
                 .unsigned_transaction_id(&txn_id),
         )
         .await;
@@ -202,11 +203,7 @@ async fn test_day_divider_duplication() {
 
     // … when the second remote event is re-received (day still the same)
     let event_id = items[2].as_event().unwrap().event_id().unwrap();
-    timeline
-        .handle_live_event(
-            f.text_msg("B").event_id(event_id).server_ts(MilliSecondsSinceUnixEpoch(uint!(1))),
-        )
-        .await;
+    timeline.handle_live_event(f.text_msg("B").event_id(event_id).server_ts(1)).await;
 
     // … it should not impact the day dividers.
     let items = timeline.controller.items().await;
@@ -225,11 +222,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
     let f = &timeline.factory;
 
     timeline
-        .handle_live_event(
-            f.text_msg("remote echo")
-                .sender(user_id!("@a:b.c"))
-                .server_ts(MilliSecondsSinceUnixEpoch(0.try_into().unwrap())),
-        )
+        .handle_live_event(f.text_msg("remote echo").sender(user_id!("@a:b.c")).server_ts(0))
         .await;
 
     let items = timeline.controller.items().await;
@@ -267,7 +260,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
 }
 
 #[async_test]
-async fn test_read_marker_removed_after_local_echo_disappeared() {
+async fn test_no_read_marker_with_local_echo() {
     let event_id = event_id!("$1");
 
     let timeline = TestTimeline::with_room_data_provider(
@@ -306,11 +299,10 @@ async fn test_read_marker_removed_after_local_echo_disappeared() {
 
     let items = timeline.controller.items().await;
 
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 3);
     assert!(items[0].is_day_divider());
     assert!(items[1].is_remote_event());
-    assert!(items[2].is_read_marker());
-    assert!(items[3].is_local_echo());
+    assert!(items[2].is_local_echo());
 
     // Cancel the local echo.
     timeline

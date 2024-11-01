@@ -649,6 +649,12 @@ macro_rules! cryptostore_integration_tests {
                     assert_eq!(sessions_1_k_batch.len(), 2);
 
                     previous_last_session_id = Some(last_session.session_id().to_owned());
+
+                    // Modify one of the results, to check that that doesn't break iteration
+                    let mut last_session = last_session.clone();
+                    last_session.sender_data = SenderData::unknown();
+                    store.save_inbound_group_sessions(vec![last_session], None).await.unwrap();
+
                     sessions_1_k.append(&mut sessions_1_k_batch);
                 }
 
@@ -1241,8 +1247,7 @@ macro_rules! cryptostore_integration_tests {
                         device_keys: account.device_keys().clone(),
                         legacy_session: false,
                     },
-                    SenderDataType::SenderUnverifiedButPreviouslyVerified =>
-                        panic!("SenderUnverifiedButPreviouslyVerified not supported"),
+                    SenderDataType::VerificationViolation => panic!("VerificationViolation not supported"),
                     SenderDataType::SenderUnverified=> panic!("SenderUnverified not supported"),
                     SenderDataType::SenderVerified => panic!("SenderVerified not supported"),
                 };

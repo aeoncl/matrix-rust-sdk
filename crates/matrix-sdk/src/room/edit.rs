@@ -19,6 +19,10 @@ use std::future::Future;
 use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, SendOutsideWasm};
 use ruma::{
     events::{
+        poll::unstable_start::{
+            ReplacementUnstablePollStartEventContent, UnstablePollStartContentBlock,
+            UnstablePollStartEventContent,
+        },
         room::message::{Relation, ReplacementMetadata, RoomMessageEventContentWithoutRelation},
         AnyMessageLikeEvent, AnyMessageLikeEventContent, AnySyncMessageLikeEvent,
         AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEvent, SyncMessageLikeEvent,
@@ -34,6 +38,14 @@ use crate::Room;
 pub enum EditedContent {
     /// The content is a `m.room.message`.
     RoomMessage(RoomMessageEventContentWithoutRelation),
+
+    /// The content is a new poll start.
+    PollStart {
+        /// New fallback text for the poll.
+        fallback_text: String,
+        /// New start block for the poll.
+        new_content: UnstablePollStartContentBlock,
+    },
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -41,6 +53,7 @@ impl std::fmt::Debug for EditedContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RoomMessage(_) => f.debug_tuple("RoomMessage").finish(),
+            Self::PollStart { .. } => f.debug_tuple("PollStart").finish(),
         }
     }
 }
@@ -129,7 +142,7 @@ async fn make_edit_event<S: EventSource>(
 ) -> Result<AnyMessageLikeEventContent, EditError> {
     let target = source.get_event(event_id).await?;
 
-    let event = target.event.deserialize().map_err(EditError::Deserialize)?;
+    let event = target.raw().deserialize().map_err(EditError::Deserialize)?;
 
     // The event must be message-like.
     let AnySyncTimelineEvent::MessageLike(message_like_event) = event else {
@@ -173,7 +186,7 @@ async fn make_edit_event<S: EventSource>(
             let replied_to_original_room_msg = replied_to_sync_timeline_event
                 .and_then(|sync_timeline_event| {
                     sync_timeline_event
-                        .event
+                        .raw()
                         .deserialize()
                         .map_err(|err| warn!("unable to deserialize replied-to event: {err}"))
                         .ok()
@@ -189,12 +202,34 @@ async fn make_edit_event<S: EventSource>(
                     }
                 });
 
-            return Ok(new_content
+            Ok(new_content
                 .make_replacement(
                     ReplacementMetadata::new(event_id.to_owned(), mentions),
                     replied_to_original_room_msg.as_ref(),
                 )
-                .into());
+                .into())
+        }
+
+        EditedContent::PollStart { fallback_text, new_content } => {
+            if !matches!(
+                message_like_event,
+                AnySyncMessageLikeEvent::UnstablePollStart(SyncMessageLikeEvent::Original(_))
+            ) {
+                return Err(EditError::IncompatibleEditType {
+                    target: message_like_event.event_type().to_string(),
+                    new_content: "poll start",
+                });
+            }
+
+            let replacement = UnstablePollStartEventContent::Replacement(
+                ReplacementUnstablePollStartEventContent::plain_text(
+                    fallback_text,
+                    new_content,
+                    event_id.to_owned(),
+                ),
+            );
+
+            Ok(replacement.into())
         }
     }
 }

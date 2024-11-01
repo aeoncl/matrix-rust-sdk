@@ -19,6 +19,7 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    assert_let_timeout,
     config::SyncSettings,
     test_utils::{events::EventFactory, logged_in_client_with_server},
 };
@@ -26,14 +27,22 @@ use matrix_sdk_test::{
     async_test,
     mocks::{mock_encryption_state, mock_redaction},
     sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
-    SyncResponseBuilder,
+    SyncResponseBuilder, BOB,
 };
-use matrix_sdk_ui::timeline::{EventSendState, RoomExt, TimelineItemContent, VirtualTimelineItem};
+use matrix_sdk_ui::{
+    timeline::{
+        AnyOtherFullStateEventContent, Error, EventSendState, RedactError, RoomExt,
+        TimelineEventItemId, TimelineItemContent, VirtualTimelineItem,
+    },
+    RoomListService, Timeline,
+};
 use ruma::{
-    event_id, events::room::message::RoomMessageEventContent, room_id, user_id,
-    MilliSecondsSinceUnixEpoch,
+    event_id,
+    events::room::{encryption::RoomEncryptionEventContent, message::RoomMessageEventContent},
+    owned_event_id, room_id, user_id, MilliSecondsSinceUnixEpoch,
 };
 use serde_json::json;
+use stream_assert::{assert_next_matches, assert_pending};
 use wiremock::{
     matchers::{header, method, path_regex},
     Mock, ResponseTemplate,
@@ -267,10 +276,7 @@ async fn test_redact_message() {
     // Redacting a remote event works.
     mock_redaction(event_id!("$42")).mount(&server).await;
 
-    let event_id = first.as_event().unwrap();
-
-    let did_redact = timeline.redact(event_id, Some("inapprops")).await.unwrap();
-    assert!(did_redact);
+    timeline.redact(&first.as_event().unwrap().identifier(), Some("inapprops")).await.unwrap();
 
     // Redacting a local event works.
     timeline
@@ -292,11 +298,106 @@ async fn test_redact_message() {
     assert_matches!(second.send_state(), Some(EventSendState::SendingFailed { .. }));
 
     // Let's redact the local echo.
-    let did_redact = timeline.redact(second, None).await.unwrap();
-    assert!(did_redact);
+    timeline.redact(&second.identifier(), None).await.unwrap();
 
     // Observe local echo being removed.
     assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 2 }));
+}
+
+#[async_test]
+async fn test_redact_local_sent_message() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    mock_encryption_state(&server, false).await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    // Mock event sending.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Send the event so it's added to the send queue as a local event.
+    timeline
+        .send(RoomMessageEventContent::text_plain("i will disappear soon").into())
+        .await
+        .unwrap();
+
+    // Assert the local event is in the timeline now and is not sent yet.
+    assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
+    let event = item.as_event().unwrap();
+    assert!(event.is_local_echo());
+    assert_matches!(event.send_state(), Some(EventSendState::NotSentYet));
+
+    // As well as a day divider.
+    assert_let_timeout!(
+        Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next()
+    );
+    assert!(day_divider.is_day_divider());
+
+    // We receive an update in the timeline from the send queue.
+    assert_let_timeout!(Some(VectorDiff::Set { index, value: item }) = timeline_stream.next());
+    assert_eq!(index, 1);
+
+    // Check the event is sent but still considered local.
+    let event = item.as_event().unwrap();
+    assert!(event.is_local_echo());
+    assert_matches!(event.send_state(), Some(EventSendState::Sent { .. }));
+
+    // Mock the redaction response for the event we just sent. Ensure it's called
+    // once.
+    mock_redaction(event.event_id().unwrap()).expect(1).mount(&server).await;
+
+    // Let's redact the local echo with the remote handle.
+    timeline.redact(&event.identifier(), None).await.unwrap();
+}
+
+#[async_test]
+async fn test_redact_nonexisting_item() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    mock_encryption_state(&server, false).await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
+
+    let error = timeline
+        .redact(&TimelineEventItemId::EventId(owned_event_id!("$123:example.com")), None)
+        .await
+        .err();
+    assert_matches!(error, Some(Error::RedactError(RedactError::ItemNotFound(_))));
+
+    let error =
+        timeline.redact(&TimelineEventItemId::TransactionId("something".into()), None).await.err();
+    assert_matches!(error, Some(Error::RedactError(RedactError::ItemNotFound(_))));
 }
 
 #[async_test]
@@ -621,6 +722,95 @@ async fn test_unpin_event_is_returning_an_error() {
     setup.reset_server().await;
 }
 
+#[async_test]
+async fn test_timeline_without_encryption_info() {
+    // No encryption is mocked for this client/server pair
+    let (client, server) = logged_in_client_with_server().await;
+    let _ = RoomListService::new(client.clone()).await.unwrap();
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let f = EventFactory::new().room(room_id).sender(*BOB);
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id).add_timeline_event(f.text_msg("A message").into_raw_sync()),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    // Previously this would have panicked.
+    let timeline = room.timeline().await.unwrap();
+
+    let (items, _) = timeline.subscribe().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].as_virtual().is_some());
+    // No encryption, no shields
+    assert!(items[1].as_event().unwrap().get_shield(false).is_none());
+}
+
+#[async_test]
+async fn test_timeline_without_encryption_can_update() {
+    // No encryption is mocked for this client/server pair
+    let (client, server) = logged_in_client_with_server().await;
+    let _ = RoomListService::new(client.clone()).await.unwrap();
+
+    let room_id = room_id!("!jEsUZKDJdhlrceRyVU:example.org");
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let f = EventFactory::new().room(room_id).sender(*BOB);
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id).add_timeline_event(f.text_msg("A message").into_raw_sync()),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    // Previously this would have panicked.
+    // We're creating a timeline without read receipts tracking to check only the
+    // encryption changes
+    let timeline = Timeline::builder(&room).build().await.unwrap();
+
+    let (items, mut stream) = timeline.subscribe().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].as_virtual().is_some());
+    // No encryption, no shields
+    assert!(items[1].as_event().unwrap().get_shield(false).is_none());
+
+    let encryption_event_content = RoomEncryptionEventContent::with_recommended_defaults();
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.event(encryption_event_content).state_key("").into_raw_sync())
+            .add_timeline_event(f.text_msg("An encrypted message").into_raw_sync()),
+    );
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // Previous timeline event now has a shield
+    assert_next_matches!(stream, VectorDiff::Set { index, value } => {
+        assert_eq!(index, 1);
+        assert!(value.as_event().unwrap().get_shield(false).is_some());
+    });
+    // Room encryption event is received
+    assert_next_matches!(stream, VectorDiff::PushBack { value } => {
+        assert_let!(TimelineItemContent::OtherState(other_state) = value.as_event().unwrap().content());
+        assert_let!(AnyOtherFullStateEventContent::RoomEncryption(_) = other_state.content());
+        assert!(value.as_event().unwrap().get_shield(false).is_some());
+    });
+    // New message event is received and has a shield
+    assert_next_matches!(stream, VectorDiff::PushBack { value } => {
+        assert!(value.as_event().unwrap().get_shield(false).is_some());
+    });
+    assert_pending!(stream);
+}
+
 struct PinningTestSetup<'a> {
     event_id: &'a ruma::EventId,
     room_id: &'a ruma::RoomId,
@@ -647,7 +837,7 @@ impl PinningTestSetup<'_> {
         Self { event_id, room_id, client, server, sync_settings, sync_builder }
     }
 
-    async fn timeline(&self) -> matrix_sdk_ui::Timeline {
+    async fn timeline(&self) -> Timeline {
         mock_encryption_state(&self.server, false).await;
         let room = self.client.get_room(self.room_id).unwrap();
         room.timeline().await.unwrap()

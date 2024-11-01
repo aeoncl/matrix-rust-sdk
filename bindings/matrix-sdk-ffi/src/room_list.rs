@@ -1,13 +1,18 @@
-use std::{fmt::Debug, mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, time::Duration};
+#![allow(deprecated)]
+
+use std::{
+    fmt::Debug,
+    mem::{ManuallyDrop, MaybeUninit},
+    ptr::addr_of_mut,
+    sync::Arc,
+    time::Duration,
+};
 
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt, TryFutureExt};
-use matrix_sdk::{
-    ruma::{
-        api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
-        assign, RoomId,
-    },
-    sliding_sync::http,
+use matrix_sdk::ruma::{
+    api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
+    RoomId,
 };
 use matrix_sdk_ui::{
     room_list_service::filters::{
@@ -19,12 +24,14 @@ use matrix_sdk_ui::{
     timeline::default_event_filter,
     unable_to_decrypt_hook::UtdHookManager,
 };
+use ruma::{OwnedRoomOrAliasId, OwnedServerName, ServerName};
 use tokio::sync::RwLock;
 
 use crate::{
     error::ClientError,
     room::{Membership, Room},
     room_info::RoomInfo,
+    room_preview::RoomPreview,
     timeline::{EventTimelineItem, Timeline},
     timeline_event_filter::TimelineEventTypeFilter,
     TaskHandle, RUNTIME,
@@ -51,7 +58,7 @@ pub enum RoomListError {
     #[error("Event cache ran into an error: {error}")]
     EventCache { error: String },
     #[error("The requested room doesn't match the membership requirements {expected:?}, observed {actual:?}")]
-    IncorrectRoomMembership { expected: Membership, actual: Membership },
+    IncorrectRoomMembership { expected: Vec<Membership>, actual: Membership },
 }
 
 impl From<matrix_sdk_ui::room_list_service::Error> for RoomListError {
@@ -85,7 +92,7 @@ pub struct RoomListService {
     pub(crate) utd_hook: Option<Arc<UtdHookManager>>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListService {
     fn state(&self, listener: Box<dyn RoomListServiceStateListener>) -> Arc<TaskHandle> {
         let state_stream = self.inner.state();
@@ -135,11 +142,7 @@ impl RoomListService {
         })))
     }
 
-    fn subscribe_to_rooms(
-        &self,
-        room_ids: Vec<String>,
-        settings: Option<RoomSubscription>,
-    ) -> Result<(), RoomListError> {
+    fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
         let room_ids = room_ids
             .into_iter()
             .map(|room_id| {
@@ -147,10 +150,7 @@ impl RoomListService {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        self.inner.subscribe_to_rooms(
-            &room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-            settings.map(Into::into),
-        );
+        self.inner.subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>());
 
         Ok(())
     }
@@ -162,7 +162,7 @@ pub struct RoomList {
     inner: Arc<matrix_sdk_ui::room_list_service::RoomList>,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomList {
     fn loading_state(
         &self,
@@ -180,33 +180,6 @@ impl RoomList {
                 }
             }))),
         })
-    }
-
-    fn entries(&self, listener: Box<dyn RoomListEntriesListener>) -> Arc<TaskHandle> {
-        let this = self.inner.clone();
-        let utd_hook = self.room_list_service.utd_hook.clone();
-
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
-            let (entries, entries_stream) = this.entries();
-
-            pin_mut!(entries_stream);
-
-            listener.on_update(vec![RoomListEntriesUpdate::Append {
-                values: entries
-                    .into_iter()
-                    .map(|room| Arc::new(RoomListItem::from(room, utd_hook.clone())))
-                    .collect(),
-            }]);
-
-            while let Some(diffs) = entries_stream.next().await {
-                listener.on_update(
-                    diffs
-                        .into_iter()
-                        .map(|diff| RoomListEntriesUpdate::from(diff, utd_hook.clone()))
-                        .collect(),
-                );
-            }
-        })))
     }
 
     fn entries_with_dynamic_adapters(
@@ -319,7 +292,7 @@ pub struct RoomListEntriesWithDynamicAdaptersResult {
     entries_stream: Arc<TaskHandle>,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListEntriesWithDynamicAdaptersResult {
     fn controller(&self) -> Arc<RoomListDynamicEntriesController> {
         self.controller.clone()
@@ -397,17 +370,17 @@ impl From<matrix_sdk_ui::room_list_service::RoomListLoadingState> for RoomListLo
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListServiceStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListServiceState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListLoadingStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListLoadingState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListServiceSyncIndicatorListener: Send + Sync + Debug {
     fn on_update(&self, sync_indicator: RoomListServiceSyncIndicator);
 }
@@ -470,7 +443,7 @@ impl RoomListEntriesUpdate {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListEntriesListener: Send + Sync + Debug {
     fn on_update(&self, room_entries_update: Vec<RoomListEntriesUpdate>);
 }
@@ -488,7 +461,7 @@ impl RoomListDynamicEntriesController {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListDynamicEntriesController {
     fn set_filter(&self, kind: RoomListEntriesDynamicFilterKind) -> bool {
         self.inner.set_filter(kind.into())
@@ -576,7 +549,7 @@ impl RoomListItem {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListItem {
     fn id(&self) -> String {
         self.inner.id().to_string()
@@ -611,21 +584,58 @@ impl RoomListItem {
     }
 
     /// Builds a `Room` FFI from an invited room without initializing its
-    /// internal timeline
+    /// internal timeline.
     ///
-    /// An error will be returned if the room is a state different than invited
+    /// An error will be returned if the room is a state different than invited.
     ///
     /// ⚠️ Holding on to this room instance after it has been joined is not
-    /// safe. Use `full_room` instead
+    /// safe. Use `full_room` instead.
+    #[deprecated(note = "Please use `preview_room` instead.")]
     fn invited_room(&self) -> Result<Arc<Room>, RoomListError> {
         if !matches!(self.membership(), Membership::Invited) {
             return Err(RoomListError::IncorrectRoomMembership {
-                expected: Membership::Invited,
+                expected: vec![Membership::Invited],
                 actual: self.membership(),
             });
         }
-
         Ok(Arc::new(Room::new(self.inner.inner_room().clone())))
+    }
+
+    /// Builds a `RoomPreview` from a room list item. This is intended for
+    /// invited or knocked rooms.
+    ///
+    /// An error will be returned if the room is in a state other than invited
+    /// or knocked.
+    async fn preview_room(&self, via: Vec<String>) -> Result<Arc<RoomPreview>, ClientError> {
+        // Validate parameters first.
+        let server_names: Vec<OwnedServerName> = via
+            .into_iter()
+            .map(|server| ServerName::parse(server).map_err(ClientError::from))
+            .collect::<Result<_, ClientError>>()?;
+
+        // Validate internal room state.
+        let membership = self.membership();
+        if !matches!(membership, Membership::Invited | Membership::Knocked) {
+            return Err(RoomListError::IncorrectRoomMembership {
+                expected: vec![Membership::Invited, Membership::Knocked],
+                actual: membership,
+            }
+            .into());
+        }
+
+        // Do the thing.
+        let client = self.inner.client();
+        let (room_or_alias_id, server_names) = if let Some(alias) = self.inner.canonical_alias() {
+            let room_or_alias_id: OwnedRoomOrAliasId = alias.into();
+            (room_or_alias_id, Vec::new())
+        } else {
+            let room_or_alias_id: OwnedRoomOrAliasId = self.inner.id().to_owned().into();
+            (room_or_alias_id, server_names)
+        };
+
+        let room_preview = client.get_room_preview(&room_or_alias_id, server_names).await?;
+
+        Ok(Arc::new(RoomPreview::new(ManuallyDrop::new(client), room_preview)))
     }
 
     /// Build a full `Room` FFI object, filling its associated timeline.
@@ -635,7 +645,7 @@ impl RoomListItem {
     fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
         if !matches!(self.membership(), Membership::Joined) {
             return Err(RoomListError::IncorrectRoomMembership {
-                expected: Membership::Joined,
+                expected: vec![Membership::Joined],
                 actual: self.membership(),
             });
         }
@@ -702,33 +712,8 @@ impl RoomListItem {
         self.inner.is_encrypted().await.unwrap_or(false)
     }
 
-    async fn latest_event(&self) -> Option<Arc<EventTimelineItem>> {
-        self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new)
-    }
-}
-
-#[derive(uniffi::Record)]
-pub struct RequiredState {
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(uniffi::Record)]
-pub struct RoomSubscription {
-    pub required_state: Option<Vec<RequiredState>>,
-    pub timeline_limit: Option<u32>,
-    pub include_heroes: Option<bool>,
-}
-
-impl From<RoomSubscription> for http::request::RoomSubscription {
-    fn from(val: RoomSubscription) -> Self {
-        assign!(http::request::RoomSubscription::default(), {
-            required_state: val.required_state.map(|r|
-                r.into_iter().map(|s| (s.key.into(), s.value)).collect()
-            ).unwrap_or_default(),
-            timeline_limit: val.timeline_limit.map(|u| u.into()),
-            include_heroes: val.include_heroes,
-        })
+    async fn latest_event(&self) -> Option<EventTimelineItem> {
+        self.inner.latest_event().await.map(Into::into)
     }
 }
 
@@ -738,7 +723,7 @@ pub struct UnreadNotificationsCount {
     notification_count: u32,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl UnreadNotificationsCount {
     fn highlight_count(&self) -> u32 {
         self.highlight_count

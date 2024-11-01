@@ -4,16 +4,25 @@ use assert_matches2::{assert_let, assert_matches};
 use eyeball_im::VectorDiff;
 use futures_util::FutureExt;
 use matrix_sdk::{
-    config::SyncSettings, sync::RoomUpdate, test_utils::no_retry_test_client_with_server,
+    config::{RequestConfig, StoreConfig, SyncSettings},
+    matrix_auth::{MatrixSession, MatrixSessionTokens},
+    sync::RoomUpdate,
+    test_utils::no_retry_test_client_with_server,
+    Client, MemoryStore, SessionMeta, StateChanges, StateStore,
 };
 use matrix_sdk_base::{sync::RoomUpdates, RoomState};
 use matrix_sdk_test::{
     async_test, sync_state_event,
     test_json::{
         self,
-        sync::{MIXED_INVITED_ROOM_ID, MIXED_JOINED_ROOM_ID, MIXED_LEFT_ROOM_ID, MIXED_SYNC},
+        sync::{
+            MIXED_INVITED_ROOM_ID, MIXED_JOINED_ROOM_ID, MIXED_KNOCKED_ROOM_ID, MIXED_LEFT_ROOM_ID,
+            MIXED_SYNC,
+        },
+        sync_events::PINNED_EVENTS,
+        TAG,
     },
-    JoinedRoomBuilder, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
+    GlobalAccountDataTestEvent, JoinedRoomBuilder, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
     api::client::{
@@ -334,7 +343,7 @@ async fn test_subscribe_all_room_updates() {
     client.sync_once(sync_settings).await.unwrap();
 
     let room_updates = rx.recv().now_or_never().unwrap().unwrap();
-    assert_let!(RoomUpdates { leave, join, invite } = room_updates);
+    assert_let!(RoomUpdates { leave, join, invite, knocked } = room_updates);
 
     // Check the left room updates.
     {
@@ -376,6 +385,16 @@ async fn test_subscribe_all_room_updates() {
 
         assert_eq!(room_id, *MIXED_INVITED_ROOM_ID);
         assert_eq!(update.invite_state.events.len(), 2);
+    }
+
+    // Check the knocked room updates.
+    {
+        assert_eq!(knocked.len(), 1);
+
+        let (room_id, update) = knocked.iter().next().unwrap();
+
+        assert_eq!(room_id, *MIXED_KNOCKED_ROOM_ID);
+        assert_eq!(update.knock_state.events.len(), 2);
     }
 }
 
@@ -744,13 +763,13 @@ async fn test_encrypt_room_event() {
         .expect("We should be able to decrypt an event that we ourselves have encrypted");
 
     let event = timeline_event
-        .event
+        .raw()
         .deserialize()
         .expect("We should be able to deserialize the decrypted event");
 
     assert_let!(
-        ruma::events::AnyTimelineEvent::MessageLike(
-            ruma::events::AnyMessageLikeEvent::RoomMessage(message_event)
+        ruma::events::AnySyncTimelineEvent::MessageLike(
+            ruma::events::AnySyncMessageLikeEvent::RoomMessage(message_event)
         ) = event
     );
 
@@ -1237,4 +1256,137 @@ async fn test_rooms_stream() {
     assert_eq!(room_3.room_id(), room_id_3);
 
     assert_pending!(rooms_stream);
+}
+
+#[async_test]
+async fn test_dms_are_processed_in_any_sync_response() {
+    let (client, server) = logged_in_client_with_server().await;
+    let user_a_id = user_id!("@a:e.uk");
+    let user_b_id = user_id!("@b:e.uk");
+    let room_id_1 = room_id!("!r:e.uk");
+    let room_id_2 = room_id!("!s:e.uk");
+
+    let joined_room_builder = JoinedRoomBuilder::new(room_id_1);
+    let mut sync_response_builder = SyncResponseBuilder::new();
+    sync_response_builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(
+        json!({
+          "content": {
+            user_a_id: [
+                room_id_1
+            ],
+            user_b_id: [
+                room_id_2
+            ]
+          },
+          "type": "m.direct",
+          "event_id": "$757957878228ekrDs:localhost",
+            "origin_server_ts": 17195787,
+            "sender": "@example:localhost",
+            "state_key": "",
+            "type": "m.direct",
+            "unsigned": {
+              "age": 139298
+            }
+        }),
+    ));
+    sync_response_builder.add_joined_room(joined_room_builder);
+    let json_response = sync_response_builder.build_json_sync_response();
+
+    mock_sync(&server, json_response, None).await;
+    client.sync_once(SyncSettings::default()).await.unwrap();
+    server.reset().await;
+
+    let room_1 = client.get_room(room_id_1).unwrap();
+    assert!(room_1.is_direct().await.unwrap());
+
+    // Now perform a sync without new account data
+    let joined_room_builder = JoinedRoomBuilder::new(room_id_2);
+    sync_response_builder.add_joined_room(joined_room_builder);
+    let json_response = sync_response_builder.build_json_sync_response();
+
+    mock_sync(&server, json_response, None).await;
+    client.sync_once(SyncSettings::default()).await.unwrap();
+    server.reset().await;
+
+    let room_2 = client.get_room(room_id_2).unwrap();
+    assert!(room_2.is_direct().await.unwrap());
+}
+
+#[async_test]
+async fn test_restore_room() {
+    let room_id = room_id!("!stored_room:localhost");
+
+    // Create memory store with some room data.
+    let store = MemoryStore::new();
+
+    let mut changes = StateChanges::default();
+
+    let raw_tag_event = Raw::new(&*TAG).unwrap().cast();
+    let tag_event = raw_tag_event.deserialize().unwrap();
+    changes.add_room_account_data(room_id, tag_event, raw_tag_event);
+
+    let raw_pinned_events_event = Raw::new(&*PINNED_EVENTS).unwrap().cast();
+    let pinned_events_event = raw_pinned_events_event.deserialize().unwrap();
+    changes.add_state_event(room_id, pinned_events_event, raw_pinned_events_event);
+
+    let room_info = serde_json::from_value(json!({
+        "room_id": room_id,
+        "room_state": "Joined",
+        "notification_counts": {
+            "highlight_count": 0,
+            "notification_count": 0,
+        },
+        "summary": {
+            "room_heroes": [],
+            "joined_member_count": 1,
+            "invited_member_count": 0,
+        },
+        "members_synced": true,
+        "last_prev_batch": "pb",
+        "sync_info": "FullySynced",
+        "encryption_state_synced": true,
+        "base_info": {
+            "avatar": null,
+            "canonical_alias": null,
+            "create": null,
+            "dm_targets": [],
+            "encryption": null,
+            "guest_access": null,
+            "history_visibility": null,
+            "join_rules": null,
+            "max_power_level": 100,
+            "name": null,
+            "tombstone": null,
+            "topic": null,
+        },
+    }))
+    .unwrap();
+    changes.add_room(room_info);
+
+    store.save_changes(&changes).await.unwrap();
+
+    // Build a client with that store.
+    let store_config = StoreConfig::new().state_store(store);
+    let client = Client::builder()
+        .homeserver_url("http://localhost:1234")
+        .request_config(RequestConfig::new().disable_retry())
+        .store_config(store_config)
+        .build()
+        .await
+        .unwrap();
+    client
+        .matrix_auth()
+        .restore_session(MatrixSession {
+            meta: SessionMeta {
+                user_id: user_id!("@example:localhost").to_owned(),
+                device_id: device_id!("DEVICEID").to_owned(),
+            },
+            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        })
+        .await
+        .unwrap();
+
+    let room = client.get_room(room_id).unwrap();
+    assert!(room.is_favourite());
+    assert!(!room.pinned_event_ids().is_empty());
 }

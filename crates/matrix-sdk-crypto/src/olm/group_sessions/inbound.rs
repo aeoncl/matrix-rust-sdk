@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    cmp::Ordering,
     fmt,
     ops::Deref,
     sync::{
@@ -127,7 +128,7 @@ pub struct InboundGroupSession {
     /// the session, or, if we can use that device information to find the
     /// sender's cross-signing identity, holds the user ID and cross-signing
     /// key.
-    pub(crate) sender_data: SenderData,
+    pub sender_data: SenderData,
 
     /// The Room this GroupSession belongs to
     pub room_id: OwnedRoomId,
@@ -375,8 +376,8 @@ impl InboundGroupSession {
         self.imported
     }
 
-    /// Check if the `InboundGroupSession` is better than the given other
-    /// `InboundGroupSession`
+    /// Check if the [`InboundGroupSession`] is better than the given other
+    /// [`InboundGroupSession`]
     pub async fn compare(&self, other: &InboundGroupSession) -> SessionOrdering {
         // If this is the same object the ordering is the same, we can't compare because
         // we would deadlock while trying to acquire the same lock twice.
@@ -389,8 +390,18 @@ impl InboundGroupSession {
         {
             SessionOrdering::Unconnected
         } else {
-            let mut other = other.inner.lock().await;
-            self.inner.lock().await.compare(&mut other)
+            let mut other_inner = other.inner.lock().await;
+
+            match self.inner.lock().await.compare(&mut other_inner) {
+                SessionOrdering::Equal => {
+                    match self.sender_data.compare_trust_level(&other.sender_data) {
+                        Ordering::Less => SessionOrdering::Worse,
+                        Ordering::Equal => SessionOrdering::Equal,
+                        Ordering::Greater => SessionOrdering::Better,
+                    }
+                }
+                result => result,
+            }
         }
     }
 
@@ -648,7 +659,7 @@ mod tests {
     };
 
     use crate::{
-        olm::{InboundGroupSession, SenderData},
+        olm::{InboundGroupSession, KnownSenderData, SenderData},
         types::EventEncryptionAlgorithm,
         Account,
     };
@@ -771,7 +782,7 @@ mod tests {
                 "signing_key":{"ed25519":"wTRTdz4rn4EY+68cKPzpMdQ6RAlg7T8cbTmEjaXuUww"},
                 "sender_data":{
                     "UnknownDevice":{
-                        "legacy_session":true
+                        "legacy_session":false
                     }
                 },
                 "room_id":"!test:localhost",
@@ -866,6 +877,29 @@ mod tests {
                 .unwrap();
 
         assert_eq!(inbound.compare(&copy).await, SessionOrdering::Unconnected);
+    }
+
+    #[async_test]
+    async fn test_session_comparison_sender_data() {
+        let alice = Account::with_device_id(alice_id(), alice_device_id());
+        let room_id = room_id!("!test:localhost");
+
+        let (_, mut inbound) = alice.create_group_session_pair_with_defaults(room_id).await;
+
+        let sender_data = SenderData::SenderVerified(KnownSenderData {
+            user_id: alice.user_id().into(),
+            device_id: Some(alice.device_id().into()),
+            master_key: alice.identity_keys().ed25519.into(),
+        });
+
+        let mut better = InboundGroupSession::from_pickle(inbound.pickle().await).unwrap();
+        better.sender_data = sender_data.clone();
+
+        assert_eq!(inbound.compare(&better).await, SessionOrdering::Worse);
+        assert_eq!(better.compare(&inbound).await, SessionOrdering::Better);
+
+        inbound.sender_data = sender_data;
+        assert_eq!(better.compare(&inbound).await, SessionOrdering::Equal);
     }
 
     fn create_session_key() -> SessionKey {

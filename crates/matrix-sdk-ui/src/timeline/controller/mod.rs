@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "e2e-encryption")]
-use std::collections::BTreeSet;
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use as_variant::as_variant;
 use eyeball_im::{ObservableVectorEntry, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
 use futures_core::Stream;
 use imbl::Vector;
-#[cfg(all(test, feature = "e2e-encryption"))]
+#[cfg(test)]
 use matrix_sdk::crypto::OlmMachine;
 use matrix_sdk::{
     deserialized_responses::SyncTimelineEvent,
@@ -31,10 +29,6 @@ use matrix_sdk::{
     },
     Result, Room,
 };
-#[cfg(test)]
-use ruma::events::receipt::ReceiptEventContent;
-#[cfg(all(test, feature = "e2e-encryption"))]
-use ruma::RoomId;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType as SendReceiptType,
     events::{
@@ -50,21 +44,22 @@ use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, RoomVersionId,
     TransactionId, UserId,
 };
+#[cfg(test)]
+use ruma::{events::receipt::ReceiptEventContent, RoomId};
 use tokio::sync::{RwLock, RwLockWriteGuard};
-use tracing::{debug, error, field::debug, info, instrument, trace, warn};
-#[cfg(feature = "e2e-encryption")]
-use tracing::{field, info_span, Instrument as _};
+use tracing::{
+    debug, error, field, field::debug, info, info_span, instrument, trace, warn, Instrument as _,
+};
 
 pub(super) use self::state::{
-    EventMeta, FullEventMeta, TimelineEnd, TimelineMetadata, TimelineState,
-    TimelineStateTransaction,
+    EventMeta, FullEventMeta, PendingEdit, PendingEditKind, TimelineEnd, TimelineMetadata,
+    TimelineState, TimelineStateTransaction,
 };
-#[cfg(feature = "e2e-encryption")]
-use super::traits::Decryptor;
 use super::{
     event_handler::TimelineEventKind,
     event_item::{ReactionStatus, RemoteEventOrigin},
-    traits::RoomDataProvider,
+    item::TimelineUniqueId,
+    traits::{Decryptor, RoomDataProvider},
     util::{rfind_event_by_id, rfind_event_item, RelativePosition},
     Error, EventSendState, EventTimelineItem, InReplyToDetails, Message, PaginationError, Profile,
     ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
@@ -76,7 +71,7 @@ use crate::{
         event_item::EventTimelineItemKind,
         pinned_events_loader::{PinnedEventsLoader, PinnedEventsLoaderError},
         reactions::FullReactionKey,
-        util::rfind_event_by_uid,
+        util::rfind_event_by_item_id,
         TimelineEventFilterFn,
     },
     unable_to_decrypt_hook::UtdHookManager,
@@ -246,7 +241,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
         focus: TimelineFocus,
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
-        is_room_encrypted: bool,
+        is_room_encrypted: Option<bool>,
     ) -> Self {
         let (focus_data, focus_kind) = match focus {
             TimelineFocus::Live => (TimelineFocusData::Live, TimelineFocusKind::Live),
@@ -259,11 +254,12 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 )
             }
 
-            TimelineFocus::PinnedEvents { max_events_to_load } => (
+            TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests } => (
                 TimelineFocusData::PinnedEvents {
                     loader: PinnedEventsLoader::new(
                         Arc::new(room_data_provider.clone()),
                         max_events_to_load as usize,
+                        max_concurrent_requests as usize,
                     ),
                 },
                 TimelineFocusKind::PinnedEvents,
@@ -272,6 +268,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
         let state = TimelineState::new(
             focus_kind,
+            room_data_provider.own_user_id().to_owned(),
             room_data_provider.room_version(),
             internal_id_prefix,
             unable_to_decrypt_hook,
@@ -349,6 +346,34 @@ impl<P: RoomDataProvider> TimelineController<P> {
         }
     }
 
+    /// Listens to encryption state changes for the room in
+    /// [`matrix_sdk_base::RoomInfo`] and applies the new value to the
+    /// existing timeline items. This will then cause a refresh of those
+    /// timeline items.
+    pub async fn handle_encryption_state_changes(&self) {
+        let mut room_info = self.room_data_provider.room_info();
+
+        while let Some(info) = room_info.next().await {
+            let changed = {
+                let state = self.state.read().await;
+                let mut old_is_room_encrypted = state.meta.is_room_encrypted.write().unwrap();
+                let is_encrypted_now = info.is_encrypted();
+
+                if *old_is_room_encrypted != Some(is_encrypted_now) {
+                    *old_is_room_encrypted = Some(is_encrypted_now);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if changed {
+                let mut state = self.state.write().await;
+                state.update_all_events_is_room_encrypted();
+            }
+        }
+    }
+
     pub(crate) async fn reload_pinned_events(
         &self,
     ) -> Result<Vec<SyncTimelineEvent>, PinnedEventsLoaderError> {
@@ -370,14 +395,13 @@ impl<P: RoomDataProvider> TimelineController<P> {
         num_events: u16,
     ) -> Result<bool, PaginationError> {
         let pagination = match &*self.focus.read().await {
-            TimelineFocusData::Live => return Err(PaginationError::NotEventFocusMode),
+            TimelineFocusData::Live | TimelineFocusData::PinnedEvents { .. } => {
+                return Err(PaginationError::NotEventFocusMode)
+            }
             TimelineFocusData::Event { paginator, .. } => paginator
                 .paginate_backward(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
-            TimelineFocusData::PinnedEvents { .. } => {
-                return Err(PaginationError::NotEventFocusMode)
-            }
         };
 
         self.add_events_at(pagination.events, TimelineEnd::Front, RemoteEventOrigin::Pagination)
@@ -395,14 +419,13 @@ impl<P: RoomDataProvider> TimelineController<P> {
         num_events: u16,
     ) -> Result<bool, PaginationError> {
         let pagination = match &*self.focus.read().await {
-            TimelineFocusData::Live => return Err(PaginationError::NotEventFocusMode),
+            TimelineFocusData::Live | TimelineFocusData::PinnedEvents { .. } => {
+                return Err(PaginationError::NotEventFocusMode)
+            }
             TimelineFocusData::Event { paginator, .. } => paginator
                 .paginate_forward(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
-            TimelineFocusData::PinnedEvents { .. } => {
-                return Err(PaginationError::NotEventFocusMode)
-            }
         };
 
         self.add_events_at(pagination.events, TimelineEnd::Back, RemoteEventOrigin::Pagination)
@@ -462,12 +485,12 @@ impl<P: RoomDataProvider> TimelineController<P> {
     #[instrument(skip_all)]
     pub(super) async fn toggle_reaction_local(
         &self,
-        unique_id: &str,
+        item_id: &TimelineEventItemId,
         key: &str,
     ) -> Result<bool, Error> {
         let mut state = self.state.write().await;
 
-        let Some((item_pos, item)) = rfind_event_by_uid(&state.items, unique_id) else {
+        let Some((item_pos, item)) = rfind_event_by_item_id(&state.items, item_id) else {
             warn!("Timeline item not found, can't add reaction");
             return Err(Error::FailedToToggleReaction);
         };
@@ -480,7 +503,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
             .map(|reaction_info| reaction_info.status.clone());
 
         let Some(prev_status) = prev_status else {
-            match &item.inner.kind {
+            match &item.kind {
                 EventTimelineItemKind::Local(local) => {
                     if let Some(send_handle) = local.send_handle.clone() {
                         if send_handle
@@ -643,8 +666,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
     ) {
         let mut state = self.state.write().await;
 
-        state.clear();
-
         let track_read_markers = self.settings.track_read_receipts;
         if track_read_markers {
             state.populate_initial_user_receipt(&self.room_data_provider, ReceiptType::Read).await;
@@ -653,9 +674,14 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 .await;
         }
 
-        if !events.is_empty() {
+        // Replace the events if either the current event list or the new one aren't
+        // empty.
+        // Previously we just had to check the new one wasn't empty because
+        // we did a clear operation before so the current one would always be empty, but
+        // now we may want to replace a populated timeline with an empty one.
+        if !state.items.is_empty() || !events.is_empty() {
             state
-                .add_remote_events_at(
+                .replace_with_remote_events(
                     events,
                     TimelineEnd::Back,
                     origin,
@@ -710,7 +736,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
     ///
     /// If the corresponding local timeline item is missing, a warning is
     /// raised.
-    #[instrument(skip_all, fields(txn_id))]
+    #[instrument(skip(self))]
     pub(super) async fn update_event_send_state(
         &self,
         txn_id: &TransactionId,
@@ -787,7 +813,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 }
             }
 
-            warn!("Timeline item not found, can't add event ID");
+            warn!("Timeline item not found, can't update send state");
             return;
         };
 
@@ -799,7 +825,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
         // The event was already marked as sent, that's a broken state, let's
         // emit an error but also override to the given sent state.
         if let EventSendState::Sent { event_id: existing_event_id } = &local_item.send_state {
-            let new_event_id = new_event_id.map(debug);
             error!(?existing_event_id, ?new_event_id, "Local echo already marked as sent");
         }
 
@@ -923,10 +948,9 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
         // Replace the local-related state (kind) and the content state.
         let new_item = TimelineItem::new(
-            prev_item.with_kind(ti_kind).with_content(
-                TimelineItemContent::message(content, Default::default(), &txn.items),
-                None,
-            ),
+            prev_item
+                .with_kind(ti_kind)
+                .with_content(TimelineItemContent::message(content, None, &txn.items), None),
             prev_item.internal_id.to_owned(),
         );
 
@@ -941,7 +965,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
         true
     }
 
-    #[cfg(feature = "e2e-encryption")]
     #[instrument(skip(self, room), fields(room_id = ?room.room_id()))]
     pub(super) async fn retry_event_decryption(
         &self,
@@ -951,7 +974,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.retry_event_decryption_inner(room.to_owned(), session_ids).await
     }
 
-    #[cfg(all(test, feature = "e2e-encryption"))]
+    #[cfg(test)]
     pub(super) async fn retry_event_decryption_test(
         &self,
         room_id: &RoomId,
@@ -961,14 +984,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.retry_event_decryption_inner((olm_machine, room_id.to_owned()), session_ids).await
     }
 
-    #[cfg(feature = "e2e-encryption")]
     async fn retry_event_decryption_inner(
         &self,
         decryptor: impl Decryptor,
         session_ids: Option<BTreeSet<String>>,
     ) {
-        use matrix_sdk::crypto::types::events::UtdCause;
-
         use super::EncryptedMessage;
 
         let mut state = self.state.clone().write_owned().await;
@@ -1016,16 +1036,17 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 async move {
                     let event_item = item.as_event()?;
 
-                    let session_id = match event_item.content().as_unable_to_decrypt()? {
-                        EncryptedMessage::MegolmV1AesSha2 { session_id, .. }
-                            if should_retry(session_id) =>
-                        {
-                            session_id
-                        }
-                        EncryptedMessage::MegolmV1AesSha2 { .. }
-                        | EncryptedMessage::OlmV1Curve25519AesSha2 { .. }
-                        | EncryptedMessage::Unknown => return None,
-                    };
+                    let (session_id, utd_cause) =
+                        match event_item.content().as_unable_to_decrypt()? {
+                            EncryptedMessage::MegolmV1AesSha2 { session_id, cause, .. }
+                                if should_retry(session_id) =>
+                            {
+                                (session_id, cause)
+                            }
+                            EncryptedMessage::MegolmV1AesSha2 { .. }
+                            | EncryptedMessage::OlmV1Curve25519AesSha2 { .. }
+                            | EncryptedMessage::Unknown => return None,
+                        };
 
                     tracing::Span::current().record("session_id", session_id);
 
@@ -1047,11 +1068,9 @@ impl<P: RoomDataProvider> TimelineController<P> {
                                 "Successfully decrypted event that previously failed to decrypt"
                             );
 
-                            let cause = UtdCause::determine(Some(original_json));
-
                             // Notify observers that we managed to eventually decrypt an event.
                             if let Some(hook) = unable_to_decrypt_hook {
-                                hook.on_late_decrypt(&remote_event.event_id, cause).await;
+                                hook.on_late_decrypt(&remote_event.event_id, *utd_cause).await;
                             }
 
                             Some(event)
@@ -1211,10 +1230,15 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.state.read().await.latest_user_read_receipt_timeline_event_id(user_id)
     }
 
+    /// Subscribe to changes in the read receipts of our own user.
+    pub async fn subscribe_own_user_read_receipts_changed(&self) -> impl Stream<Item = ()> {
+        self.state.read().await.meta.read_receipts.subscribe_own_user_read_receipts_changed()
+    }
+
     /// Handle a room send update that's a new local echo.
     pub(crate) async fn handle_local_echo(&self, echo: LocalEcho) {
         match echo.content {
-            LocalEchoContent::Event { serialized_event, send_handle, is_wedged } => {
+            LocalEchoContent::Event { serialized_event, send_handle, send_error } => {
                 let content = match serialized_event.deserialize() {
                     Ok(d) => d,
                     Err(err) => {
@@ -1230,15 +1254,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 )
                 .await;
 
-                if is_wedged {
+                if let Some(send_error) = send_error {
                     self.update_event_send_state(
                         &echo.transaction_id,
                         EventSendState::SendingFailed {
-                            // Put a dummy error in this case, since we're not persisting the errors
-                            // that occurred in previous sessions.
-                            error: Arc::new(matrix_sdk::Error::UnknownError(Box::new(
-                                MissingLocalEchoFailError,
-                            ))),
+                            error: Arc::new(matrix_sdk::Error::SendQueueWedgeError(send_error)),
                             is_recoverable: false,
                         },
                     )
@@ -1331,6 +1351,10 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 .await;
             }
 
+            RoomSendQueueUpdate::RetryEvent { transaction_id } => {
+                self.update_event_send_state(&transaction_id, EventSendState::NotSentYet).await;
+            }
+
             RoomSendQueueUpdate::SentEvent { transaction_id, event_id } => {
                 self.update_event_send_state(&transaction_id, EventSendState::Sent { event_id })
                     .await;
@@ -1349,9 +1373,12 @@ impl TimelineController {
     #[instrument(skip(self))]
     pub(super) async fn fetch_in_reply_to_details(&self, event_id: &EventId) -> Result<(), Error> {
         let state = self.state.write().await;
-        let (index, item) =
-            rfind_event_by_id(&state.items, event_id).ok_or(Error::RemoteEventNotInTimeline)?;
-        let remote_item = item.as_remote().ok_or(Error::RemoteEventNotInTimeline)?.clone();
+        let (index, item) = rfind_event_by_id(&state.items, event_id)
+            .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?;
+        let remote_item = item
+            .as_remote()
+            .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?
+            .clone();
 
         let TimelineItemContent::Message(message) = item.content().clone() else {
             debug!("Event is not a message");
@@ -1387,7 +1414,7 @@ impl TimelineController {
         // changed while waiting for the request.
         let mut state = self.state.write().await;
         let (index, item) = rfind_event_by_id(&state.items, &remote_item.event_id)
-            .ok_or(Error::RemoteEventNotInTimeline)?;
+            .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?;
 
         // Check the state of the event again, it might have been redacted while
         // the request was in-flight.
@@ -1488,10 +1515,6 @@ impl TimelineController {
     }
 }
 
-#[derive(Debug, Error)]
-#[error("local echo failed to send in a previous session")]
-struct MissingLocalEchoFailError;
-
 #[derive(Debug, Default)]
 pub(super) struct HandleManyEventsResult {
     /// The number of items that were added to the timeline.
@@ -1508,7 +1531,7 @@ async fn fetch_replied_to_event(
     mut state: RwLockWriteGuard<'_, TimelineState>,
     index: usize,
     item: &EventTimelineItem,
-    internal_id: String,
+    internal_id: TimelineUniqueId,
     message: &Message,
     in_reply_to: &EventId,
     room: &Room,

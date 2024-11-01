@@ -1,3 +1,17 @@
+// Copyright 2024 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! High-level room API
 
 use std::{
@@ -8,16 +22,25 @@ use std::{
     time::Duration,
 };
 
+#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+use async_trait::async_trait;
 use eyeball::SharedObservable;
 use futures_core::Stream;
 use futures_util::{
     future::{try_join, try_join_all},
     stream::FuturesUnordered,
 };
+#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+pub use identity_status_changes::IdentityStatusChanges;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::{DecryptionSettings, RoomEventDecryptionResult};
+#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
 use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
+    media::{MediaThumbnailSettings, MediaThumbnailSize},
     store::StateStoreExt,
     ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
     StateStoreDataValue,
@@ -38,7 +61,7 @@ use ruma::{
         membership::{
             ban_user, forget_room, get_member_events,
             invite_user::{self, v3::InvitationRecipient},
-            join_room_by_id, kick_user, leave_room, unban_user, Invite3pid,
+            kick_user, leave_room, unban_user, Invite3pid,
         },
         message::send_message_event,
         read_marker::set_read_marker,
@@ -55,18 +78,23 @@ use ruma::{
         beacon_info::BeaconInfoEventContent,
         call::notify::{ApplicationType, CallNotifyEventContent, NotifyType},
         direct::DirectEventContent,
-        marked_unread::MarkedUnreadEventContent,
+        marked_unread::{MarkedUnreadEventContent, UnstableMarkedUnreadEventContent},
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
             avatar::{self, RoomAvatarEventContent},
             encryption::RoomEncryptionEventContent,
             history_visibility::HistoryVisibility,
-            message::RoomMessageEventContent,
+            message::{
+                AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
+                ImageMessageEventContent, MessageType, RoomMessageEventContent,
+                UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock, VideoInfo,
+                VideoMessageEventContent,
+            },
             name::RoomNameEventContent,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
             server_acl::RoomServerAclEventContent,
             topic::RoomTopicEventContent,
-            MediaSource,
+            ImageInfo, MediaSource, ThumbnailInfo,
         },
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
@@ -96,7 +124,7 @@ pub use self::{
 #[cfg(doc)]
 use crate::event_cache::EventCache;
 use crate::{
-    attachment::AttachmentConfig,
+    attachment::{AttachmentConfig, AttachmentInfo},
     client::WeakClient,
     config::RequestConfig,
     error::{BeaconError, WrongRoomState},
@@ -112,6 +140,7 @@ use crate::{
 
 pub mod edit;
 pub mod futures;
+pub mod identity_status_changes;
 mod member;
 mod messages;
 pub mod power_levels;
@@ -180,9 +209,7 @@ impl Room {
                 false
             });
 
-        let request = join_room_by_id::v3::Request::new(self.inner.room_id().to_owned());
-        let response = self.client.send(request, None).await?;
-        self.client.base_client().room_joined(&response.room_id).await?;
+        self.client.join_room_by_id(self.room_id()).await?;
 
         if mark_as_direct {
             self.set_is_direct(true).await?;
@@ -306,7 +333,7 @@ impl Room {
 
             for event in &mut response.chunk {
                 event.push_actions =
-                    Some(push_rules.get_actions(&event.event, &push_context).to_owned());
+                    Some(push_rules.get_actions(event.raw(), &push_context).to_owned());
             }
         }
 
@@ -365,6 +392,35 @@ impl Room {
         (drop_guard, receiver)
     }
 
+    /// Subscribe to updates about users who are in "pin violation" i.e. their
+    /// identity has changed and the user has not yet acknowledged this.
+    ///
+    /// The returned receiver will receive a new vector of
+    /// [`IdentityStatusChange`] each time a /keys/query response shows a
+    /// changed identity for a member of this room, or a sync shows a change
+    /// to the membership of an affected user. (Changes to the current user are
+    /// not directly included, but some changes to the current user's identity
+    /// can trigger changes to how we see other users' identities, which
+    /// will be included.)
+    ///
+    /// The first item in the stream provides the current state of the room:
+    /// each member of the room who is not in "pinned" or "verified" state will
+    /// be included (except the current user).
+    ///
+    /// If the `changed_to` property of an [`IdentityStatusChange`] is set to
+    /// `PinViolation` then a warning should be displayed to the user. If it is
+    /// set to `Pinned` then no warning should be displayed.
+    ///
+    /// Note that if a user who is in pin violation leaves the room, a `Pinned`
+    /// update is sent, to indicate that the warning should be removed, even
+    /// though the user's identity is not necessarily pinned.
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    pub async fn subscribe_to_identity_status_changes(
+        &self,
+    ) -> Result<impl Stream<Item = Vec<IdentityStatusChange>>> {
+        IdentityStatusChanges::create_stream(self.clone()).await
+    }
+
     /// Returns a wrapping `TimelineEvent` for the input `AnyTimelineEvent`,
     /// decrypted if needs be.
     ///
@@ -382,7 +438,7 @@ impl Room {
         }
 
         let mut event = TimelineEvent::new(event);
-        event.push_actions = self.event_push_actions(&event.event).await?;
+        event.push_actions = self.event_push_actions(event.raw()).await?;
 
         Ok(event)
     }
@@ -578,60 +634,6 @@ impl Room {
         } else {
             Ok(())
         }
-    }
-
-    /// Get active members for this room, includes invited, joined members.
-    ///
-    /// *Note*: This method will fetch the members from the homeserver if the
-    /// member list isn't synchronized due to member lazy loading. Because of
-    /// that, it might panic if it isn't run on a tokio thread.
-    ///
-    /// Use [active_members_no_sync()](#method.active_members_no_sync) if you
-    /// want a method that doesn't do any requests.
-    #[deprecated = "Use members with RoomMemberships::ACTIVE instead"]
-    pub async fn active_members(&self) -> Result<Vec<RoomMember>> {
-        self.sync_members().await?;
-        self.members_no_sync(RoomMemberships::ACTIVE).await
-    }
-
-    /// Get active members for this room, includes invited, joined members.
-    ///
-    /// *Note*: This method will not fetch the members from the homeserver if
-    /// the member list isn't synchronized due to member lazy loading. Thus,
-    /// members could be missing from the list.
-    ///
-    /// Use [active_members()](#method.active_members) if you want to ensure to
-    /// always get the full member list.
-    #[deprecated = "Use members_no_sync with RoomMemberships::ACTIVE instead"]
-    pub async fn active_members_no_sync(&self) -> Result<Vec<RoomMember>> {
-        self.members_no_sync(RoomMemberships::ACTIVE).await
-    }
-
-    /// Get all the joined members of this room.
-    ///
-    /// *Note*: This method will fetch the members from the homeserver if the
-    /// member list isn't synchronized due to member lazy loading. Because of
-    /// that it might panic if it isn't run on a tokio thread.
-    ///
-    /// Use [joined_members_no_sync()](#method.joined_members_no_sync) if you
-    /// want a method that doesn't do any requests.
-    #[deprecated = "Use members with RoomMemberships::JOIN instead"]
-    pub async fn joined_members(&self) -> Result<Vec<RoomMember>> {
-        self.sync_members().await?;
-        self.members_no_sync(RoomMemberships::JOIN).await
-    }
-
-    /// Get all the joined members of this room.
-    ///
-    /// *Note*: This method will not fetch the members from the homeserver if
-    /// the member list isn't synchronized due to member lazy loading. Thus,
-    /// members could be missing from the list.
-    ///
-    /// Use [joined_members()](#method.joined_members) if you want to ensure to
-    /// always get the full member list.
-    #[deprecated = "Use members_no_sync with RoomMemberships::JOIN instead"]
-    pub async fn joined_members_no_sync(&self) -> Result<Vec<RoomMember>> {
-        self.members_no_sync(RoomMemberships::JOIN).await
     }
 
     /// Get a specific member of this room.
@@ -1226,7 +1228,8 @@ impl Room {
     /// # Arguments
     /// * `event` - The room event to be decrypted.
     ///
-    /// Returns the decrypted event.
+    /// Returns the decrypted event. In the case of a decryption error, returns
+    /// a `TimelineEvent` representing the decryption error.
     #[cfg(feature = "e2e-encryption")]
     pub async fn decrypt_event(
         &self,
@@ -1235,21 +1238,24 @@ impl Room {
         let machine = self.client.olm_machine().await;
         let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        let mut event =
-            match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
-                Ok(event) => event,
-                Err(e) => {
-                    self.client
-                        .encryption()
-                        .backups()
-                        .maybe_download_room_key(self.room_id().to_owned(), event.clone());
+        let decryption_settings = DecryptionSettings {
+            sender_device_trust_requirement: self.client.base_client().decryption_trust_requirement,
+        };
+        let mut event: TimelineEvent = match machine
+            .try_decrypt_room_event(event.cast_ref(), self.inner.room_id(), &decryption_settings)
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => decrypted.into(),
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                self.client
+                    .encryption()
+                    .backups()
+                    .maybe_download_room_key(self.room_id().to_owned(), event.clone());
+                TimelineEvent::new_utd_event(event.clone().cast(), utd_info)
+            }
+        };
 
-                    return Err(e.into());
-                }
-            };
-
-        event.push_actions = self.event_push_actions(&event.event).await?;
-
+        event.push_actions = self.event_push_actions(event.raw()).await?;
         Ok(event)
     }
 
@@ -1569,6 +1575,25 @@ impl Room {
             // could be quite useful if someone wants to enable encryption and
             // send a message right after it's enabled.
             _ = timeout(self.client.inner.sync_beat.listen(), SYNC_WAIT_TIME).await;
+
+            // If after waiting for a sync, we don't have the encryption state we expect,
+            // assume the local encryption state is incorrect; this will cause
+            // the SDK to re-request it later for confirmation, instead of
+            // assuming it's sync'd and correct (and not encrypted).
+            let _sync_lock = self.client.base_client().sync_lock().lock().await;
+            if !self.inner.is_encrypted() {
+                debug!("still not marked as encrypted, marking encryption state as missing");
+
+                let mut room_info = self.clone_info();
+                room_info.mark_encryption_state_missing();
+                let mut changes = StateChanges::default();
+                changes.add_room(room_info.clone());
+
+                self.client.store().save_changes(&changes).await?;
+                self.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
+            } else {
+                debug!("room successfully marked as encrypted");
+            }
         }
 
         Ok(())
@@ -1702,7 +1727,7 @@ impl Room {
     /// let txn_id = TransactionId::new();
     ///
     /// if let Some(room) = client.get_room(&room_id) {
-    ///     room.send(content).with_transaction_id(&txn_id).await?;
+    ///     room.send(content).with_transaction_id(txn_id).await?;
     /// }
     ///
     /// // Custom events work too:
@@ -1897,6 +1922,13 @@ impl Room {
     ///   media.
     ///
     /// * `config` - Metadata and configuration for the attachment.
+    ///
+    /// * `send_progress` - An observable to transmit forward progress about the
+    ///   upload.
+    ///
+    /// * `store_in_cache` - A boolean defining whether the uploaded media will
+    ///   be stored in the cache immediately after a successful upload.
+    #[instrument(skip_all)]
     pub(super) async fn prepare_and_send_attachment<'a>(
         &'a self,
         filename: &'a str,
@@ -1904,48 +1936,195 @@ impl Room {
         data: Vec<u8>,
         mut config: AttachmentConfig,
         send_progress: SharedObservable<TransmissionProgress>,
+        store_in_cache: bool,
     ) -> Result<send_message_event::v3::Response> {
         self.ensure_room_joined()?;
 
         let txn_id = config.txn_id.take();
         let mentions = config.mentions.take();
 
+        let thumbnail = config.thumbnail.take();
+
+        // If necessary, store caching data for the thumbnail ahead of time.
+        let thumbnail_cache_info = if store_in_cache {
+            // Use a small closure returning Option to avoid an unnecessary complicated
+            // chain of map/and_then.
+            let get_info = || {
+                let thumbnail = thumbnail.as_ref()?;
+                let info = thumbnail.info.as_ref()?;
+                Some((thumbnail.data.clone(), info.height?, info.width?))
+            };
+            get_info()
+        } else {
+            None
+        };
+
         #[cfg(feature = "e2e-encryption")]
-        let content = if self.is_encrypted().await? {
+        let (media_source, thumbnail_source, thumbnail_info) = if self.is_encrypted().await? {
             self.client
-                .prepare_encrypted_attachment_message(
-                    filename,
-                    content_type,
-                    data,
-                    config,
-                    send_progress,
-                )
+                .upload_encrypted_media_and_thumbnail(content_type, &data, thumbnail, send_progress)
                 .await?
         } else {
             self.client
                 .media()
-                .prepare_attachment_message(filename, content_type, data, config, send_progress)
+                .upload_plain_media_and_thumbnail(
+                    content_type,
+                    // TODO: get rid of this clone; wait for Ruma to use `Bytes` or something
+                    // similar.
+                    data.clone(),
+                    thumbnail,
+                    send_progress,
+                )
                 .await?
         };
 
         #[cfg(not(feature = "e2e-encryption"))]
-        let content = self
+        let (media_source, thumbnail_source, thumbnail_info) = self
             .client
             .media()
-            .prepare_attachment_message(filename, content_type, data, config, send_progress)
+            .upload_plain_media_and_thumbnail(content_type, data.clone(), thumbnail, send_progress)
             .await?;
 
-        let mut message = RoomMessageEventContent::new(content);
+        if store_in_cache {
+            let cache_store = self.client.event_cache_store();
 
-        if let Some(mentions) = mentions {
-            message = message.add_mentions(mentions);
+            // A failure to cache shouldn't prevent the whole upload from finishing
+            // properly, so only log errors during caching.
+
+            debug!("caching the media");
+            let request = MediaRequest { source: media_source.clone(), format: MediaFormat::File };
+            if let Err(err) = cache_store.add_media_content(&request, data).await {
+                warn!("unable to cache the media after uploading it: {err}");
+            }
+
+            if let Some(((data, height, width), source)) =
+                thumbnail_cache_info.zip(thumbnail_source.as_ref())
+            {
+                debug!("caching the thumbnail");
+
+                // Do a best guess at figuring the media request: not animated, cropped
+                // thumbnail of the original size.
+                let request = MediaRequest {
+                    source: source.clone(),
+                    format: MediaFormat::Thumbnail(MediaThumbnailSettings {
+                        size: MediaThumbnailSize {
+                            method: ruma::media::Method::Scale,
+                            width,
+                            height,
+                        },
+                        animated: false,
+                    }),
+                };
+
+                if let Err(err) = cache_store.add_media_content(&request, data).await {
+                    warn!("unable to cache the media after uploading it: {err}");
+                }
+            }
         }
 
-        let mut fut = self.send(message);
-        if let Some(txn_id) = &txn_id {
+        let msg_type = self.make_attachment_message(
+            content_type,
+            media_source,
+            thumbnail_source,
+            thumbnail_info,
+            filename,
+            config,
+        );
+
+        let mut content = RoomMessageEventContent::new(msg_type);
+
+        if let Some(mentions) = mentions {
+            content = content.add_mentions(mentions);
+        }
+
+        let mut fut = self.send(content);
+        if let Some(txn_id) = txn_id {
             fut = fut.with_transaction_id(txn_id);
         }
         fut.await
+    }
+
+    /// Creates the inner [`MessageType`] for an already-uploaded media file
+    /// provided by its source.
+    fn make_attachment_message(
+        &self,
+        content_type: &Mime,
+        source: MediaSource,
+        thumbnail_source: Option<MediaSource>,
+        thumbnail_info: Option<Box<ThumbnailInfo>>,
+        filename: &str,
+        config: AttachmentConfig,
+    ) -> MessageType {
+        // if config.caption is set, use it as body, and filename as the file name
+        // otherwise, body is the filename, and the filename is not set.
+        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
+        let (body, filename) = match config.caption {
+            Some(caption) => (caption, Some(filename.to_owned())),
+            None => (filename.to_owned(), None),
+        };
+
+        match content_type.type_() {
+            mime::IMAGE => {
+                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(ImageMessageEventContent::new(body, source), {
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
+                });
+                MessageType::Image(content)
+            }
+
+            mime::AUDIO => {
+                let mut content = AudioMessageEventContent::new(body, source);
+
+                if let Some(AttachmentInfo::Voice { audio_info, waveform: Some(waveform_vec) }) =
+                    &config.info
+                {
+                    if let Some(duration) = audio_info.duration {
+                        let waveform = waveform_vec.iter().map(|v| (*v).into()).collect();
+                        content.audio =
+                            Some(UnstableAudioDetailsContentBlock::new(duration, waveform));
+                    }
+                    content.voice = Some(UnstableVoiceContentBlock::new());
+                }
+
+                let mut audio_info = config.info.map(AudioInfo::from).unwrap_or_default();
+                audio_info.mimetype = Some(content_type.as_ref().to_owned());
+                let content = content.info(Box::new(audio_info));
+
+                MessageType::Audio(content)
+            }
+
+            mime::VIDEO => {
+                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(VideoMessageEventContent::new(body, source), {
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
+                });
+                MessageType::Video(content)
+            }
+
+            _ => {
+                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(FileMessageEventContent::new(body, source), {
+                    info: Some(Box::new(info))
+                });
+                MessageType::File(content)
+            }
+        }
     }
 
     /// Update the power levels of a select set of users of this room.
@@ -1960,7 +2139,7 @@ impl Room {
         &self,
         updates: Vec<(&UserId, Int)>,
     ) -> Result<send_state_event::v3::Response> {
-        let mut power_levels = self.room_power_levels().await?;
+        let mut power_levels = self.power_levels().await?;
 
         for (user_id, new_level) in updates {
             if new_level == power_levels.users_default {
@@ -1978,20 +2157,10 @@ impl Room {
     /// Any values that are `None` in the given `RoomPowerLevelChanges` will
     /// remain unchanged.
     pub async fn apply_power_level_changes(&self, changes: RoomPowerLevelChanges) -> Result<()> {
-        let mut power_levels = self.room_power_levels().await?;
+        let mut power_levels = self.power_levels().await?;
         power_levels.apply(changes)?;
         self.send_state_event(RoomPowerLevelsEventContent::from(power_levels)).await?;
         Ok(())
-    }
-
-    /// Get the current power levels of this room.
-    pub async fn room_power_levels(&self) -> Result<RoomPowerLevels> {
-        Ok(self
-            .get_state_event_static::<RoomPowerLevelsEventContent>()
-            .await?
-            .ok_or(Error::InsufficientData)?
-            .deserialize()?
-            .power_levels())
     }
 
     /// Resets the room's power levels to the default values
@@ -2001,7 +2170,7 @@ impl Room {
         let default_power_levels = RoomPowerLevels::from(RoomPowerLevelsEventContent::new());
         let changes = RoomPowerLevelChanges::from(default_power_levels);
         self.apply_power_level_changes(changes).await?;
-        self.room_power_levels().await
+        Ok(self.power_levels().await?)
     }
 
     /// Gets the suggested role for the user with the provided `user_id`.
@@ -2018,14 +2187,14 @@ impl Room {
     /// This method checks the `RoomPowerLevels` events instead of loading the
     /// member list and looking for the member.
     pub async fn get_user_power_level(&self, user_id: &UserId) -> Result<i64> {
-        let event = self.room_power_levels().await?;
+        let event = self.power_levels().await?;
         Ok(event.for_user(user_id).into())
     }
 
     /// Gets a map with the `UserId` of users with power levels other than `0`
     /// and this power level.
     pub async fn users_with_power_levels(&self) -> HashMap<OwnedUserId, i64> {
-        let power_levels = self.room_power_levels().await.ok();
+        let power_levels = self.power_levels().await.ok();
         let mut user_power_levels = HashMap::<OwnedUserId, i64>::new();
         if let Some(power_levels) = power_levels {
             for (id, level) in power_levels.users.into_iter() {
@@ -2308,7 +2477,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_redact_own(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_redact_own_event(user_id))
+        Ok(self.power_levels().await?.user_can_redact_own_event(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to redact
@@ -2316,7 +2485,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_redact_other(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_redact_event_of_other(user_id))
+        Ok(self.power_levels().await?.user_can_redact_event_of_other(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to ban in the
@@ -2324,7 +2493,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_ban(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_ban(user_id))
+        Ok(self.power_levels().await?.user_can_ban(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to kick in the
@@ -2332,7 +2501,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_invite(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_invite(user_id))
+        Ok(self.power_levels().await?.user_can_invite(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to kick in the
@@ -2340,7 +2509,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_kick(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_kick(user_id))
+        Ok(self.power_levels().await?.user_can_kick(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to send a
@@ -2352,7 +2521,7 @@ impl Room {
         user_id: &UserId,
         state_event: StateEventType,
     ) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_send_state(user_id, state_event))
+        Ok(self.power_levels().await?.user_can_send_state(user_id, state_event))
     }
 
     /// Returns true if the user with the given user_id is able to send a
@@ -2364,7 +2533,7 @@ impl Room {
         user_id: &UserId,
         message: MessageLikeEventType,
     ) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_send_message(user_id, message))
+        Ok(self.power_levels().await?.user_can_send_message(user_id, message))
     }
 
     /// Returns true if the user with the given user_id is able to pin or unpin
@@ -2373,7 +2542,7 @@ impl Room {
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_pin_unpin(&self, user_id: &UserId) -> Result<bool> {
         Ok(self
-            .room_power_levels()
+            .power_levels()
             .await?
             .user_can_send_state(user_id, StateEventType::RoomPinnedEvents))
     }
@@ -2383,7 +2552,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_trigger_room_notification(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_trigger_room_notification(user_id))
+        Ok(self.power_levels().await?.user_can_trigger_room_notification(user_id))
     }
 
     /// Get a list of servers that should know this room.
@@ -2644,7 +2813,17 @@ impl Room {
 
         let request = forget_room::v3::Request::new(self.inner.room_id().to_owned());
         let _response = self.client.send(request, None).await?;
-        self.client.store().remove_room(self.inner.room_id()).await?;
+
+        // If it was a DM, remove the room from the `m.direct` global account data.
+        if self.inner.direct_targets_length() != 0 {
+            if let Err(e) = self.set_is_direct(false).await {
+                // It is not important whether we managed to remove the room, it will not have
+                // any consequences, so just log the error.
+                warn!(room_id = ?self.room_id(), "failed to remove room from m.direct account data: {e}");
+            }
+        }
+
+        self.client.base_client().forget_room(self.inner.room_id()).await?;
 
         Ok(())
     }
@@ -2752,7 +2931,7 @@ impl Room {
     pub async fn set_unread_flag(&self, unread: bool) -> Result<()> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
-        let content = MarkedUnreadEventContent::new(unread);
+        let content = UnstableMarkedUnreadEventContent::from(MarkedUnreadEventContent::new(unread));
 
         let request = set_room_account_data::v3::Request::new(
             user_id.to_owned(),
@@ -2769,13 +2948,7 @@ impl Room {
     pub async fn event_cache(
         &self,
     ) -> event_cache::Result<(RoomEventCache, Arc<EventCacheDropHandles>)> {
-        let global_event_cache = self.client.event_cache();
-
-        global_event_cache.for_room(self.room_id()).await.map(|(maybe_room, drop_handles)| {
-            // SAFETY: the `RoomEventCache` must always been found, since we're constructing
-            // from a `Room`.
-            (maybe_room.unwrap(), drop_handles)
-        })
+        self.client.event_cache().for_room(self.room_id()).await
     }
 
     /// This will only send a call notification event if appropriate.
@@ -2956,6 +3129,38 @@ impl Room {
             .remove_kv_data(StateStoreDataKey::ComposerDraft(self.room_id()))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+#[async_trait]
+impl RoomIdentityProvider for Room {
+    async fn is_member(&self, user_id: &UserId) -> bool {
+        self.get_member(user_id).await.unwrap_or(None).is_some()
+    }
+
+    async fn member_identities(&self) -> Vec<UserIdentity> {
+        let members = self
+            .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+            .await
+            .unwrap_or_else(|_| Default::default());
+
+        let mut ret: Vec<UserIdentity> = Vec::new();
+        for member in members {
+            if let Some(i) = self.user_identity(member.user_id()).await {
+                ret.push(i);
+            }
+        }
+        ret
+    }
+
+    async fn user_identity(&self, user_id: &UserId) -> Option<UserIdentity> {
+        self.client
+            .encryption()
+            .get_user_identity(user_id)
+            .await
+            .unwrap_or(None)
+            .map(|u| u.underlying_identity())
     }
 }
 

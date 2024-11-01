@@ -21,8 +21,9 @@ use std::{
 use itertools::Itertools;
 use matrix_sdk_common::{
     deserialized_responses::{
-        AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, TimelineEvent, UnableToDecryptInfo,
-        UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel, VerificationState,
+        AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo, UnableToDecryptInfo,
+        UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
+        VerificationState,
     },
     BoxFuture,
 };
@@ -40,10 +41,10 @@ use ruma::{
     assign,
     events::{
         secret::request::SecretName, AnyMessageLikeEvent, AnyMessageLikeEventContent,
-        AnyTimelineEvent, AnyToDeviceEvent, MessageLikeEventContent,
+        AnyToDeviceEvent, MessageLikeEventContent,
     },
     serde::{JsonObject, Raw},
-    DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedDeviceKeyId,
+    DeviceId, MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedDeviceKeyId,
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde_json::{value::to_raw_value, Value};
@@ -63,7 +64,7 @@ use crate::{
     dehydrated_devices::{DehydratedDevices, DehydrationError},
     error::{EventError, MegolmError, MegolmResult, OlmError, OlmResult, SetRoomSettingsError},
     gossiping::GossipMachine,
-    identities::{user::UserIdentities, Device, IdentityManager, UserDevices},
+    identities::{user::UserIdentity, Device, IdentityManager, UserDevices},
     olm::{
         Account, CrossSigningStatus, EncryptionSettings, IdentityKeys, InboundGroupSession,
         KnownSenderData, OlmDecryptionInfo, PrivateCrossSigningIdentity, SenderData,
@@ -93,8 +94,8 @@ use crate::{
     },
     utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
-    CrossSigningKeyExport, CryptoStoreError, DeviceData, KeysQueryRequest, LocalTrust,
-    SignatureError, ToDeviceRequest,
+    CrossSigningKeyExport, CryptoStoreError, DecryptionSettings, DeviceData, KeysQueryRequest,
+    LocalTrust, RoomEventDecryptionResult, SignatureError, ToDeviceRequest, TrustRequirement,
 };
 
 /// State machine implementation of the Olm/Megolm encryption protocol used for
@@ -185,29 +186,42 @@ impl OlmMachine {
             })
             .await?;
 
+        let (verification_machine, store, identity_manager) =
+            Self::new_helper_prelude(store, static_account, self.store().private_identity());
+
         Ok(Self::new_helper(
             device_id,
             store,
-            static_account,
+            verification_machine,
+            identity_manager,
             self.store().private_identity(),
             None,
         ))
     }
 
+    fn new_helper_prelude(
+        store_wrapper: Arc<CryptoStoreWrapper>,
+        account: StaticAccountData,
+        user_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
+    ) -> (VerificationMachine, Store, IdentityManager) {
+        let verification_machine =
+            VerificationMachine::new(account.clone(), user_identity.clone(), store_wrapper.clone());
+        let store = Store::new(account, user_identity, store_wrapper, verification_machine.clone());
+
+        let identity_manager = IdentityManager::new(store.clone());
+
+        (verification_machine, store, identity_manager)
+    }
+
     fn new_helper(
         device_id: &DeviceId,
-        store: Arc<CryptoStoreWrapper>,
-        account: StaticAccountData,
+        store: Store,
+        verification_machine: VerificationMachine,
+        identity_manager: IdentityManager,
         user_identity: Arc<Mutex<PrivateCrossSigningIdentity>>,
         maybe_backup_key: Option<MegolmV1BackupKey>,
     ) -> Self {
-        let verification_machine =
-            VerificationMachine::new(account.clone(), user_identity.clone(), store.clone());
-        let store = Store::new(account, user_identity.clone(), store, verification_machine.clone());
-
         let group_session_manager = GroupSessionManager::new(store.clone());
-
-        let identity_manager = IdentityManager::new(store.clone());
 
         let users_for_key_claim = Arc::new(StdRwLock::new(BTreeMap::new()));
         let key_request_machine = GossipMachine::new(
@@ -360,11 +374,21 @@ impl OlmMachine {
         let identity = Arc::new(Mutex::new(identity));
         let store = Arc::new(CryptoStoreWrapper::new(user_id, device_id, store));
 
+        let (verification_machine, store, identity_manager) =
+            Self::new_helper_prelude(store, static_account, identity.clone());
+
         // FIXME: We might want in the future a more generic high-level data migration
         // mechanism (at the store wrapper layer).
-        Self::migration_post_verified_latch_support(&store).await?;
+        Self::migration_post_verified_latch_support(&store, &identity_manager).await?;
 
-        Ok(OlmMachine::new_helper(device_id, store, static_account, identity, maybe_backup_key))
+        Ok(Self::new_helper(
+            device_id,
+            store,
+            verification_machine,
+            identity_manager,
+            identity,
+            maybe_backup_key,
+        ))
     }
 
     // The sdk now support verified identity change detection.
@@ -375,19 +399,15 @@ impl OlmMachine {
     //
     // pub(crate) visibility for testing.
     pub(crate) async fn migration_post_verified_latch_support(
-        store: &CryptoStoreWrapper,
+        store: &Store,
+        identity_manager: &IdentityManager,
     ) -> Result<(), CryptoStoreError> {
         let maybe_migrate_for_identity_verified_latch =
             store.get_custom_value(Self::HAS_MIGRATED_VERIFICATION_LATCH).await?.is_none();
+
         if maybe_migrate_for_identity_verified_latch {
-            // We want to mark all tracked users as dirty to ensure the verified latch is
-            // set up correctly.
-            let tracked_user = store.load_tracked_users().await?;
-            let mut store_updates = Vec::with_capacity(tracked_user.len());
-            tracked_user.iter().for_each(|tu| {
-                store_updates.push((tu.user_id.as_ref(), true));
-            });
-            store.save_tracked_users(&store_updates).await?;
+            identity_manager.mark_all_tracked_users_as_dirty(store.cache().await?).await?;
+
             store.set_custom_value(Self::HAS_MIGRATED_VERIFICATION_LATCH, vec![0]).await?
         }
         Ok(())
@@ -623,28 +643,32 @@ impl OlmMachine {
         &self,
         reset: bool,
     ) -> StoreResult<CrossSigningBootstrapRequests> {
-        let mut identity = self.inner.user_identity.lock().await;
+        // Don't hold the lock, otherwise we might deadlock in
+        // `bootstrap_cross_signing()` on `account` if a sync task is already
+        // running (which locks `account`), or we will deadlock
+        // in `upload_device_keys()` which locks private identity again.
+        let identity = self.inner.user_identity.lock().await.clone();
 
         let (upload_signing_keys_req, upload_signatures_req) = if reset || identity.is_empty().await
         {
             info!("Creating new cross signing identity");
 
-            let (new_identity, upload_signing_keys_req, upload_signatures_req) = {
+            let (identity, upload_signing_keys_req, upload_signatures_req) = {
                 let cache = self.inner.store.cache().await?;
                 let account = cache.account().await?;
                 account.bootstrap_cross_signing().await
             };
 
-            *identity = new_identity;
-
             let public = identity.to_public_identity().await.expect(
                 "Couldn't create a public version of the identity from a new private identity",
             );
 
+            *self.inner.user_identity.lock().await = identity.clone();
+
             self.store()
                 .save_changes(Changes {
                     identities: IdentityChanges { new: vec![public.into()], ..Default::default() },
-                    private_identity: Some(identity.clone()),
+                    private_identity: Some(identity),
                     ..Default::default()
                 })
                 .await?;
@@ -662,11 +686,6 @@ impl OlmMachine {
 
             (upload_signing_keys_req, upload_signatures_req)
         };
-
-        // `upload_device_keys()` will attempt to sign the device keys using this
-        // `identity`, it will attempt to acquire the lock, so we need to drop
-        // here to avoid a deadlock.
-        drop(identity);
 
         // If there are any *device* keys to upload (i.e. the account isn't shared),
         // upload them before we upload the signatures, since the signatures may
@@ -838,9 +857,9 @@ impl OlmMachine {
 
     #[instrument(
         skip_all,
-    // This function is only ever called by add_room_key via
-    // handle_decrypted_to_device_event, so sender, sender_key, and algorithm are
-    // already recorded.
+        // This function is only ever called by add_room_key via
+        // handle_decrypted_to_device_event, so sender, sender_key, and algorithm are
+        // already recorded.
         fields(room_id = ? content.room_id, session_id)
     )]
     async fn handle_key(
@@ -869,17 +888,21 @@ impl OlmMachine {
 
                 session.sender_data = sender_data;
 
-                if self.store().compare_group_session(&session).await? == SessionOrdering::Better {
-                    info!("Received a new megolm room key");
+                match self.store().compare_group_session(&session).await? {
+                    SessionOrdering::Better => {
+                        info!("Received a new megolm room key");
 
-                    Ok(Some(session))
-                } else {
-                    warn!(
-                        "Received a megolm room key that we already have a better version of, \
-                        discarding",
-                    );
+                        Ok(Some(session))
+                    }
+                    comparison_result => {
+                        warn!(
+                            ?comparison_result,
+                            "Received a megolm room key that we already have a better version \
+                             of, discarding"
+                        );
 
-                    Ok(None)
+                        Ok(None)
+                    }
                 }
             }
             Err(e) => {
@@ -934,8 +957,6 @@ impl OlmMachine {
         &self,
         room_id: &RoomId,
     ) -> OlmResult<()> {
-        use crate::olm::SenderData;
-
         let (_, session) = self
             .inner
             .group_session_manager
@@ -957,8 +978,6 @@ impl OlmMachine {
         &self,
         room_id: &RoomId,
     ) -> OlmResult<InboundGroupSession> {
-        use crate::olm::SenderData;
-
         let (_, session) = self
             .inner
             .group_session_manager
@@ -1458,7 +1477,7 @@ impl OlmMachine {
                 sender_data,
                 SenderData::UnknownDevice { .. }
                     | SenderData::DeviceInfo { .. }
-                    | SenderData::SenderUnverifiedButPreviouslyVerified { .. }
+                    | SenderData::VerificationViolation { .. }
             )
         }
 
@@ -1597,6 +1616,7 @@ impl OlmMachine {
         room_id: &RoomId,
         event: &EncryptedEvent,
         content: &SupportedEventEncryptionSchemes<'_>,
+        decryption_settings: &DecryptionSettings,
     ) -> MegolmResult<(JsonObject, EncryptionInfo)> {
         let session =
             self.get_inbound_group_session_or_error(room_id, content.session_id()).await?;
@@ -1612,6 +1632,13 @@ impl OlmMachine {
         match result {
             Ok((decrypted_event, _)) => {
                 let encryption_info = self.get_encryption_info(&session, &event.sender).await?;
+
+                self.check_sender_trust_requirement(
+                    &session,
+                    &encryption_info,
+                    &decryption_settings.sender_device_trust_requirement,
+                )?;
+
                 Ok((decrypted_event, encryption_info))
             }
             Err(error) => Err(
@@ -1633,6 +1660,55 @@ impl OlmMachine {
                     error
                 },
             ),
+        }
+    }
+
+    /// Check that the sender of a Megolm session satisfies the trust
+    /// requirement from the decryption settings.
+    fn check_sender_trust_requirement(
+        &self,
+        session: &InboundGroupSession,
+        encryption_info: &EncryptionInfo,
+        trust_requirement: &TrustRequirement,
+    ) -> MegolmResult<()> {
+        /// Get the error from the encryption information.
+        fn encryption_info_to_error(encryption_info: &EncryptionInfo) -> MegolmResult<()> {
+            // When this is called, the verification state *must* be unverified,
+            // otherwise the sender_data would have been SenderVerified
+            let VerificationState::Unverified(verification_level) =
+                &encryption_info.verification_state
+            else {
+                unreachable!("inconsistent verification state");
+            };
+            Err(MegolmError::SenderIdentityNotTrusted(verification_level.clone()))
+        }
+
+        match trust_requirement {
+            TrustRequirement::Untrusted => Ok(()),
+
+            TrustRequirement::CrossSignedOrLegacy => match &session.sender_data {
+                // Reject if the sender was previously verified, but changed
+                // their identity and is not verified any more.
+                SenderData::VerificationViolation(..) => Err(
+                    MegolmError::SenderIdentityNotTrusted(VerificationLevel::VerificationViolation),
+                ),
+                SenderData::SenderUnverified(..) => Ok(()),
+                SenderData::SenderVerified(..) => Ok(()),
+                SenderData::DeviceInfo { legacy_session: true, .. } => Ok(()),
+                SenderData::UnknownDevice { legacy_session: true, .. } => Ok(()),
+                _ => encryption_info_to_error(encryption_info),
+            },
+
+            TrustRequirement::CrossSigned => match &session.sender_data {
+                // Reject if the sender was previously verified, but changed
+                // their identity and is not verified any more.
+                SenderData::VerificationViolation(..) => Err(
+                    MegolmError::SenderIdentityNotTrusted(VerificationLevel::VerificationViolation),
+                ),
+                SenderData::SenderUnverified(..) => Ok(()),
+                SenderData::SenderVerified(..) => Ok(()),
+                _ => encryption_info_to_error(encryption_info),
+            },
         }
     }
 
@@ -1659,6 +1735,34 @@ impl OlmMachine {
         }
     }
 
+    /// Attempt to decrypt an event from a room timeline, returning information
+    /// on the failure if it fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event that should be decrypted.
+    ///
+    /// * `room_id` - The ID of the room where the event was sent to.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted event, if it was successfully decrypted. Otherwise,
+    /// information on the failure, unless the failure was due to an
+    /// internal error, in which case, an `Err` result.
+    pub async fn try_decrypt_room_event(
+        &self,
+        raw_event: &Raw<EncryptedEvent>,
+        room_id: &RoomId,
+        decryption_settings: &DecryptionSettings,
+    ) -> Result<RoomEventDecryptionResult, CryptoStoreError> {
+        match self.decrypt_room_event_inner(raw_event, room_id, true, decryption_settings).await {
+            Ok(decrypted) => Ok(RoomEventDecryptionResult::Decrypted(decrypted)),
+            Err(err) => Ok(RoomEventDecryptionResult::UnableToDecrypt(megolm_error_to_utd_info(
+                raw_event, err,
+            )?)),
+        }
+    }
+
     /// Decrypt an event from a room timeline.
     ///
     /// # Arguments
@@ -1670,17 +1774,19 @@ impl OlmMachine {
         &self,
         event: &Raw<EncryptedEvent>,
         room_id: &RoomId,
-    ) -> MegolmResult<TimelineEvent> {
-        self.decrypt_room_event_inner(event, room_id, true).await
+        decryption_settings: &DecryptionSettings,
+    ) -> MegolmResult<DecryptedRoomEvent> {
+        self.decrypt_room_event_inner(event, room_id, true, decryption_settings).await
     }
 
-    #[instrument(name = "decrypt_room_event", skip_all, fields(?room_id, event_id, origin_server_ts, sender, algorithm, session_id, sender_key))]
+    #[instrument(name = "decrypt_room_event", skip_all, fields(?room_id, event_id, origin_server_ts, sender, algorithm, session_id, message_index, sender_key))]
     async fn decrypt_room_event_inner(
         &self,
         event: &Raw<EncryptedEvent>,
         room_id: &RoomId,
         decrypt_unsigned: bool,
-    ) -> MegolmResult<TimelineEvent> {
+        decryption_settings: &DecryptionSettings,
+    ) -> MegolmResult<DecryptedRoomEvent> {
         let event = event.deserialize()?;
 
         Span::current()
@@ -1707,7 +1813,10 @@ impl OlmMachine {
         };
 
         Span::current().record("session_id", content.session_id());
-        let result = self.decrypt_megolm_events(room_id, &event, &content).await;
+        Span::current().record("message_index", content.message_index());
+
+        let result =
+            self.decrypt_megolm_events(room_id, &event, &content, decryption_settings).await;
 
         if let Err(e) = &result {
             #[cfg(feature = "automatic-room-key-forwarding")]
@@ -1732,18 +1841,14 @@ impl OlmMachine {
         let mut unsigned_encryption_info = None;
         if decrypt_unsigned {
             // Try to decrypt encrypted unsigned events.
-            unsigned_encryption_info =
-                self.decrypt_unsigned_events(&mut decrypted_event, room_id).await;
+            unsigned_encryption_info = self
+                .decrypt_unsigned_events(&mut decrypted_event, room_id, decryption_settings)
+                .await;
         }
 
-        let event = serde_json::from_value::<Raw<AnyTimelineEvent>>(decrypted_event.into())?;
+        let event = serde_json::from_value::<Raw<AnyMessageLikeEvent>>(decrypted_event.into())?;
 
-        Ok(TimelineEvent {
-            event,
-            encryption_info: Some(encryption_info),
-            push_actions: None,
-            unsigned_encryption_info,
-        })
+        Ok(DecryptedRoomEvent { event, encryption_info, unsigned_encryption_info })
     }
 
     /// Try to decrypt the events bundled in the `unsigned` object of the given
@@ -1759,6 +1864,7 @@ impl OlmMachine {
         &self,
         main_event: &mut JsonObject,
         room_id: &RoomId,
+        decryption_settings: &DecryptionSettings,
     ) -> Option<BTreeMap<UnsignedEventLocation, UnsignedDecryptionResult>> {
         let unsigned = main_event.get_mut("unsigned")?.as_object_mut()?;
         let mut unsigned_encryption_info: Option<
@@ -1768,7 +1874,9 @@ impl OlmMachine {
         // Search for an encrypted event in `m.replace`, an edit.
         let location = UnsignedEventLocation::RelationsReplace;
         let replace = location.find_mut(unsigned);
-        if let Some(decryption_result) = self.decrypt_unsigned_event(replace, room_id).await {
+        if let Some(decryption_result) =
+            self.decrypt_unsigned_event(replace, room_id, decryption_settings).await
+        {
             unsigned_encryption_info
                 .get_or_insert_with(Default::default)
                 .insert(location, decryption_result);
@@ -1779,7 +1887,7 @@ impl OlmMachine {
         let location = UnsignedEventLocation::RelationsThreadLatestEvent;
         let thread_latest_event = location.find_mut(unsigned);
         if let Some(decryption_result) =
-            self.decrypt_unsigned_event(thread_latest_event, room_id).await
+            self.decrypt_unsigned_event(thread_latest_event, room_id, decryption_settings).await
         {
             unsigned_encryption_info
                 .get_or_insert_with(Default::default)
@@ -1800,6 +1908,7 @@ impl OlmMachine {
         &'a self,
         event: Option<&'a mut Value>,
         room_id: &'a RoomId,
+        decryption_settings: &'a DecryptionSettings,
     ) -> BoxFuture<'a, Option<UnsignedDecryptionResult>> {
         Box::pin(async move {
             let event = event?;
@@ -1813,24 +1922,22 @@ impl OlmMachine {
             }
 
             let raw_event = serde_json::from_value(event.clone()).ok()?;
-            match self.decrypt_room_event_inner(&raw_event, room_id, false).await {
+            match self
+                .decrypt_room_event_inner(&raw_event, room_id, false, decryption_settings)
+                .await
+            {
                 Ok(decrypted_event) => {
                     // Replace the encrypted event.
                     *event = serde_json::to_value(decrypted_event.event).ok()?;
-                    Some(UnsignedDecryptionResult::Decrypted(decrypted_event.encryption_info?))
+                    Some(UnsignedDecryptionResult::Decrypted(decrypted_event.encryption_info))
                 }
-                Err(_) => {
-                    let session_id =
-                        raw_event.deserialize().ok().and_then(|ev| match ev.content.scheme {
-                            RoomEventEncryptionScheme::MegolmV1AesSha2(s) => Some(s.session_id),
-                            #[cfg(feature = "experimental-algorithms")]
-                            RoomEventEncryptionScheme::MegolmV2AesSha2(s) => Some(s.session_id),
-                            RoomEventEncryptionScheme::Unknown(_) => None,
-                        });
-
-                    Some(UnsignedDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
-                        session_id,
-                    }))
+                Err(err) => {
+                    // For now, we throw away crypto store errors and just treat the unsigned event
+                    // as unencrypted. Crypto store errors represent problems with the application
+                    // rather than normal UTD errors, so they should probably be propagated
+                    // rather than swallowed.
+                    let utd_info = megolm_error_to_utd_info(&raw_event, err).ok()?;
+                    Some(UnsignedDecryptionResult::UnableToDecrypt(utd_info))
                 }
             }
         })
@@ -1928,6 +2035,17 @@ impl OlmMachine {
         self.inner.identity_manager.update_tracked_users(users).await
     }
 
+    /// Mark all tracked users as dirty.
+    ///
+    /// All users *whose device lists we are tracking* are flagged as needing a
+    /// key query. Users whose devices we are not tracking are ignored.
+    pub async fn mark_all_tracked_users_as_dirty(&self) -> StoreResult<()> {
+        self.inner
+            .identity_manager
+            .mark_all_tracked_users_as_dirty(self.inner.store.cache().await?)
+            .await
+    }
+
     async fn wait_if_user_pending(
         &self,
         user_id: &UserId,
@@ -1995,14 +2113,14 @@ impl OlmMachine {
     /// the requests from [`OlmMachine::outgoing_requests`] are being
     /// processed and sent out.
     ///
-    /// Returns a `UserIdentities` enum if one is found and the crypto store
+    /// Returns a [`UserIdentity`] enum if one is found and the crypto store
     /// didn't throw an error.
     #[instrument(skip(self))]
     pub async fn get_identity(
         &self,
         user_id: &UserId,
         timeout: Option<Duration>,
-    ) -> StoreResult<Option<UserIdentities>> {
+    ) -> StoreResult<Option<UserIdentity>> {
         self.wait_if_user_pending(user_id, timeout).await?;
         self.store().get_identity(user_id).await
     }
@@ -2340,10 +2458,10 @@ impl OlmMachine {
         Ok(())
     }
 
-    #[cfg(any(feature = "testing", test))]
     /// Returns whether this `OlmMachine` is the same another one.
     ///
     /// Useful for testing purposes only.
+    #[cfg(any(feature = "testing", test))]
     pub fn same_as(&self, other: &OlmMachine) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -2354,6 +2472,18 @@ impl OlmMachine {
         let cache = self.inner.store.cache().await?;
         let account = cache.account().await?;
         Ok(account.uploaded_key_count())
+    }
+
+    /// Returns the identity manager.
+    #[cfg(test)]
+    pub(crate) fn identity_manager(&self) -> &IdentityManager {
+        &self.inner.identity_manager
+    }
+
+    /// Returns a store key, only useful for testing purposes.
+    #[cfg(test)]
+    pub(crate) fn key_for_has_migrated_verification_latch() -> &'static str {
+        Self::HAS_MIGRATED_VERIFICATION_LATCH
     }
 }
 
@@ -2381,9 +2511,9 @@ fn sender_data_to_verification_state(
             VerificationState::Unverified(VerificationLevel::UnsignedDevice),
             Some(device_keys.device_id),
         ),
-        SenderData::SenderUnverifiedButPreviouslyVerified(KnownSenderData {
-            device_id, ..
-        }) => (VerificationState::Unverified(VerificationLevel::PreviouslyVerified), device_id),
+        SenderData::VerificationViolation(KnownSenderData { device_id, .. }) => {
+            (VerificationState::Unverified(VerificationLevel::VerificationViolation), device_id)
+        }
         SenderData::SenderUnverified(KnownSenderData { device_id, .. }) => {
             (VerificationState::Unverified(VerificationLevel::UnverifiedIdentity), device_id)
         }
@@ -2427,11 +2557,50 @@ pub struct EncryptionSyncChanges<'a> {
     /// sync response.
     pub changed_devices: &'a DeviceLists,
     /// The number of one time keys, as returned in the sync response.
-    pub one_time_keys_counts: &'a BTreeMap<DeviceKeyAlgorithm, UInt>,
+    pub one_time_keys_counts: &'a BTreeMap<OneTimeKeyAlgorithm, UInt>,
     /// An optional list of fallback keys.
-    pub unused_fallback_keys: Option<&'a [DeviceKeyAlgorithm]>,
+    pub unused_fallback_keys: Option<&'a [OneTimeKeyAlgorithm]>,
     /// A next-batch token obtained from a to-device sync query.
     pub next_batch_token: Option<String>,
+}
+
+/// Convert a [`MegolmError`] into an [`UnableToDecryptInfo`] or a
+/// [`CryptoStoreError`].
+///
+/// Most `MegolmError` codes are converted into a suitable
+/// `UnableToDecryptInfo`. The exception is [`MegolmError::Store`], which
+/// represents a problem with our datastore rather than with the message itself,
+/// and is therefore returned as a `CryptoStoreError`.
+fn megolm_error_to_utd_info(
+    raw_event: &Raw<EncryptedEvent>,
+    error: MegolmError,
+) -> Result<UnableToDecryptInfo, CryptoStoreError> {
+    use MegolmError::*;
+    let reason = match error {
+        EventError(_) => UnableToDecryptReason::MalformedEncryptedEvent,
+        Decode(_) => UnableToDecryptReason::MalformedEncryptedEvent,
+        MissingRoomKey(_) => UnableToDecryptReason::MissingMegolmSession,
+        Decryption(DecryptionError::UnknownMessageIndex(_, _)) => {
+            UnableToDecryptReason::UnknownMegolmMessageIndex
+        }
+        Decryption(_) => UnableToDecryptReason::MegolmDecryptionFailure,
+        JsonError(_) => UnableToDecryptReason::PayloadDeserializationFailure,
+        MismatchedIdentityKeys(_) => UnableToDecryptReason::MismatchedIdentityKeys,
+        SenderIdentityNotTrusted(level) => UnableToDecryptReason::SenderIdentityNotTrusted(level),
+
+        // Pass through crypto store errors, which indicate a problem with our
+        // application, rather than a UTD.
+        Store(error) => Err(error)?,
+    };
+
+    let session_id = raw_event.deserialize().ok().and_then(|ev| match ev.content.scheme {
+        RoomEventEncryptionScheme::MegolmV1AesSha2(s) => Some(s.session_id),
+        #[cfg(feature = "experimental-algorithms")]
+        RoomEventEncryptionScheme::MegolmV2AesSha2(s) => Some(s.session_id),
+        RoomEventEncryptionScheme::Unknown(_) => None,
+    });
+
+    Ok(UnableToDecryptInfo { session_id, reason })
 }
 
 #[cfg(test)]

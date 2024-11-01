@@ -25,7 +25,8 @@ use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
 use matrix_sdk_base::{
-    event_cache_store::EventCacheStoreError, Error as SdkBaseError, RoomState, StoreError,
+    event_cache_store::EventCacheStoreError, Error as SdkBaseError, QueueWedgeError, RoomState,
+    StoreError,
 };
 use reqwest::Error as ReqwestError;
 use ruma::{
@@ -44,7 +45,7 @@ use serde_json::Error as JsonError;
 use thiserror::Error;
 use url::ParseError as UrlParseError;
 
-use crate::{event_cache::EventCacheError, store_locks::LockStoreError};
+use crate::{event_cache::EventCacheError, media::MediaError, store_locks::LockStoreError};
 
 /// Result type of the matrix-sdk.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -336,11 +337,6 @@ pub enum Error {
     #[error(transparent)]
     UserTagName(#[from] InvalidUserTagName),
 
-    /// An error while processing images.
-    #[cfg(feature = "image-proc")]
-    #[error(transparent)]
-    ImageError(#[from] ImageError),
-
     /// An error occurred within sliding-sync
     #[cfg(feature = "experimental-sliding-sync")]
     #[error(transparent)]
@@ -376,9 +372,17 @@ pub enum Error {
     #[error(transparent)]
     EventCache(#[from] EventCacheError),
 
+    /// An item has been wedged in the send queue.
+    #[error(transparent)]
+    SendQueueWedgeError(#[from] QueueWedgeError),
+
     /// Backups are not enabled
     #[error("backups are not enabled")]
     BackupNotEnabled,
+
+    /// An error happened during handling of a media subrequest.
+    #[error(transparent)]
+    Media(#[from] MediaError),
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -498,27 +502,6 @@ impl From<ReqwestError> for Error {
     fn from(e: ReqwestError) -> Self {
         Error::Http(HttpError::Reqwest(e))
     }
-}
-
-/// All possible errors that can happen during image processing.
-#[cfg(feature = "image-proc")]
-#[derive(Error, Debug)]
-pub enum ImageError {
-    /// Error processing the image data.
-    #[error(transparent)]
-    Proc(#[from] image::ImageError),
-
-    /// Error parsing the mimetype of the image.
-    #[error(transparent)]
-    Mime(#[from] mime::FromStrError),
-
-    /// The image format is not supported.
-    #[error("the image format is not supported")]
-    FormatNotSupported,
-
-    /// The thumbnail size is bigger than the original image.
-    #[error("the thumbnail size is bigger than the original image size")]
-    ThumbnailBiggerThanOriginal,
 }
 
 /// Errors that can happen when interacting with the beacon API.

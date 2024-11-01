@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::{collections::HashMap, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use matrix_sdk::{
+    crypto::LocalTrust,
     event_cache::paginator::PaginatorError,
     room::{
         edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
@@ -23,7 +25,8 @@ use ruma::{
         },
         TimelineEventType,
     },
-    EventId, Int, RoomAliasId, UserId,
+    EventId, Int, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomAliasId, TransactionId,
+    UserId,
 };
 use tokio::sync::RwLock;
 use tracing::error;
@@ -33,6 +36,7 @@ use crate::{
     chunk_iterator::ChunkIterator,
     error::{ClientError, MediaInfoError, RoomError},
     event::{MessageLikeEventType, StateEventType},
+    identity_status_change::IdentityStatusChange,
     room_info::RoomInfo,
     room_member::RoomMember,
     ruma::{ImageInfo, Mentions, NotifyType},
@@ -41,11 +45,12 @@ use crate::{
     TaskHandle,
 };
 
-#[derive(Debug, uniffi::Enum)]
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum Membership {
     Invited,
     Joined,
     Left,
+    Knocked,
 }
 
 impl From<RoomState> for Membership {
@@ -54,6 +59,7 @@ impl From<RoomState> for Membership {
             RoomState::Invited => Membership::Invited,
             RoomState::Joined => Membership::Joined,
             RoomState::Left => Membership::Left,
+            RoomState::Knocked => Membership::Knocked,
         }
     }
 }
@@ -76,7 +82,7 @@ impl Room {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Room {
     pub fn id(&self) -> String {
         self.inner.room_id().to_string()
@@ -157,7 +163,12 @@ impl Room {
     /// the user who invited the logged-in user to a room.
     pub async fn inviter(&self) -> Option<RoomMember> {
         if self.inner.state() == RoomState::Invited {
-            self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
+            self.inner
+                .invite_details()
+                .await
+                .ok()
+                .and_then(|a| a.inviter)
+                .and_then(|m| m.try_into().ok())
         } else {
             None
         }
@@ -232,6 +243,7 @@ impl Room {
         &self,
         internal_id_prefix: Option<String>,
         max_events_to_load: u16,
+        max_concurrent_requests: u16,
     ) -> Result<Arc<Timeline>, ClientError> {
         let room = &self.inner;
 
@@ -241,8 +253,10 @@ impl Room {
             builder = builder.with_internal_id_prefix(internal_id_prefix);
         }
 
-        let timeline =
-            builder.with_focus(TimelineFocus::PinnedEvents { max_events_to_load }).build().await?;
+        let timeline = builder
+            .with_focus(TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests })
+            .build()
+            .await?;
 
         Ok(Timeline::new(timeline))
     }
@@ -264,7 +278,7 @@ impl Room {
     pub async fn member(&self, user_id: String) -> Result<RoomMember, ClientError> {
         let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
         let member = self.inner.get_member(&user_id).await?.context("User not found")?;
-        Ok(member.into())
+        Ok(member.try_into().context("Unknown state membership")?)
     }
 
     pub async fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
@@ -577,6 +591,31 @@ impl Room {
         })))
     }
 
+    pub fn subscribe_to_identity_status_changes(
+        &self,
+        listener: Box<dyn IdentityStatusChangeListener>,
+    ) -> Arc<TaskHandle> {
+        let room = self.inner.clone();
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            let status_changes = room.subscribe_to_identity_status_changes().await;
+            if let Ok(status_changes) = status_changes {
+                // TODO: what to do with failures?
+                let mut status_changes = pin!(status_changes);
+                while let Some(identity_status_changes) = status_changes.next().await {
+                    listener.call(
+                        identity_status_changes
+                            .into_iter()
+                            .map(|change| {
+                                let user_id = change.user_id.to_string();
+                                IdentityStatusChange { user_id, changed_to: change.changed_to }
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        })))
+    }
+
     /// Set (or unset) a flag on the room to indicate that the user has
     /// explicitly marked it as unread.
     pub async fn set_unread_flag(&self, new_value: bool) -> Result<(), ClientError> {
@@ -595,7 +634,7 @@ impl Room {
     }
 
     pub async fn get_power_levels(&self) -> Result<RoomPowerLevels, ClientError> {
-        let power_levels = self.inner.room_power_levels().await?;
+        let power_levels = self.inner.power_levels().await.map_err(matrix_sdk::Error::from)?;
         Ok(RoomPowerLevels::from(power_levels))
     }
 
@@ -737,10 +776,97 @@ impl Room {
         self.inner.send_queue().send(replacement_event).await?;
         Ok(())
     }
+
+    /// Remove verification requirements for the given users and
+    /// resend messages that failed to send because their identities were no
+    /// longer verified (in response to
+    /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity`)
+    ///
+    /// # Arguments
+    ///
+    /// * `user_ids` - The list of users identifiers received in the error
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo the send error applies to
+    pub async fn withdraw_verification_and_resend(
+        &self,
+        user_ids: Vec<String>,
+        transaction_id: String,
+    ) -> Result<(), ClientError> {
+        let transaction_id: OwnedTransactionId = transaction_id.into();
+
+        let user_ids: Vec<OwnedUserId> =
+            user_ids.iter().map(UserId::parse).collect::<Result<_, _>>()?;
+
+        let encryption = self.inner.client().encryption();
+
+        for user_id in user_ids {
+            if let Some(user_identity) = encryption.get_user_identity(&user_id).await? {
+                user_identity.withdraw_verification().await?;
+            }
+        }
+
+        self.inner.send_queue().unwedge(&transaction_id).await?;
+
+        Ok(())
+    }
+
+    /// Set the local trust for the given devices to `LocalTrust::Ignored`
+    /// and resend messages that failed to send because said devices are
+    /// unverified (in response to
+    /// `SessionRecipientCollectionError::VerifiedUserHasUnsignedDevice`).
+    /// # Arguments
+    ///
+    /// * `devices` - The map of users identifiers to device identifiers
+    ///   received in the error
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo the send error applies to
+    pub async fn ignore_device_trust_and_resend(
+        &self,
+        devices: HashMap<String, Vec<String>>,
+        transaction_id: String,
+    ) -> Result<(), ClientError> {
+        let transaction_id: OwnedTransactionId = transaction_id.into();
+
+        let encryption = self.inner.client().encryption();
+
+        for (user_id, device_ids) in devices.iter() {
+            let user_id = UserId::parse(user_id)?;
+
+            for device_id in device_ids {
+                let device_id: OwnedDeviceId = device_id.as_str().into();
+
+                if let Some(device) = encryption.get_device(&user_id, &device_id).await? {
+                    device.set_local_trust(LocalTrust::Ignored).await?;
+                }
+            }
+        }
+
+        self.inner.send_queue().unwedge(&transaction_id).await?;
+
+        Ok(())
+    }
+
+    /// Attempt to manually resend messages that failed to send due to issues
+    /// that should now have been fixed.
+    ///
+    /// This is useful for example, when there's a
+    /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity` error;
+    /// the user may have re-verified on a different device and would now
+    /// like to send the failed message that's waiting on this device.
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo that should be unwedged.
+    pub async fn try_resend(&self, transaction_id: String) -> Result<(), ClientError> {
+        let transaction_id: &TransactionId = transaction_id.as_str().into();
+        self.inner.send_queue().unwedge(transaction_id).await?;
+        Ok(())
+    }
 }
 
 /// Generates a `matrix.to` permalink to the given room alias.
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn matrix_to_room_alias_permalink(
     room_alias: String,
 ) -> std::result::Result<String, ClientError> {
@@ -796,14 +922,19 @@ impl From<RumaPowerLevels> for RoomPowerLevels {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomInfoListener: Sync + Send {
     fn call(&self, room_info: RoomInfo);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait TypingNotificationsListener: Sync + Send {
     fn call(&self, typing_user_ids: Vec<String>);
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait IdentityStatusChangeListener: Sync + Send {
+    fn call(&self, identity_status_change: Vec<IdentityStatusChange>);
 }
 
 #[derive(uniffi::Object)]
@@ -817,7 +948,7 @@ impl RoomMembersIterator {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomMembersIterator {
     fn len(&self) -> u32 {
         self.chunk_iterator.len()
@@ -826,7 +957,7 @@ impl RoomMembersIterator {
     fn next_chunk(&self, chunk_size: u32) -> Option<Vec<RoomMember>> {
         self.chunk_iterator
             .next(chunk_size)
-            .map(|members| members.into_iter().map(|m| m.into()).collect())
+            .map(|members| members.into_iter().filter_map(|m| m.try_into().ok()).collect())
     }
 }
 

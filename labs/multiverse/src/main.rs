@@ -35,7 +35,7 @@ use matrix_sdk_ui::{
 };
 use ratatui::{prelude::*, style::palette::tailwind, widgets::*};
 use tokio::{runtime::Handle, spawn, task::JoinHandle};
-use tracing::error;
+use tracing::{error, warn};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
 
 const HEADER_BG: Color = tailwind::BLUE.c950;
@@ -129,6 +129,9 @@ struct ExtraRoomInfo {
 
     /// Calculated display name for the room.
     display_name: Option<String>,
+
+    /// Is the room a DM?
+    is_dm: Option<bool>,
 }
 
 struct App {
@@ -223,6 +226,23 @@ impl App {
                 let mut new_ui_rooms = HashMap::new();
                 let mut new_timelines = Vec::new();
 
+                // Update all the room info for all rooms.
+                for room in all_rooms.iter() {
+                    let raw_name = room.name();
+                    let display_name = room.cached_display_name();
+                    let is_dm = room
+                        .is_direct()
+                        .await
+                        .map_err(|err| {
+                            warn!("couldn't figure whether a room is a DM or not: {err}");
+                        })
+                        .ok();
+                    room_infos.lock().unwrap().insert(
+                        room.room_id().to_owned(),
+                        ExtraRoomInfo { raw_name, display_name, is_dm },
+                    );
+                }
+
                 // Initialize all the new rooms.
                 for ui_room in all_rooms
                     .into_iter()
@@ -264,15 +284,6 @@ impl App {
 
                     // Save the room list service room in the cache.
                     new_ui_rooms.insert(ui_room.room_id().to_owned(), ui_room);
-                }
-
-                for (room_id, room) in &new_ui_rooms {
-                    let raw_name = room.name();
-                    let display_name = room.cached_display_name();
-                    room_infos
-                        .lock()
-                        .unwrap()
-                        .insert(room_id.to_owned(), ExtraRoomInfo { raw_name, display_name });
                 }
 
                 ui_rooms.lock().unwrap().extend(new_ui_rooms);
@@ -345,6 +356,41 @@ impl App {
         }
     }
 
+    async fn toggle_reaction_to_latest_msg(&mut self) {
+        let selected = self.get_selected_room_id(None);
+
+        if let Some((sdk_timeline, items)) = selected.and_then(|room_id| {
+            self.timelines
+                .lock()
+                .unwrap()
+                .get(&room_id)
+                .map(|timeline| (timeline.timeline.clone(), timeline.items.clone()))
+        }) {
+            // Look for the latest (most recent) room message.
+            let item_id = {
+                let items = items.lock().unwrap();
+                items.iter().rev().find_map(|it| {
+                    it.as_event()
+                        .and_then(|ev| ev.content().as_message().is_some().then(|| ev.identifier()))
+                })
+            };
+
+            // If found, send a reaction.
+            if let Some(item_id) = item_id {
+                match sdk_timeline.toggle_reaction(&item_id, "🥰").await {
+                    Ok(_) => {
+                        self.set_status_message("reaction sent!".to_owned());
+                    }
+                    Err(err) => self.set_status_message(format!("error when reacting: {err}")),
+                }
+            } else {
+                self.set_status_message("no item to react to".to_owned());
+            }
+        } else {
+            self.set_status_message("missing timeline for room".to_owned());
+        };
+    }
+
     /// Run a small back-pagination (expect a batch of 20 events, continue until
     /// we get 10 timeline items or hit the timeline start).
     fn back_paginate(&mut self) {
@@ -398,7 +444,7 @@ impl App {
             .get_selected_room_id(Some(selected))
             .and_then(|room_id| self.ui_rooms.lock().unwrap().get(&room_id).cloned())
         {
-            self.sync_service.room_list_service().subscribe_to_rooms(&[room.room_id()], None);
+            self.sync_service.room_list_service().subscribe_to_rooms(&[room.room_id()]);
             self.current_room_subscription = Some(room);
         }
     }
@@ -468,6 +514,8 @@ impl App {
                                     self.set_status_message("missing timeline for room".to_owned());
                                 };
                             }
+
+                            Char('l') => self.toggle_reaction_to_latest_msg().await,
 
                             Char('r') => self.details_mode = DetailsMode::ReadReceipts,
                             Char('t') => self.details_mode = DetailsMode::TimelineItems,
@@ -588,11 +636,13 @@ impl App {
                     let room_id = room.room_id();
                     let room_info = room_info.remove(room_id);
 
-                    let (raw, display) = if let Some(info) = room_info {
-                        (info.raw_name, info.display_name)
+                    let (raw, display, is_dm) = if let Some(info) = room_info {
+                        (info.raw_name, info.display_name, info.is_dm)
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
+
+                    let dm_marker = if is_dm.unwrap_or(false) { "🤫" } else { "" };
 
                     let room_name = if let Some(n) = display {
                         format!("{n} ({room_id})")
@@ -602,7 +652,7 @@ impl App {
                         room_id.to_string()
                     };
 
-                    format!("#{i} {}", room_name)
+                    format!("#{i}{dm_marker} {}", room_name)
                 };
 
                 let line = Line::styled(line, TEXT_COLOR);
@@ -712,7 +762,7 @@ impl App {
 
                         let rendered_events = events
                             .into_iter()
-                            .map(|sync_timeline_item| sync_timeline_item.event.json().to_string())
+                            .map(|sync_timeline_item| sync_timeline_item.raw().json().to_string())
                             .collect::<Vec<_>>()
                             .join("\n\n");
 

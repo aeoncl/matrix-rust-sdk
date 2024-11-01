@@ -1,8 +1,8 @@
-use matrix_sdk_crypto::{types::CrossSigningKey, UserIdentities};
+use matrix_sdk_crypto::{types::CrossSigningKey, UserIdentity as SdkUserIdentity};
 
 use crate::CryptoStoreError;
 
-/// Enum representing cross signing identities of our own user or some other
+/// Enum representing cross signing identity of our own user or some other
 /// user.
 #[derive(uniffi::Enum)]
 pub enum UserIdentity {
@@ -18,6 +18,8 @@ pub enum UserIdentity {
         user_signing_key: String,
         /// The public self-signing key of our identity.
         self_signing_key: String,
+        /// True if this identity was verified at some point but is not anymore.
+        has_verification_violation: bool,
     },
     /// The user identity of other users.
     Other {
@@ -27,13 +29,15 @@ pub enum UserIdentity {
         master_key: String,
         /// The public self-signing key of our identity.
         self_signing_key: String,
+        /// True if this identity was verified at some point but is not anymore.
+        has_verification_violation: bool,
     },
 }
 
 impl UserIdentity {
-    pub(crate) async fn from_rust(i: UserIdentities) -> Result<Self, CryptoStoreError> {
+    pub(crate) async fn from_rust(i: SdkUserIdentity) -> Result<Self, CryptoStoreError> {
         Ok(match i {
-            UserIdentities::Own(i) => {
+            SdkUserIdentity::Own(i) => {
                 let master: CrossSigningKey = i.master_key().as_ref().to_owned();
                 let user_signing: CrossSigningKey = i.user_signing_key().as_ref().to_owned();
                 let self_signing: CrossSigningKey = i.self_signing_key().as_ref().to_owned();
@@ -44,9 +48,10 @@ impl UserIdentity {
                     master_key: serde_json::to_string(&master)?,
                     user_signing_key: serde_json::to_string(&user_signing)?,
                     self_signing_key: serde_json::to_string(&self_signing)?,
+                    has_verification_violation: i.has_verification_violation(),
                 }
             }
-            UserIdentities::Other(i) => {
+            SdkUserIdentity::Other(i) => {
                 let master: CrossSigningKey = i.master_key().as_ref().to_owned();
                 let self_signing: CrossSigningKey = i.self_signing_key().as_ref().to_owned();
 
@@ -54,6 +59,7 @@ impl UserIdentity {
                     user_id: i.user_id().to_string(),
                     master_key: serde_json::to_string(&master)?,
                     self_signing_key: serde_json::to_string(&self_signing)?,
+                    has_verification_violation: i.has_verification_violation(),
                 }
             }
         })

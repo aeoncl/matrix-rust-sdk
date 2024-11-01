@@ -17,7 +17,8 @@ use matrix_sdk_crypto::{
     decrypt_room_key_export, encrypt_room_key_export,
     olm::ExportedRoomKey,
     store::{BackupDecryptionKey, Changes},
-    LocalTrust, OlmMachine as InnerMachine, ToDeviceRequest, UserIdentities,
+    DecryptionSettings, LocalTrust, OlmMachine as InnerMachine, ToDeviceRequest,
+    UserIdentity as SdkUserIdentity,
 };
 use ruma::{
     api::{
@@ -37,11 +38,12 @@ use ruma::{
     },
     events::{
         key::verification::VerificationMethod, room::message::MessageType, AnyMessageLikeEvent,
-        AnySyncMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent,
+        AnySyncMessageLikeEvent, MessageLikeEvent,
     },
     serde::Raw,
     to_device::DeviceIdOrAllDevices,
-    DeviceKeyAlgorithm, EventId, OwnedTransactionId, OwnedUserId, RoomId, UserId,
+    DeviceKeyAlgorithm, EventId, OneTimeKeyAlgorithm, OwnedTransactionId, OwnedUserId, RoomId,
+    UserId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
@@ -177,7 +179,7 @@ impl From<RustSignatureCheckResult> for SignatureVerification {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl OlmMachine {
     /// Create a new `OlmMachine`
     ///
@@ -313,8 +315,8 @@ impl OlmMachine {
 
         if let Some(user_identity) = user_identity {
             Ok(match user_identity {
-                UserIdentities::Own(i) => self.runtime.block_on(i.verify())?,
-                UserIdentities::Other(i) => self.runtime.block_on(i.verify())?,
+                SdkUserIdentity::Own(i) => self.runtime.block_on(i.verify())?,
+                SdkUserIdentity::Other(i) => self.runtime.block_on(i.verify())?,
             }
             .into())
         } else {
@@ -527,11 +529,11 @@ impl OlmMachine {
     ) -> Result<SyncChangesResult, CryptoStoreError> {
         let to_device: ToDevice = serde_json::from_str(&events)?;
         let device_changes: RumaDeviceLists = device_changes.into();
-        let key_counts: BTreeMap<DeviceKeyAlgorithm, UInt> = key_counts
+        let key_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = key_counts
             .into_iter()
             .map(|(k, v)| {
                 (
-                    DeviceKeyAlgorithm::from(k),
+                    OneTimeKeyAlgorithm::from(k),
                     v.clamp(0, i32::MAX)
                         .try_into()
                         .expect("Couldn't convert key counts into an UInt"),
@@ -539,8 +541,8 @@ impl OlmMachine {
             })
             .collect();
 
-        let unused_fallback_keys: Option<Vec<DeviceKeyAlgorithm>> =
-            unused_fallback_keys.map(|u| u.into_iter().map(DeviceKeyAlgorithm::from).collect());
+        let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> =
+            unused_fallback_keys.map(|u| u.into_iter().map(OneTimeKeyAlgorithm::from).collect());
 
         let (to_device_events, room_key_infos) = self.runtime.block_on(
             self.inner.receive_sync_changes(matrix_sdk_crypto::EncryptionSyncChanges {
@@ -860,12 +862,14 @@ impl OlmMachine {
     /// * `strict_shields` - If `true`, messages will be decorated with strict
     ///   warnings (use `false` to match legacy behaviour where unsafe keys have
     ///   lower severity warnings and unverified identities are not decorated).
+    /// * `decryption_settings` - The setting for decrypting messages.
     pub fn decrypt_room_event(
         &self,
         event: String,
         room_id: String,
         handle_verification_events: bool,
         strict_shields: bool,
+        decryption_settings: DecryptionSettings,
     ) -> Result<DecryptedEvent, DecryptionError> {
         // Element Android wants only the content and the type and will create a
         // decrypted event with those two itself, this struct makes sure we
@@ -881,10 +885,14 @@ impl OlmMachine {
         let event: Raw<_> = serde_json::from_str(&event)?;
         let room_id = RoomId::parse(room_id)?;
 
-        let decrypted = self.runtime.block_on(self.inner.decrypt_room_event(&event, &room_id))?;
+        let decrypted = self.runtime.block_on(self.inner.decrypt_room_event(
+            &event,
+            &room_id,
+            &decryption_settings,
+        ))?;
 
         if handle_verification_events {
-            if let Ok(AnyTimelineEvent::MessageLike(e)) = decrypted.event.deserialize() {
+            if let Ok(e) = decrypted.event.deserialize() {
                 match &e {
                     AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(
                         original_event,
@@ -902,8 +910,7 @@ impl OlmMachine {
             }
         }
 
-        let encryption_info =
-            decrypted.encryption_info.expect("Decrypted event didn't contain any encryption info");
+        let encryption_info = decrypted.encryption_info;
 
         let event_json: Event<'_> = serde_json::from_str(decrypted.event.json().get())?;
 

@@ -15,6 +15,7 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(missing_docs, missing_debug_implementations)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 
 pub mod backups;
 mod ciphers;
@@ -38,12 +39,18 @@ mod verification;
 pub mod testing {
     pub use crate::identities::{
         device::testing::get_device,
-        user::testing::{get_other_identity, get_own_identity},
+        user::testing::{
+            get_other_identity, get_own_identity, simulate_key_query_response_for_verification,
+        },
     };
 }
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use identities::room_identity_state::{
+    IdentityState, IdentityStatusChange, RoomIdentityChange, RoomIdentityProvider,
+    RoomIdentityState,
+};
 use ruma::OwnedRoomId;
 
 /// Return type for the room key importing.
@@ -80,10 +87,11 @@ pub use file_encryption::{
 };
 pub use gossiping::{GossipRequest, GossippedSecret};
 pub use identities::{
-    Device, DeviceData, LocalTrust, OtherUserIdentityData, OwnUserIdentity, OwnUserIdentityData,
-    UserDevices, UserIdentities, UserIdentity, UserIdentityData,
+    Device, DeviceData, LocalTrust, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity,
+    OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
 };
 pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
+use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecryptInfo};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
@@ -91,6 +99,7 @@ pub use requests::{
     IncomingResponse, KeysBackupRequest, KeysQueryRequest, OutgoingRequest, OutgoingRequests,
     OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest, UploadSigningKeysRequest,
 };
+use serde::{Deserialize, Serialize};
 pub use session_manager::CollectStrategy;
 pub use store::{
     CrossSigningKeyExport, CryptoStoreError, SecretImportError, SecretInfo, TrackedUser,
@@ -112,3 +121,38 @@ matrix_sdk_test::init_tracing_for_tests!();
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
+
+/// The trust level in the sender's device that is required to decrypt an
+/// event.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum TrustRequirement {
+    /// Decrypt events from everyone regardless of trust.
+    Untrusted,
+    /// Only decrypt events from cross-signed devices or legacy sessions (Megolm
+    /// sessions created before we started collecting trust information).
+    CrossSignedOrLegacy,
+    /// Only decrypt events from cross-signed devices.
+    CrossSigned,
+}
+
+/// Settings for decrypting messages
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DecryptionSettings {
+    /// The trust level in the sender's device that is required to decrypt the
+    /// event. If the sender's device is not sufficiently trusted,
+    /// [`MegolmError::SenderIdentityNotTrusted`] will be returned.
+    pub sender_device_trust_requirement: TrustRequirement,
+}
+
+/// The result of an attempt to decrypt a room event: either a successful
+/// decryption, or information on a failure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RoomEventDecryptionResult {
+    /// A successfully-decrypted encrypted event.
+    Decrypted(DecryptedRoomEvent),
+
+    /// We were unable to decrypt the event
+    UnableToDecrypt(UnableToDecryptInfo),
+}

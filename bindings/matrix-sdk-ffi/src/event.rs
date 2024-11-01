@@ -1,9 +1,14 @@
 use anyhow::{bail, Context};
-use ruma::events::{
-    room::{message::Relation, redaction::SyncRoomRedactionEvent},
-    AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
-    MessageLikeEventContent as RumaMessageLikeEventContent, RedactContent,
-    RedactedStateEventContent, StaticStateEventContent, SyncMessageLikeEvent, SyncStateEvent,
+use matrix_sdk::IdParseError;
+use matrix_sdk_ui::timeline::TimelineEventItemId;
+use ruma::{
+    events::{
+        room::{message::Relation, redaction::SyncRoomRedactionEvent},
+        AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
+        MessageLikeEventContent as RumaMessageLikeEventContent, RedactContent,
+        RedactedStateEventContent, StaticStateEventContent, SyncMessageLikeEvent, SyncStateEvent,
+    },
+    EventId,
 };
 
 use crate::{
@@ -15,7 +20,7 @@ use crate::{
 #[derive(uniffi::Object)]
 pub struct TimelineEvent(pub(crate) AnySyncTimelineEvent);
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl TimelineEvent {
     pub fn event_id(&self) -> String {
         self.0.event_id().to_string()
@@ -100,7 +105,7 @@ impl TryFrom<AnySyncStateEvent> for StateEventContent {
                 let original_content = get_state_event_original_content(content)?;
                 StateEventContent::RoomMemberContent {
                     user_id: state_key,
-                    membership_state: original_content.membership.into(),
+                    membership_state: original_content.membership.try_into()?,
                 }
             }
             AnySyncStateEvent::RoomName(_) => StateEventContent::RoomName,
@@ -347,6 +352,41 @@ impl From<MessageLikeEventType> for ruma::events::MessageLikeEventType {
             MessageLikeEventType::UnstablePollEnd => Self::UnstablePollEnd,
             MessageLikeEventType::UnstablePollResponse => Self::UnstablePollResponse,
             MessageLikeEventType::UnstablePollStart => Self::UnstablePollStart,
+        }
+    }
+}
+
+/// Contains the 2 possible identifiers of an event, either it has a remote
+/// event id or a local transaction id, never both or none.
+#[derive(Clone, uniffi::Enum)]
+pub enum EventOrTransactionId {
+    EventId { event_id: String },
+    TransactionId { transaction_id: String },
+}
+
+impl From<TimelineEventItemId> for EventOrTransactionId {
+    fn from(value: TimelineEventItemId) -> Self {
+        match value {
+            TimelineEventItemId::EventId(event_id) => {
+                EventOrTransactionId::EventId { event_id: event_id.to_string() }
+            }
+            TimelineEventItemId::TransactionId(transaction_id) => {
+                EventOrTransactionId::TransactionId { transaction_id: transaction_id.to_string() }
+            }
+        }
+    }
+}
+
+impl TryFrom<EventOrTransactionId> for TimelineEventItemId {
+    type Error = IdParseError;
+    fn try_from(value: EventOrTransactionId) -> Result<Self, Self::Error> {
+        match value {
+            EventOrTransactionId::EventId { event_id } => {
+                Ok(TimelineEventItemId::EventId(EventId::parse(event_id)?))
+            }
+            EventOrTransactionId::TransactionId { transaction_id } => {
+                Ok(TimelineEventItemId::TransactionId(transaction_id.into()))
+            }
         }
     }
 }

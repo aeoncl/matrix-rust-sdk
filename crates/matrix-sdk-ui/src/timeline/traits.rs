@@ -14,26 +14,29 @@
 
 use std::future::Future;
 
+use eyeball::Subscriber;
 use futures_util::FutureExt as _;
 use indexmap::IndexMap;
-#[cfg(feature = "e2e-encryption")]
-use matrix_sdk::{deserialized_responses::TimelineEvent, Result};
-use matrix_sdk::{event_cache::paginator::PaginableRoom, BoxFuture, Room};
-use matrix_sdk_base::latest_event::LatestEvent;
-#[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw};
+#[cfg(test)]
+use matrix_sdk::crypto::{DecryptionSettings, TrustRequirement};
+use matrix_sdk::{
+    deserialized_responses::TimelineEvent, event_cache::paginator::PaginableRoom, BoxFuture,
+    Result, Room,
+};
+use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo};
 use ruma::{
     events::{
         fully_read::FullyReadEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        AnyMessageLikeEventContent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
     push::{PushConditionRoomCtx, Ruleset},
+    serde::Raw,
     EventId, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId, UserId,
 };
 use tracing::{debug, error};
 
-use super::{Profile, TimelineBuilder};
+use super::{Profile, RedactError, TimelineBuilder};
 use crate::timeline::{self, pinned_events_loader::PinnedEventsRoom, Timeline};
 
 pub trait RoomExt {
@@ -105,6 +108,8 @@ pub(super) trait RoomDataProvider:
         reason: Option<&'a str>,
         transaction_id: Option<OwnedTransactionId>,
     ) -> BoxFuture<'a, Result<(), super::Error>>;
+
+    fn room_info(&self) -> Subscriber<RoomInfo>;
 }
 
 impl RoomDataProvider for Room {
@@ -264,16 +269,20 @@ impl RoomDataProvider for Room {
             let _ = self
                 .redact(event_id, reason, transaction_id)
                 .await
+                .map_err(RedactError::HttpError)
                 .map_err(super::Error::RedactError)?;
             Ok(())
         }
         .boxed()
     }
+
+    fn room_info(&self) -> Subscriber<RoomInfo> {
+        self.subscribe_info()
+    }
 }
 
 // Internal helper to make most of retry_event_decryption independent of a room
 // object, which is annoying to create for testing and not really needed
-#[cfg(feature = "e2e-encryption")]
 pub(super) trait Decryptor: Clone + Send + Sync + 'static {
     fn decrypt_event_impl(
         &self,
@@ -281,18 +290,20 @@ pub(super) trait Decryptor: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<TimelineEvent>> + Send;
 }
 
-#[cfg(feature = "e2e-encryption")]
 impl Decryptor for Room {
     async fn decrypt_event_impl(&self, raw: &Raw<AnySyncTimelineEvent>) -> Result<TimelineEvent> {
         self.decrypt_event(raw.cast_ref()).await
     }
 }
 
-#[cfg(all(test, feature = "e2e-encryption"))]
+#[cfg(test)]
 impl Decryptor for (matrix_sdk_base::crypto::OlmMachine, ruma::OwnedRoomId) {
     async fn decrypt_event_impl(&self, raw: &Raw<AnySyncTimelineEvent>) -> Result<TimelineEvent> {
         let (olm_machine, room_id) = self;
-        let event = olm_machine.decrypt_room_event(raw.cast_ref(), room_id).await?;
-        Ok(event)
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let event =
+            olm_machine.decrypt_room_event(raw.cast_ref(), room_id, &decryption_settings).await?;
+        Ok(event.into())
     }
 }

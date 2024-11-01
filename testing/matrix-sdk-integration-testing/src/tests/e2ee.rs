@@ -70,6 +70,7 @@ async fn test_mutual_sas_verification() -> Result<()> {
     bob.get_room(room_id).unwrap().join().await?;
 
     alice.sync_once().await?;
+    bob.sync_once().await?;
 
     warn!("alice and bob are both aware of each other in the e2ee room");
 
@@ -331,6 +332,7 @@ async fn test_mutual_qrcode_verification() -> Result<()> {
     bob.get_room(room_id).unwrap().join().await?;
 
     alice.sync_once().await?;
+    bob.sync_once().await?;
 
     warn!("alice and bob are both aware of each other in the e2ee room");
 
@@ -841,6 +843,9 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
     // The first client is not verified from the point of view of the second client.
     assert!(!seconds_first_device.is_verified());
 
+    // Make the first client aware of the device we're requesting verification for
+    first_client.sync_once().await?;
+
     // Let's send out a request to verify with each other.
     let seconds_verification_request = seconds_first_device.request_verification().await?;
     let flow_id = seconds_verification_request.flow_id();
@@ -950,11 +955,11 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
 
     let timeline_event = room.event(&event_id, None).await?;
     timeline_event
-        .encryption_info
+        .encryption_info()
         .expect("The event should have been encrypted and successfully decrypted.");
 
     let event: OriginalSyncMessageLikeEvent<RoomMessageEventContent> =
-        timeline_event.event.deserialize_as()?;
+        timeline_event.raw().deserialize_as()?;
     let message = event.content.msgtype;
 
     assert_let!(MessageType::Text(message) = message);

@@ -2,6 +2,33 @@
 
 Changes:
 
+- Add new method `OlmMachine::try_decrypt_room_event`.
+  ([#4116](https://github.com/matrix-org/matrix-rust-sdk/pull/4116))
+
+- Add reason code to `matrix_sdk_common::deserialized_responses::UnableToDecryptInfo`.
+  ([#4116](https://github.com/matrix-org/matrix-rust-sdk/pull/4116))
+
+- The `UserIdentity` struct has been renamed to `OtherUserIdentity`
+  ([#4036](https://github.com/matrix-org/matrix-rust-sdk/pull/4036]))
+
+- The `UserIdentities` enum has been renamed to `UserIdentity`
+  ([#4036](https://github.com/matrix-org/matrix-rust-sdk/pull/4036]))
+
+- Change the withheld code for keys not shared due to the `IdentityBasedStrategy`, from `m.unauthorised`
+  to `m.unverified`.
+  ([#3985](https://github.com/matrix-org/matrix-rust-sdk/pull/3985))
+
+- Improve logging for undecryptable Megolm events.
+  ([#3989](https://github.com/matrix-org/matrix-rust-sdk/pull/3989))
+
+- Miscellaneous improvements to logging for verification and `OwnUserIdentity`
+  updates.
+  ([#3949](https://github.com/matrix-org/matrix-rust-sdk/pull/3949))
+
+- Update `SenderData` on existing inbound group sessions when we receive
+  updates via `/keys/query`.
+  ([#3849](https://github.com/matrix-org/matrix-rust-sdk/pull/3849))
+
 - Add message IDs to all outgoing to-device messages encrypted by
   `matrix-sdk-crypto`. The `message-ids` feature of `matrix-sdk-crypto` and
   `matrix-sdk-base` is now a no-op.
@@ -32,9 +59,27 @@ Changes:
 
 Breaking changes:
 
-  **NOTE**: this version causes changes to the format of the serialised data in
+- `VerificationRequestState::Transitioned` now includes a new field
+  `other_device_data` of type `DeviceData`.
+  ([#4153](https://github.com/matrix-org/matrix-rust-sdk/pull/4153))
+
+- `OlmMachine::decrypt_room_event` now returns a `DecryptedRoomEvent` type,
+  instead of the more generic `TimelineEvent` type.
+
+- **NOTE**: this version causes changes to the format of the serialised data in
   the CryptoStore, meaning that, once upgraded, it will not be possible to roll
   back applications to earlier versions without breaking user sessions.
+
+- Renamed `VerificationLevel::PreviouslyVerified` to
+  `VerificationLevel::VerificationViolation`.
+
+- `OlmMachine::decrypt_room_event` now takes a `DecryptionSettings` argument,
+  which includes a `TrustRequirement` indicating the required trust level for
+  the sending device.  When it is called with `TrustRequirement` other than
+  `TrustRequirement::Unverified`, it may return the new
+  `MegolmError::SenderIdentityNotTrusted` variant if the sending device does not
+  satisfy the required trust level.
+  ([#3899](https://github.com/matrix-org/matrix-rust-sdk/pull/3899))
 
 - Change the structure of the `SenderData` enum to separate variants for
   previously-verified, unverified and verified.
@@ -56,6 +101,11 @@ Breaking changes:
   `OlmMachine::share_room_key` to fail with an error if any verified users on
   the recipient list have unsigned devices, or are no lonver verified.
 
+  When `CallectStrategy::IdentityBasedStrategy` is used,
+  `OlmMachine::share_room_key` will fail with an error if any verified users on
+  the recipient list are no longer verified, or if our own device is not
+  properly cross-signed.
+
   Also remove `CollectStrategy::new_device_based`: callers should construct a
   `CollectStrategy::DeviceBasedStrategy` directly.
 
@@ -63,6 +113,7 @@ Breaking changes:
   a list of booleans.
   ([#3810](https://github.com/matrix-org/matrix-rust-sdk/pull/3810))
   ([#3816](https://github.com/matrix-org/matrix-rust-sdk/pull/3816))
+  ([#3896](https://github.com/matrix-org/matrix-rust-sdk/pull/3896))
 
 - Remove the method `OlmMachine::clear_crypto_cache()`, crypto stores are not
   supposed to have any caches anymore.

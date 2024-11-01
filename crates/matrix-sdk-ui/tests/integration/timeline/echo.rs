@@ -60,7 +60,13 @@ async fn test_echo() {
     mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
-    let timeline = Arc::new(room.timeline().await.unwrap());
+    let timeline = Arc::new(
+        room.timeline_builder()
+            .with_internal_id_prefix("le_prefix".to_owned())
+            .build()
+            .await
+            .unwrap(),
+    );
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     Mock::given(method("PUT"))
@@ -107,7 +113,7 @@ async fn test_echo() {
             f.text_msg("Hello, World!")
                 .sender(user_id!("@example:localhost"))
                 .event_id(event_id!("$7at8sd:localhost"))
-                .server_ts(MilliSecondsSinceUnixEpoch(uint!(152038280)))
+                .server_ts(152038280)
                 .unsigned_transaction_id(txn_id),
         ),
     );
@@ -262,7 +268,7 @@ async fn test_dedup_by_event_id_late() {
             f.text_msg("Hello, World!")
                 .sender(user_id!("@example:localhost"))
                 .event_id(event_id)
-                .server_ts(MilliSecondsSinceUnixEpoch(uint!(123456))),
+                .server_ts(123456),
         ),
     );
 

@@ -10,6 +10,7 @@ use wiremock::{
     Mock, MockGuard, MockServer, ResponseTemplate,
 };
 
+mod account;
 mod client;
 #[cfg(feature = "e2e-encryption")]
 mod encryption;
@@ -19,6 +20,7 @@ mod media;
 mod notification;
 mod refresh_token;
 mod room;
+mod room_preview;
 mod send_queue;
 #[cfg(feature = "experimental-widgets")]
 mod widget;

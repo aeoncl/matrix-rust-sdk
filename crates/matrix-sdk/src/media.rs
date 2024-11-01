@@ -27,19 +27,12 @@ pub use matrix_sdk_base::media::*;
 use mime::Mime;
 use ruma::{
     api::{
-        client::{authenticated_media, media},
+        client::{authenticated_media, error::ErrorKind, media},
         MatrixVersion,
     },
     assign,
-    events::room::{
-        message::{
-            AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
-            ImageMessageEventContent, MessageType, UnstableAudioDetailsContentBlock,
-            UnstableVoiceContentBlock, VideoInfo, VideoMessageEventContent,
-        },
-        ImageInfo, MediaSource, ThumbnailInfo,
-    },
-    MxcUri,
+    events::room::{MediaSource, ThumbnailInfo},
+    MilliSecondsSinceUnixEpoch, MxcUri, OwnedMxcUri,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
@@ -47,9 +40,7 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
 
 use crate::{
-    attachment::{AttachmentConfig, AttachmentInfo, Thumbnail},
-    futures::SendRequest,
-    Client, Result, TransmissionProgress,
+    attachment::Thumbnail, futures::SendRequest, Client, Error, Result, TransmissionProgress,
 };
 
 /// A conservative upload speed of 1Mbps
@@ -116,6 +107,28 @@ impl fmt::Display for PersistError {
     }
 }
 
+/// A preallocated MXC URI created by [`Media::create_content_uri()`], and
+/// to be used with [`Media::upload_preallocated()`].
+#[derive(Debug)]
+pub struct PreallocatedMxcUri {
+    /// The URI for the media URI.
+    pub uri: OwnedMxcUri,
+    /// The expiration date for the media URI.
+    expire_date: Option<MilliSecondsSinceUnixEpoch>,
+}
+
+/// An error that happened in the realm of media.
+#[derive(Debug, thiserror::Error)]
+pub enum MediaError {
+    /// A preallocated MXC URI has expired.
+    #[error("a preallocated MXC URI has expired")]
+    ExpiredPreallocatedMxcUri,
+
+    /// Preallocated media already had content, cannot overwrite.
+    #[error("preallocated media already had content, cannot overwrite")]
+    CannotOverwriteMedia,
+}
+
 /// `IntoFuture` returned by [`Media::upload`].
 pub type SendUploadRequest = SendRequest<media::create_content::v3::Request>;
 
@@ -165,6 +178,96 @@ impl Media {
         self.client.send(request, Some(request_config))
     }
 
+    /// Preallocates an MXC URI for a media that will be uploaded soon.
+    ///
+    /// This preallocates an URI *before* any content is uploaded to the server.
+    /// The resulting preallocated MXC URI can then be consumed with
+    /// [`Media::upload_preallocated`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::fs;
+    /// # use matrix_sdk::{Client, ruma::room_id};
+    /// # use url::Url;
+    /// # use mime;
+    /// # async {
+    /// # let homeserver = Url::parse("http://localhost:8080")?;
+    /// # let mut client = Client::new(homeserver).await?;
+    ///
+    /// let preallocated = client.media().create_content_uri().await?;
+    /// println!("Cat URI: {}", preallocated.uri);
+    ///
+    /// let image = fs::read("/home/example/my-cat.jpg")?;
+    /// client
+    ///     .media()
+    ///     .upload_preallocated(preallocated, &mime::IMAGE_JPEG, image)
+    ///     .await?;
+    ///
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn create_content_uri(&self) -> Result<PreallocatedMxcUri> {
+        // Note: this request doesn't have any parameters.
+        let request = media::create_mxc_uri::v1::Request::default();
+
+        let response = self.client.send(request, None).await?;
+
+        Ok(PreallocatedMxcUri {
+            uri: response.content_uri,
+            expire_date: response.unused_expires_at,
+        })
+    }
+
+    /// Fills the content of a preallocated MXC URI with the given content type
+    /// and data.
+    ///
+    /// The URI must have been preallocated with [`Self::create_content_uri`].
+    /// See this method's documentation for a full example.
+    pub async fn upload_preallocated(
+        &self,
+        uri: PreallocatedMxcUri,
+        content_type: &Mime,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        // Do a best-effort at reporting an expired MXC URI here; otherwise the server
+        // may complain about it later.
+        if let Some(expire_date) = uri.expire_date {
+            if MilliSecondsSinceUnixEpoch::now() >= expire_date {
+                return Err(Error::Media(MediaError::ExpiredPreallocatedMxcUri));
+            }
+        }
+
+        let timeout = std::cmp::max(
+            Duration::from_secs(data.len() as u64 / DEFAULT_UPLOAD_SPEED),
+            MIN_UPLOAD_REQUEST_TIMEOUT,
+        );
+
+        let request = assign!(media::create_content_async::v3::Request::from_url(&uri.uri, data)?, {
+            content_type: Some(content_type.as_ref().to_owned()),
+        });
+
+        let request_config = self.client.request_config().timeout(timeout);
+
+        if let Err(err) = self.client.send(request, Some(request_config)).await {
+            match err.client_api_error_kind() {
+                Some(ErrorKind::CannotOverwriteMedia) => {
+                    Err(Error::Media(MediaError::CannotOverwriteMedia))
+                }
+
+                // Unfortunately, the spec says a server will return 404 for either an expired MXC
+                // ID or a non-existing MXC ID. Do a best-effort guess to recognize an expired MXC
+                // ID based on the error string, which will work with Synapse (as of 2024-10-23).
+                Some(ErrorKind::Unknown) if err.to_string().contains("expired") => {
+                    Err(Error::Media(MediaError::ExpiredPreallocatedMxcUri))
+                }
+
+                _ => Err(err.into()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     /// Gets a media file by copying it to a temporary location on disk.
     ///
     /// The file won't be encrypted even if it is encrypted on the server.
@@ -176,8 +279,13 @@ impl Media {
     ///
     /// * `request` - The `MediaRequest` of the content.
     ///
+    /// * `filename` - The filename specified in the event. It is suggested to
+    ///   use the `filename()` method on the event's content instead of using
+    ///   the `filename` field directly. If not provided, a random name will be
+    ///   generated.
+    ///
     /// * `content_type` - The type of the media, this will be used to set the
-    ///   temporary file's extension.
+    ///   temporary file's extension when one isn't included in the filename.
     ///
     /// * `use_cache` - If we should use the media cache for this request.
     ///
@@ -189,7 +297,7 @@ impl Media {
     pub async fn get_media_file(
         &self,
         request: &MediaRequest,
-        body: Option<String>,
+        filename: Option<String>,
         content_type: &Mime,
         use_cache: bool,
         temp_dir: Option<String>,
@@ -198,49 +306,50 @@ impl Media {
 
         let inferred_extension = mime2ext::mime2ext(content_type);
 
-        let body_path = body.as_ref().map(Path::new);
-        let filename = body_path.and_then(|f| f.file_name().and_then(|f| f.to_str()));
-        let filename_with_extension = body_path.and_then(|f| {
-            if f.extension().is_some() {
-                f.file_name().and_then(|f| f.to_str())
-            } else {
-                None
-            }
-        });
+        let filename_as_path = filename.as_ref().map(Path::new);
 
-        let (temp_file, temp_dir) = match (filename, filename_with_extension, inferred_extension) {
-            // If the body is a file name and has an extension use that
-            (Some(_), Some(filename_with_extension), Some(_)) => {
-                // Use an intermediary directory to avoid conflicts
-                let temp_dir = temp_dir.map(TempDir::new_in).unwrap_or_else(TempDir::new)?;
-                let temp_file = TempFileBuilder::new()
-                    .prefix(filename_with_extension)
-                    .rand_bytes(0)
-                    .tempfile_in(&temp_dir)?;
-                (temp_file, Some(temp_dir))
-            }
-            // If the body is a file name but doesn't have an extension try inferring one for it
-            (Some(filename), None, Some(inferred_extension)) => {
-                // Use an intermediary directory to avoid conflicts
-                let temp_dir = temp_dir.map(TempDir::new_in).unwrap_or_else(TempDir::new)?;
-                let temp_file = TempFileBuilder::new()
-                    .prefix(filename)
-                    .suffix(&(".".to_owned() + inferred_extension))
-                    .rand_bytes(0)
-                    .tempfile_in(&temp_dir)?;
-                (temp_file, Some(temp_dir))
-            }
-            // If the only thing we have is an inferred extension then use that together with a
-            // randomly generated file name
-            (None, None, Some(inferred_extension)) => (
-                TempFileBuilder::new()
-                    .suffix(&&(".".to_owned() + inferred_extension))
-                    .tempfile()?,
-                None,
-            ),
-            // Otherwise just use a completely random file name
-            _ => (TempFileBuilder::new().tempfile()?, None),
+        let (sanitized_filename, filename_has_extension) = if let Some(path) = filename_as_path {
+            let sanitized_filename = path.file_name().and_then(|f| f.to_str());
+            let filename_has_extension = path.extension().is_some();
+            (sanitized_filename, filename_has_extension)
+        } else {
+            (None, false)
         };
+
+        let (temp_file, temp_dir) =
+            match (sanitized_filename, filename_has_extension, inferred_extension) {
+                // If the file name has an extension use that
+                (Some(filename_with_extension), true, _) => {
+                    // Use an intermediary directory to avoid conflicts
+                    let temp_dir = temp_dir.map(TempDir::new_in).unwrap_or_else(TempDir::new)?;
+                    let temp_file = TempFileBuilder::new()
+                        .prefix(filename_with_extension)
+                        .rand_bytes(0)
+                        .tempfile_in(&temp_dir)?;
+                    (temp_file, Some(temp_dir))
+                }
+                // If the file name doesn't have an extension try inferring one for it
+                (Some(filename), false, Some(inferred_extension)) => {
+                    // Use an intermediary directory to avoid conflicts
+                    let temp_dir = temp_dir.map(TempDir::new_in).unwrap_or_else(TempDir::new)?;
+                    let temp_file = TempFileBuilder::new()
+                        .prefix(filename)
+                        .suffix(&(".".to_owned() + inferred_extension))
+                        .rand_bytes(0)
+                        .tempfile_in(&temp_dir)?;
+                    (temp_file, Some(temp_dir))
+                }
+                // If the only thing we have is an inferred extension then use that together with a
+                // randomly generated file name
+                (None, _, Some(inferred_extension)) => (
+                    TempFileBuilder::new()
+                        .suffix(&&(".".to_owned() + inferred_extension))
+                        .tempfile()?,
+                    None,
+                ),
+                // Otherwise just use a completely random file name
+                _ => (TempFileBuilder::new().tempfile()?, None),
+            };
 
         let mut file = TokioFile::from_std(temp_file.reopen()?);
         file.write_all(&data).await?;
@@ -274,15 +383,34 @@ impl Media {
             }
         };
 
-        // Use the authenticated endpoints when the server supports Matrix 1.11.
-        let use_auth = self.client.server_versions().await?.contains(&MatrixVersion::V1_11);
+        // Use the authenticated endpoints when the server supports Matrix 1.11 or the
+        // authenticated media stable feature.
+        const AUTHENTICATED_MEDIA_STABLE_FEATURE: &str = "org.matrix.msc3916.stable";
+
+        let (use_auth, request_config) =
+            if self.client.server_versions().await?.contains(&MatrixVersion::V1_11) {
+                (true, None)
+            } else if self
+                .client
+                .unstable_features()
+                .await?
+                .get(AUTHENTICATED_MEDIA_STABLE_FEATURE)
+                .is_some_and(|is_supported| *is_supported)
+            {
+                // We need to force the use of the stable endpoint with the Matrix version
+                // because Ruma does not handle stable features.
+                let request_config = self.client.request_config();
+                (true, Some(request_config.force_matrix_version(MatrixVersion::V1_11)))
+            } else {
+                (false, None)
+            };
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
                 let content = if use_auth {
                     let request =
                         authenticated_media::get_content::v1::Request::from_uri(&file.url)?;
-                    self.client.send(request, None).await?.file
+                    self.client.send(request, request_config).await?.file
                 } else {
                     #[allow(deprecated)]
                     let request = media::get_content::v3::Request::from_url(&file.url)?;
@@ -321,7 +449,7 @@ impl Media {
                         request.method = Some(settings.size.method.clone());
                         request.animated = Some(settings.animated);
 
-                        self.client.send(request, None).await?.file
+                        self.client.send(request, request_config).await?.file
                     } else {
                         #[allow(deprecated)]
                         let request = {
@@ -339,7 +467,7 @@ impl Media {
                     }
                 } else if use_auth {
                     let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
-                    self.client.send(request, None).await?.file
+                    self.client.send(request, request_config).await?.file
                 } else {
                     #[allow(deprecated)]
                     let request = media::get_content::v3::Request::from_url(uri)?;
@@ -478,129 +606,54 @@ impl Media {
         Ok(())
     }
 
-    /// Upload the file bytes in `data` and construct an attachment
-    /// message.
-    pub(crate) async fn prepare_attachment_message(
+    /// Upload the file bytes in `data` and return the source information.
+    pub(crate) async fn upload_plain_media_and_thumbnail(
         &self,
-        filename: &str,
         content_type: &Mime,
         data: Vec<u8>,
-        config: AttachmentConfig,
+        thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<MessageType> {
-        let upload_thumbnail = self.upload_thumbnail(config.thumbnail, send_progress.clone());
+    ) -> Result<(MediaSource, Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
+        let upload_thumbnail = self.upload_thumbnail(thumbnail, send_progress.clone());
 
         let upload_attachment = async move {
             self.upload(content_type, data)
                 .with_send_progress_observable(send_progress)
                 .await
-                .map_err(crate::Error::from)
+                .map_err(Error::from)
         };
 
         let ((thumbnail_source, thumbnail_info), response) =
             try_join(upload_thumbnail, upload_attachment).await?;
 
-        // if config.caption is set, use it as body, and filename as the file name
-        // otherwise, body is the filename, and the filename is not set
-        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
-        let (body, filename) = match config.caption {
-            Some(caption) => (caption, Some(filename.to_owned())),
-            None => (filename.to_owned(), None),
-        };
-
-        let url = response.content_uri;
-
-        Ok(match content_type.type_() {
-            mime::IMAGE => {
-                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info,
-                });
-                let mut image_message_event_content =
-                    ImageMessageEventContent::plain(body, url).info(Box::new(info));
-                image_message_event_content.filename = filename;
-                image_message_event_content.formatted = config.formatted_caption;
-                MessageType::Image(image_message_event_content)
-            }
-            mime::AUDIO => {
-                let mut audio_message_event_content = AudioMessageEventContent::plain(body, url);
-                audio_message_event_content.filename = filename;
-                audio_message_event_content.formatted = config.formatted_caption;
-                MessageType::Audio(update_audio_message_event(
-                    audio_message_event_content,
-                    content_type,
-                    config.info,
-                ))
-            }
-            mime::VIDEO => {
-                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let mut video_message_event_content =
-                    VideoMessageEventContent::plain(body, url).info(Box::new(info));
-                video_message_event_content.filename = filename;
-                video_message_event_content.formatted = config.formatted_caption;
-                MessageType::Video(video_message_event_content)
-            }
-            _ => {
-                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let mut file_message_event_content =
-                    FileMessageEventContent::plain(body, url).info(Box::new(info));
-                file_message_event_content.filename = filename;
-                file_message_event_content.formatted = config.formatted_caption;
-                MessageType::File(file_message_event_content)
-            }
-        })
+        Ok((MediaSource::Plain(response.content_uri), thumbnail_source, thumbnail_info))
     }
 
+    /// Uploads an unencrypted thumbnail to the media repository, and returns
+    /// its source and extra information.
     async fn upload_thumbnail(
         &self,
         thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
-        if let Some(thumbnail) = thumbnail {
-            let response = self
-                .upload(&thumbnail.content_type, thumbnail.data)
-                .with_send_progress_observable(send_progress)
-                .await?;
-            let url = response.content_uri;
+        let Some(thumbnail) = thumbnail else {
+            return Ok((None, None));
+        };
 
-            let thumbnail_info = assign!(
-                thumbnail.info
-                    .as_ref()
-                    .map(|info| ThumbnailInfo::from(info.clone()))
-                    .unwrap_or_default(),
-                { mimetype: Some(thumbnail.content_type.as_ref().to_owned()) }
-            );
+        let response = self
+            .upload(&thumbnail.content_type, thumbnail.data)
+            .with_send_progress_observable(send_progress)
+            .await?;
+        let url = response.content_uri;
 
-            Ok((Some(MediaSource::Plain(url)), Some(Box::new(thumbnail_info))))
-        } else {
-            Ok((None, None))
-        }
+        let thumbnail_info = assign!(
+            thumbnail.info
+                .as_ref()
+                .map(|info| ThumbnailInfo::from(info.clone()))
+                .unwrap_or_default(),
+            { mimetype: Some(thumbnail.content_type.as_ref().to_owned()) }
+        );
+
+        Ok((Some(MediaSource::Plain(url)), Some(Box::new(thumbnail_info))))
     }
-}
-
-pub(crate) fn update_audio_message_event(
-    mut audio_message_event_content: AudioMessageEventContent,
-    content_type: &Mime,
-    info: Option<AttachmentInfo>,
-) -> AudioMessageEventContent {
-    if let Some(AttachmentInfo::Voice { audio_info, waveform: Some(waveform_vec) }) = &info {
-        if let Some(duration) = audio_info.duration {
-            let waveform = waveform_vec.iter().map(|v| (*v).into()).collect();
-            audio_message_event_content.audio =
-                Some(UnstableAudioDetailsContentBlock::new(duration, waveform));
-        }
-        audio_message_event_content.voice = Some(UnstableVoiceContentBlock::new());
-    }
-
-    let audio_info = assign!(info.map(AudioInfo::from).unwrap_or_default(), {mimetype: Some(content_type.as_ref().to_owned()), });
-    audio_message_event_content.info(Box::new(audio_info))
 }

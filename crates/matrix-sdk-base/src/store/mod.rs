@@ -57,6 +57,7 @@ use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tracing::warn;
 
 use crate::{
     event_cache_store::{DynEventCacheStore, IntoEventCacheStore},
@@ -67,16 +68,19 @@ use crate::{
 pub(crate) mod ambiguity_map;
 mod memory_store;
 pub mod migration_helpers;
+mod send_queue;
 
 #[cfg(any(test, feature = "testing"))]
 pub use self::integration_tests::StateStoreIntegrationTests;
 pub use self::{
     memory_store::MemoryStore,
+    send_queue::{
+        ChildTransactionId, DependentQueuedRequest, DependentQueuedRequestKind, QueueWedgeError,
+        QueuedRequest, QueuedRequestKind, SerializableEventContent,
+    },
     traits::{
-        ChildTransactionId, ComposerDraft, ComposerDraftType, DependentQueuedEvent,
-        DependentQueuedEventKind, DynStateStore, IntoStateStore, QueuedEvent,
-        SerializableEventContent, ServerCapabilities, StateStore, StateStoreDataKey,
-        StateStoreDataValue, StateStoreExt,
+        ComposerDraft, ComposerDraftType, DynStateStore, IntoStateStore, ServerCapabilities,
+        StateStore, StateStoreDataKey, StateStoreDataValue, StateStoreExt,
     },
 };
 
@@ -171,6 +175,36 @@ impl Store {
         &self.sync_lock
     }
 
+    /// Load the room infos from the inner `StateStore`.
+    ///
+    /// Applies migrations to the room infos if needed.
+    async fn load_room_infos(&self) -> Result<Vec<RoomInfo>> {
+        let mut room_infos = self.inner.get_room_infos().await?;
+        let mut migrated_room_infos = Vec::with_capacity(room_infos.len());
+
+        for room_info in room_infos.iter_mut() {
+            if room_info.apply_migrations(self.inner.clone()).await {
+                migrated_room_infos.push(room_info.clone());
+            }
+        }
+
+        if !migrated_room_infos.is_empty() {
+            let changes = StateChanges {
+                room_infos: migrated_room_infos
+                    .into_iter()
+                    .map(|room_info| (room_info.room_id.clone(), room_info))
+                    .collect(),
+                ..Default::default()
+            };
+
+            if let Err(error) = self.inner.save_changes(&changes).await {
+                warn!("Failed to save migrated room infos: {error}");
+            }
+        }
+
+        Ok(room_infos)
+    }
+
     /// Set the meta of the session.
     ///
     /// Restores the state of this `Store` from the given `SessionMeta` and the
@@ -183,7 +217,7 @@ impl Store {
         room_info_notable_update_sender: &broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Result<()> {
         {
-            let room_infos = self.inner.get_room_infos().await?;
+            let room_infos = self.load_room_infos().await?;
 
             let mut rooms = self.rooms.write().unwrap();
 
@@ -273,6 +307,17 @@ impl Store {
             })
             .clone()
     }
+
+    /// Forget the room with the given room ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The id of the room that should be forgotten.
+    pub(crate) async fn forget_room(&self, room_id: &RoomId) -> Result<()> {
+        self.inner.remove_room(room_id).await?;
+        self.rooms.write().unwrap().remove(room_id);
+        Ok(())
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -358,15 +403,6 @@ impl StateChanges {
     /// Update the `StateChanges` struct with the given `RoomInfo`.
     pub fn add_room(&mut self, room: RoomInfo) {
         self.room_infos.insert(room.room_id.clone(), room);
-    }
-
-    /// Update the `StateChanges` struct with the given `AnyBasicEvent`.
-    pub fn add_account_data(
-        &mut self,
-        event: AnyGlobalAccountDataEvent,
-        raw_event: Raw<AnyGlobalAccountDataEvent>,
-    ) {
-        self.account_data.insert(event.event_type(), raw_event);
     }
 
     /// Update the `StateChanges` struct with the given room with a new

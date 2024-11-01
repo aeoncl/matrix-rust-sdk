@@ -31,7 +31,7 @@ use crate::{
     DeviceData, EncryptionSettings, LocalTrust, OlmError, OwnUserIdentityData, UserIdentityData,
 };
 #[cfg(doc)]
-use crate::{Device, UserIdentities};
+use crate::{Device, UserIdentity};
 
 /// Strategy to collect the devices that should receive room keys for the
 /// current discussion.
@@ -120,6 +120,7 @@ pub(crate) async fn collect_session_recipients(
     let users: BTreeSet<&UserId> = users.collect();
     let mut devices: BTreeMap<OwnedUserId, Vec<DeviceData>> = Default::default();
     let mut withheld_devices: Vec<(DeviceData, WithheldCode)> = Default::default();
+    let mut verified_users_with_new_identities: Vec<OwnedUserId> = Default::default();
 
     trace!(?users, ?settings, "Calculating group session recipients");
 
@@ -145,6 +146,8 @@ pub(crate) async fn collect_session_recipients(
     // This is calculated in the following code and stored in this variable.
     let mut should_rotate = user_left || visibility_changed || algorithm_changed;
 
+    let own_identity = store.get_user_identity(store.user_id()).await?.and_then(|i| i.into_own());
+
     // Get the recipient and withheld devices, based on the collection strategy.
     match settings.sharing_strategy {
         CollectStrategy::DeviceBasedStrategy {
@@ -153,10 +156,6 @@ pub(crate) async fn collect_session_recipients(
         } => {
             let mut unsigned_devices_of_verified_users: BTreeMap<OwnedUserId, Vec<OwnedDeviceId>> =
                 Default::default();
-            let mut verified_users_with_new_identities: Vec<OwnedUserId> = Default::default();
-
-            let own_identity =
-                store.get_user_identity(store.user_id()).await?.and_then(|i| i.into_own());
 
             for user_id in users {
                 trace!("Considering recipient devices for user {}", user_id);
@@ -233,23 +232,38 @@ pub(crate) async fn collect_session_recipients(
                     ),
                 ));
             }
-
-            // Alternatively, we may have encountered previously-verified users who have
-            // changed their identities. We bail out for that, too.
-            if !verified_users_with_new_identities.is_empty() {
-                return Err(OlmError::SessionRecipientCollectionError(
-                    SessionRecipientCollectionError::VerifiedUserChangedIdentity(
-                        verified_users_with_new_identities,
-                    ),
-                ));
-            }
         }
         CollectStrategy::IdentityBasedStrategy => {
+            // We require our own cross-signing to be properly set up for the
+            // identity-based strategy, so return an error if it isn't.
+            match &own_identity {
+                None => {
+                    return Err(OlmError::SessionRecipientCollectionError(
+                        SessionRecipientCollectionError::CrossSigningNotSetup,
+                    ))
+                }
+                Some(identity) if !identity.is_verified() => {
+                    return Err(OlmError::SessionRecipientCollectionError(
+                        SessionRecipientCollectionError::SendingFromUnverifiedDevice,
+                    ))
+                }
+                Some(_) => (),
+            }
+
             for user_id in users {
                 trace!("Considering recipient devices for user {}", user_id);
                 let user_devices = store.get_device_data_for_user_filtered(user_id).await?;
 
                 let device_owner_identity = store.get_user_identity(user_id).await?;
+
+                if has_identity_verification_violation(
+                    own_identity.as_ref(),
+                    device_owner_identity.as_ref(),
+                ) {
+                    verified_users_with_new_identities.push(user_id.to_owned());
+                    // No point considering the individual devices of this user.
+                    continue;
+                }
 
                 let recipient_devices = split_recipients_withhelds_for_user_based_on_identity(
                     user_devices,
@@ -275,6 +289,16 @@ pub(crate) async fn collect_session_recipients(
                 withheld_devices.extend(recipient_devices.denied_devices_with_code);
             }
         }
+    }
+
+    // We may have encountered previously-verified users who have changed their
+    // identities. If so, we bail out with an error.
+    if !verified_users_with_new_identities.is_empty() {
+        return Err(OlmError::SessionRecipientCollectionError(
+            SessionRecipientCollectionError::VerifiedUserChangedIdentity(
+                verified_users_with_new_identities,
+            ),
+        ));
     }
 
     if should_rotate {
@@ -424,7 +448,7 @@ fn split_recipients_withhelds_for_user_based_on_identity(
                 allowed_devices: Vec::default(),
                 denied_devices_with_code: user_devices
                     .into_values()
-                    .map(|d| (d, WithheldCode::Unauthorised))
+                    .map(|d| (d, WithheldCode::Unverified))
                     .collect(),
             }
         }
@@ -437,7 +461,7 @@ fn split_recipients_withhelds_for_user_based_on_identity(
                 if d.is_cross_signed_by_owner(device_owner_identity) {
                     Either::Left(d)
                 } else {
-                    Either::Right((d, WithheldCode::Unauthorised))
+                    Either::Right((d, WithheldCode::Unverified))
                 }
             });
             IdentityBasedRecipientDevices {
@@ -462,9 +486,9 @@ fn is_unsigned_device_of_verified_user(
 /// Check if the user was previously verified, but they have now changed their
 /// identity so that they are no longer verified.
 ///
-/// This is much the same as [`UserIdentities::has_verification_violation`], but
+/// This is much the same as [`UserIdentity::has_verification_violation`], but
 /// works with a low-level [`UserIdentityData`] rather than higher-level
-/// [`UserIdentities`].
+/// [`UserIdentity`].
 fn has_identity_verification_violation(
     own_identity: Option<&OwnUserIdentityData>,
     device_owner_identity: Option<&UserIdentityData>,
@@ -491,14 +515,19 @@ fn is_user_verified(
 mod tests {
     use std::{collections::BTreeMap, iter, sync::Arc};
 
+    use assert_matches::assert_matches;
     use assert_matches2::assert_let;
     use matrix_sdk_test::{
         async_test, test_json,
-        test_json::keys_query_sets::{KeyDistributionTestData, PreviouslyVerifiedTestData},
+        test_json::keys_query_sets::{
+            IdentityChangeDataSet, KeyDistributionTestData, MaloIdentityChangeDataSet,
+            VerificationViolationTestData,
+        },
     };
     use ruma::{
         device_id, events::room::history_visibility::HistoryVisibility, room_id, TransactionId,
     };
+    use serde_json::json;
 
     use crate::{
         error::SessionRecipientCollectionError,
@@ -506,6 +535,7 @@ mod tests {
         session_manager::{
             group_sessions::share_strategy::collect_session_recipients, CollectStrategy,
         },
+        testing::simulate_key_query_response_for_verification,
         types::events::room_key_withheld::WithheldCode,
         CrossSigningKeyExport, EncryptionSettings, LocalTrust, OlmError, OlmMachine,
     };
@@ -682,7 +712,7 @@ mod tests {
     /// `error_on_verified_user_problem` is set.
     #[async_test]
     async fn test_error_on_unsigned_of_verified_users() {
-        use PreviouslyVerifiedTestData as DataSet;
+        use VerificationViolationTestData as DataSet;
 
         // We start with Bob, who is verified and has one unsigned device.
         let machine = unsigned_of_verified_setup().await;
@@ -738,7 +768,7 @@ mod tests {
     /// device.
     #[async_test]
     async fn test_error_on_unsigned_of_verified_resolve_by_whitelisting() {
-        use PreviouslyVerifiedTestData as DataSet;
+        use VerificationViolationTestData as DataSet;
 
         let machine = unsigned_of_verified_setup().await;
 
@@ -774,7 +804,7 @@ mod tests {
     /// device.
     #[async_test]
     async fn test_error_on_unsigned_of_verified_resolve_by_blacklisting() {
-        use PreviouslyVerifiedTestData as DataSet;
+        use VerificationViolationTestData as DataSet;
 
         let machine = unsigned_of_verified_setup().await;
 
@@ -818,7 +848,7 @@ mod tests {
     /// is verified and we have unsigned devices.
     #[async_test]
     async fn test_error_on_unsigned_of_verified_owner_is_us() {
-        use PreviouslyVerifiedTestData as DataSet;
+        use VerificationViolationTestData as DataSet;
 
         let machine = unsigned_of_verified_setup().await;
 
@@ -863,7 +893,7 @@ mod tests {
     /// error.
     #[async_test]
     async fn test_should_not_error_on_unsigned_of_unverified() {
-        use PreviouslyVerifiedTestData as DataSet;
+        use VerificationViolationTestData as DataSet;
 
         let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
 
@@ -913,7 +943,7 @@ mod tests {
     /// error, when we have not verified our own identity.
     #[async_test]
     async fn test_should_not_error_on_unsigned_of_signed_but_unverified() {
-        use PreviouslyVerifiedTestData as DataSet;
+        use VerificationViolationTestData as DataSet;
 
         let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
 
@@ -961,7 +991,7 @@ mod tests {
     /// withdrawing verification
     #[async_test]
     async fn test_verified_user_changed_identity() {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         // We start with Bob, who is verified and has one unsigned device. We have also
         // verified our own identity.
@@ -1011,7 +1041,7 @@ mod tests {
     /// withdrawing verification
     #[async_test]
     async fn test_own_verified_identity_changed() {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         // We start with a verified identity.
         let machine = unsigned_of_verified_setup().await;
@@ -1110,7 +1140,7 @@ mod tests {
             .find(|(d, _)| d.device_id() == KeyDistributionTestData::dan_unsigned_device_id())
             .expect("This dan's device should receive a withheld code");
 
-        assert_eq!(code, &WithheldCode::Unauthorised);
+        assert_eq!(code, &WithheldCode::Unverified);
 
         // Check withhelds for others
         let (_, code) = share_result
@@ -1119,7 +1149,241 @@ mod tests {
             .find(|(d, _)| d.device_id() == KeyDistributionTestData::dave_device_id())
             .expect("This dave device should receive a withheld code");
 
-        assert_eq!(code, &WithheldCode::Unauthorised);
+        assert_eq!(code, &WithheldCode::Unverified);
+    }
+
+    /// Test key sharing with the identity-based strategy with different
+    /// states of our own verification.
+    #[async_test]
+    async fn test_share_identity_strategy_no_cross_signing() {
+        // Starting off, we have not yet set up our own cross-signing, so
+        // sharing with the identity-based strategy should fail.
+        let machine: OlmMachine = OlmMachine::new(
+            KeyDistributionTestData::me_id(),
+            KeyDistributionTestData::me_device_id(),
+        )
+        .await;
+
+        let keys_query = KeyDistributionTestData::dan_keys_query_response();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+
+        let fake_room_id = room_id!("!roomid:localhost");
+
+        let encryption_settings = EncryptionSettings {
+            sharing_strategy: CollectStrategy::new_identity_based(),
+            ..Default::default()
+        };
+
+        let request_result = machine
+            .share_room_key(
+                fake_room_id,
+                iter::once(KeyDistributionTestData::dan_id()),
+                encryption_settings.clone(),
+            )
+            .await;
+
+        assert_matches!(
+            request_result,
+            Err(OlmError::SessionRecipientCollectionError(
+                SessionRecipientCollectionError::CrossSigningNotSetup
+            ))
+        );
+
+        // We now get our public cross-signing keys, but we don't trust them
+        // yet.  In this case, sharing the keys should still fail since our own
+        // device is still unverified.
+        let keys_query = KeyDistributionTestData::me_keys_query_response();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+
+        let request_result = machine
+            .share_room_key(
+                fake_room_id,
+                iter::once(KeyDistributionTestData::dan_id()),
+                encryption_settings.clone(),
+            )
+            .await;
+
+        assert_matches!(
+            request_result,
+            Err(OlmError::SessionRecipientCollectionError(
+                SessionRecipientCollectionError::SendingFromUnverifiedDevice
+            ))
+        );
+
+        // Finally, after we trust our own cross-signing keys, key sharing
+        // should succeed.
+        machine
+            .import_cross_signing_keys(CrossSigningKeyExport {
+                master_key: KeyDistributionTestData::MASTER_KEY_PRIVATE_EXPORT.to_owned().into(),
+                self_signing_key: KeyDistributionTestData::SELF_SIGNING_KEY_PRIVATE_EXPORT
+                    .to_owned()
+                    .into(),
+                user_signing_key: KeyDistributionTestData::USER_SIGNING_KEY_PRIVATE_EXPORT
+                    .to_owned()
+                    .into(),
+            })
+            .await
+            .unwrap();
+
+        let requests = machine
+            .share_room_key(
+                fake_room_id,
+                iter::once(KeyDistributionTestData::dan_id()),
+                encryption_settings.clone(),
+            )
+            .await
+            .unwrap();
+
+        // Dan has two devices, but only one is cross-signed, so there should
+        // only be one key share.
+        assert_eq!(requests.len(), 1);
+    }
+
+    /// Test that identity-based key sharing gives an error when a verified
+    /// user changes their identity, and that the key can be shared when the
+    /// identity change is resolved.
+    #[async_test]
+    async fn test_share_identity_strategy_report_verification_violation() {
+        let machine: OlmMachine = OlmMachine::new(
+            KeyDistributionTestData::me_id(),
+            KeyDistributionTestData::me_device_id(),
+        )
+        .await;
+
+        machine.bootstrap_cross_signing(false).await.unwrap();
+
+        // We will try sending a key to two different users.
+        let user1 = IdentityChangeDataSet::user_id();
+        let user2 = MaloIdentityChangeDataSet::user_id();
+
+        // We first get both users' initial device and identity keys.
+        let keys_query = IdentityChangeDataSet::key_query_with_identity_a();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+
+        let keys_query = MaloIdentityChangeDataSet::initial_key_query();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+
+        // And then we get both user' changed identity keys.  We simulate a
+        // verification violation by marking both users as having been
+        // previously verified, in which case the key sharing should fail.
+        let keys_query = IdentityChangeDataSet::key_query_with_identity_b();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+        machine
+            .get_identity(user1, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .other()
+            .unwrap()
+            .mark_as_previously_verified()
+            .await
+            .unwrap();
+
+        let keys_query = MaloIdentityChangeDataSet::updated_key_query();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+        machine
+            .get_identity(user2, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .other()
+            .unwrap()
+            .mark_as_previously_verified()
+            .await
+            .unwrap();
+
+        let fake_room_id = room_id!("!roomid:localhost");
+
+        // We share the key using the identity-based strategy.
+        let encryption_settings = EncryptionSettings {
+            sharing_strategy: CollectStrategy::new_identity_based(),
+            ..Default::default()
+        };
+
+        let request_result = machine
+            .share_room_key(
+                fake_room_id,
+                vec![user1, user2].into_iter(),
+                encryption_settings.clone(),
+            )
+            .await;
+
+        // The key share should fail with an error indicating that recipients
+        // were previously verified.
+        assert_let!(
+            Err(OlmError::SessionRecipientCollectionError(
+                SessionRecipientCollectionError::VerifiedUserChangedIdentity(affected_users)
+            )) = request_result
+        );
+        // Both our recipients should be in `affected_users`.
+        assert_eq!(2, affected_users.len());
+
+        // We resolve this for user1 by withdrawing their verification.
+        machine
+            .get_identity(user1, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .withdraw_verification()
+            .await
+            .unwrap();
+
+        // We resolve this for user2 by re-verifying.
+        let verification_request = machine
+            .get_identity(user2, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .other()
+            .unwrap()
+            .verify()
+            .await
+            .unwrap();
+
+        let master_key =
+            &machine.get_identity(user2, None).await.unwrap().unwrap().other().unwrap().master_key;
+
+        let my_identity = machine
+            .get_identity(KeyDistributionTestData::me_id(), None)
+            .await
+            .expect("Should not fail to find own identity")
+            .expect("Our own identity should not be missing")
+            .own()
+            .expect("Our own identity should be of type Own");
+
+        let msk = json!({ user2: serde_json::to_value(master_key).expect("Should not fail to serialize")});
+        let ssk =
+            serde_json::to_value(&MaloIdentityChangeDataSet::updated_key_query().self_signing_keys)
+                .expect("Should not fail to serialize");
+
+        let kq_response = simulate_key_query_response_for_verification(
+            verification_request,
+            my_identity,
+            KeyDistributionTestData::me_id(),
+            user2,
+            msk,
+            ssk,
+        );
+
+        machine
+            .mark_request_as_sent(
+                &TransactionId::new(),
+                crate::IncomingResponse::KeysQuery(&kq_response),
+            )
+            .await
+            .unwrap();
+
+        assert!(machine.get_identity(user2, None).await.unwrap().unwrap().is_verified());
+
+        // And now the key share should succeed.
+        machine
+            .share_room_key(
+                fake_room_id,
+                vec![user1, user2].into_iter(),
+                encryption_settings.clone(),
+            )
+            .await
+            .unwrap();
     }
 
     #[async_test]
@@ -1226,10 +1490,10 @@ mod tests {
     ///
     /// Returns an `OlmMachine` which is properly configured with trusted
     /// cross-signing keys. Also imports a set of keys for
-    /// Bob ([`PreviouslyVerifiedTestData::bob_id`]), where Bob is verified and
-    /// has 2 devices, one signed and the other not.
+    /// Bob ([`VerificationViolationTestData::bob_id`]), where Bob is verified
+    /// and has 2 devices, one signed and the other not.
     async fn unsigned_of_verified_setup() -> OlmMachine {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
 

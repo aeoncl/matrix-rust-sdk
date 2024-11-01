@@ -26,8 +26,11 @@ use matrix_sdk::{
     Client, SlidingSync, SlidingSyncList,
 };
 use matrix_sdk_base::RoomInfoNotableUpdate;
-use tokio::{select, sync::broadcast};
-use tracing::trace;
+use tokio::{
+    select,
+    sync::broadcast::{self, error::RecvError},
+};
+use tracing::{error, trace};
 
 use super::{
     filters::BoxedFilterFn,
@@ -115,8 +118,8 @@ impl RoomList {
         self.loading_state.subscribe()
     }
 
-    /// Get all previous rooms, in addition to a [`Stream`] to rooms' updates.
-    pub fn entries(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
+    /// Get a stream of rooms.
+    fn entries(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
         let (rooms, stream) = self.client.rooms_stream();
 
         let map_room = |room| Room::new(room, &self.sliding_sync);
@@ -127,9 +130,11 @@ impl RoomList {
         )
     }
 
-    /// Similar to [`Self::entries`] except that it's possible to provide a
-    /// filter that will filter out room list entries, and that it's also
-    /// possible to “paginate” over the entries by `page_size`.
+    /// Get a configurable stream of rooms.
+    ///
+    /// It's possible to provide a filter that will filter out room list
+    /// entries, and that it's also possible to “paginate” over the entries by
+    /// `page_size`. The rooms are also sorted.
     ///
     /// The returned stream will only start yielding diffs once a filter is set
     /// through the returned [`RoomListDynamicEntriesController`]. For every
@@ -215,32 +220,27 @@ fn merge_stream_and_receiver(
                     }
                 }
 
-                Ok(update) = room_info_notable_update_receiver.recv() => {
-                    // We are temporarily listening to all updates.
-                    /*
-                    use RoomInfoNotableUpdateReasons as NotableUpdate;
-
-                    let reasons = &update.reasons;
-
-                    // We are interested by these _reasons_.
-                    if reasons.contains(NotableUpdate::LATEST_EVENT) ||
-                        reasons.contains(NotableUpdate::RECENCY_STAMP) ||
-                        reasons.contains(NotableUpdate::READ_RECEIPT) ||
-                        reasons.contains(NotableUpdate::UNREAD_MARKER) ||
-                        reasons.contains(NotableUpdate::MEMBERSHIP) {
-                     */
-                        // Emit a `VectorDiff::Set` for the specific rooms.
-                        if let Some(index) = raw_current_values.iter().position(|room| room.room_id() == update.room_id) {
-                            let room = &raw_current_values[index];
-                            let update = VectorDiff::Set { index, value: room.clone() };
-                    /*
-                            trace!(room = %room.room_id(), "updated because of notable reason: {reasons:?}");
-                    */
-                            yield vec![update];
+                update = room_info_notable_update_receiver.recv() => {
+                    match update {
+                        Ok(update) => {
+                            // Emit a `VectorDiff::Set` for the specific rooms.
+                            if let Some(index) = raw_current_values.iter().position(|room| room.room_id() == update.room_id) {
+                                let room = &raw_current_values[index];
+                                let update = VectorDiff::Set { index, value: room.clone() };
+                                yield vec![update];
+                            }
                         }
-                    /*
+
+                        Err(RecvError::Closed) => {
+                            error!("Cannot receive room info notable updates because the sender has been closed");
+
+                            break;
+                        }
+
+                        Err(RecvError::Lagged(n)) => {
+                            error!(number_of_missed_updates = n, "Lag when receiving room info notable update");
+                        }
                     }
-                    */
                 }
             }
         }
