@@ -21,10 +21,10 @@
 //!
 //! Every E2EE capable Matrix client will create a new Olm account and upload
 //! the public keys of the Olm account to the server. This is represented as a
-//! `ReadOnlyDevice`.
+//! [`DeviceData`] struct.
 //!
 //! Devices can have a local trust state which is needs to be saved in our
-//! `CryptoStore`, to avoid reference cycles a wrapper for the `ReadOnlyDevice`
+//! `CryptoStore`, to avoid reference cycles a wrapper for the [`DeviceData`]
 //! exists which adds methods to manipulate the local trust state.
 //!
 //! ## User
@@ -42,6 +42,7 @@
 //! `/keys/query` API call.
 pub(crate) mod device;
 pub(crate) mod manager;
+pub(crate) mod room_identity_state;
 pub(crate) mod user;
 
 use std::sync::{
@@ -49,12 +50,12 @@ use std::sync::{
     Arc,
 };
 
-pub use device::{Device, LocalTrust, ReadOnlyDevice, UserDevices};
+pub use device::{Device, DeviceData, LocalTrust, UserDevices};
 pub(crate) use manager::IdentityManager;
 use serde::{Deserialize, Deserializer, Serializer};
 pub use user::{
-    OwnUserIdentity, ReadOnlyOwnUserIdentity, ReadOnlyUserIdentities, ReadOnlyUserIdentity,
-    UserIdentities, UserIdentity,
+    OtherUserIdentity, OtherUserIdentityData, OwnUserIdentity, OwnUserIdentityData, UserIdentity,
+    UserIdentityData,
 };
 
 // These methods are only here because Serialize and Deserialize don't seem to

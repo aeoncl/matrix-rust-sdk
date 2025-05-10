@@ -21,15 +21,18 @@ mod account;
 mod group_sessions;
 mod session;
 mod signing;
-mod utility;
+pub(crate) mod utility;
 
 pub use account::{Account, OlmMessageHash, PickledAccount, StaticAccountData};
 pub(crate) use account::{OlmDecryptionInfo, SessionType};
-pub(crate) use group_sessions::ShareState;
+pub(crate) use group_sessions::{
+    sender_data_finder::{self, SenderDataFinder},
+    ShareState,
+};
 pub use group_sessions::{
-    BackedUpRoomKey, EncryptionSettings, ExportedRoomKey, InboundGroupSession,
-    OutboundGroupSession, PickledInboundGroupSession, PickledOutboundGroupSession,
-    SessionCreationError, SessionExportError, SessionKey, ShareInfo,
+    BackedUpRoomKey, EncryptionSettings, ExportedRoomKey, InboundGroupSession, KnownSenderData,
+    OutboundGroupSession, PickledInboundGroupSession, PickledOutboundGroupSession, SenderData,
+    SenderDataType, SessionCreationError, SessionExportError, SessionKey, ShareInfo,
 };
 pub use session::{PickledSession, Session};
 pub use signing::{CrossSigningStatus, PickledCrossSigningIdentity, PrivateCrossSigningIdentity};
@@ -51,11 +54,8 @@ pub(crate) mod tests {
         serde::Raw,
         user_id, DeviceId, UserId,
     };
-    use serde_json::{json, Value};
-    use vodozemac::{
-        olm::{OlmMessage, SessionConfig},
-        Curve25519PublicKey, Ed25519PublicKey,
-    };
+    use serde_json::{from_value, json, Value};
+    use vodozemac::olm::{OlmMessage, SessionConfig};
 
     use crate::{
         olm::{Account, ExportedRoomKey, InboundGroupSession, Session},
@@ -93,6 +93,7 @@ pub(crate) mod tests {
             sender_key,
             one_time_key,
             false,
+            alice.device_keys(),
         );
 
         (alice, session)
@@ -144,19 +145,22 @@ pub(crate) mod tests {
             alice_keys.curve25519,
             one_time_key,
             false,
+            bob.device_keys(),
         );
 
         let plaintext = "Hello world";
 
         let message = bob_session.encrypt_helper(plaintext).await;
 
-        let prekey_message = match message.clone() {
+        let prekey_message = match message {
             OlmMessage::PreKey(m) => m,
             OlmMessage::Normal(_) => panic!("Incorrect message type"),
         };
 
         let bob_keys = bob.identity_keys();
-        let result = alice.create_inbound_session(bob_keys.curve25519, &prekey_message).unwrap();
+        let result = alice
+            .create_inbound_session(bob_keys.curve25519, alice.device_keys(), &prekey_message)
+            .unwrap();
 
         assert_eq!(bob_session.session_id(), result.session.session_id());
 
@@ -168,26 +172,14 @@ pub(crate) mod tests {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
 
-        let (outbound, _) = alice.create_group_session_pair_with_defaults(room_id).await;
+        let (outbound, inbound) = alice.create_group_session_pair_with_defaults(room_id).await;
 
         assert_eq!(0, outbound.message_index().await);
         assert!(!outbound.shared());
         outbound.mark_as_shared();
         assert!(outbound.shared());
 
-        let inbound = InboundGroupSession::new(
-            Curve25519PublicKey::from_base64("Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw")
-                .unwrap(),
-            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
-            room_id,
-            &outbound.session_key().await,
-            outbound.settings().algorithm.to_owned(),
-            None,
-        )
-        .expect("We can always create an inbound group session from an outbound one");
-
         assert_eq!(0, inbound.first_known_index());
-
         assert_eq!(outbound.session_id(), inbound.session_id());
 
         let plaintext = "This is a secret to everybody".to_owned();
@@ -200,12 +192,12 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn edit_decryption() {
+    async fn test_edit_decryption() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
         let event_id = event_id!("$1234adfad:asdf");
 
-        let (outbound, _) = alice.create_group_session_pair_with_defaults(room_id).await;
+        let (outbound, inbound) = alice.create_group_session_pair_with_defaults(room_id).await;
 
         assert_eq!(0, outbound.message_index().await);
         assert!(!outbound.shared());
@@ -218,19 +210,7 @@ pub(crate) mod tests {
             RoomMessageEventContent::text_plain("Hello edit").into(),
         )));
 
-        let inbound = InboundGroupSession::new(
-            Curve25519PublicKey::from_base64("Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw")
-                .unwrap(),
-            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
-            room_id,
-            &outbound.session_key().await,
-            outbound.settings().algorithm.to_owned(),
-            None,
-        )
-        .unwrap();
-
         assert_eq!(0, inbound.first_known_index());
-
         assert_eq!(outbound.session_id(), inbound.session_id());
 
         let encrypted_content =
@@ -250,7 +230,7 @@ pub(crate) mod tests {
 
         if let AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
             MessageLikeEvent::Original(e),
-        )) = decrypted.deserialize().unwrap()
+        )) = from_value(decrypted.into()).unwrap()
         {
             assert_matches!(e.content.relates_to, Some(Relation::Replacement(_)));
         } else {
@@ -259,7 +239,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn relates_to_decryption() {
+    async fn test_relates_to_decryption() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
         let event_id = event_id!("$1234adfad:asdf");
@@ -331,7 +311,7 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn group_session_export() {
+    async fn test_group_session_export() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let room_id = room_id!("!test:localhost");
 

@@ -1,4 +1,4 @@
-// Copyright 2022 The Matrix.org Foundation C.I.C.
+// Copyright 2022-2024 The Matrix.org Foundation C.I.C.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
 
 //! Module containing customized types modeling Matrix keys and events.
 //!
-//! These types were mostly taken from the Ruma project. The types differ in two
-//! important ways to the Ruma types of the same name:
+//! These types were mostly taken from the Ruma project. The types differ in a
+//! couple of important ways to the Ruma types of the same name:
 //!
 //! 1. They are using vodozemac types so we directly deserialize into a
 //!    vodozemac Curve25519 or Ed25519 key.
 //! 2. They support lossless serialization cycles in a canonical JSON supported
 //!    way, meaning the white-space and field order won't be preserved but the
 //!    data will.
+//! 3. Types containing secrets implement the [`Zeroize`] and [`ZeroizeOnDrop`]
+//!    traits to clear out any memory containing secret key material.
 
 use std::{
     borrow::Borrow,
@@ -32,19 +34,130 @@ use std::{
 };
 
 use as_variant::as_variant;
+use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
 use ruma::{
-    serde::StringEnum, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, UserId,
+    events::AnyToDeviceEvent,
+    serde::{Raw, StringEnum},
+    DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, UserId,
 };
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature, KeyError};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod backup;
 mod cross_signing;
 mod device_keys;
 pub mod events;
 mod one_time_keys;
+pub mod qr_login;
+pub mod requests;
+pub mod room_history;
 
 pub use self::{backup::*, cross_signing::*, device_keys::*, one_time_keys::*};
+use crate::store::BackupDecryptionKey;
+
+macro_rules! from_base64 {
+    ($foo:ident, $name:ident) => {
+        pub(crate) fn $name<'de, D>(deserializer: D) -> Result<$foo, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let mut string = String::deserialize(deserializer)?;
+
+            let result = $foo::from_base64(&string);
+            string.zeroize();
+
+            result.map_err(serde::de::Error::custom)
+        }
+    };
+}
+
+macro_rules! to_base64 {
+    ($foo:ident, $name:ident) => {
+        pub(crate) fn $name<S>(v: &$foo, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut string = v.to_base64();
+            let ret = string.serialize(serializer);
+
+            string.zeroize();
+
+            ret
+        }
+    };
+}
+
+/// Struct containing the bundle of secrets to fully activate a new devices for
+/// end-to-end encryption.
+#[derive(Debug, Deserialize, Clone, Serialize, ZeroizeOnDrop)]
+pub struct SecretsBundle {
+    /// The cross-signing keys.
+    pub cross_signing: CrossSigningSecrets,
+    /// The backup key, if available.
+    pub backup: Option<BackupSecrets>,
+}
+
+/// Data for the secrets bundle containing the cross-signing keys.
+#[derive(Deserialize, Clone, Serialize, ZeroizeOnDrop)]
+pub struct CrossSigningSecrets {
+    /// The seed for the private part of the cross-signing master key, encoded
+    /// as base64.
+    pub master_key: String,
+    /// The seed for the private part of the cross-signing user-signing key,
+    /// encoded as base64.
+    pub user_signing_key: String,
+    /// The seed for the private part of the cross-signing self-signing key,
+    /// encoded as base64.
+    pub self_signing_key: String,
+}
+
+impl std::fmt::Debug for CrossSigningSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossSigningSecrets")
+            .field("master_key", &"...")
+            .field("user_signing_key", &"...")
+            .field("self_signing_key", &"...")
+            .finish()
+    }
+}
+
+/// Data for the secrets bundle containing the secret and version for a
+/// `m.megolm_backup.v1.curve25519-aes-sha2` backup.
+#[derive(Debug, Deserialize, Clone, Serialize, ZeroizeOnDrop)]
+pub struct MegolmBackupV1Curve25519AesSha2Secrets {
+    /// The private half of the backup key, can be used to access and decrypt
+    /// room keys in the backup. Also called the recovery key in the
+    /// [spec](https://spec.matrix.org/v1.10/client-server-api/#recovery-key).
+    #[serde(serialize_with = "backup_key_to_base64", deserialize_with = "backup_key_from_base64")]
+    pub key: BackupDecryptionKey,
+    /// The backup version that is tied to the above backup key.
+    pub backup_version: String,
+}
+
+from_base64!(BackupDecryptionKey, backup_key_from_base64);
+to_base64!(BackupDecryptionKey, backup_key_to_base64);
+
+/// Enum for the algorithm-specific secrets for the room key backup.
+#[derive(Debug, Clone, ZeroizeOnDrop, Serialize, Deserialize)]
+#[serde(tag = "algorithm")]
+pub enum BackupSecrets {
+    /// Backup secrets for the `m.megolm_backup.v1.curve25519-aes-sha2` backup
+    /// algorithm.
+    #[serde(rename = "m.megolm_backup.v1.curve25519-aes-sha2")]
+    MegolmBackupV1Curve25519AesSha2(MegolmBackupV1Curve25519AesSha2Secrets),
+}
+
+impl BackupSecrets {
+    /// Get the algorithm of the secrets contained in the [`BackupSecrets`].
+    pub fn algorithm(&self) -> &str {
+        match &self {
+            BackupSecrets::MegolmBackupV1Curve25519AesSha2(_) => {
+                "m.megolm_backup.v1.curve25519-aes-sha2"
+            }
+        }
+    }
+}
 
 /// Represents a potentially decoded signature (but *not* a validated one).
 ///
@@ -52,7 +165,7 @@ pub use self::{backup::*, cross_signing::*, device_keys::*, one_time_keys::*};
 ///
 /// 1. If the claimed algorithm is supported *and* the payload has an expected
 ///    format, the signature will be represent by the enum variant corresponding
-///    to that algorithm. For example, decodeable Ed25519 signatures are
+///    to that algorithm. For example, decodable Ed25519 signatures are
 ///    represented as `Ed25519(...)`.
 /// 2. If the claimed algorithm is unsupported, the signature is represented as
 ///    `Other(...)`.
@@ -169,10 +282,10 @@ impl IntoIterator for Signatures {
 impl<'de> Deserialize<'de> for Signatures {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let map: BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceKeyId, String>> =
-            serde::Deserialize::deserialize(deserializer)?;
+            Deserialize::deserialize(deserializer)?;
 
         let map = map
             .into_iter()
@@ -226,7 +339,7 @@ impl Serialize for Signatures {
             })
             .collect();
 
-        serde::Serialize::serialize(&signatures, serializer)
+        Serialize::serialize(&signatures, serializer)
     }
 }
 
@@ -246,10 +359,10 @@ impl<T: Ord> SigningKeys<T> {
     }
 
     /// Get a `SigningKey` with the given `DeviceKeyId`.
-    pub fn get<Q: ?Sized>(&self, key_id: &Q) -> Option<&SigningKey>
+    pub fn get<Q>(&self, key_id: &Q) -> Option<&SigningKey>
     where
         T: Borrow<Q>,
-        Q: Ord,
+        Q: Ord + ?Sized,
     {
         self.0.get(key_id)
     }
@@ -316,20 +429,6 @@ impl Algorithm for DeviceKeyAlgorithm {
     }
 }
 
-// Wrapper around `Box<str>` that cannot be used in a meaningful way outside of
-// this crate. Used for string enums because their `_Custom` variant can't be
-// truly private (only `#[doc(hidden)]`).
-#[doc(hidden)]
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PrivOwnedStr(Box<str>);
-
-#[cfg(not(tarpaulin_include))]
-impl std::fmt::Debug for PrivOwnedStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// An encryption algorithm to be used to encrypt messages sent to a room.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, StringEnum)]
 #[non_exhaustive]
@@ -371,9 +470,9 @@ impl<T: Ord + Serialize> Serialize for SigningKeys<T> {
 impl<'de, T: Algorithm + Ord + Deserialize<'de>> Deserialize<'de> for SigningKeys<T> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
-        let map: BTreeMap<T, String> = serde::Deserialize::deserialize(deserializer)?;
+        let map: BTreeMap<T, String> = Deserialize::deserialize(deserializer)?;
 
         let map: Result<_, _> = map
             .into_iter()
@@ -393,41 +492,15 @@ impl<'de, T: Algorithm + Ord + Deserialize<'de>> Deserialize<'de> for SigningKey
 // likes to base64 encode all byte slices.
 //
 // This ensures that we serialize/deserialize in a Matrix-compatible way.
-pub(crate) fn deserialize_curve_key<'de, D>(de: D) -> Result<Curve25519PublicKey, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let key: String = Deserialize::deserialize(de)?;
-    Curve25519PublicKey::from_base64(&key).map_err(serde::de::Error::custom)
-}
+from_base64!(Curve25519PublicKey, deserialize_curve_key);
+to_base64!(Curve25519PublicKey, serialize_curve_key);
 
-pub(crate) fn serialize_curve_key<S>(key: &Curve25519PublicKey, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let key = key.to_base64();
-    s.serialize_str(&key)
-}
-
-pub(crate) fn deserialize_ed25519_key<'de, D>(de: D) -> Result<Ed25519PublicKey, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let key: String = Deserialize::deserialize(de)?;
-    Ed25519PublicKey::from_base64(&key).map_err(serde::de::Error::custom)
-}
-
-pub(crate) fn serialize_ed25519_key<S>(key: &Ed25519PublicKey, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let key = key.to_base64();
-    s.serialize_str(&key)
-}
+from_base64!(Ed25519PublicKey, deserialize_ed25519_key);
+to_base64!(Ed25519PublicKey, serialize_ed25519_key);
 
 pub(crate) fn deserialize_curve_key_vec<'de, D>(de: D) -> Result<Vec<Curve25519PublicKey>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     let keys: Vec<String> = Deserialize::deserialize(de)?;
     let keys: Result<Vec<Curve25519PublicKey>, KeyError> =
@@ -445,4 +518,145 @@ where
 {
     let keys: Vec<String> = keys.iter().map(|k| k.to_base64()).collect();
     keys.serialize(s)
+}
+
+#[cfg(test)]
+mod test {
+    use insta::{assert_debug_snapshot, assert_json_snapshot, with_settings};
+    use ruma::{device_id, user_id};
+    use serde_json::json;
+    use similar_asserts::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn serialize_secrets_bundle() {
+        let json = json!({
+            "cross_signing": {
+                "master_key": "rTtSv67XGS6k/rg6/yTG/m573cyFTPFRqluFhQY+hSw",
+                "self_signing_key": "4jbPt7jh5D2iyM4U+3IDa+WthgJB87IQN1ATdkau+xk",
+                "user_signing_key": "YkFKtkjcsTxF6UAzIIG/l6Nog/G2RigCRfWj3cjNWeM",
+            },
+            "backup": {
+                "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+                "backup_version": "2",
+                "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+        });
+
+        let deserialized: SecretsBundle = serde_json::from_value(json.clone())
+            .expect("We should be able to deserialize the secrets bundle");
+
+        let serialized = serde_json::to_value(&deserialized)
+            .expect("We should be able to serialize a secrets bundle");
+
+        assert_eq!(json, serialized, "A serialization cycle should yield the same result");
+    }
+
+    #[test]
+    fn snapshot_backup_decryption_key() {
+        let decryption_key = BackupDecryptionKey { inner: Box::new([1u8; 32]) };
+        assert_json_snapshot!(decryption_key);
+
+        // should not log the key !
+        assert_debug_snapshot!(decryption_key);
+    }
+
+    #[test]
+    fn snapshot_signatures() {
+        let signatures = Signatures(BTreeMap::from([
+            (
+                user_id!("@alice:localhost").to_owned(),
+                BTreeMap::from([
+                    (
+                        DeviceKeyId::from_parts(
+                            DeviceKeyAlgorithm::Ed25519,
+                            device_id!("ABCDEFGH"),
+                        ),
+                        Ok(Signature::from(Ed25519Signature::from_slice(&[0u8; 64]).unwrap())),
+                    ),
+                    (
+                        DeviceKeyId::from_parts(
+                            DeviceKeyAlgorithm::Curve25519,
+                            device_id!("IJKLMNOP"),
+                        ),
+                        Ok(Signature::from(Ed25519Signature::from_slice(&[1u8; 64]).unwrap())),
+                    ),
+                ]),
+            ),
+            (
+                user_id!("@bob:localhost").to_owned(),
+                BTreeMap::from([(
+                    DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, device_id!("ABCDEFGH")),
+                    Err(InvalidSignature { source: "SOME+B64+SOME+B64+SOME+B64+==".to_owned() }),
+                )]),
+            ),
+        ]));
+
+        with_settings!({sort_maps =>true}, {
+            assert_json_snapshot!(signatures)
+        });
+    }
+
+    #[test]
+    fn snapshot_secret_bundle() {
+        let secret_bundle = SecretsBundle {
+            cross_signing: CrossSigningSecrets {
+                master_key: "MSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSK".to_owned(),
+                user_signing_key: "USKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSK".to_owned(),
+                self_signing_key: "SSKSSKSSKSSKSSKSSKSSKSSKSSKSSKSSK".to_owned(),
+            },
+            backup: Some(BackupSecrets::MegolmBackupV1Curve25519AesSha2(
+                MegolmBackupV1Curve25519AesSha2Secrets {
+                    key: BackupDecryptionKey::from_bytes(&[0u8; 32]),
+                    backup_version: "v1.1".to_owned(),
+                },
+            )),
+        };
+
+        assert_json_snapshot!(secret_bundle);
+
+        let secret_bundle = SecretsBundle {
+            cross_signing: CrossSigningSecrets {
+                master_key: "MSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSK".to_owned(),
+                user_signing_key: "USKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSK".to_owned(),
+                self_signing_key: "SSKSSKSSKSSKSSKSSKSSKSSKSSKSSKSSK".to_owned(),
+            },
+            backup: None,
+        };
+
+        assert_json_snapshot!(secret_bundle);
+    }
+}
+
+/// Represents a to-device event after it has been processed by the olm machine.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ProcessedToDeviceEvent {
+    /// A successfully-decrypted encrypted event.
+    /// Contains the raw decrypted event .
+    Decrypted(Raw<AnyToDeviceEvent>),
+
+    /// An encrypted event which could not be decrypted.
+    UnableToDecrypt(Raw<AnyToDeviceEvent>),
+
+    /// An unencrypted event.
+    PlainText(Raw<AnyToDeviceEvent>),
+
+    /// An invalid to device event that was ignored because it is missing some
+    /// required information to be processed (like no event `type` for
+    /// example)
+    Invalid(Raw<AnyToDeviceEvent>),
+}
+
+impl ProcessedToDeviceEvent {
+    /// Converts a ProcessedToDeviceEvent to the `Raw<AnyToDeviceEvent>` it
+    /// encapsulates
+    pub fn to_raw(&self) -> Raw<AnyToDeviceEvent> {
+        match self {
+            ProcessedToDeviceEvent::Decrypted(decrypted_event) => decrypted_event.clone(),
+            ProcessedToDeviceEvent::UnableToDecrypt(event) => event.clone(),
+            ProcessedToDeviceEvent::PlainText(event) => event.clone(),
+            ProcessedToDeviceEvent::Invalid(event) => event.clone(),
+        }
+    }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -30,7 +30,8 @@ use ruma::{
 };
 
 use crate::{
-    deserialized_responses::{MemberEvent, SyncOrStrippedState},
+    deserialized_responses::{DisplayName, MemberEvent, SyncOrStrippedState},
+    store::ambiguity_map::is_display_name_ambiguous,
     MinimalRoomMemberEvent,
 };
 
@@ -52,8 +53,12 @@ pub struct RoomMember {
 }
 
 impl RoomMember {
-    pub(crate) fn from_parts(member_info: MemberInfo, room_info: &MemberRoomInfo<'_>) -> Self {
-        let MemberInfo { event, profile, presence } = member_info;
+    pub(crate) fn from_parts(
+        event: MemberEvent,
+        profile: Option<MinimalRoomMemberEvent>,
+        presence: Option<PresenceEvent>,
+        room_info: &MemberRoomInfo<'_>,
+    ) -> Self {
         let MemberRoomInfo {
             power_levels,
             max_power_level,
@@ -63,8 +68,10 @@ impl RoomMember {
         } = room_info;
 
         let is_room_creator = room_creator.as_deref() == Some(event.user_id());
-        let display_name_ambiguous =
-            users_display_names.get(event.display_name()).is_some_and(|s| s.len() > 1);
+        let display_name = event.display_name();
+        let display_name_ambiguous = users_display_names
+            .get(&display_name)
+            .is_some_and(|s| is_display_name_ambiguous(&display_name, s));
         let is_ignored = ignored_users.as_ref().is_some_and(|s| s.contains(event.user_id()));
 
         Self {
@@ -122,7 +129,8 @@ impl RoomMember {
     /// Get the normalized power level of this member.
     ///
     /// The normalized power level depends on the maximum power level that can
-    /// be found in a certain room, it's always in the range of 0-100.
+    /// be found in a certain room, positive values are always in the range of
+    /// 0-100.
     pub fn normalized_power_level(&self) -> i64 {
         if self.max_power_level > 0 {
             (self.power_level() * 100) / self.max_power_level
@@ -189,6 +197,11 @@ impl RoomMember {
         self.can_do_impl(|pls| pls.user_can_send_state(self.user_id(), state_type))
     }
 
+    /// Whether this user can pin or unpin events based on the power levels.
+    pub fn can_pin_or_unpin_event(&self) -> bool {
+        self.can_send_state(StateEventType::RoomPinnedEvents)
+    }
+
     /// Whether this user can notify everybody in the room by writing `@room` in
     /// a message.
     ///
@@ -230,18 +243,11 @@ impl RoomMember {
     }
 }
 
-// Information about a room member.
-pub(crate) struct MemberInfo {
-    pub event: MemberEvent,
-    pub(crate) profile: Option<MinimalRoomMemberEvent>,
-    pub(crate) presence: Option<PresenceEvent>,
-}
-
-// Information about a the room a member is in.
+// Information about the room a member is in.
 pub(crate) struct MemberRoomInfo<'a> {
     pub(crate) power_levels: Arc<Option<SyncOrStrippedState<RoomPowerLevelsEventContent>>>,
     pub(crate) max_power_level: i64,
     pub(crate) room_creator: Option<OwnedUserId>,
-    pub(crate) users_display_names: BTreeMap<&'a str, BTreeSet<OwnedUserId>>,
+    pub(crate) users_display_names: HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>,
     pub(crate) ignored_users: Option<BTreeSet<OwnedUserId>>,
 }

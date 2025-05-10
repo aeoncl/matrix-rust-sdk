@@ -1,3 +1,6 @@
+// TODO: Remove this once all tests are re-enabled.
+#![allow(unused)]
+
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
@@ -31,8 +34,8 @@ use crate::helpers::TestClientBuilder;
 async fn test_notification() -> Result<()> {
     // Create new users for each test run, to avoid conflicts with invites existing
     // from previous runs.
-    let alice = TestClientBuilder::new("alice").randomize_username().use_sqlite().build().await?;
-    let bob = TestClientBuilder::new("bob").randomize_username().use_sqlite().build().await?;
+    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
+    let bob = TestClientBuilder::new("bob").use_sqlite().build().await?;
 
     let dummy_sync_service = Arc::new(SyncService::builder(bob.clone()).build().await?);
     let process_setup =
@@ -43,28 +46,28 @@ async fn test_notification() -> Result<()> {
     alice.account().set_display_name(Some(ALICE_NAME)).await?;
 
     // Initial setup: Alice creates a room, invites Bob.
+    const ROOM_NAME: &str = "Kingdom of Integration Testing";
     let invite = vec![bob.user_id().expect("bob has a userid!").to_owned()];
     let request = assign!(CreateRoomRequest::new(), {
         invite,
+        name: Some(ROOM_NAME.to_owned()),
         is_direct: true,
     });
 
     let alice_room = alice.create_room(request).await?;
-
-    const ROOM_NAME: &str = "Kingdom of Integration Testing";
-    alice_room.set_name(ROOM_NAME.to_owned()).await?;
-
     let room_id = alice_room.room_id().to_owned();
 
     // Bob receives a notification about it.
-
     let bob_invite_response = bob.sync_once(Default::default()).await?;
     let sync_token = bob_invite_response.next_batch;
 
-    let mut invited_rooms = bob_invite_response.rooms.invite.into_iter();
+    let mut invited_rooms = bob_invite_response.rooms.invited;
 
-    let (_, invited_room) = invited_rooms.next().expect("must be invited to one room");
-    assert!(invited_rooms.next().is_none(), "no more invited rooms: {invited_rooms:#?}");
+    assert_eq!(invited_rooms.len(), 1, "must be only one invitation");
+
+    let Some(invited_room) = invited_rooms.get(&room_id) else {
+        panic!("bob is invited in an unexpected room");
+    };
 
     if let Some(event_id) = invited_room.invite_state.events.iter().find_map(|event| {
         let Ok(AnyStrippedStateEvent::RoomMember(room_member_ev)) = event.deserialize() else {
@@ -85,7 +88,8 @@ async fn test_notification() -> Result<()> {
 
         // Try with sliding sync first.
         let notification_client =
-            NotificationClient::builder(bob.clone(), process_setup.clone()).await.unwrap().build();
+            NotificationClient::new(bob.clone(), process_setup.clone()).await.unwrap();
+
         assert_let!(
             NotificationStatus::Event(notification) =
                 notification_client.get_notification_with_sliding_sync(&room_id, &event_id).await?
@@ -93,9 +97,10 @@ async fn test_notification() -> Result<()> {
 
         warn!("sliding_sync: checking invite notification");
 
+        assert_matches!(notification.event, NotificationEvent::Invite(_));
         assert_eq!(notification.event.sender(), alice.user_id().unwrap());
-        assert_eq!(notification.joined_members_count, 1);
-        assert_eq!(notification.is_room_encrypted, None);
+        assert_eq!(notification.joined_members_count, 0);
+        assert_eq!(notification.is_room_encrypted, Some(false));
         assert!(notification.is_direct_message_room);
 
         assert_matches!(notification.event, NotificationEvent::Invite(observed_invite) => {
@@ -103,16 +108,11 @@ async fn test_notification() -> Result<()> {
         });
 
         assert_eq!(notification.sender_display_name.as_deref(), Some(ALICE_NAME));
-
-        // In theory, the room name ought to be ROOM_NAME here, but the sliding sync
-        // proxy returns the other person's name as the room's name (as of
-        // 2023-08-04).
-        assert!(notification.room_display_name != ROOM_NAME);
-        assert_eq!(notification.room_display_name, ALICE_NAME);
+        assert_eq!(notification.room_computed_display_name, ROOM_NAME);
 
         // Then with /context.
         let notification_client =
-            NotificationClient::builder(bob.clone(), process_setup.clone()).await.unwrap().build();
+            NotificationClient::new(bob.clone(), process_setup.clone()).await.unwrap();
         let notification =
             notification_client.get_notification_with_context(&room_id, &event_id).await;
         // We aren't authorized to inspect events from rooms we were not invited to.
@@ -121,7 +121,7 @@ async fn test_notification() -> Result<()> {
         warn!("Couldn't get the invite event.");
     }
 
-    // Bob accepts the invite, joins the room.
+    // Bob inspects the invite room.
     {
         let room = bob.get_room(&room_id).expect("bob doesn't know about the room");
         ensure!(
@@ -133,16 +133,19 @@ async fn test_notification() -> Result<()> {
         assert_eq!(sender.user_id(), alice.user_id().expect("alice has a user_id"));
     }
 
-    // Bob joins the room.
-    bob.get_room(alice_room.room_id()).unwrap().join().await?;
+    bob.get_room(&room_id)
+        .unwrap()
+        // Bob joins the room.
+        .join()
+        .await?;
 
     // Now Alice sends a message to Bob.
     alice_room.send(RoomMessageEventContent::text_plain("Hello world!")).await?;
 
-    // In this sync, bob receives the message from Alice.
+    // In this sync, Bob receives the message from Alice.
     let bob_response = bob.sync_once(SyncSettings::default().token(sync_token)).await?;
 
-    let mut joined_rooms = bob_response.rooms.join.into_iter();
+    let mut joined_rooms = bob_response.rooms.joined.into_iter();
     let (_, bob_room) = joined_rooms.next().expect("must have joined one room");
     assert!(joined_rooms.next().is_none(), "no more joined rooms: {joined_rooms:#?}");
 
@@ -151,7 +154,7 @@ async fn test_notification() -> Result<()> {
         .events
         .iter()
         .find_map(|event| {
-            let event = event.event.deserialize().ok()?;
+            let event = event.raw().deserialize().ok()?;
             (event.event_type() == TimelineEventType::RoomMessage)
                 .then(|| event.event_id().to_owned())
         })
@@ -194,19 +197,20 @@ async fn test_notification() -> Result<()> {
         );
 
         assert_eq!(notification.sender_display_name.as_deref(), Some(ALICE_NAME));
-        assert_eq!(notification.room_display_name, ROOM_NAME);
+        assert_eq!(notification.room_computed_display_name, ROOM_NAME);
     };
 
+    // Check with sliding sync.
     let notification_client =
-        NotificationClient::builder(bob.clone(), process_setup.clone()).await.unwrap().build();
+        NotificationClient::new(bob.clone(), process_setup.clone()).await.unwrap();
     assert_let!(
         NotificationStatus::Event(notification) =
             notification_client.get_notification_with_sliding_sync(&room_id, &event_id).await?
     );
     check_notification(true, notification);
 
-    let notification_client =
-        NotificationClient::builder(bob.clone(), process_setup).await.unwrap().build();
+    // Check with `/context`.
+    let notification_client = NotificationClient::new(bob.clone(), process_setup).await.unwrap();
     let notification = notification_client
         .get_notification_with_context(&room_id, &event_id)
         .await?

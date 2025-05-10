@@ -1,25 +1,23 @@
 use std::{
     collections::HashMap,
-    mem::ManuallyDrop,
+    fmt::Debug,
     sync::{Arc, RwLock},
 };
 
 use anyhow::{anyhow, Context as _};
+use async_compat::get_runtime_handle;
 use matrix_sdk::{
-    media::{MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequest, MediaThumbnailSize},
-    oidc::{
-        types::{
-            client_credentials::ClientCredentials,
-            registration::{
-                ClientMetadata, ClientMetadataVerificationError, VerifiedClientMetadata,
-            },
-        },
-        OidcAccountManagementAction, OidcSession,
+    authentication::oauth::{
+        AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
+    },
+    event_cache::EventCacheError,
+    media::{
+        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
+        MediaRetentionPolicy, MediaThumbnailSettings,
     },
     ruma::{
         api::client::{
-            account::whoami,
-            media::get_content_thumbnail::v3::Method,
+            discovery::get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
             session::get_login_types,
@@ -27,39 +25,61 @@ use matrix_sdk::{
         },
         events::{
             room::{
-                avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent, MediaSource,
+                avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent,
+                message::MessageType,
             },
-            AnyInitialStateEvent, AnyToDeviceEvent, InitialStateEvent,
+            AnyInitialStateEvent, InitialStateEvent,
         },
         serde::Raw,
-        EventEncryptionAlgorithm, TransactionId, UInt, UserId,
+        EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
     },
+    sliding_sync::Version as SdkSlidingSyncVersion,
+    store::RoomLoadSettings as SdkRoomLoadSettings,
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
-use matrix_sdk_ui::notification_client::NotificationProcessSetup as MatrixNotificationProcessSetup;
+use matrix_sdk_ui::notification_client::{
+    NotificationClient as MatrixNotificationClient,
+    NotificationProcessSetup as MatrixNotificationProcessSetup,
+};
 use mime::Mime;
 use ruma::{
-    api::client::discovery::discover_homeserver::AuthenticationServerInfo,
+    api::client::{alias::get_alias, error::ErrorKind, uiaa::UserIdentifier},
     events::{
         ignored_user_list::IgnoredUserListEventContent,
-        room::power_levels::RoomPowerLevelsEventContent, GlobalAccountDataEventType,
+        key::verification::request::ToDeviceKeyVerificationRequestEvent,
+        room::{
+            history_visibility::RoomHistoryVisibilityEventContent,
+            join_rules::{
+                AllowRule as RumaAllowRule, JoinRule as RumaJoinRule, RoomJoinRulesEventContent,
+            },
+            message::OriginalSyncRoomMessageEvent,
+            power_levels::RoomPowerLevelsEventContent,
+        },
+        GlobalAccountDataEventType,
     },
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
+    OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error};
 use url::Url;
 
-use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
+use super::{room::Room, session_verification::SessionVerificationController};
 use crate::{
+    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
     encryption::Encryption,
-    notification::NotificationClientBuilder,
+    notification::NotificationClient,
     notification_settings::NotificationSettings,
+    room::RoomHistoryVisibility,
+    room_directory_search::RoomDirectorySearch,
+    room_preview::RoomPreview,
+    ruma::{AuthData, MediaSource},
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
+    utils::AsyncRuntimeDropped,
     ClientError,
 };
 
@@ -97,7 +117,7 @@ impl TryFrom<PusherKind> for RumaPusherKind {
                 let mut ruma_data = RumaHttpPusherData::new(data.url);
                 if let Some(payload) = data.default_payload {
                     let json: Value = serde_json::from_str(&payload)?;
-                    ruma_data.default_payload = json;
+                    ruma_data.data.insert("default_payload".to_owned(), json);
                 }
                 ruma_data.format = data.format.map(Into::into);
                 Ok(Self::Http(ruma_data))
@@ -123,21 +143,29 @@ impl From<PushFormat> for RumaPushFormat {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ClientDelegate: Sync + Send {
     fn did_receive_auth_error(&self, is_soft_logout: bool);
     fn did_refresh_tokens(&self);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ClientSessionDelegate: Sync + Send {
     fn retrieve_session_from_keychain(&self, user_id: String) -> Result<Session, ClientError>;
     fn save_session_in_keychain(&self, session: Session);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ProgressWatcher: Send + Sync {
     fn transmission_progress(&self, progress: TransmissionProgress);
+}
+
+/// A listener to the global (client-wide) error reporter of the send queue.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait SendQueueRoomErrorListener: Sync + Send {
+    /// Called every time the send queue has ran into an error for a given room,
+    /// which will disable the send queue for that particular room.
+    fn on_error(&self, room_id: String, error: ClientError);
 }
 
 #[derive(Clone, Copy, uniffi::Record)]
@@ -157,60 +185,67 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 
 #[derive(uniffi::Object)]
 pub struct Client {
-    pub(crate) inner: ManuallyDrop<MatrixClient>,
+    pub(crate) inner: AsyncRuntimeDropped<MatrixClient>,
     delegate: RwLock<Option<Arc<dyn ClientDelegate>>>,
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
 }
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        // Dropping the inner OlmMachine must happen within a tokio context
-        // because deadpool drops sqlite connections in the DB pool on tokio's
-        // blocking threadpool to avoid blocking async worker threads.
-        let _guard = RUNTIME.enter();
-        // SAFETY: self.inner is never used again, which is the only requirement
-        //         for ManuallyDrop::drop to be used safely.
-        unsafe {
-            ManuallyDrop::drop(&mut self.inner);
-        }
-    }
-}
-
 impl Client {
-    pub fn new(
+    pub async fn new(
         sdk_client: MatrixClient,
-        cross_process_refresh_lock_id: Option<String>,
+        enable_oidc_refresh_lock: bool,
         session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
     ) -> Result<Self, ClientError> {
         let session_verification_controller: Arc<
             tokio::sync::RwLock<Option<SessionVerificationController>>,
         > = Default::default();
-        let ctrl = session_verification_controller.clone();
+        let controller = session_verification_controller.clone();
+        sdk_client.add_event_handler(
+            move |event: ToDeviceKeyVerificationRequestEvent| async move {
+                if let Some(session_verification_controller) = &*controller.clone().read().await {
+                    session_verification_controller
+                        .process_incoming_verification_request(
+                            &event.sender,
+                            event.content.transaction_id,
+                        )
+                        .await;
+                }
+            },
+        );
 
-        sdk_client.add_event_handler(move |ev: AnyToDeviceEvent| async move {
-            if let Some(session_verification_controller) = &*ctrl.clone().read().await {
-                session_verification_controller.process_to_device_message(ev).await;
-            } else {
-                debug!("received to-device message, but verification controller isn't ready");
+        let controller = session_verification_controller.clone();
+        sdk_client.add_event_handler(move |event: OriginalSyncRoomMessageEvent| async move {
+            if let MessageType::VerificationRequest(_) = &event.content.msgtype {
+                if let Some(session_verification_controller) = &*controller.clone().read().await {
+                    session_verification_controller
+                        .process_incoming_verification_request(&event.sender, event.event_id)
+                        .await;
+                }
             }
         });
 
+        let cross_process_store_locks_holder_name =
+            sdk_client.cross_process_store_locks_holder_name().to_owned();
+
         let client = Client {
-            inner: ManuallyDrop::new(sdk_client),
+            inner: AsyncRuntimeDropped::new(sdk_client),
             delegate: RwLock::new(None),
             session_verification_controller,
         };
 
-        if let Some(process_id) = cross_process_refresh_lock_id {
+        if enable_oidc_refresh_lock {
             if session_delegate.is_none() {
                 return Err(anyhow::anyhow!(
                     "missing session delegates when enabling the cross-process lock"
                 ))?;
             }
-            RUNTIME.block_on(async {
-                client.inner.oidc().enable_cross_process_refresh_lock(process_id.clone()).await
-            })?;
+
+            client
+                .inner
+                .oauth()
+                .enable_cross_process_refresh_lock(cross_process_store_locks_holder_name)
+                .await?;
         }
 
         if let Some(session_delegate) = session_delegate {
@@ -227,9 +262,7 @@ impl Client {
                     let session_delegate = session_delegate.clone();
                     Box::new(move |client| {
                         let session_delegate = session_delegate.clone();
-                        Box::pin(
-                            async move { Ok(Self::save_session(session_delegate, client).await?) },
-                        )
+                        Ok(Self::save_session(session_delegate, client)?)
                     })
                 },
             )?;
@@ -239,33 +272,183 @@ impl Client {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Client {
+    /// Information about login options for the client's homeserver.
+    pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
+        let oauth = self.inner.oauth();
+        let (supports_oidc_login, supported_oidc_prompts) = match oauth.server_metadata().await {
+            Ok(metadata) => {
+                let prompts =
+                    metadata.prompt_values_supported.into_iter().map(Into::into).collect();
+
+                (true, prompts)
+            }
+            Err(error) => {
+                error!("Failed to fetch OIDC provider metadata: {error}");
+                (false, Default::default())
+            }
+        };
+
+        let supports_password_login = self.supports_password_login().await.ok().unwrap_or(false);
+        let sliding_sync_version = self.sliding_sync_version();
+
+        Arc::new(HomeserverLoginDetails {
+            url: self.homeserver(),
+            sliding_sync_version,
+            supports_oidc_login,
+            supported_oidc_prompts,
+            supports_password_login,
+        })
+    }
+
     /// Login using a username and password.
-    pub fn login(
+    pub async fn login(
         &self,
         username: String,
         password: String,
         initial_device_name: Option<String>,
         device_id: Option<String>,
     ) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let mut builder = self.inner.matrix_auth().login_username(&username, &password);
-            if let Some(initial_device_name) = initial_device_name.as_ref() {
-                builder = builder.initial_device_display_name(initial_device_name);
-            }
-            if let Some(device_id) = device_id.as_ref() {
-                builder = builder.device_id(device_id);
-            }
-            builder.send().await?;
-            Ok(())
-        })
+        let mut builder = self.inner.matrix_auth().login_username(&username, &password);
+        if let Some(initial_device_name) = initial_device_name.as_ref() {
+            builder = builder.initial_device_display_name(initial_device_name);
+        }
+        if let Some(device_id) = device_id.as_ref() {
+            builder = builder.device_id(device_id);
+        }
+        builder.send().await?;
+        Ok(())
+    }
+
+    /// Login using JWT
+    /// This is an implementation of the custom_login https://docs.rs/matrix-sdk/latest/matrix_sdk/matrix_auth/struct.MatrixAuth.html#method.login_custom
+    /// For more information on logging in with JWT: https://element-hq.github.io/synapse/latest/jwt.html
+    pub async fn custom_login_with_jwt(
+        &self,
+        jwt: String,
+        initial_device_name: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        let data = json!({ "token": jwt }).as_object().unwrap().clone();
+
+        let mut builder = self.inner.matrix_auth().login_custom("org.matrix.login.jwt", data)?;
+
+        if let Some(initial_device_name) = initial_device_name.as_ref() {
+            builder = builder.initial_device_display_name(initial_device_name);
+        }
+
+        if let Some(device_id) = device_id.as_ref() {
+            builder = builder.device_id(device_id);
+        }
+
+        builder.send().await?;
+        Ok(())
+    }
+
+    /// Login using an email and password.
+    pub async fn login_with_email(
+        &self,
+        email: String,
+        password: String,
+        initial_device_name: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        let mut builder = self
+            .inner
+            .matrix_auth()
+            .login_identifier(UserIdentifier::Email { address: email }, &password);
+
+        if let Some(initial_device_name) = initial_device_name.as_ref() {
+            builder = builder.initial_device_display_name(initial_device_name);
+        }
+
+        if let Some(device_id) = device_id.as_ref() {
+            builder = builder.device_id(device_id);
+        }
+
+        builder.send().await?;
+
+        Ok(())
+    }
+
+    /// Returns a handler to start the SSO login process.
+    pub(crate) async fn start_sso_login(
+        self: &Arc<Self>,
+        redirect_url: String,
+        idp_id: Option<String>,
+    ) -> Result<Arc<SsoHandler>, SsoError> {
+        let auth = self.inner.matrix_auth();
+        let url = auth
+            .get_sso_login_url(redirect_url.as_str(), idp_id.as_deref())
+            .await
+            .map_err(|e| SsoError::Generic { message: e.to_string() })?;
+        Ok(Arc::new(SsoHandler { client: Arc::clone(self), url }))
+    }
+
+    /// Requests the URL needed for opening a web view using OIDC. Once the web
+    /// view has succeeded, call `login_with_oidc_callback` with the callback it
+    /// returns. If a failure occurs and a callback isn't available, make sure
+    /// to call `abort_oidc_auth` to inform the client of this.
+    ///
+    /// # Arguments
+    ///
+    /// * `oidc_configuration` - The configuration used to load the credentials
+    ///   of the client if it is already registered with the authorization
+    ///   server, or register the client and store its credentials if it isn't.
+    ///
+    /// * `prompt` - The desired user experience in the web UI. No value means
+    ///   that the user wishes to login into an existing account, and a value of
+    ///   `Create` means that the user wishes to register a new account.
+    ///
+    /// * `login_hint` - A generic login hint that an identity provider can use
+    ///   to pre-fill the login form. The format of this hint is not restricted
+    ///   by the spec as external providers all have their own way to handle the hint.
+    ///   However, it should be noted that when providing a user ID as a hint
+    ///   for MAS (with no upstream provider), then the format to use is defined
+    ///   by [MSC4198]: https://github.com/matrix-org/matrix-spec-proposals/pull/4198
+    pub async fn url_for_oidc(
+        &self,
+        oidc_configuration: &OidcConfiguration,
+        prompt: Option<OidcPrompt>,
+        login_hint: Option<String>,
+    ) -> Result<Arc<OAuthAuthorizationData>, OidcError> {
+        let registration_data = oidc_configuration.registration_data()?;
+        let redirect_uri = oidc_configuration.redirect_uri()?;
+
+        let mut url_builder = self.inner.oauth().login(redirect_uri, None, Some(registration_data));
+
+        if let Some(prompt) = prompt {
+            url_builder = url_builder.prompt(vec![prompt.into()]);
+        }
+        if let Some(login_hint) = login_hint {
+            url_builder = url_builder.login_hint(login_hint);
+        }
+
+        let data = url_builder.build().await?;
+
+        Ok(Arc::new(data))
+    }
+
+    /// Aborts an existing OIDC login operation that might have been cancelled,
+    /// failed etc.
+    pub async fn abort_oidc_auth(&self, authorization_data: Arc<OAuthAuthorizationData>) {
+        self.inner.oauth().abort_login(&authorization_data.state).await;
+    }
+
+    /// Completes the OIDC login process.
+    pub async fn login_with_oidc_callback(&self, callback_url: String) -> Result<(), OidcError> {
+        let url = Url::parse(&callback_url).or(Err(OidcError::CallbackUrlInvalid))?;
+
+        self.inner.oauth().finish_login(url.into()).await?;
+
+        Ok(())
     }
 
     pub async fn get_media_file(
         &self,
         media_source: Arc<MediaSource>,
-        body: Option<String>,
+        filename: Option<String>,
         mime_type: String,
         use_cache: bool,
         temp_dir: Option<String>,
@@ -277,8 +460,8 @@ impl Client {
             .inner
             .media()
             .get_media_file(
-                &MediaRequest { source, format: MediaFormat::File },
-                body,
+                &MediaRequestParameters { source: source.media_source, format: MediaFormat::File },
+                filename,
                 &mime_type,
                 use_cache,
                 temp_dir,
@@ -289,51 +472,97 @@ impl Client {
     }
 
     /// Restores the client from a `Session`.
-    pub fn restore_session(&self, session: Session) -> Result<(), ClientError> {
-        let sliding_sync_proxy = session.sliding_sync_proxy.clone();
+    ///
+    /// It reloads the entire set of rooms from the previous session.
+    ///
+    /// If you want to control the amount of rooms to reloads, check
+    /// [`Client::restore_session_with`].
+    pub async fn restore_session(&self, session: Session) -> Result<(), ClientError> {
+        self.restore_session_with(session, RoomLoadSettings::All).await
+    }
+
+    /// Restores the client from a `Session`.
+    ///
+    /// It reloads a set of rooms controlled by [`RoomLoadSettings`].
+    pub async fn restore_session_with(
+        &self,
+        session: Session,
+        room_load_settings: RoomLoadSettings,
+    ) -> Result<(), ClientError> {
+        let sliding_sync_version = session.sliding_sync_version.clone();
         let auth_session: AuthSession = session.try_into()?;
 
-        self.restore_session_inner(auth_session)?;
-
-        if let Some(sliding_sync_proxy) = sliding_sync_proxy {
-            let sliding_sync_proxy = Url::parse(&sliding_sync_proxy)
-                .map_err(|error| ClientError::Generic { msg: error.to_string() })?;
-
-            self.inner.set_sliding_sync_proxy(Some(sliding_sync_proxy));
-        }
+        self.inner
+            .restore_session_with(
+                auth_session,
+                room_load_settings
+                    .try_into()
+                    .map_err(|error| ClientError::from_str(error, None))?,
+            )
+            .await?;
+        self.inner.set_sliding_sync_version(sliding_sync_version.try_into()?);
 
         Ok(())
+    }
+
+    /// Enables or disables all the room send queues at once.
+    ///
+    /// When connectivity is lost on a device, it is recommended to disable the
+    /// room sending queues.
+    ///
+    /// This can be controlled for individual rooms, using
+    /// [`Room::enable_send_queue`].
+    pub async fn enable_all_send_queues(&self, enable: bool) {
+        self.inner.send_queue().set_enabled(enable).await;
+    }
+
+    /// Subscribe to the global enablement status of the send queue, at the
+    /// client-wide level.
+    ///
+    /// The given listener will be immediately called with the initial value of
+    /// the enablement status.
+    pub fn subscribe_to_send_queue_status(
+        &self,
+        listener: Box<dyn SendQueueRoomErrorListener>,
+    ) -> Arc<TaskHandle> {
+        let q = self.inner.send_queue();
+        let mut subscriber = q.subscribe_errors();
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            // Respawn tasks for rooms that had unsent events. At this point we've just
+            // created the subscriber, so it'll be notified about errors.
+            q.respawn_tasks_for_rooms_with_unsent_requests().await;
+
+            loop {
+                match subscriber.recv().await {
+                    Ok(report) => listener
+                        .on_error(report.room_id.to_string(), ClientError::from_err(report.error)),
+                    Err(err) => {
+                        error!("error when listening to the send queue error reporter: {err}");
+                    }
+                }
+            }
+        })))
+    }
+
+    /// Allows generic GET requests to be made through the SDKs internal HTTP
+    /// client
+    pub async fn get_url(&self, url: String) -> Result<String, ClientError> {
+        let http_client = self.inner.http_client();
+        Ok(http_client.get(url).send().await?.text().await?)
+    }
+
+    /// Empty the server version and unstable features cache.
+    ///
+    /// Since the SDK caches server capabilities (versions and unstable
+    /// features), it's possible to have a stale entry in the cache. This
+    /// functions makes it possible to force reset it.
+    pub async fn reset_server_capabilities(&self) -> Result<(), ClientError> {
+        Ok(self.inner.reset_server_capabilities().await?)
     }
 }
 
 impl Client {
-    /// Restores the client from an `AuthSession`.
-    pub(crate) fn restore_session_inner(
-        &self,
-        session: impl Into<AuthSession>,
-    ) -> anyhow::Result<()> {
-        RUNTIME.block_on(async move {
-            self.inner.restore_session(session).await?;
-            Ok(())
-        })
-    }
-
-    /// The homeserver's trusted OIDC Provider that was discovered in the
-    /// well-known.
-    ///
-    /// This will only be set if the homeserver supports authenticating via
-    /// OpenID Connect and this `Client` was constructed using auto-discovery by
-    /// setting the homeserver with [`ClientBuilder::server_name()`].
-    pub(crate) fn discovered_authentication_server(&self) -> Option<AuthenticationServerInfo> {
-        self.inner.oidc().authentication_server_info().cloned()
-    }
-
-    /// The sliding sync proxy that is trusted by the homeserver. `None` when
-    /// not configured.
-    pub fn discovered_sliding_sync_proxy(&self) -> Option<Url> {
-        self.inner.sliding_sync_proxy()
-    }
-
     /// Whether or not the client's homeserver supports the password login flow.
     pub(crate) async fn supports_password_login(&self) -> anyhow::Result<bool> {
         let login_types = self.inner.matrix_auth().get_login_types().await?;
@@ -343,16 +572,26 @@ impl Client {
             .any(|login_type| matches!(login_type, get_login_types::v3::LoginType::Password(_)));
         Ok(supports_password)
     }
-
-    /// Gets information about the owner of a given access token.
-    pub(crate) fn whoami(&self) -> anyhow::Result<whoami::v3::Response> {
-        RUNTIME
-            .block_on(async move { self.inner.whoami().await.map_err(|e| anyhow!(e.to_string())) })
-    }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Client {
+    /// The sliding sync version.
+    pub fn sliding_sync_version(&self) -> SlidingSyncVersion {
+        self.inner.sliding_sync_version().into()
+    }
+
+    /// Find all sliding sync versions that are available.
+    ///
+    /// Be careful: This method may hit the store and will send new requests for
+    /// each call. It can be costly to call it repeatedly.
+    ///
+    /// If `.well-known` or `/versions` is unreachable, it will simply move
+    /// potential sliding sync versions aside. No error will be reported.
+    pub async fn available_sliding_sync_versions(&self) -> Vec<SlidingSyncVersion> {
+        self.inner.available_sliding_sync_versions().await.into_iter().map(Into::into).collect()
+    }
+
     pub fn set_delegate(
         self: Arc<Self>,
         delegate: Option<Box<dyn ClientDelegate>>,
@@ -360,7 +599,7 @@ impl Client {
         delegate.map(|delegate| {
             let mut session_change_receiver = self.inner.subscribe_to_session_changes();
             let client_clone = self.clone();
-            let session_change_task = RUNTIME.spawn(async move {
+            let session_change_task = get_runtime_handle().spawn(async move {
                 loop {
                     match session_change_receiver.recv().await {
                         Ok(session_change) => client_clone.process_session_change(session_change),
@@ -379,20 +618,31 @@ impl Client {
     }
 
     pub fn session(&self) -> Result<Session, ClientError> {
-        RUNTIME.block_on(async move { Self::session_inner((*self.inner).clone()).await })
+        Self::session_inner((*self.inner).clone())
     }
 
-    pub fn account_url(
+    pub async fn account_url(
         &self,
         action: Option<AccountManagementAction>,
     ) -> Result<Option<String>, ClientError> {
-        match self.inner.oidc().account_management_url(action.map(Into::into)) {
-            Ok(url) => Ok(url.map(|u| u.to_string())),
-            Err(e) => {
-                tracing::error!("Failed retrieving account management URL: {e}");
-                Err(e.into())
-            }
+        if !matches!(self.inner.auth_api(), Some(AuthApi::OAuth(..))) {
+            return Ok(None);
         }
+
+        let mut url_builder = match self.inner.oauth().account_management_url().await {
+            Ok(Some(url_builder)) => url_builder,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                error!("Failed retrieving account management URL: {e}");
+                return Err(e.into());
+            }
+        };
+
+        if let Some(action) = action {
+            url_builder = url_builder.action(action.into());
+        }
+
+        Ok(Some(url_builder.build().to_string()))
     }
 
     pub fn user_id(&self) -> Result<String, ClientError> {
@@ -400,57 +650,49 @@ impl Client {
         Ok(user_id.to_string())
     }
 
-    pub fn display_name(&self) -> Result<String, ClientError> {
-        let l = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let display_name = l.account().get_display_name().await?.context("No User ID found")?;
-            Ok(display_name)
-        })
+    /// The server name part of the current user ID
+    pub fn user_id_server_name(&self) -> Result<String, ClientError> {
+        let user_id = self.inner.user_id().context("No User ID found")?;
+        Ok(user_id.server_name().to_string())
     }
 
-    pub fn set_display_name(&self, name: String) -> Result<(), ClientError> {
-        let client = self.inner.clone();
-        RUNTIME.block_on(async move {
-            client
-                .account()
-                .set_display_name(Some(name.as_str()))
-                .await
-                .context("Unable to set display name")?;
-            Ok(())
-        })
+    pub async fn display_name(&self) -> Result<String, ClientError> {
+        let display_name =
+            self.inner.account().get_display_name().await?.context("No User ID found")?;
+        Ok(display_name)
     }
 
-    pub fn upload_avatar(&self, mime_type: String, data: Vec<u8>) -> Result<(), ClientError> {
-        let client = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let mime: Mime = mime_type.parse()?;
-            client.account().upload_avatar(&mime, data).await?;
-            Ok(())
-        })
+    pub async fn set_display_name(&self, name: String) -> Result<(), ClientError> {
+        self.inner
+            .account()
+            .set_display_name(Some(name.as_str()))
+            .await
+            .context("Unable to set display name")?;
+        Ok(())
     }
 
-    pub fn remove_avatar(&self) -> Result<(), ClientError> {
-        let client = self.inner.clone();
-        RUNTIME.block_on(async move {
-            client.account().set_avatar_url(None).await?;
-            Ok(())
-        })
+    pub async fn upload_avatar(&self, mime_type: String, data: Vec<u8>) -> Result<(), ClientError> {
+        let mime: Mime = mime_type.parse()?;
+        self.inner.account().upload_avatar(&mime, data).await?;
+        Ok(())
     }
 
-    pub fn avatar_url(&self) -> Result<Option<String>, ClientError> {
-        let l = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let avatar_url = l.account().get_avatar_url().await?;
-            Ok(avatar_url.map(|u| u.to_string()))
-        })
+    pub async fn remove_avatar(&self) -> Result<(), ClientError> {
+        self.inner.account().set_avatar_url(None).await?;
+        Ok(())
     }
 
-    pub fn cached_avatar_url(&self) -> Result<Option<String>, ClientError> {
-        let l = self.inner.clone();
-        RUNTIME.block_on(async move {
-            let url = l.account().get_cached_avatar_url().await?;
-            Ok(url)
-        })
+    /// Sends a request to retrieve the avatar URL. Will fill the cache used by
+    /// [`Self::cached_avatar_url`] on success.
+    pub async fn avatar_url(&self) -> Result<Option<String>, ClientError> {
+        let avatar_url = self.inner.account().get_avatar_url().await?;
+
+        Ok(avatar_url.map(|u| u.to_string()))
+    }
+
+    /// Retrieves an avatar cached from a previous call to [`Self::avatar_url`].
+    pub async fn cached_avatar_url(&self) -> Result<Option<String>, ClientError> {
+        Ok(self.inner.account().get_cached_avatar_url().await?.map(Into::into))
     }
 
     pub fn device_id(&self) -> Result<String, ClientError> {
@@ -458,35 +700,31 @@ impl Client {
         Ok(device_id.to_string())
     }
 
-    pub fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
-        let client = self.inner.clone();
-
-        RUNTIME.block_on(async move {
-            let response = client.create_room(request.into()).await?;
-            Ok(String::from(response.room_id()))
-        })
+    pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
+        let response = self.inner.create_room(request.try_into()?).await?;
+        Ok(String::from(response.room_id()))
     }
 
     /// Get the content of the event of the given type out of the account data
     /// store.
     ///
     /// It will be returned as a JSON string.
-    pub fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
-        RUNTIME.block_on(async move {
-            let event = self.inner.account().account_data_raw(event_type.into()).await?;
-            Ok(event.map(|e| e.json().get().to_owned()))
-        })
+    pub async fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
+        let event = self.inner.account().account_data_raw(event_type.into()).await?;
+        Ok(event.map(|e| e.json().get().to_owned()))
     }
 
     /// Set the given account data content for the given event type.
     ///
     /// It should be supplied as a JSON string.
-    pub fn set_account_data(&self, event_type: String, content: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let raw_content = Raw::from_json_string(content)?;
-            self.inner.account().set_account_data_raw(event_type.into(), raw_content).await?;
-            Ok(())
-        })
+    pub async fn set_account_data(
+        &self,
+        event_type: String,
+        content: String,
+    ) -> Result<(), ClientError> {
+        let raw_content = Raw::from_json_string(content)?;
+        self.inner.account().set_account_data_raw(event_type.into(), raw_content).await?;
+        Ok(())
     }
 
     pub async fn upload_media(
@@ -496,11 +734,11 @@ impl Client {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<String, ClientError> {
         let mime_type: mime::Mime = mime_type.parse().context("Parsing mime type")?;
-        let request = self.inner.media().upload(&mime_type, data);
+        let request = self.inner.media().upload(&mime_type, data, None);
 
         if let Some(progress_watcher) = progress_watcher {
             let mut subscriber = request.subscribe_to_send_progress();
-            RUNTIME.spawn(async move {
+            get_runtime_handle().spawn(async move {
                 while let Some(progress) = subscriber.next().await {
                     progress_watcher.transmission_progress(progress.into());
                 }
@@ -516,12 +754,13 @@ impl Client {
         &self,
         media_source: Arc<MediaSource>,
     ) -> Result<Vec<u8>, ClientError> {
-        let source = (*media_source).clone();
+        let source = (*media_source).clone().media_source;
 
+        debug!(?source, "requesting media file");
         Ok(self
             .inner
             .media()
-            .get_media_content(&MediaRequest { source, format: MediaFormat::File }, true)
+            .get_media_content(&MediaRequestParameters { source, format: MediaFormat::File }, true)
             .await?)
     }
 
@@ -531,83 +770,60 @@ impl Client {
         width: u64,
         height: u64,
     ) -> Result<Vec<u8>, ClientError> {
-        let source = (*media_source).clone();
+        let source = (*media_source).clone().media_source;
 
+        debug!(?source, width, height, "requesting media thumbnail");
         Ok(self
             .inner
             .media()
             .get_media_content(
-                &MediaRequest {
+                &MediaRequestParameters {
                     source,
-                    format: MediaFormat::Thumbnail(MediaThumbnailSize {
-                        method: Method::Scale,
-                        width: UInt::new(width).unwrap(),
-                        height: UInt::new(height).unwrap(),
-                    }),
+                    format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
+                        UInt::new(width).unwrap(),
+                        UInt::new(height).unwrap(),
+                    )),
                 },
                 true,
             )
             .await?)
     }
 
-    pub fn get_session_verification_controller(
+    pub async fn get_session_verification_controller(
         &self,
     ) -> Result<Arc<SessionVerificationController>, ClientError> {
-        RUNTIME.block_on(async move {
-            if let Some(session_verification_controller) =
-                &*self.session_verification_controller.read().await
-            {
-                return Ok(Arc::new(session_verification_controller.clone()));
-            }
-            let user_id = self.inner.user_id().context("Failed retrieving current user_id")?;
-            let user_identity = self
-                .inner
-                .encryption()
-                .get_user_identity(user_id)
-                .await?
-                .context("Failed retrieving user identity")?;
+        if let Some(session_verification_controller) =
+            &*self.session_verification_controller.read().await
+        {
+            return Ok(Arc::new(session_verification_controller.clone()));
+        }
+        let user_id = self.inner.user_id().context("Failed retrieving current user_id")?;
+        let user_identity = self
+            .inner
+            .encryption()
+            .get_user_identity(user_id)
+            .await?
+            .context("Failed retrieving user identity")?;
 
-            let session_verification_controller =
-                SessionVerificationController::new(self.inner.encryption(), user_identity);
+        let session_verification_controller = SessionVerificationController::new(
+            self.inner.encryption(),
+            user_identity,
+            self.inner.account(),
+        );
 
-            *self.session_verification_controller.write().await =
-                Some(session_verification_controller.clone());
+        *self.session_verification_controller.write().await =
+            Some(session_verification_controller.clone());
 
-            Ok(Arc::new(session_verification_controller))
-        })
+        Ok(Arc::new(session_verification_controller))
     }
 
-    /// Log out the current user. This method returns an optional URL that
-    /// should be presented to the user to complete logout (in the case of
-    /// Session having been authenticated using OIDC).
-    pub fn logout(&self) -> Result<Option<String>, ClientError> {
-        let Some(auth_api) = self.inner.auth_api() else {
-            return Err(anyhow!("Missing authentication API").into());
-        };
-
-        match auth_api {
-            AuthApi::Matrix(a) => {
-                tracing::info!("Logging out via the homeserver.");
-                RUNTIME.block_on(a.logout())?;
-                Ok(None)
-            }
-            AuthApi::Oidc(api) => {
-                tracing::info!("Logging out via OIDC.");
-                let end_session_builder = RUNTIME.block_on(api.logout())?;
-
-                if let Some(builder) = end_session_builder {
-                    let url = builder.build()?.url;
-                    return Ok(Some(url.to_string()));
-                }
-
-                Ok(None)
-            }
-            _ => Err(anyhow!("Unknown authentication API").into()),
-        }
+    /// Log the current user out.
+    pub async fn logout(&self) -> Result<(), ClientError> {
+        Ok(self.inner.logout().await?)
     }
 
     /// Registers a pusher with given parameters
-    pub fn set_pusher(
+    pub async fn set_pusher(
         &self,
         identifiers: PusherIdentifiers,
         kind: PusherKind,
@@ -616,20 +832,24 @@ impl Client {
         profile_tag: Option<String>,
         lang: String,
     ) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let ids = identifiers.into();
+        let ids = identifiers.into();
 
-            let pusher_init = PusherInit {
-                ids,
-                kind: kind.try_into()?,
-                app_display_name,
-                device_display_name,
-                profile_tag,
-                lang,
-            };
-            self.inner.set_pusher(pusher_init.into()).await?;
-            Ok(())
-        })
+        let pusher_init = PusherInit {
+            ids,
+            kind: kind.try_into()?,
+            app_display_name,
+            device_display_name,
+            profile_tag,
+            lang,
+        };
+        self.inner.pusher().set(pusher_init.into()).await?;
+        Ok(())
+    }
+
+    /// Deletes a pusher of given pusher ids
+    pub async fn delete_pusher(&self, identifiers: PusherIdentifiers) -> Result<(), ClientError> {
+        self.inner.pusher().delete(identifiers.into()).await?;
+        Ok(())
     }
 
     /// The homeserver this client is configured to use.
@@ -637,8 +857,41 @@ impl Client {
         self.inner.homeserver().to_string()
     }
 
+    /// The URL of the server.
+    ///
+    /// Not to be confused with the `Self::homeserver`. `server` is usually
+    /// the server part in a user ID, e.g. with `@mnt_io:matrix.org`, here
+    /// `matrix.org` is the server, whilst `matrix-client.matrix.org` is the
+    /// homeserver (at the time of writing — 2024-08-28).
+    ///
+    /// This value is optional depending on how the `Client` has been built.
+    /// If it's been built from a homeserver URL directly, we don't know the
+    /// server. However, if the `Client` has been built from a server URL or
+    /// name, then the homeserver has been discovered, and we know both.
+    pub fn server(&self) -> Option<String> {
+        self.inner.server().map(ToString::to_string)
+    }
+
     pub fn rooms(&self) -> Vec<Arc<Room>> {
         self.inner.rooms().into_iter().map(|room| Arc::new(Room::new(room))).collect()
+    }
+
+    /// Get a room by its ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The ID of the room to get.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing an optional room, or a `ClientError`.
+    /// This method will not initialize the room's timeline or populate it with
+    /// events.
+    pub fn get_room(&self, room_id: String) -> Result<Option<Arc<Room>>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let sdk_room = self.inner.get_room(&room_id);
+        let room = sdk_room.map(|room| Arc::new(Room::new(room)));
+        Ok(room)
     }
 
     pub fn get_dm_room(&self, user_id: String) -> Result<Option<Arc<Room>>, ClientError> {
@@ -648,54 +901,50 @@ impl Client {
         Ok(dm)
     }
 
-    pub fn search_users(
+    pub async fn search_users(
         &self,
         search_term: String,
         limit: u64,
     ) -> Result<SearchUsersResults, ClientError> {
-        RUNTIME.block_on(async move {
-            let response = self.inner.search_users(&search_term, limit).await?;
-            Ok(SearchUsersResults::from(response))
+        let response = self.inner.search_users(&search_term, limit).await?;
+        Ok(SearchUsersResults::from(response))
+    }
+
+    pub async fn get_profile(&self, user_id: String) -> Result<UserProfile, ClientError> {
+        let owned_user_id = UserId::parse(user_id.clone())?;
+
+        let response = self.inner.account().fetch_user_profile_of(&owned_user_id).await?;
+
+        Ok(UserProfile {
+            user_id,
+            display_name: response.displayname.clone(),
+            avatar_url: response.avatar_url.as_ref().map(|url| url.to_string()),
         })
     }
 
-    pub fn get_profile(&self, user_id: String) -> Result<UserProfile, ClientError> {
-        RUNTIME.block_on(async move {
-            let owned_user_id = UserId::parse(user_id.clone())?;
-            let response = self.inner.get_profile(&owned_user_id).await?;
-
-            let user_profile = UserProfile {
-                user_id,
-                display_name: response.displayname.clone(),
-                avatar_url: response.avatar_url.as_ref().map(|url| url.to_string()),
-            };
-
-            Ok(user_profile)
-        })
-    }
-
-    pub fn notification_client(
+    pub async fn notification_client(
         self: Arc<Self>,
         process_setup: NotificationProcessSetup,
-    ) -> Result<Arc<NotificationClientBuilder>, ClientError> {
-        NotificationClientBuilder::new(self.clone(), process_setup.into())
+    ) -> Result<Arc<NotificationClient>, ClientError> {
+        Ok(Arc::new(NotificationClient {
+            inner: MatrixNotificationClient::new((*self.inner).clone(), process_setup.into())
+                .await?,
+            _client: self.clone(),
+        }))
     }
 
     pub fn sync_service(&self) -> Arc<SyncServiceBuilder> {
         SyncServiceBuilder::new((*self.inner).clone())
     }
 
-    pub fn get_notification_settings(&self) -> Arc<NotificationSettings> {
-        RUNTIME.block_on(async move {
-            Arc::new(NotificationSettings::new(
-                (*self.inner).clone(),
-                self.inner.notification_settings().await,
-            ))
-        })
+    pub async fn get_notification_settings(&self) -> Arc<NotificationSettings> {
+        let inner = self.inner.notification_settings().await;
+
+        Arc::new(NotificationSettings::new((*self.inner).clone(), inner))
     }
 
-    pub fn encryption(&self) -> Arc<Encryption> {
-        Arc::new(self.inner.encryption().into())
+    pub fn encryption(self: Arc<Self>) -> Arc<Encryption> {
+        Arc::new(Encryption { inner: self.inner.encryption(), _client: self.clone() })
     }
 
     // Ignored users
@@ -734,15 +983,244 @@ impl Client {
         listener: Box<dyn IgnoredUsersListener>,
     ) -> Arc<TaskHandle> {
         let mut subscriber = self.inner.subscribe_to_ignore_user_list_changes();
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             while let Some(user_ids) = subscriber.next().await {
                 listener.call(user_ids);
             }
         })))
     }
+
+    pub fn room_directory_search(&self) -> Arc<RoomDirectorySearch> {
+        Arc::new(RoomDirectorySearch::new(
+            matrix_sdk::room_directory_search::RoomDirectorySearch::new((*self.inner).clone()),
+        ))
+    }
+
+    /// Join a room by its ID.
+    ///
+    /// Use this method when the homeserver already knows of the given room ID.
+    /// Otherwise use `join_room_by_id_or_alias` so you can pass a list of
+    /// server names for the homeserver to find the room.
+    pub async fn join_room_by_id(&self, room_id: String) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let room = self.inner.join_room_by_id(room_id.as_ref()).await?;
+        Ok(Arc::new(Room::new(room)))
+    }
+
+    /// Join a room by its ID or alias.
+    ///
+    /// When supplying the room's ID, you can also supply a list of server names
+    /// for the homeserver to find the room. Typically these server names
+    /// come from a permalink's `via` parameters, or from resolving a room's
+    /// alias into an ID.
+    pub async fn join_room_by_id_or_alias(
+        &self,
+        room_id_or_alias: String,
+        server_names: Vec<String>,
+    ) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomOrAliasId::parse(&room_id_or_alias)?;
+        let server_names = server_names
+            .iter()
+            .map(|name| OwnedServerName::try_from(name.as_str()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let room =
+            self.inner.join_room_by_id_or_alias(room_id.as_ref(), server_names.as_ref()).await?;
+        Ok(Arc::new(Room::new(room)))
+    }
+
+    /// Knock on a room to join it using its ID or alias.
+    pub async fn knock(
+        &self,
+        room_id_or_alias: String,
+        reason: Option<String>,
+        server_names: Vec<String>,
+    ) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomOrAliasId::parse(&room_id_or_alias)?;
+        let server_names =
+            server_names.iter().map(ServerName::parse).collect::<Result<Vec<_>, _>>()?;
+        let room = self.inner.knock(room_id, reason, server_names).await?;
+        Ok(Arc::new(Room::new(room)))
+    }
+
+    pub async fn get_recently_visited_rooms(&self) -> Result<Vec<String>, ClientError> {
+        Ok(self
+            .inner
+            .account()
+            .get_recently_visited_rooms()
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    pub async fn track_recently_visited_room(&self, room: String) -> Result<(), ClientError> {
+        let room_id = RoomId::parse(room)?;
+        self.inner.account().track_recently_visited_room(room_id).await?;
+        Ok(())
+    }
+
+    /// Resolves the given room alias to a room ID (and a list of servers), if
+    /// possible.
+    pub async fn resolve_room_alias(
+        &self,
+        room_alias: String,
+    ) -> Result<Option<ResolvedRoomAlias>, ClientError> {
+        let room_alias = RoomAliasId::parse(&room_alias)?;
+        match self.inner.resolve_room_alias(&room_alias).await {
+            Ok(response) => Ok(Some(response.into())),
+            Err(error) => match error.client_api_error_kind() {
+                // The room alias wasn't found, so we return None.
+                Some(ErrorKind::NotFound) => Ok(None),
+                // In any other case we just return the error, mapped.
+                _ => Err(error.into()),
+            },
+        }
+    }
+
+    /// Checks if a room alias exists in the current homeserver.
+    pub async fn room_alias_exists(&self, room_alias: String) -> Result<bool, ClientError> {
+        self.resolve_room_alias(room_alias).await.map(|ret| ret.is_some())
+    }
+
+    /// Given a room id, get the preview of a room, to interact with it.
+    ///
+    /// The list of `via_servers` must be a list of servers that know
+    /// about the room and can resolve it, and that may appear as a `via`
+    /// parameter in e.g. a permalink URL. This list can be empty.
+    pub async fn get_room_preview_from_room_id(
+        &self,
+        room_id: String,
+        via_servers: Vec<String>,
+    ) -> Result<Arc<RoomPreview>, ClientError> {
+        let room_id = RoomId::parse(&room_id).context("room_id is not a valid room id")?;
+
+        let via_servers = via_servers
+            .into_iter()
+            .map(ServerName::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .context("at least one `via` server name is invalid")?;
+
+        // The `into()` call below doesn't work if I do `(&room_id).into()`, so I let
+        // rustc win that one fight.
+        let room_id: &RoomId = &room_id;
+
+        let room_preview = self.inner.get_room_preview(room_id.into(), via_servers).await?;
+
+        Ok(Arc::new(RoomPreview::new(self.inner.clone(), room_preview)))
+    }
+
+    /// Given a room alias, get the preview of a room, to interact with it.
+    pub async fn get_room_preview_from_room_alias(
+        &self,
+        room_alias: String,
+    ) -> Result<Arc<RoomPreview>, ClientError> {
+        let room_alias =
+            RoomAliasId::parse(&room_alias).context("room_alias is not a valid room alias")?;
+
+        // The `into()` call below doesn't work if I do `(&room_id).into()`, so I let
+        // rustc win that one fight.
+        let room_alias: &RoomAliasId = &room_alias;
+
+        let room_preview = self.inner.get_room_preview(room_alias.into(), Vec::new()).await?;
+
+        Ok(Arc::new(RoomPreview::new(self.inner.clone(), room_preview)))
+    }
+
+    /// Waits until an at least partially synced room is received, and returns
+    /// it.
+    ///
+    /// **Note: this function will loop endlessly until either it finds the room
+    /// or an externally set timeout happens.**
+    pub async fn await_room_remote_echo(&self, room_id: String) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        Ok(Arc::new(Room::new(self.inner.await_room_remote_echo(&room_id).await)))
+    }
+
+    /// Lets the user know whether this is an `m.login.password` based
+    /// auth and if the account can actually be deactivated
+    pub fn can_deactivate_account(&self) -> bool {
+        matches!(self.inner.auth_api(), Some(AuthApi::Matrix(_)))
+    }
+
+    /// Deactivate this account definitively.
+    /// Similarly to `encryption::reset_identity` this
+    /// will only work with password-based authentication (`m.login.password`)
+    ///
+    /// # Arguments
+    ///
+    /// * `auth_data` - This request uses the [User-Interactive Authentication
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail and the same request needs to be made but this time with
+    ///   some `auth_data` provided.
+    pub async fn deactivate_account(
+        &self,
+        auth_data: Option<AuthData>,
+        erase_data: bool,
+    ) -> Result<(), ClientError> {
+        if let Some(auth_data) = auth_data {
+            _ = self.inner.account().deactivate(None, Some(auth_data.into()), erase_data).await?;
+        } else {
+            _ = self.inner.account().deactivate(None, None, erase_data).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Checks if a room alias is not in use yet.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the room alias is available.
+    /// - `Ok(false)` if it's not (the resolve alias request returned a `404`
+    ///   status code).
+    /// - An `Err` otherwise.
+    pub async fn is_room_alias_available(&self, alias: String) -> Result<bool, ClientError> {
+        let alias = RoomAliasId::parse(alias)?;
+        self.inner.is_room_alias_available(&alias).await.map_err(Into::into)
+    }
+
+    /// Set the media retention policy.
+    pub async fn set_media_retention_policy(
+        &self,
+        policy: MediaRetentionPolicy,
+    ) -> Result<(), ClientError> {
+        let closure = async || -> Result<_, EventCacheError> {
+            let store = self.inner.event_cache_store().lock().await?;
+            Ok(store.set_media_retention_policy(policy).await?)
+        };
+
+        Ok(closure().await?)
+    }
+
+    /// Clear all the non-critical caches for this Client instance.
+    ///
+    /// - This will empty all the room's persisted event caches, so all rooms
+    ///   will start as if they were empty.
+    /// - This will empty the media cache according to the current media
+    ///   retention policy.
+    pub async fn clear_caches(&self) -> Result<(), ClientError> {
+        let closure = async || -> Result<_, EventCacheError> {
+            // Clean up the media cache according to the current media retention policy.
+            self.inner.event_cache_store().lock().await?.clean_up_media_cache().await?;
+
+            // Clear all the room chunks. It's important to *not* call
+            // `EventCacheStore::clear_all_rooms_chunks` here, because there might be live
+            // observers of the linked chunks, and that would cause some very bad state
+            // mismatch.
+            self.inner.event_cache().clear_all_rooms().await?;
+
+            Ok(())
+        };
+
+        Ok(closure().await?)
+    }
+
+    /// Checks if the server supports the report room API.
+    pub async fn is_report_room_api_supported(&self) -> Result<bool, ClientError> {
+        Ok(self.inner.server_versions().await?.contains(&ruma::api::MatrixVersion::V1_13))
+    }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait IgnoredUsersListener: Sync + Send {
     fn call(&self, ignored_user_ids: Vec<String>);
 }
@@ -764,6 +1242,24 @@ impl From<NotificationProcessSetup> for MatrixNotificationProcessSetup {
                     sync_service: sync_service.inner.clone(),
                 }
             }
+        }
+    }
+}
+
+/// Information about a room, that was resolved from a room alias.
+#[derive(uniffi::Record)]
+pub struct ResolvedRoomAlias {
+    /// The room ID that the alias resolved to.
+    pub room_id: String,
+    /// A list of servers that can be used to find the room by its room ID.
+    pub servers: Vec<String>,
+}
+
+impl From<get_alias::v3::Response> for ResolvedRoomAlias {
+    fn from(value: get_alias::v3::Response) -> Self {
+        Self {
+            room_id: value.room_id.to_string(),
+            servers: value.servers.iter().map(ToString::to_string).collect(),
         }
     }
 }
@@ -802,7 +1298,7 @@ impl Client {
     fn process_session_change(&self, session_change: SessionChange) {
         if let Some(delegate) = self.delegate.read().unwrap().clone() {
             debug!("Applying session change: {session_change:?}");
-            RUNTIME.spawn_blocking(move || match session_change {
+            get_runtime_handle().spawn_blocking(move || match session_change {
                 SessionChange::UnknownToken { soft_logout } => {
                     delegate.did_receive_auth_error(soft_logout);
                 }
@@ -821,31 +1317,57 @@ impl Client {
         session_delegate: Arc<dyn ClientSessionDelegate>,
         user_id: &UserId,
     ) -> anyhow::Result<SessionTokens> {
-        let session = session_delegate.retrieve_session_from_keychain(user_id.to_string())?;
-        let auth_session = TryInto::<AuthSession>::try_into(session)?;
-        match auth_session {
-            AuthSession::Oidc(session) => Ok(SessionTokens::Oidc(session.user.tokens)),
-            AuthSession::Matrix(session) => Ok(SessionTokens::Matrix(session.tokens)),
-            _ => anyhow::bail!("Unexpected session kind."),
-        }
+        Ok(session_delegate.retrieve_session_from_keychain(user_id.to_string())?.into_tokens())
     }
 
-    async fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
+    fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
         let auth_api = client.auth_api().context("Missing authentication API")?;
 
         let homeserver_url = client.homeserver().into();
-        let sliding_sync_proxy = client.sliding_sync_proxy().map(|url| url.to_string());
+        let sliding_sync_version = client.sliding_sync_version();
 
-        Session::new(auth_api, homeserver_url, sliding_sync_proxy)
+        Session::new(auth_api, homeserver_url, sliding_sync_version.into())
     }
 
-    async fn save_session(
+    fn save_session(
         session_delegate: Arc<dyn ClientSessionDelegate>,
         client: matrix_sdk::Client,
     ) -> anyhow::Result<()> {
-        let session = Self::session_inner(client).await?;
+        let session = Self::session_inner(client)?;
         session_delegate.save_session_in_keychain(session);
         Ok(())
+    }
+}
+
+/// Configure how many rooms will be restored when restoring the session with
+/// [`Client::restore_session_with`].
+///
+/// Please, see the documentation of [`matrix_sdk::store::RoomLoadSettings`] to
+/// learn more.
+#[derive(uniffi::Enum)]
+pub enum RoomLoadSettings {
+    /// Load all rooms from the `StateStore` into the in-memory state store
+    /// `BaseStateStore`.
+    All,
+
+    /// Load a single room from the `StateStore` into the in-memory state
+    /// store `BaseStateStore`.
+    ///
+    /// Please, be careful with this option. Read the documentation of
+    /// [`RoomLoadSettings`].
+    One { room_id: String },
+}
+
+impl TryInto<SdkRoomLoadSettings> for RoomLoadSettings {
+    type Error = String;
+
+    fn try_into(self) -> Result<SdkRoomLoadSettings, Self::Error> {
+        Ok(match self {
+            Self::All => SdkRoomLoadSettings::All,
+            Self::One { room_id } => {
+                SdkRoomLoadSettings::One(RoomId::parse(room_id).map_err(|error| error.to_string())?)
+            }
+        })
     }
 }
 
@@ -945,16 +1467,25 @@ pub struct CreateRoomParameters {
     pub avatar: Option<String>,
     #[uniffi(default = None)]
     pub power_level_content_override: Option<PowerLevels>,
+    #[uniffi(default = None)]
+    pub join_rule_override: Option<JoinRule>,
+    #[uniffi(default = None)]
+    pub history_visibility_override: Option<RoomHistoryVisibility>,
+    #[uniffi(default = None)]
+    pub canonical_alias: Option<String>,
 }
 
-impl From<CreateRoomParameters> for create_room::v3::Request {
-    fn from(value: CreateRoomParameters) -> create_room::v3::Request {
+impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
+    type Error = ClientError;
+
+    fn try_from(value: CreateRoomParameters) -> Result<create_room::v3::Request, Self::Error> {
         let mut request = create_room::v3::Request::new();
         request.name = value.name;
         request.topic = value.topic;
         request.is_direct = value.is_direct;
         request.visibility = value.visibility.into();
         request.preset = Some(value.preset.into());
+        request.room_alias_name = value.canonical_alias;
         request.invite = match value.invite {
             Some(invite) => invite
                 .iter()
@@ -982,6 +1513,18 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
             content.url = Some(url.into());
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
+
+        if let Some(join_rule_override) = value.join_rule_override {
+            let content = RoomJoinRulesEventContent::new(join_rule_override.try_into()?);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
+
+        if let Some(history_visibility_override) = value.history_visibility_override {
+            let content =
+                RoomHistoryVisibilityEventContent::new(history_visibility_override.try_into()?);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
+
         request.initial_state = initial_state;
 
         if let Some(power_levels) = value.power_level_content_override {
@@ -990,12 +1533,15 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
                     request.power_level_content_override = Some(power_levels);
                 }
                 Err(e) => {
-                    error!("Failed to serialize power levels, error: {e}");
+                    return Err(ClientError::Generic {
+                        msg: format!("Failed to serialize power levels, error: {e}"),
+                        details: Some(format!("{e:?}")),
+                    });
                 }
             }
         }
 
-        request
+        Ok(request)
     }
 }
 
@@ -1006,6 +1552,9 @@ pub enum RoomVisibility {
 
     /// Indicates that the room will not be shown in the published room list.
     Private,
+
+    /// A custom value that's not present in the spec.
+    Custom { value: String },
 }
 
 impl From<RoomVisibility> for Visibility {
@@ -1013,6 +1562,17 @@ impl From<RoomVisibility> for Visibility {
         match value {
             RoomVisibility::Public => Self::Public,
             RoomVisibility::Private => Self::Private,
+            RoomVisibility::Custom { value } => value.as_str().into(),
+        }
+    }
+}
+
+impl From<Visibility> for RoomVisibility {
+    fn from(value: Visibility) -> Self {
+        match value {
+            Visibility::Public => Self::Public,
+            Visibility::Private => Self::Private,
+            _ => Self::Custom { value: value.as_str().to_owned() },
         }
     }
 }
@@ -1063,23 +1623,22 @@ pub struct Session {
     /// Additional data for this session if OpenID Connect was used for
     /// authentication.
     pub oidc_data: Option<String>,
-    /// The URL for the sliding sync proxy used for this session.
-    pub sliding_sync_proxy: Option<String>,
+    /// The sliding sync version used for this session.
+    pub sliding_sync_version: SlidingSyncVersion,
 }
 
 impl Session {
     fn new(
         auth_api: AuthApi,
         homeserver_url: String,
-        sliding_sync_proxy: Option<String>,
+        sliding_sync_version: SlidingSyncVersion,
     ) -> Result<Session, ClientError> {
         match auth_api {
             // Build the session from the regular Matrix Auth Session.
             AuthApi::Matrix(a) => {
-                let matrix_sdk::matrix_auth::MatrixSession {
+                let matrix_sdk::authentication::matrix::MatrixSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
-                    tokens:
-                        matrix_sdk::matrix_auth::MatrixSessionTokens { access_token, refresh_token },
+                    tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
                 } = a.session().context("Missing session")?;
 
                 Ok(Session {
@@ -1089,34 +1648,17 @@ impl Session {
                     device_id: device_id.to_string(),
                     homeserver_url,
                     oidc_data: None,
-                    sliding_sync_proxy,
+                    sliding_sync_version,
                 })
             }
             // Build the session from the OIDC UserSession.
-            AuthApi::Oidc(api) => {
-                let matrix_sdk::oidc::UserSession {
+            AuthApi::OAuth(api) => {
+                let matrix_sdk::authentication::oauth::UserSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
-                    tokens:
-                        matrix_sdk::oidc::OidcSessionTokens {
-                            access_token,
-                            refresh_token,
-                            latest_id_token,
-                        },
-                    issuer_info,
+                    tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
                 } = api.user_session().context("Missing session")?;
-                let client_id = api
-                    .client_credentials()
-                    .context("OIDC client credentials are missing.")?
-                    .client_id()
-                    .to_owned();
-                let client_metadata =
-                    api.client_metadata().context("OIDC client metadata is missing.")?.clone();
-                let oidc_data = OidcSessionData {
-                    client_id,
-                    client_metadata,
-                    latest_id_token: latest_id_token.map(|t| t.to_string()),
-                    issuer_info,
-                };
+                let client_id = api.client_id().context("OIDC client ID is missing.")?.clone();
+                let oidc_data = OidcSessionData { client_id };
 
                 let oidc_data = serde_json::to_string(&oidc_data).ok();
                 Ok(Session {
@@ -1126,11 +1668,15 @@ impl Session {
                     device_id: device_id.to_string(),
                     homeserver_url,
                     oidc_data,
-                    sliding_sync_proxy,
+                    sliding_sync_version,
                 })
             }
             _ => Err(anyhow!("Unknown authentication API").into()),
         }
+    }
+
+    fn into_tokens(self) -> matrix_sdk::SessionTokens {
+        SessionTokens { access_token: self.access_token, refresh_token: self.refresh_token }
     }
 }
 
@@ -1144,51 +1690,32 @@ impl TryFrom<Session> for AuthSession {
             device_id,
             homeserver_url: _,
             oidc_data,
-            sliding_sync_proxy: _,
+            sliding_sync_version: _,
         } = value;
 
         if let Some(oidc_data) = oidc_data {
             // Create an OidcSession.
-            let oidc_data = serde_json::from_str::<OidcUnvalidatedSessionData>(&oidc_data)?
-                .validate()
-                .context("OIDC metadata validation failed.")?;
-            let latest_id_token = oidc_data
-                .latest_id_token
-                .map(TryInto::try_into)
-                .transpose()
-                .context("OIDC latest_id_token is invalid.")?;
+            let oidc_data = serde_json::from_str::<OidcSessionData>(&oidc_data)?;
 
-            let user_session = matrix_sdk::oidc::UserSession {
+            let user_session = matrix_sdk::authentication::oauth::UserSession {
                 meta: matrix_sdk::SessionMeta {
                     user_id: user_id.try_into()?,
                     device_id: device_id.into(),
                 },
-                tokens: matrix_sdk::oidc::OidcSessionTokens {
-                    access_token,
-                    refresh_token,
-                    latest_id_token,
-                },
-                issuer_info: oidc_data.issuer_info,
+                tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
             };
 
-            let session = OidcSession {
-                credentials: ClientCredentials::None { client_id: oidc_data.client_id },
-                metadata: oidc_data.client_metadata,
-                user: user_session,
-            };
+            let session = OAuthSession { client_id: oidc_data.client_id, user: user_session };
 
-            Ok(AuthSession::Oidc(session))
+            Ok(AuthSession::OAuth(session.into()))
         } else {
             // Create a regular Matrix Session.
-            let session = matrix_sdk::matrix_auth::MatrixSession {
+            let session = matrix_sdk::authentication::matrix::MatrixSession {
                 meta: matrix_sdk::SessionMeta {
                     user_id: user_id.try_into()?,
                     device_id: device_id.into(),
                 },
-                tokens: matrix_sdk::matrix_auth::MatrixSessionTokens {
-                    access_token,
-                    refresh_token,
-                },
+                tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
             };
 
             Ok(AuthSession::Matrix(session))
@@ -1198,34 +1725,9 @@ impl TryFrom<Session> for AuthSession {
 
 /// Represents a client registration against an OpenID Connect authentication
 /// issuer.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub(crate) struct OidcSessionData {
-    client_id: String,
-    client_metadata: VerifiedClientMetadata,
-    latest_id_token: Option<String>,
-    issuer_info: AuthenticationServerInfo,
-}
-
-/// Represents an unverified client registration against an OpenID Connect
-/// authentication issuer. Call `validate` on this to use it for restoration.
-#[derive(Deserialize)]
-pub(crate) struct OidcUnvalidatedSessionData {
-    client_id: String,
-    client_metadata: ClientMetadata,
-    latest_id_token: Option<String>,
-    issuer_info: AuthenticationServerInfo,
-}
-
-impl OidcUnvalidatedSessionData {
-    /// Validates the data so that it can be used.
-    fn validate(self) -> Result<OidcSessionData, ClientMetadataVerificationError> {
-        Ok(OidcSessionData {
-            client_id: self.client_id,
-            client_metadata: self.client_metadata.validate()?,
-            latest_id_token: self.latest_id_token,
-            issuer_info: self.issuer_info,
-        })
-    }
+    client_id: ClientId,
 }
 
 #[derive(uniffi::Enum)]
@@ -1234,9 +1736,11 @@ pub enum AccountManagementAction {
     SessionsList,
     SessionView { device_id: String },
     SessionEnd { device_id: String },
+    AccountDeactivate,
+    CrossSigningReset,
 }
 
-impl From<AccountManagementAction> for OidcAccountManagementAction {
+impl From<AccountManagementAction> for AccountManagementActionFull {
     fn from(value: AccountManagementAction) -> Self {
         match value {
             AccountManagementAction::Profile => Self::Profile,
@@ -1247,11 +1751,13 @@ impl From<AccountManagementAction> for OidcAccountManagementAction {
             AccountManagementAction::SessionEnd { device_id } => {
                 Self::SessionEnd { device_id: device_id.into() }
             }
+            AccountManagementAction::AccountDeactivate => Self::AccountDeactivate,
+            AccountManagementAction::CrossSigningReset => Self::CrossSigningReset,
         }
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 fn gen_transaction_id() -> String {
     TransactionId::new().to_string()
 }
@@ -1269,7 +1775,7 @@ impl MediaFileHandle {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl MediaFileHandle {
     /// Get the media file's path.
     pub fn path(&self) -> Result<String, ClientError> {
@@ -1300,5 +1806,219 @@ impl MediaFileHandle {
                 }
             },
         )
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum SlidingSyncVersion {
+    None,
+    Native,
+}
+
+impl From<SdkSlidingSyncVersion> for SlidingSyncVersion {
+    fn from(value: SdkSlidingSyncVersion) -> Self {
+        match value {
+            SdkSlidingSyncVersion::None => Self::None,
+            SdkSlidingSyncVersion::Native => Self::Native,
+        }
+    }
+}
+
+impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
+    type Error = ClientError;
+
+    fn try_from(value: SlidingSyncVersion) -> Result<Self, Self::Error> {
+        Ok(match value {
+            SlidingSyncVersion::None => Self::None,
+            SlidingSyncVersion::Native => Self::Native,
+        })
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum OidcPrompt {
+    /// The Authorization Server should prompt the End-User to create a user
+    /// account.
+    ///
+    /// Defined in [Initiating User Registration via OpenID Connect](https://openid.net/specs/openid-connect-prompt-create-1_0.html).
+    Create,
+
+    /// The Authorization Server should prompt the End-User for
+    /// reauthentication.
+    Login,
+
+    /// The Authorization Server should prompt the End-User for consent before
+    /// returning information to the Client.
+    Consent,
+
+    /// An unknown value.
+    Unknown { value: String },
+}
+
+impl From<RumaOidcPrompt> for OidcPrompt {
+    fn from(value: RumaOidcPrompt) -> Self {
+        match value {
+            RumaOidcPrompt::Create => Self::Create,
+            value => match value.as_str() {
+                "consent" => Self::Consent,
+                "login" => Self::Login,
+                _ => Self::Unknown { value: value.to_string() },
+            },
+        }
+    }
+}
+
+impl From<OidcPrompt> for RumaOidcPrompt {
+    fn from(value: OidcPrompt) -> Self {
+        match value {
+            OidcPrompt::Create => Self::Create,
+            OidcPrompt::Consent => Self::from("consent"),
+            OidcPrompt::Login => Self::from("login"),
+            OidcPrompt::Unknown { value } => value.into(),
+        }
+    }
+}
+
+/// The rule used for users wishing to join this room.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum JoinRule {
+    /// Anyone can join the room without any prior action.
+    Public,
+
+    /// A user who wishes to join the room must first receive an invite to the
+    /// room from someone already inside of the room.
+    Invite,
+
+    /// Users can join the room if they are invited, or they can request an
+    /// invite to the room.
+    ///
+    /// They can be allowed (invited) or denied (kicked/banned) access.
+    Knock,
+
+    /// Reserved but not yet implemented by the Matrix specification.
+    Private,
+
+    /// Users can join the room if they are invited, or if they meet any of the
+    /// conditions described in a set of [`AllowRule`]s.
+    Restricted { rules: Vec<AllowRule> },
+
+    /// Users can join the room if they are invited, or if they meet any of the
+    /// conditions described in a set of [`AllowRule`]s, or they can request
+    /// an invite to the room.
+    KnockRestricted { rules: Vec<AllowRule> },
+
+    /// A custom join rule, up for interpretation by the consumer.
+    Custom {
+        /// The string representation for this custom rule.
+        repr: String,
+    },
+}
+
+/// An allow rule which defines a condition that allows joining a room.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AllowRule {
+    /// Only a member of the `room_id` Room can join the one this rule is used
+    /// in.
+    RoomMembership { room_id: String },
+
+    /// A custom allow rule implementation, containing its JSON representation
+    /// as a `String`.
+    Custom { json: String },
+}
+
+impl TryFrom<JoinRule> for RumaJoinRule {
+    type Error = ClientError;
+
+    fn try_from(value: JoinRule) -> Result<Self, Self::Error> {
+        match value {
+            JoinRule::Public => Ok(Self::Public),
+            JoinRule::Invite => Ok(Self::Invite),
+            JoinRule::Knock => Ok(Self::Knock),
+            JoinRule::Private => Ok(Self::Private),
+            JoinRule::Restricted { rules } => {
+                let rules = ruma_allow_rules_from_ffi(rules)?;
+                Ok(Self::Restricted(ruma::events::room::join_rules::Restricted::new(rules)))
+            }
+            JoinRule::KnockRestricted { rules } => {
+                let rules = ruma_allow_rules_from_ffi(rules)?;
+                Ok(Self::KnockRestricted(ruma::events::room::join_rules::Restricted::new(rules)))
+            }
+            JoinRule::Custom { repr } => Ok(serde_json::from_str(&repr)?),
+        }
+    }
+}
+
+fn ruma_allow_rules_from_ffi(value: Vec<AllowRule>) -> Result<Vec<RumaAllowRule>, ClientError> {
+    let mut ret = Vec::with_capacity(value.len());
+    for rule in value {
+        let rule: Result<RumaAllowRule, ClientError> = rule.try_into();
+        match rule {
+            Ok(rule) => ret.push(rule),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(ret)
+}
+
+impl TryFrom<AllowRule> for RumaAllowRule {
+    type Error = ClientError;
+
+    fn try_from(value: AllowRule) -> Result<Self, Self::Error> {
+        match value {
+            AllowRule::RoomMembership { room_id } => {
+                let room_id = RoomId::parse(room_id)?;
+                Ok(Self::RoomMembership(ruma::events::room::join_rules::RoomMembership::new(
+                    room_id,
+                )))
+            }
+            AllowRule::Custom { json } => Ok(Self::_Custom(Box::new(serde_json::from_str(&json)?))),
+        }
+    }
+}
+
+impl TryFrom<RumaJoinRule> for JoinRule {
+    type Error = String;
+    fn try_from(value: RumaJoinRule) -> Result<Self, Self::Error> {
+        match value {
+            RumaJoinRule::Knock => Ok(JoinRule::Knock),
+            RumaJoinRule::Public => Ok(JoinRule::Public),
+            RumaJoinRule::Private => Ok(JoinRule::Private),
+            RumaJoinRule::KnockRestricted(restricted) => {
+                let rules = restricted.allow.into_iter().map(TryInto::try_into).collect::<Result<
+                    Vec<_>,
+                    Self::Error,
+                >>(
+                )?;
+                Ok(JoinRule::KnockRestricted { rules })
+            }
+            RumaJoinRule::Restricted(restricted) => {
+                let rules = restricted.allow.into_iter().map(TryInto::try_into).collect::<Result<
+                    Vec<_>,
+                    Self::Error,
+                >>(
+                )?;
+                Ok(JoinRule::Restricted { rules })
+            }
+            RumaJoinRule::Invite => Ok(JoinRule::Invite),
+            RumaJoinRule::_Custom(_) => Ok(JoinRule::Custom { repr: value.as_str().to_owned() }),
+            _ => Err(format!("Unknown JoinRule: {:?}", value)),
+        }
+    }
+}
+
+impl TryFrom<RumaAllowRule> for AllowRule {
+    type Error = String;
+    fn try_from(value: RumaAllowRule) -> Result<Self, Self::Error> {
+        match value {
+            RumaAllowRule::RoomMembership(membership) => {
+                Ok(AllowRule::RoomMembership { room_id: membership.room_id.to_string() })
+            }
+            RumaAllowRule::_Custom(repr) => {
+                let json = serde_json::to_string(&repr)
+                    .map_err(|e| format!("Couldn't serialize custom AllowRule: {e:?}"))?;
+                Ok(Self::Custom { json })
+            }
+            _ => Err(format!("Invalid AllowRule: {:?}", value)),
+        }
     }
 }

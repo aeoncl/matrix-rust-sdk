@@ -1240,8 +1240,11 @@ pub static MIXED_LEFT_ROOM_ID: Lazy<&RoomId> =
 /// In the [`MIXED_SYNC`], the room id of the invited room.
 pub static MIXED_INVITED_ROOM_ID: Lazy<&RoomId> =
     Lazy::new(|| room_id!("!SVkFJHzfwvuaIEawgE:localhost"));
+/// In the [`MIXED_SYNC`], the room id of the knocked room.
+pub static MIXED_KNOCKED_ROOM_ID: Lazy<&RoomId> =
+    Lazy::new(|| room_id!("!SVkFJHzfwvuaIEawgF:localhost"));
 
-/// A sync that contains updates to joined/invited/left rooms.
+/// A sync that contains updates to joined/invited/knocked/left rooms.
 pub static MIXED_SYNC: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "account_data": {
@@ -1351,6 +1354,30 @@ pub static MIXED_SYNC: Lazy<JsonValue> = Lazy::new(|| {
                         "state_key": "@bob:example.com",
                         "content": {
                           "membership": "invite"
+                        }
+                      }
+                    ]
+                  }
+                }
+            },
+            "knock": {
+                *MIXED_KNOCKED_ROOM_ID: {
+                  "knock_state": {
+                    "events": [
+                      {
+                        "sender": "@alice:example.com",
+                        "type": "m.room.name",
+                        "state_key": "",
+                        "content": {
+                          "name": "My Room Name"
+                        }
+                      },
+                      {
+                        "sender": "@bob:example.com",
+                        "type": "m.room.member",
+                        "state_key": "@bob:example.com",
+                        "content": {
+                          "membership": "knock"
                         }
                       }
                     ]
@@ -1475,7 +1502,7 @@ pub static VOIP_SYNC: Lazy<JsonValue> = Lazy::new(|| {
                                     "call_id": "12345",
                                     "candidates": [
                                         {
-                                            "candidate": "candidate:863018703 1 udp 2122260223 10.9.64.156 43670 typ host generation 0",
+                                            "candidate": "candidate:863018703 1 udp 2122260223 10.9.64.156 43670 type host generation 0",
                                             "sdpMLineIndex": 0,
                                             "sdpMid": "audio"
                                         }
@@ -1503,6 +1530,336 @@ pub static VOIP_SYNC: Lazy<JsonValue> = Lazy::new(|| {
                                 "type": "m.call.hangup",
                                 "unsigned": {
                                     "age": 1234
+                                }
+                            }
+                        ],
+                        "limited": true,
+                        "prev_batch": "t392-516_47314_0_7_1_1_1_11444_1"
+                    },
+                    "unread_notifications": {
+                        "highlight_count": 0,
+                        "notification_count": 11
+                    }
+                }
+            },
+            "leave": {}
+        },
+        "to_device": {
+            "events": []
+        },
+        "presence": {
+            "events": []
+        }
+    })
+});
+
+pub static SYNC_ADMIN_AND_MOD: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "device_one_time_keys_count": {},
+        "next_batch": "s526_47314_0_7_1_1_1_11444_1",
+        "device_lists": {
+            "changed": [
+                "@admin:example.org"
+            ],
+            "left": []
+        },
+        "rooms": {
+            "invite": {},
+            "join": {
+                *DEFAULT_TEST_ROOM_ID: {
+                    "summary": {
+                        "m.heroes": [
+                          "@example2:localhost"
+                        ],
+                        "m.joined_member_count": 2,
+                        "m.invited_member_count": 0
+                      },
+                    "account_data": {
+                        "events": []
+                    },
+                    "ephemeral": {
+                        "events": []
+                    },
+                    "state": {
+                        "events": [
+                            {
+                                "content": {
+                                    "join_rule": "public"
+                                },
+                                "event_id": "$15139375514WsgmR:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.join_rules",
+                                "unsigned": {
+                                    "age": 7034220
+                                }
+                            },
+                            {
+                                "content": {
+                                    "avatar_url": null,
+                                    "displayname": "admin",
+                                    "membership": "join"
+                                },
+                                "event_id": "$151800140517rfvjc:localhost",
+                                "membership": "join",
+                                "origin_server_ts": 151800140000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "@admin:localhost",
+                                "type": "m.room.member",
+                                "unsigned": {
+                                    "age": 297036,
+                                    "replaces_state": "$151800111315tsynI:localhost"
+                                }
+                            },
+                            {
+                                "content": {
+                                    "avatar_url": null,
+                                    "displayname": "mod",
+                                    "membership": "join"
+                                },
+                                "event_id": "$151800140518rfvjc:localhost",
+                                "membership": "join",
+                                "origin_server_ts": 1518001450000000_u64,
+                                "sender": "@mod:localhost",
+                                "state_key": "@mod:localhost",
+                                "type": "m.room.member",
+                                "unsigned": {
+                                    "age": 297035,
+                                }
+                            },
+                            {
+                                "content": {
+                                    "history_visibility": "shared"
+                                },
+                                "event_id": "$15139375515VaJEY:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.history_visibility",
+                                "unsigned": {
+                                    "age": 703422
+                                }
+                            },
+                            {
+                                "content": {
+                                    "creator": "@example:localhost"
+                                },
+                                "event_id": "$15139375510KUZHi:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.create",
+                                "unsigned": {
+                                    "age": 703422
+                                }
+                            },
+                            {
+                                "content": {
+                                    "topic": "room topic"
+                                },
+                                "event_id": "$151957878228ssqrJ:localhost",
+                                "origin_server_ts": 151957878000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.topic",
+                                "unsigned": {
+                                    "age": 1392989709,
+                                    "prev_content": {
+                                        "topic": "test"
+                                    },
+                                    "prev_sender": "@example:localhost",
+                                    "replaces_state": "$151957069225EVYKm:localhost"
+                                }
+                            },
+                            {
+                                "content": {
+                                    "ban": 50,
+                                    "events": {
+                                        "m.room.avatar": 50,
+                                        "m.room.canonical_alias": 50,
+                                        "m.room.history_visibility": 100,
+                                        "m.room.name": 50,
+                                        "m.room.power_levels": 100
+                                    },
+                                    "events_default": 0,
+                                    "invite": 0,
+                                    "kick": 50,
+                                    "redact": 50,
+                                    "state_default": 50,
+                                    "users": {
+                                        "@admin:localhost": 100,
+                                        "@mod:localhost": 50
+                                    },
+                                    "users_default": 0
+                                },
+                                "event_id": "$15139375512JaHAW:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.power_levels",
+                                "unsigned": {
+                                    "age": 703422
+                                }
+                            }
+                        ]
+                    },
+                    "timeline": {
+                        "events": [
+                            {
+                                "content": {
+                                    "body": "baba",
+                                    "format": "org.matrix.custom.html",
+                                    "formatted_body": "<strong>baba</strong>",
+                                    "msgtype": "m.text"
+                                },
+                                "event_id": "$152037280074GZeOm:localhost",
+                                "origin_server_ts": 152037280000000_u64,
+                                "sender": "@admin:localhost",
+                                "type": "m.room.message",
+                                "unsigned": {
+                                    "age": 598971425
+                                }
+                            }
+                        ],
+                        "limited": true,
+                        "prev_batch": "t392-516_47314_0_7_1_1_1_11444_1"
+                    },
+                    "unread_notifications": {
+                        "highlight_count": 0,
+                        "notification_count": 11
+                    }
+                }
+            },
+            "leave": {}
+        },
+        "to_device": {
+            "events": []
+        },
+        "presence": {
+            "events": []
+        }
+    })
+});
+
+pub static CUSTOM_ROOM_POWER_LEVELS: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "device_one_time_keys_count": {},
+        "next_batch": "s526_47314_0_7_1_1_1_11444_1",
+        "device_lists": {
+            "changed": [
+                "@admin:example.org"
+            ],
+            "left": []
+        },
+        "rooms": {
+            "invite": {},
+            "join": {
+                *DEFAULT_TEST_ROOM_ID: {
+                    "summary": {
+                        "m.heroes": [
+                          "@example2:localhost"
+                        ],
+                        "m.joined_member_count": 1,
+                        "m.invited_member_count": 0
+                      },
+                    "account_data": {
+                        "events": []
+                    },
+                    "ephemeral": {
+                        "events": []
+                    },
+                    "state": {
+                        "events": [
+                            {
+                                "content": {
+                                    "join_rule": "public"
+                                },
+                                "event_id": "$15139375514WsgmR:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.join_rules",
+                                "unsigned": {
+                                    "age": 7034220
+                                }
+                            },
+                            {
+                                "content": {
+                                    "avatar_url": null,
+                                    "displayname": "admin",
+                                    "membership": "join"
+                                },
+                                "event_id": "$151800140517rfvjc:localhost",
+                                "membership": "join",
+                                "origin_server_ts": 151800140000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "@admin:localhost",
+                                "type": "m.room.member",
+                                "unsigned": {
+                                    "age": 297036,
+                                    "replaces_state": "$151800111315tsynI:localhost"
+                                }
+                            },
+                            {
+                                "content": {
+                                    "creator": "@example:localhost"
+                                },
+                                "event_id": "$15139375510KUZHi:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.create",
+                                "unsigned": {
+                                    "age": 703422
+                                }
+                            },
+                            {
+                                "content": {
+                                    "ban": 100,
+                                    "events": {
+                                        "m.room.avatar": 100,
+                                        "m.room.canonical_alias": 50,
+                                        "m.room.history_visibility": 100,
+                                        "m.room.name": 50,
+                                        "m.room.power_levels": 100
+                                    },
+                                    "events_default": 0,
+                                    "invite": 0,
+                                    "kick": 50,
+                                    "redact": 50,
+                                    "state_default": 50,
+                                    "users": {
+                                        "@admin:localhost": 100
+                                    },
+                                    "users_default": 0
+                                },
+                                "event_id": "$15139375512JaHAW:localhost",
+                                "origin_server_ts": 151393755000000_u64,
+                                "sender": "@admin:localhost",
+                                "state_key": "",
+                                "type": "m.room.power_levels",
+                                "unsigned": {
+                                    "age": 703422
+                                }
+                            }
+                        ]
+                    },
+                    "timeline": {
+                        "events": [
+                            {
+                                "content": {
+                                    "body": "baba",
+                                    "format": "org.matrix.custom.html",
+                                    "formatted_body": "<strong>baba</strong>",
+                                    "msgtype": "m.text"
+                                },
+                                "event_id": "$152037280074GZeOm:localhost",
+                                "origin_server_ts": 152037280000000_u64,
+                                "sender": "@admin:localhost",
+                                "type": "m.room.message",
+                                "unsigned": {
+                                    "age": 598971425
                                 }
                             }
                         ],

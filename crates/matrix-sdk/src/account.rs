@@ -15,7 +15,7 @@
 // limitations under the License.
 
 use matrix_sdk_base::{
-    media::{MediaFormat, MediaRequest},
+    media::{MediaFormat, MediaRequestParameters},
     store::StateStoreExt,
     StateStoreDataKey, StateStoreDataValue,
 };
@@ -44,12 +44,12 @@ use ruma::{
     push::Ruleset,
     serde::Raw,
     thirdparty::Medium,
-    ClientSecret, MxcUri, OwnedMxcUri, OwnedUserId, RoomId, SessionId, UInt, UserId,
+    ClientSecret, MxcUri, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, SessionId, UInt, UserId,
 };
 use serde::Deserialize;
 use tracing::error;
 
-use crate::{config::RequestConfig, Client, Error, HttpError, Result};
+use crate::{config::RequestConfig, Client, Error, Result};
 
 /// A high-level API to manage the client owner's account.
 ///
@@ -61,6 +61,10 @@ pub struct Account {
 }
 
 impl Account {
+    /// The maximum number of visited room identifiers to keep in the state
+    /// store.
+    const VISITED_ROOMS_LIMIT: usize = 20;
+
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
@@ -87,7 +91,7 @@ impl Account {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request = get_display_name::v3::Request::new(user_id.to_owned());
         let request_config = self.client.request_config().force_auth();
-        let response = self.client.send(request, Some(request_config)).await?;
+        let response = self.client.send(request).with_request_config(request_config).await?;
         Ok(response.displayname)
     }
 
@@ -111,11 +115,15 @@ impl Account {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request =
             set_display_name::v3::Request::new(user_id.to_owned(), name.map(ToOwned::to_owned));
-        self.client.send(request, None).await?;
+        self.client.send(request).await?;
         Ok(())
     }
 
     /// Get the MXC URI of the account's avatar, if set.
+    ///
+    /// This always sends a request to the server to retrieve this information.
+    /// If successful, this fills the cache, and makes it so that
+    /// [`Self::get_cached_avatar_url`] will always return something.
     ///
     /// # Examples
     ///
@@ -139,30 +147,36 @@ impl Account {
 
         let config = Some(RequestConfig::new().force_auth());
 
-        let response = self.client.send(request, config).await?;
+        let response = self.client.send(request).with_request_config(config).await?;
         if let Some(url) = response.avatar_url.clone() {
             // If an avatar is found cache it.
             let _ = self
                 .client
-                .store()
+                .state_store()
                 .set_kv_data(
                     StateStoreDataKey::UserAvatarUrl(user_id),
-                    StateStoreDataValue::UserAvatarUrl(url.to_string()),
+                    StateStoreDataValue::UserAvatarUrl(url),
                 )
                 .await;
         } else {
             // If there is no avatar the user has removed it and we uncache it.
-            let _ =
-                self.client.store().remove_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await;
+            let _ = self
+                .client
+                .state_store()
+                .remove_kv_data(StateStoreDataKey::UserAvatarUrl(user_id))
+                .await;
         }
         Ok(response.avatar_url)
     }
 
     /// Get the URL of the account's avatar, if is stored in cache.
-    pub async fn get_cached_avatar_url(&self) -> Result<Option<String>> {
+    pub async fn get_cached_avatar_url(&self) -> Result<Option<OwnedMxcUri>> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
-        let data =
-            self.client.store().get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await?;
+        let data = self
+            .client
+            .state_store()
+            .get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id))
+            .await?;
         Ok(data.map(|v| v.into_user_avatar_url().expect("Session data is not a user avatar url")))
     }
 
@@ -173,7 +187,7 @@ impl Account {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
         let request =
             set_avatar_url::v3::Request::new(user_id.to_owned(), url.map(ToOwned::to_owned));
-        self.client.send(request, None).await?;
+        self.client.send(request).await?;
         Ok(())
     }
 
@@ -209,7 +223,7 @@ impl Account {
     /// ```
     pub async fn get_avatar(&self, format: MediaFormat) -> Result<Option<Vec<u8>>> {
         if let Some(url) = self.get_avatar_url().await? {
-            let request = MediaRequest { source: MediaSource::Plain(url), format };
+            let request = MediaRequestParameters { source: MediaSource::Plain(url), format };
             Ok(Some(self.client.media().get_media_content(&request, true).await?))
         } else {
             Ok(None)
@@ -244,7 +258,7 @@ impl Account {
     ///
     /// [`Media::upload()`]: crate::Media::upload
     pub async fn upload_avatar(&self, content_type: &Mime, data: Vec<u8>) -> Result<OwnedMxcUri> {
-        let upload_response = self.client.media().upload(content_type, data).await?;
+        let upload_response = self.client.media().upload(content_type, data, None).await?;
         self.set_avatar_url(Some(&upload_response.content_uri)).await?;
         Ok(upload_response.content_uri)
     }
@@ -261,18 +275,33 @@ impl Account {
     /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let client = Client::new(homeserver).await?;
-    /// let profile = client.account().get_profile().await?;
+    /// let profile = client.account().fetch_user_profile().await?;
     /// println!(
     ///     "You are '{:?}' with avatar '{:?}'",
     ///     profile.displayname, profile.avatar_url
     /// );
     /// # anyhow::Ok(()) };
     /// ```
-    pub async fn get_profile(&self) -> Result<get_profile::v3::Response> {
+    pub async fn fetch_user_profile(&self) -> Result<get_profile::v3::Response> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        self.fetch_user_profile_of(user_id).await
+    }
+
+    /// Get the profile for a given user id
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` the matrix id this function downloads the profile for
+    pub async fn fetch_user_profile_of(
+        &self,
+        user_id: &UserId,
+    ) -> Result<get_profile::v3::Response> {
         let request = get_profile::v3::Request::new(user_id.to_owned());
-        let request_config = self.client.request_config().force_auth();
-        Ok(self.client.send(request, Some(request_config)).await?)
+        Ok(self
+            .client
+            .send(request)
+            .with_request_config(RequestConfig::short_retry().force_auth())
+            .await?)
     }
 
     /// Change the password of the account.
@@ -282,10 +311,10 @@ impl Account {
     /// * `new_password` - The new password to set.
     ///
     /// * `auth_data` - This request uses the [User-Interactive Authentication
-    /// API][uiaa]. The first request needs to set this to `None` and will
-    /// always fail with an [`UiaaResponse`]. The response will contain
-    /// information for the interactive auth and the same request needs to be
-    /// made but this time with some `auth_data` provided.
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail with an [`UiaaResponse`]. The response will contain
+    ///   information for the interactive auth and the same request needs to be
+    ///   made but this time with some `auth_data` provided.
     ///
     /// # Returns
     ///
@@ -325,7 +354,7 @@ impl Account {
         let request = assign!(change_password::v3::Request::new(new_password.to_owned()), {
             auth: auth_data,
         });
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Deactivate this account definitively.
@@ -333,13 +362,16 @@ impl Account {
     /// # Arguments
     ///
     /// * `id_server` - The identity server from which to unbind the user’s
-    /// [Third Party Identifiers][3pid].
+    ///   [Third Party Identifiers][3pid].
     ///
     /// * `auth_data` - This request uses the [User-Interactive Authentication
-    /// API][uiaa]. The first request needs to set this to `None` and will
-    /// always fail with an [`UiaaResponse`]. The response will contain
-    /// information for the interactive auth and the same request needs to be
-    /// made but this time with some `auth_data` provided.
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail with an [`UiaaResponse`]. The response will contain
+    ///   information for the interactive auth and the same request needs to be
+    ///   made but this time with some `auth_data` provided.
+    ///
+    /// * `erase` - Whether the user would like their content to be erased as
+    ///   much as possible from the server.
     ///
     /// # Examples
     ///
@@ -357,7 +389,7 @@ impl Account {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let client = Client::new(homeserver).await?;
     /// # let account = client.account();
-    /// let response = account.deactivate(None, None).await;
+    /// let response = account.deactivate(None, None, false).await;
     ///
     /// // Proceed with UIAA.
     /// # anyhow::Ok(()) };
@@ -369,12 +401,14 @@ impl Account {
         &self,
         id_server: Option<&str>,
         auth_data: Option<AuthData>,
+        erase_data: bool,
     ) -> Result<deactivate::v3::Response> {
         let request = assign!(deactivate::v3::Request::new(), {
             id_server: id_server.map(ToOwned::to_owned),
             auth: auth_data,
+            erase: erase_data,
         });
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Get the registered [Third Party Identifiers][3pid] on the homeserver of
@@ -404,7 +438,7 @@ impl Account {
     /// [3pid]: https://spec.matrix.org/v1.2/appendices/#3pid-types
     pub async fn get_3pids(&self) -> Result<get_3pids::v3::Response> {
         let request = get_3pids::v3::Request::new();
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Request a token to validate an email address as a [Third Party
@@ -417,22 +451,21 @@ impl Account {
     /// # Arguments
     ///
     /// * `client_secret` - A client-generated secret string used to protect
-    /// this session.
+    ///   this session.
     ///
     /// * `email` - The email address to validate.
     ///
     /// * `send_attempt` - The attempt number. This number needs to be
-    /// incremented if you want to request another token for the same
-    /// validation.
+    ///   incremented if you want to request another token for the same
+    ///   validation.
     ///
     /// # Returns
     ///
-    /// * `sid` - The session ID to be used in following requests for
-    /// this 3PID.
+    /// * `sid` - The session ID to be used in following requests for this 3PID.
     ///
-    /// * `submit_url` - If present, the user will submit the token to
-    /// the client, that must send it to this URL. If not, the client will not
-    /// be involved in the token submission.
+    /// * `submit_url` - If present, the user will submit the token to the
+    ///   client, that must send it to this URL. If not, the client will not be
+    ///   involved in the token submission.
     ///
     /// This method might return an [`ErrorKind::ThreepidInUse`] error if the
     /// email address is already registered for this account or another, or an
@@ -476,7 +509,7 @@ impl Account {
             email.to_owned(),
             send_attempt,
         );
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Request a token to validate a phone number as a [Third Party
@@ -489,25 +522,25 @@ impl Account {
     /// # Arguments
     ///
     /// * `client_secret` - A client-generated secret string used to protect
-    /// this session.
+    ///   this session.
     ///
     /// * `country` - The two-letter uppercase ISO-3166-1 alpha-2 country code
-    /// that the number in phone_number should be parsed as if it were dialled
-    /// from.
+    ///   that the number in phone_number should be parsed as if it were dialled
+    ///   from.
     ///
     /// * `phone_number` - The phone number to validate.
     ///
     /// * `send_attempt` - The attempt number. This number needs to be
-    /// incremented if you want to request another token for the same
-    /// validation.
+    ///   incremented if you want to request another token for the same
+    ///   validation.
     ///
     /// # Returns
     ///
     /// * `sid` - The session ID to be used in following requests for this 3PID.
     ///
     /// * `submit_url` - If present, the user will submit the token to the
-    /// client, that must send it to this URL. If not, the client will not be
-    /// involved in the token submission.
+    ///   client, that must send it to this URL. If not, the client will not be
+    ///   involved in the token submission.
     ///
     /// This method might return an [`ErrorKind::ThreepidInUse`] error if the
     /// phone number is already registered for this account or another, or an
@@ -553,7 +586,7 @@ impl Account {
             phone_number.to_owned(),
             send_attempt,
         );
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Add a [Third Party Identifier][3pid] on the homeserver for this
@@ -569,18 +602,18 @@ impl Account {
     /// # Arguments
     ///
     /// * `client_secret` - The same client secret used in
-    /// [`Account::request_3pid_email_token()`] or
-    /// [`Account::request_3pid_msisdn_token()`].
+    ///   [`Account::request_3pid_email_token()`] or
+    ///   [`Account::request_3pid_msisdn_token()`].
     ///
     /// * `sid` - The session ID returned in
-    /// [`Account::request_3pid_email_token()`] or
-    /// [`Account::request_3pid_msisdn_token()`].
+    ///   [`Account::request_3pid_email_token()`] or
+    ///   [`Account::request_3pid_msisdn_token()`].
     ///
     /// * `auth_data` - This request uses the [User-Interactive Authentication
-    /// API][uiaa]. The first request needs to set this to `None` and will
-    /// always fail with an [`UiaaResponse`]. The response will contain
-    /// information for the interactive auth and the same request needs to be
-    /// made but this time with some `auth_data` provided.
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail with an [`UiaaResponse`]. The response will contain
+    ///   information for the interactive auth and the same request needs to be
+    ///   made but this time with some `auth_data` provided.
     ///
     /// [3pid]: https://spec.matrix.org/v1.2/appendices/#3pid-types
     /// [uiaa]: https://spec.matrix.org/v1.2/client-server-api/#user-interactive-authentication-api
@@ -596,7 +629,7 @@ impl Account {
             assign!(add_3pid::v3::Request::new(client_secret.to_owned(), sid.to_owned()), {
                 auth: auth_data
             });
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Delete a [Third Party Identifier][3pid] from the homeserver for this
@@ -609,17 +642,17 @@ impl Account {
     /// * `medium` - The type of the 3PID.
     ///
     /// * `id_server` - The identity server to unbind from. If not provided, the
-    /// homeserver should unbind the 3PID from the identity server it was bound
-    /// to previously.
+    ///   homeserver should unbind the 3PID from the identity server it was
+    ///   bound to previously.
     ///
     /// # Returns
     ///
     /// * [`ThirdPartyIdRemovalStatus::Success`] if the 3PID was also unbound
-    /// from the identity server.
+    ///   from the identity server.
     ///
     /// * [`ThirdPartyIdRemovalStatus::NoSupport`] if the 3PID was not unbound
-    /// from the identity server. This can also mean that the 3PID was not bound
-    /// to an identity server in the first place.
+    ///   from the identity server. This can also mean that the 3PID was not
+    ///   bound to an identity server in the first place.
     ///
     /// # Examples
     ///
@@ -656,7 +689,7 @@ impl Account {
         let request = assign!(delete_3pid::v3::Request::new(medium, address.to_owned()), {
             id_server: id_server.map(ToOwned::to_owned),
         });
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Get the content of an account data event of statically-known type.
@@ -684,7 +717,7 @@ impl Account {
     where
         C: GlobalAccountDataEventContent + StaticEventContent,
     {
-        get_raw_content(self.client.store().get_account_data_event_static::<C>().await?)
+        get_raw_content(self.client.state_store().get_account_data_event_static::<C>().await?)
     }
 
     /// Get the content of an account data event of a given type.
@@ -692,7 +725,7 @@ impl Account {
         &self,
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>> {
-        get_raw_content(self.client.store().get_account_data_event(event_type).await?)
+        get_raw_content(self.client.state_store().get_account_data_event(event_type).await?)
     }
 
     /// Fetch a global account data event from the server.
@@ -722,12 +755,11 @@ impl Account {
         &self,
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>> {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request = get_global_account_data::v3::Request::new(own_user.to_owned(), event_type);
 
-        match self.client.send(request, None).await {
+        match self.client.send(request).await {
             Ok(r) => Ok(Some(r.account_data)),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
@@ -776,12 +808,11 @@ impl Account {
     where
         T: GlobalAccountDataEventContent,
     {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request = set_global_account_data::v3::Request::new(own_user.to_owned(), &content)?;
 
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Set the given raw account data event.
@@ -790,13 +821,12 @@ impl Account {
         event_type: GlobalAccountDataEventType,
         content: Raw<AnyGlobalAccountDataEventContent>,
     ) -> Result<set_global_account_data::v3::Response> {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request =
             set_global_account_data::v3::Request::new_raw(own_user.to_owned(), event_type, content);
 
-        Ok(self.client.send(request, None).await?)
+        Ok(self.client.send(request).await?)
     }
 
     /// Marks the room identified by `room_id` as a "direct chat" with each
@@ -806,7 +836,7 @@ impl Account {
     ///
     /// * `room_id` - The room ID of the direct message room.
     /// * `user_ids` - The user IDs to be associated with this direct message
-    /// room.
+    ///   room.
     pub async fn mark_as_dm(&self, room_id: &RoomId, user_ids: &[OwnedUserId]) -> Result<()> {
         use ruma::events::direct::DirectEventContent;
 
@@ -824,25 +854,24 @@ impl Account {
         // existing `m.direct` event and append the room to the list of DMs we
         // have with this user.
 
-        // TODO: Uncomment this once we can rely on `/sync`. Because of the
-        // `unwrap_or_default()` we're using, this may lead to us resetting the
-        // `m.direct` account data event and unmarking the user's DMs.
-        // let mut content = self
-        //     .account_data::<DirectEventContent>()
-        //     .await?
-        //     .map(|c| c.deserialize())
-        //     .transpose()?
-        //     .unwrap_or_default();
-
         // We are fetching the content from the server because we currently can't rely
         // on `/sync` giving us the correct data in a timely manner.
         let raw_content = self.fetch_account_data(GlobalAccountDataEventType::Direct).await?;
-        let mut content = raw_content
-            .and_then(|content| content.deserialize_as::<DirectEventContent>().ok())
-            .unwrap_or_default();
+
+        let mut content = if let Some(raw_content) = raw_content {
+            // Log the error and pass it upwards if we fail to deserialize the m.direct
+            // event.
+            raw_content.deserialize_as::<DirectEventContent>().map_err(|err| {
+                error!("unable to deserialize m.direct event content; aborting request to mark {room_id} as dm: {err}");
+                err
+            })?
+        } else {
+            // If there was no m.direct event server-side, create a default one.
+            Default::default()
+        };
 
         for user_id in user_ids {
-            content.entry(user_id.to_owned()).or_default().push(room_id.to_owned());
+            content.entry(user_id.into()).or_default().push(room_id.to_owned());
         }
 
         // TODO: We should probably save the fact that we need to send this out
@@ -887,7 +916,7 @@ impl Account {
         Ok(ignored_user_list)
     }
 
-    /// Get the current push rules.
+    /// Get the current push rules from storage.
     ///
     /// If no push rules event was found, or it fails to deserialize, a ruleset
     /// with the server-default push rules is returned.
@@ -909,6 +938,47 @@ impl Account {
                     self.client.user_id().expect("The client should be logged in"),
                 )
             }))
+    }
+
+    /// Retrieves the user's recently visited room list
+    pub async fn get_recently_visited_rooms(&self) -> Result<Vec<OwnedRoomId>> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        let data = self
+            .client
+            .state_store()
+            .get_kv_data(StateStoreDataKey::RecentlyVisitedRooms(user_id))
+            .await?;
+
+        Ok(data
+            .map(|v| {
+                v.into_recently_visited_rooms()
+                    .expect("Session data is not a list of recently visited rooms")
+            })
+            .unwrap_or_default())
+    }
+
+    /// Moves/inserts the given room to the front of the recently visited list
+    pub async fn track_recently_visited_room(&self, room_id: OwnedRoomId) -> Result<(), Error> {
+        let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+
+        // Get the previously stored recently visited rooms
+        let mut recently_visited_rooms = self.get_recently_visited_rooms().await?;
+
+        // Remove all other occurrences of the new room_id
+        recently_visited_rooms.retain(|r| r != &room_id);
+
+        // And insert it as the most recent
+        recently_visited_rooms.insert(0, room_id);
+
+        // Cap the whole list to the VISITED_ROOMS_LIMIT
+        recently_visited_rooms.truncate(Self::VISITED_ROOMS_LIMIT);
+
+        let data = StateStoreDataValue::RecentlyVisitedRooms(recently_visited_rooms);
+        self.client
+            .state_store()
+            .set_kv_data(StateStoreDataKey::RecentlyVisitedRooms(user_id), data)
+            .await?;
+        Ok(())
     }
 }
 

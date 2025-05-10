@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Instant;
-
+use ruma::time::Instant;
 use tracing::{callsite::DefaultCallsite, Callsite as _};
 
-/// A named RAII that will show on Drop how long its covered section took to
+/// A named RAII that will show on `Drop` how long its covered section took to
 /// execute.
 pub struct TracingTimer {
     id: String,
@@ -73,11 +72,29 @@ impl TracingTimer {
     }
 }
 
-/// Macro to create a RAII timer that will log a `tracing` event once it's
-/// dropped.
+/// Macro to create a RAII timer that will log on `Drop` how long its covered
+/// section took to execute.
 ///
 /// The tracing level can be specified as a first argument, but it's optional.
 /// If it's missing, this will use the debug level.
+///
+/// ```rust,no_run
+/// # fn do_long_computation(_x: u32) {}
+/// # fn main() {
+/// use matrix_sdk_common::timer;
+///
+/// // It's possible to specify the tracing level we want to be used for the log message on drop.
+/// {
+///     let _timer = timer!(tracing::Level::TRACE, "do long computation");
+///     // But it's optional; by default it's set to `DEBUG`.
+///     let _debug_timer = timer!("do long computation but time it in DEBUG");
+///     // The macro doesn't support formatting / structured events (yet?), but you can use
+///     // `format!()` for that.
+///     let other_timer = timer!(format!("do long computation for parameter = {}", 123));
+///     do_long_computation(123);
+/// } // The log statements will happen here.
+/// # }
+/// ```
 #[macro_export]
 macro_rules! timer {
     ($level:expr, $string:expr) => {{
@@ -98,14 +115,14 @@ macro_rules! timer {
     }};
 
     ($string:expr) => {
-        timer!(tracing::Level::DEBUG, $string)
+        $crate::timer!(tracing::Level::DEBUG, $string)
     };
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(not(target_arch = "wasm32"))]
-    #[matrix_sdk_test::async_test]
+    #[matrix_sdk_test_macros::async_test]
     async fn test_timer_name() {
         use tracing::{span, Level};
 
@@ -114,7 +131,7 @@ mod tests {
         mod time123 {
             pub async fn run() {
                 let _timer_guard = timer!(tracing::Level::DEBUG, "test");
-                tokio::time::sleep(instant::Duration::from_millis(123)).await;
+                tokio::time::sleep(ruma::time::Duration::from_millis(123)).await;
                 // Displays: 2023-08-25T15:18:31.169498Z DEBUG
                 // matrix_sdk_common::tracing_timer::tests: test finished in
                 // 124ms
@@ -127,7 +144,7 @@ mod tests {
         let _guard = span.enter();
 
         let _timer_guard = timer!("in span");
-        tokio::time::sleep(instant::Duration::from_millis(256)).await;
+        tokio::time::sleep(ruma::time::Duration::from_millis(256)).await;
 
         tracing::warn!("Test about to finish.");
         // Displays: 2023-08-25T15:18:31.427070Z DEBUG le 256ms span:

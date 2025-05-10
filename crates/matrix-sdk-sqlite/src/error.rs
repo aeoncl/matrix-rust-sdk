@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use deadpool_sqlite::{CreatePoolError, PoolError};
+#[cfg(feature = "event-cache")]
+use matrix_sdk_base::event_cache::store::EventCacheStoreError;
 #[cfg(feature = "state-store")]
 use matrix_sdk_base::store::StoreError as StateStoreError;
 #[cfg(feature = "crypto-store")]
@@ -20,12 +22,12 @@ use matrix_sdk_crypto::CryptoStoreError;
 use thiserror::Error;
 use tokio::io;
 
-/// All the errors that can occur when opening a SQLite store.
+/// All the errors that can occur when opening an SQLite store.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum OpenStoreError {
     /// Failed to create the DB's parent directory.
-    #[error("Failed to create the database's parent directory")]
+    #[error("Failed to create the database's parent directory: {0}")]
     CreateDir(#[source] io::Error),
 
     /// Failed to create the DB pool.
@@ -33,7 +35,7 @@ pub enum OpenStoreError {
     CreatePool(#[from] CreatePoolError),
 
     /// Failed to load the database's version.
-    #[error("Failed to load database version")]
+    #[error("Failed to load database version: {0}")]
     LoadVersion(#[source] rusqlite::Error),
 
     /// The version of the database is missing.
@@ -45,7 +47,7 @@ pub enum OpenStoreError {
     InvalidVersion,
 
     /// Failed to apply migrations.
-    #[error("Failed to run migrations")]
+    #[error("Failed to run migrations: {0}")]
     Migration(#[from] Error),
 
     /// Failed to get a DB connection from the pool.
@@ -53,15 +55,15 @@ pub enum OpenStoreError {
     Pool(#[from] PoolError),
 
     /// Failed to initialize the store cipher.
-    #[error("Failed to initialize the store cipher")]
+    #[error("Failed to initialize the store cipher: {0}")]
     InitCipher(#[from] matrix_sdk_store_encryption::Error),
 
     /// Failed to load the store cipher from the DB.
-    #[error("Failed to load the store cipher from the DB")]
+    #[error("Failed to load the store cipher from the DB: {0}")]
     LoadCipher(#[source] rusqlite::Error),
 
     /// Failed to save the store cipher to the DB.
-    #[error("Failed to save the store cipher to the DB")]
+    #[error("Failed to save the store cipher to the DB: {0}")]
     SaveCipher(#[source] rusqlite::Error),
 }
 
@@ -99,6 +101,12 @@ pub enum Error {
 
     #[error("Redaction failed: {0}")]
     Redaction(#[source] ruma::canonical_json::RedactionError),
+
+    #[error("An update keyed by unique ID touched more than one entry")]
+    InconsistentUpdate,
+
+    #[error("The store contains invalid data: {details}")]
+    InvalidData { details: String },
 }
 
 macro_rules! impl_from {
@@ -132,6 +140,16 @@ impl From<Error> for StateStoreError {
             Error::Encryption(e) => StateStoreError::Encryption(e),
             Error::Redaction(e) => StateStoreError::Redaction(e),
             e => StateStoreError::backend(e),
+        }
+    }
+}
+
+#[cfg(feature = "event-cache")]
+impl From<Error> for EventCacheStoreError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Encryption(e) => EventCacheStoreError::Encryption(e),
+            e => EventCacheStoreError::backend(e),
         }
     }
 }

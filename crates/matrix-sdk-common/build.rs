@@ -1,6 +1,9 @@
 use std::{env, process};
 
 fn main() {
+    // Prevent unnecessary rerunning of this build script
+    println!("cargo:rerun-if-changed=build.rs");
+
     let is_wasm = env::var_os("CARGO_CFG_TARGET_ARCH").is_some_and(|arch| arch == "wasm32");
     if is_wasm && env::var_os("CARGO_FEATURE_JS").is_none() {
         eprintln!(

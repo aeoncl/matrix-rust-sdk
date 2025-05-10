@@ -110,8 +110,8 @@
 //!   events ids in both sets. As a matter of fact, we have to manually handle
 //!   this edge case here. I hope that having an event database will help avoid
 //!   this kind of workaround here later.
-//! - In addition to that, and as noted in the timeline code, it seems that the
-//!   sliding-sync proxy could return the same event multiple times in a sync
+//! - In addition to that, and as noted in the timeline code, it seems that
+//!   sliding sync could return the same event multiple times in a sync
 //!   timeline, leading to incorrect results. We have to take that into account
 //!   by resetting the read counts *every* time we see an event that was the
 //!   target of the latest active read receipt.
@@ -123,7 +123,7 @@ use std::{
 };
 
 use eyeball_im::Vector;
-use matrix_sdk_common::{deserialized_responses::SyncTimelineEvent, ring_buffer::RingBuffer};
+use matrix_sdk_common::{deserialized_responses::TimelineEvent, ring_buffer::RingBuffer};
 use ruma::{
     events::{
         poll::{start::PollStartEventContent, unstable_start::UnstablePollStartEventContent},
@@ -202,15 +202,19 @@ impl RoomReadReceipts {
     ///
     /// Returns whether a new event triggered a new unread/notification/mention.
     #[inline(always)]
-    fn process_event(&mut self, event: &SyncTimelineEvent, user_id: &UserId) {
-        if marks_as_unread(&event.event, user_id) {
+    fn process_event(&mut self, event: &TimelineEvent, user_id: &UserId) {
+        if marks_as_unread(event.raw(), user_id) {
             self.num_unread += 1;
         }
 
         let mut has_notify = false;
         let mut has_mention = false;
 
-        for action in &event.push_actions {
+        let Some(actions) = event.push_actions.as_ref() else {
+            return;
+        };
+
+        for action in actions.iter() {
             if !has_notify && action.should_notify() {
                 self.num_notifications += 1;
                 has_notify = true;
@@ -236,15 +240,14 @@ impl RoomReadReceipts {
         &mut self,
         receipt_event_id: &EventId,
         user_id: &UserId,
-        events: impl IntoIterator<Item = &'a SyncTimelineEvent>,
+        events: impl IntoIterator<Item = &'a TimelineEvent>,
     ) -> bool {
         let mut counting_receipts = false;
 
         for event in events {
-            // The sliding sync proxy sometimes sends the same event multiple times, so it
-            // can be at the beginning and end of a batch, for instance. In that
-            // case, just reset every time we see the event matching the
-            // receipt. NOTE: SS proxy workaround.
+            // Sliding sync sometimes sends the same event multiple times, so it can be at
+            // the beginning and end of a batch, for instance. In that case, just reset
+            // every time we see the event matching the receipt.
             if let Some(event_id) = event.event_id() {
                 if event_id == receipt_event_id {
                     // Bingo! Switch over to the counting state, after resetting the
@@ -269,11 +272,11 @@ impl RoomReadReceipts {
 pub trait PreviousEventsProvider: Send + Sync {
     /// Returns the list of known timeline events, in sync order, for the given
     /// room.
-    fn for_room(&self, room_id: &RoomId) -> Vector<SyncTimelineEvent>;
+    fn for_room(&self, room_id: &RoomId) -> Vector<TimelineEvent>;
 }
 
 impl PreviousEventsProvider for () {
-    fn for_room(&self, _: &RoomId) -> Vector<SyncTimelineEvent> {
+    fn for_room(&self, _: &RoomId) -> Vector<TimelineEvent> {
         Vector::new()
     }
 }
@@ -292,7 +295,7 @@ struct ReceiptSelector {
 
 impl ReceiptSelector {
     fn new(
-        all_events: &Vector<SyncTimelineEvent>,
+        all_events: &Vector<TimelineEvent>,
         latest_active_receipt_event: Option<&EventId>,
     ) -> Self {
         let event_id_to_pos = Self::create_sync_index(all_events.iter());
@@ -310,7 +313,7 @@ impl ReceiptSelector {
     /// Create a mapping of `event_id` -> sync order for all events that have an
     /// `event_id`.
     fn create_sync_index<'a>(
-        events: impl Iterator<Item = &'a SyncTimelineEvent> + 'a,
+        events: impl Iterator<Item = &'a TimelineEvent> + 'a,
     ) -> BTreeMap<OwnedEventId, usize> {
         // TODO: this should be cached and incrementally updated.
         BTreeMap::from_iter(
@@ -405,10 +408,10 @@ impl ReceiptSelector {
     /// Try to match an implicit receipt, that is, the one we get for events we
     /// sent ourselves.
     #[instrument(skip_all)]
-    fn try_match_implicit(&mut self, user_id: &UserId, new_events: &[SyncTimelineEvent]) {
+    fn try_match_implicit(&mut self, user_id: &UserId, new_events: &[TimelineEvent]) {
         for ev in new_events {
             // Get the `sender` field, if any, or skip this event.
-            let Ok(Some(sender)) = ev.event.get_field::<OwnedUserId>("sender") else { continue };
+            let Ok(Some(sender)) = ev.raw().get_field::<OwnedUserId>("sender") else { continue };
             if sender == user_id {
                 // Get the event id, if any, or skip this event.
                 let Some(event_id) = ev.event_id() else { continue };
@@ -432,13 +435,13 @@ impl ReceiptSelector {
 /// Returns true if there's an event common to both groups of events, based on
 /// their event id.
 fn events_intersects<'a>(
-    previous_events: impl Iterator<Item = &'a SyncTimelineEvent>,
-    new_events: &[SyncTimelineEvent],
+    previous_events: impl Iterator<Item = &'a TimelineEvent>,
+    new_events: &[TimelineEvent],
 ) -> bool {
     let previous_events_ids = BTreeSet::from_iter(previous_events.filter_map(|ev| ev.event_id()));
     new_events
         .iter()
-        .any(|ev| ev.event_id().map_or(false, |event_id| previous_events_ids.contains(&event_id)))
+        .any(|ev| ev.event_id().is_some_and(|event_id| previous_events_ids.contains(&event_id)))
 }
 
 /// Given a set of events coming from sync, for a room, update the
@@ -449,15 +452,13 @@ fn events_intersects<'a>(
 /// that has been just received for an event that came in a previous sync.
 ///
 /// See this module's documentation for more information.
-///
-/// Returns a boolean indicating if a field changed value in the read receipts.
 #[instrument(skip_all, fields(room_id = %room_id))]
 pub(crate) fn compute_unread_counts(
     user_id: &UserId,
     room_id: &RoomId,
     receipt_event: Option<&ReceiptEventContent>,
-    previous_events: Vector<SyncTimelineEvent>,
-    new_events: &[SyncTimelineEvent],
+    previous_events: Vector<TimelineEvent>,
+    new_events: &[TimelineEvent],
     read_receipts: &mut RoomReadReceipts,
 ) {
     debug!(?read_receipts, "Starting.");
@@ -544,7 +545,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
     }
 
     match event {
-        ruma::events::AnySyncTimelineEvent::MessageLike(event) => {
+        AnySyncTimelineEvent::MessageLike(event) => {
             // Filter out redactions.
             let Some(content) = event.original_content() else {
                 tracing::trace!("not interesting because redacted");
@@ -563,6 +564,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
             match event {
                 AnySyncMessageLikeEvent::CallAnswer(_)
                 | AnySyncMessageLikeEvent::CallInvite(_)
+                | AnySyncMessageLikeEvent::CallNotify(_)
                 | AnySyncMessageLikeEvent::CallHangup(_)
                 | AnySyncMessageLikeEvent::CallCandidates(_)
                 | AnySyncMessageLikeEvent::CallNegotiate(_)
@@ -612,7 +614,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
             }
         }
 
-        ruma::events::AnySyncTimelineEvent::State(_) => false,
+        AnySyncTimelineEvent::State(_) => false,
     }
 }
 
@@ -621,11 +623,14 @@ mod tests {
     use std::{num::NonZeroUsize, ops::Not as _};
 
     use eyeball_im::Vector;
-    use matrix_sdk_common::{deserialized_responses::SyncTimelineEvent, ring_buffer::RingBuffer};
-    use matrix_sdk_test::{sync_timeline_event, EventBuilder};
+    use matrix_sdk_common::{deserialized_responses::TimelineEvent, ring_buffer::RingBuffer};
+    use matrix_sdk_test::event_factory::EventFactory;
     use ruma::{
         event_id,
-        events::receipt::{ReceiptThread, ReceiptType},
+        events::{
+            receipt::{ReceiptThread, ReceiptType},
+            room::{member::MembershipState, message::MessageType},
+        },
         owned_event_id, owned_user_id,
         push::Action,
         room_id, user_id, EventId, UserId,
@@ -639,24 +644,14 @@ mod tests {
         let user_id = user_id!("@alice:example.org");
         let other_user_id = user_id!("@bob:example.org");
 
+        let f = EventFactory::new();
+
         // A message from somebody else marks the room as unread...
-        let ev = sync_timeline_event!({
-            "sender": other_user_id,
-            "type": "m.room.message",
-            "event_id": "$ida",
-            "origin_server_ts": 12344446,
-            "content": { "body":"A", "msgtype": "m.text" },
-        });
+        let ev = f.text_msg("A").event_id(event_id!("$ida")).sender(other_user_id).into_raw_sync();
         assert!(marks_as_unread(&ev, user_id));
 
         // ... but a message from ourselves doesn't.
-        let ev = sync_timeline_event!({
-            "sender": user_id,
-            "type": "m.room.message",
-            "event_id": "$ida",
-            "origin_server_ts": 12344446,
-            "content": { "body":"A", "msgtype": "m.text" },
-        });
+        let ev = f.text_msg("A").event_id(event_id!("$ida")).sender(user_id).into_raw_sync();
         assert!(marks_as_unread(&ev, user_id).not());
     }
 
@@ -666,24 +661,16 @@ mod tests {
         let other_user_id = user_id!("@bob:example.org");
 
         // An edit to a message from somebody else doesn't mark the room as unread.
-        let ev = sync_timeline_event!({
-            "sender": other_user_id,
-            "type": "m.room.message",
-            "event_id": "$ida",
-            "origin_server_ts": 12344446,
-            "content": {
-                "body": " * edited message",
-                "m.new_content": {
-                    "body": "edited message",
-                    "msgtype": "m.text"
-                },
-                "m.relates_to": {
-                    "event_id": "$someeventid:localhost",
-                    "rel_type": "m.replace"
-                },
-                "msgtype": "m.text"
-            },
-        });
+        let ev = EventFactory::new()
+            .text_msg("* edited message")
+            .edit(
+                event_id!("$someeventid:localhost"),
+                MessageType::text_plain("edited message").into(),
+            )
+            .event_id(event_id!("$ida"))
+            .sender(other_user_id)
+            .into_raw_sync();
+
         assert!(marks_as_unread(&ev, user_id).not());
     }
 
@@ -693,19 +680,11 @@ mod tests {
         let other_user_id = user_id!("@bob:example.org");
 
         // A redact of a message from somebody else doesn't mark the room as unread.
-        let ev = sync_timeline_event!({
-            "content": {
-                "reason": "🛑"
-            },
-            "event_id": "$151957878228ssqrJ:localhost",
-            "origin_server_ts": 151957878000000_u64,
-            "sender": other_user_id,
-            "type": "m.room.redaction",
-            "redacts": "$151957878228ssqrj:localhost",
-            "unsigned": {
-                "age": 85
-            }
-        });
+        let ev = EventFactory::new()
+            .redaction(event_id!("$151957878228ssqrj:localhost"))
+            .sender(other_user_id)
+            .event_id(event_id!("$151957878228ssqrJ:localhost"))
+            .into_raw_sync();
 
         assert!(marks_as_unread(&ev, user_id).not());
     }
@@ -716,22 +695,11 @@ mod tests {
         let other_user_id = user_id!("@bob:example.org");
 
         // A reaction from somebody else to a message doesn't mark the room as unread.
-        let ev = sync_timeline_event!({
-            "content": {
-                "m.relates_to": {
-                    "event_id": "$15275047031IXQRi:localhost",
-                    "key": "👍",
-                    "rel_type": "m.annotation"
-                }
-            },
-            "event_id": "$15275047031IXQRi:localhost",
-            "origin_server_ts": 159027581000000_u64,
-            "sender": other_user_id,
-            "type": "m.reaction",
-            "unsigned": {
-                "age": 85
-            }
-        });
+        let ev = EventFactory::new()
+            .reaction(event_id!("$15275047031IXQRj:localhost"), "👍")
+            .sender(other_user_id)
+            .event_id(event_id!("$15275047031IXQRi:localhost"))
+            .into_raw_sync();
 
         assert!(marks_as_unread(&ev, user_id).not());
     }
@@ -740,18 +708,13 @@ mod tests {
     fn test_state_event_doesnt_mark_as_unread() {
         let user_id = user_id!("@alice:example.org");
         let event_id = event_id!("$1");
-        let ev = sync_timeline_event!({
-            "content": {
-                "displayname": "Alice",
-                "membership": "join",
-            },
-            "event_id": event_id,
-            "origin_server_ts": 1432135524678u64,
-            "sender": user_id,
-            "state_key": user_id,
-            "type": "m.room.member",
-        });
 
+        let ev = EventFactory::new()
+            .member(user_id)
+            .membership(MembershipState::Join)
+            .display_name("Alice")
+            .event_id(event_id)
+            .into_raw_sync();
         assert!(marks_as_unread(&ev, user_id).not());
 
         let other_user_id = user_id!("@bob:example.org");
@@ -760,18 +723,14 @@ mod tests {
 
     #[test]
     fn test_count_unread_and_mentions() {
-        fn make_event(user_id: &UserId, push_actions: Vec<Action>) -> SyncTimelineEvent {
-            SyncTimelineEvent {
-                event: sync_timeline_event!({
-                    "sender": user_id,
-                    "type": "m.room.message",
-                    "event_id": "$ida",
-                    "origin_server_ts": 12344446,
-                    "content": { "body":"A", "msgtype": "m.text" },
-                }),
-                encryption_info: None,
-                push_actions,
-            }
+        fn make_event(user_id: &UserId, push_actions: Vec<Action>) -> TimelineEvent {
+            let mut ev = EventFactory::new()
+                .text_msg("A")
+                .sender(user_id)
+                .event_id(event_id!("$ida"))
+                .into_event();
+            ev.push_actions = Some(push_actions);
+            ev
         }
 
         let user_id = user_id!("@alice:example.org");
@@ -845,18 +804,12 @@ mod tests {
 
         // When provided with one event, that's not the receipt event, we don't count
         // it.
-        fn make_event(event_id: &EventId) -> SyncTimelineEvent {
-            SyncTimelineEvent {
-                event: sync_timeline_event!({
-                    "sender": "@bob:example.org",
-                    "type": "m.room.message",
-                    "event_id": event_id,
-                    "origin_server_ts": 12344446,
-                    "content": { "body":"A", "msgtype": "m.text" },
-                }),
-                encryption_info: None,
-                push_actions: Vec::new(),
-            }
+        fn make_event(event_id: &EventId) -> TimelineEvent {
+            EventFactory::new()
+                .text_msg("A")
+                .sender(user_id!("@bob:example.org"))
+                .event_id(event_id)
+                .into()
         }
 
         let mut receipts = RoomReadReceipts {
@@ -954,20 +907,6 @@ mod tests {
         assert_eq!(receipts.num_mentions, 0);
     }
 
-    fn sync_timeline_message(
-        sender: &UserId,
-        event_id: impl serde::Serialize,
-        body: impl serde::Serialize,
-    ) -> SyncTimelineEvent {
-        SyncTimelineEvent::new(sync_timeline_event!({
-            "sender": sender,
-            "type": "m.room.message",
-            "event_id": event_id,
-            "origin_server_ts": 42,
-            "content": { "body": body, "msgtype": "m.text" },
-        }))
-    }
-
     /// Smoke test for `compute_unread_counts`.
     #[test]
     fn test_basic_compute_unread_counts() {
@@ -978,15 +917,14 @@ mod tests {
 
         let mut previous_events = Vector::new();
 
-        let ev1 = sync_timeline_message(other_user_id, receipt_event_id, "A");
-        let ev2 = sync_timeline_message(other_user_id, "$2", "A");
+        let f = EventFactory::new();
+        let ev1 = f.text_msg("A").sender(other_user_id).event_id(receipt_event_id).into_event();
+        let ev2 = f.text_msg("A").sender(other_user_id).event_id(event_id!("$2")).into_event();
 
-        let receipt_event = EventBuilder::new().make_receipt_event_content([(
-            receipt_event_id.to_owned(),
-            ReceiptType::Read,
-            user_id.to_owned(),
-            ReceiptThread::Unthreaded,
-        )]);
+        let receipt_event = f
+            .read_receipts()
+            .add(receipt_event_id, user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_content();
 
         let mut read_receipts = Default::default();
         compute_unread_counts(
@@ -1005,7 +943,8 @@ mod tests {
         previous_events.push_back(ev1);
         previous_events.push_back(ev2);
 
-        let new_event = sync_timeline_message(other_user_id, "$3", "A");
+        let new_event =
+            f.text_msg("A").sender(other_user_id).event_id(event_id!("$3")).into_event();
         compute_unread_counts(
             user_id,
             room_id,
@@ -1019,13 +958,14 @@ mod tests {
         assert_eq!(read_receipts.num_unread, 2);
     }
 
-    fn make_test_events(user_id: &UserId) -> Vector<SyncTimelineEvent> {
-        let ev1 = sync_timeline_message(user_id, "$1", "With the lights out, it's less dangerous");
-        let ev2 = sync_timeline_message(user_id, "$2", "Here we are now, entertain us");
-        let ev3 = sync_timeline_message(user_id, "$3", "I feel stupid and contagious");
-        let ev4 = sync_timeline_message(user_id, "$4", "Here we are now, entertain us");
-        let ev5 = sync_timeline_message(user_id, "$5", "Hello, hello, hello, how low?");
-        vec![ev1, ev2, ev3, ev4, ev5].into()
+    fn make_test_events(user_id: &UserId) -> Vector<TimelineEvent> {
+        let f = EventFactory::new().sender(user_id);
+        let ev1 = f.text_msg("With the lights out, it's less dangerous").event_id(event_id!("$1"));
+        let ev2 = f.text_msg("Here we are now, entertain us").event_id(event_id!("$2"));
+        let ev3 = f.text_msg("I feel stupid and contagious").event_id(event_id!("$3"));
+        let ev4 = f.text_msg("Here we are now, entertain us").event_id(event_id!("$4"));
+        let ev5 = f.text_msg("Hello, hello, hello, how low?").event_id(event_id!("$5"));
+        [ev1, ev2, ev3, ev4, ev5].into_iter().map(Into::into).collect()
     }
 
     /// Test that when multiple receipts come in a single event, we can still
@@ -1041,30 +981,32 @@ mod tests {
 
         // Given a receipt event marking events 1-3 as read using a combination of
         // different thread and privacy types,
+        let f = EventFactory::new();
         for receipt_type_1 in &[ReceiptType::Read, ReceiptType::ReadPrivate] {
             for receipt_thread_1 in &[ReceiptThread::Unthreaded, ReceiptThread::Main] {
                 for receipt_type_2 in &[ReceiptType::Read, ReceiptType::ReadPrivate] {
                     for receipt_thread_2 in &[ReceiptThread::Unthreaded, ReceiptThread::Main] {
-                        let receipt_event = EventBuilder::new().make_receipt_event_content([
-                            (
-                                owned_event_id!("$2"),
+                        let receipt_event = f
+                            .read_receipts()
+                            .add(
+                                event_id!("$2"),
+                                user_id,
                                 receipt_type_1.clone(),
-                                user_id.to_owned(),
                                 receipt_thread_1.clone(),
-                            ),
-                            (
-                                owned_event_id!("$3"),
+                            )
+                            .add(
+                                event_id!("$3"),
+                                user_id,
                                 receipt_type_2.clone(),
-                                user_id.to_owned(),
                                 receipt_thread_2.clone(),
-                            ),
-                            (
-                                owned_event_id!("$1"),
+                            )
+                            .add(
+                                event_id!("$1"),
+                                user_id,
                                 receipt_type_1.clone(),
-                                user_id.to_owned(),
                                 receipt_thread_2.clone(),
-                            ),
-                        ]);
+                            )
+                            .into_content();
 
                         // When I compute the notifications for this room (with no new events),
                         let mut read_receipts = RoomReadReceipts::default();
@@ -1124,12 +1066,10 @@ mod tests {
 
         let events = make_test_events(user_id!("@bob:example.org"));
 
-        let receipt_event = EventBuilder::new().make_receipt_event_content([(
-            owned_event_id!("$6"),
-            ReceiptType::Read,
-            user_id.clone(),
-            ReceiptThread::Unthreaded,
-        )]);
+        let receipt_event = EventFactory::new()
+            .read_receipts()
+            .add(event_id!("$6"), &user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_content();
 
         let mut read_receipts = RoomReadReceipts::default();
         assert!(read_receipts.pending.is_empty());
@@ -1160,12 +1100,10 @@ mod tests {
 
         let events = make_test_events(user_id!("@bob:example.org"));
 
-        let receipt_event = EventBuilder::new().make_receipt_event_content([(
-            owned_event_id!("$1"),
-            ReceiptType::Read,
-            user_id.clone(),
-            ReceiptThread::Unthreaded,
-        )]);
+        let receipt_event = EventFactory::new()
+            .read_receipts()
+            .add(event_id!("$1"), &user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_content();
 
         // Sync with a read receipt *and* a single event that was already known: in that
         // case, only consider the new events in isolation, and compute the
@@ -1196,12 +1134,7 @@ mod tests {
         let events = make_test_events(uid);
 
         // An event with no id.
-        let ev6 = SyncTimelineEvent::new(sync_timeline_event!({
-            "sender": uid,
-            "type": "m.room.message",
-            "origin_server_ts": 42,
-            "content": { "body": "yolo", "msgtype": "m.text" },
-        }));
+        let ev6 = EventFactory::new().text_msg("yolo").sender(uid).no_event_id().into_event();
 
         let index = ReceiptSelector::create_sync_index(events.iter().chain(&[ev6]));
 
@@ -1267,8 +1200,9 @@ mod tests {
     #[test]
     fn test_receipt_selector_handle_pending_receipts_noop() {
         let sender = user_id!("@bob:example.org");
-        let ev1 = sync_timeline_message(sender, event_id!("$1"), "yo");
-        let ev2 = sync_timeline_message(sender, event_id!("$2"), "well?");
+        let f = EventFactory::new().sender(sender);
+        let ev1 = f.text_msg("yo").event_id(event_id!("$1")).into_event();
+        let ev2 = f.text_msg("well?").event_id(event_id!("$2")).into_event();
         let events: Vector<_> = vec![ev1, ev2].into();
 
         {
@@ -1302,8 +1236,9 @@ mod tests {
     #[test]
     fn test_receipt_selector_handle_pending_receipts_doesnt_match_known_events() {
         let sender = user_id!("@bob:example.org");
-        let ev1 = sync_timeline_message(sender, event_id!("$1"), "yo");
-        let ev2 = sync_timeline_message(sender, event_id!("$2"), "well?");
+        let f = EventFactory::new().sender(sender);
+        let ev1 = f.text_msg("yo").event_id(event_id!("$1")).into_event();
+        let ev2 = f.text_msg("well?").event_id(event_id!("$2")).into_event();
         let events: Vector<_> = vec![ev1, ev2].into();
 
         {
@@ -1338,8 +1273,9 @@ mod tests {
     #[test]
     fn test_receipt_selector_handle_pending_receipts_matches_known_events_no_initial() {
         let sender = user_id!("@bob:example.org");
-        let ev1 = sync_timeline_message(sender, event_id!("$1"), "yo");
-        let ev2 = sync_timeline_message(sender, event_id!("$2"), "well?");
+        let f = EventFactory::new().sender(sender);
+        let ev1 = f.text_msg("yo").event_id(event_id!("$1")).into_event();
+        let ev2 = f.text_msg("well?").event_id(event_id!("$2")).into_event();
         let events: Vector<_> = vec![ev1, ev2].into();
 
         {
@@ -1379,8 +1315,9 @@ mod tests {
     #[test]
     fn test_receipt_selector_handle_pending_receipts_matches_known_events_with_initial() {
         let sender = user_id!("@bob:example.org");
-        let ev1 = sync_timeline_message(sender, event_id!("$1"), "yo");
-        let ev2 = sync_timeline_message(sender, event_id!("$2"), "well?");
+        let f = EventFactory::new().sender(sender);
+        let ev1 = f.text_msg("yo").event_id(event_id!("$1")).into_event();
+        let ev2 = f.text_msg("well?").event_id(event_id!("$2")).into_event();
         let events: Vector<_> = vec![ev1, ev2].into();
 
         {
@@ -1418,21 +1355,25 @@ mod tests {
 
     #[test]
     fn test_receipt_selector_handle_new_receipt() {
-        let myself = owned_user_id!("@alice:example.org");
+        let myself = user_id!("@alice:example.org");
         let events = make_test_events(user_id!("@bob:example.org"));
 
+        let f = EventFactory::new();
         {
             // Thread receipts are ignored.
             let mut selector = ReceiptSelector::new(&events, None);
 
-            let receipt_event = EventBuilder::new().make_receipt_event_content([(
-                owned_event_id!("$5"),
-                ReceiptType::Read,
-                myself.clone(),
-                ReceiptThread::Thread(owned_event_id!("$2")),
-            )]);
+            let receipt_event = f
+                .read_receipts()
+                .add(
+                    event_id!("$5"),
+                    myself,
+                    ReceiptType::Read,
+                    ReceiptThread::Thread(owned_event_id!("$2")),
+                )
+                .into_content();
 
-            let pending = selector.handle_new_receipt(&myself, &receipt_event);
+            let pending = selector.handle_new_receipt(myself, &receipt_event);
             assert!(pending.is_empty());
 
             let best_receipt = selector.select();
@@ -1446,14 +1387,12 @@ mod tests {
                     // receipt.
                     let mut selector = ReceiptSelector::new(&events, None);
 
-                    let receipt_event = EventBuilder::new().make_receipt_event_content([(
-                        owned_event_id!("$6"),
-                        receipt_type.clone(),
-                        myself.clone(),
-                        receipt_thread.clone(),
-                    )]);
+                    let receipt_event = f
+                        .read_receipts()
+                        .add(event_id!("$6"), myself, receipt_type.clone(), receipt_thread.clone())
+                        .into_content();
 
-                    let pending = selector.handle_new_receipt(&myself, &receipt_event);
+                    let pending = selector.handle_new_receipt(myself, &receipt_event);
                     assert_eq!(pending[0], event_id!("$6"));
                     assert_eq!(pending.len(), 1);
 
@@ -1466,14 +1405,12 @@ mod tests {
                     // receipt.
                     let mut selector = ReceiptSelector::new(&events, None);
 
-                    let receipt_event = EventBuilder::new().make_receipt_event_content([(
-                        owned_event_id!("$3"),
-                        receipt_type.clone(),
-                        myself.clone(),
-                        receipt_thread.clone(),
-                    )]);
+                    let receipt_event = f
+                        .read_receipts()
+                        .add(event_id!("$3"), myself, receipt_type.clone(), receipt_thread.clone())
+                        .into_content();
 
-                    let pending = selector.handle_new_receipt(&myself, &receipt_event);
+                    let pending = selector.handle_new_receipt(myself, &receipt_event);
                     assert!(pending.is_empty());
 
                     let best_receipt = selector.select();
@@ -1485,14 +1422,12 @@ mod tests {
                     // better receipt.
                     let mut selector = ReceiptSelector::new(&events, Some(event_id!("$4")));
 
-                    let receipt_event = EventBuilder::new().make_receipt_event_content([(
-                        owned_event_id!("$3"),
-                        receipt_type.clone(),
-                        myself.clone(),
-                        receipt_thread.clone(),
-                    )]);
+                    let receipt_event = f
+                        .read_receipts()
+                        .add(event_id!("$3"), myself, receipt_type.clone(), receipt_thread.clone())
+                        .into_content();
 
-                    let pending = selector.handle_new_receipt(&myself, &receipt_event);
+                    let pending = selector.handle_new_receipt(myself, &receipt_event);
                     assert!(pending.is_empty());
 
                     let best_receipt = selector.select();
@@ -1504,14 +1439,12 @@ mod tests {
                     // new better receipt.
                     let mut selector = ReceiptSelector::new(&events, Some(event_id!("$2")));
 
-                    let receipt_event = EventBuilder::new().make_receipt_event_content([(
-                        owned_event_id!("$3"),
-                        receipt_type.clone(),
-                        myself.clone(),
-                        receipt_thread.clone(),
-                    )]);
+                    let receipt_event = f
+                        .read_receipts()
+                        .add(event_id!("$3"), myself, receipt_type.clone(), receipt_thread.clone())
+                        .into_content();
 
-                    let pending = selector.handle_new_receipt(&myself, &receipt_event);
+                    let pending = selector.handle_new_receipt(myself, &receipt_event);
                     assert!(pending.is_empty());
 
                     let best_receipt = selector.select();
@@ -1525,23 +1458,14 @@ mod tests {
             // new better receipt.
             let mut selector = ReceiptSelector::new(&events, Some(event_id!("$2")));
 
-            let receipt_event = EventBuilder::new().make_receipt_event_content([
-                (
-                    owned_event_id!("$4"),
-                    ReceiptType::ReadPrivate,
-                    myself.clone(),
-                    ReceiptThread::Unthreaded,
-                ),
-                (
-                    owned_event_id!("$6"),
-                    ReceiptType::ReadPrivate,
-                    myself.clone(),
-                    ReceiptThread::Main,
-                ),
-                (owned_event_id!("$3"), ReceiptType::Read, myself.clone(), ReceiptThread::Main),
-            ]);
+            let receipt_event = f
+                .read_receipts()
+                .add(event_id!("$4"), myself, ReceiptType::ReadPrivate, ReceiptThread::Unthreaded)
+                .add(event_id!("$6"), myself, ReceiptType::ReadPrivate, ReceiptThread::Main)
+                .add(event_id!("$3"), myself, ReceiptType::Read, ReceiptThread::Main)
+                .into_content();
 
-            let pending = selector.handle_new_receipt(&myself, &receipt_event);
+            let pending = selector.handle_new_receipt(myself, &receipt_event);
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0], event_id!("$6"));
 
@@ -1566,8 +1490,16 @@ mod tests {
         assert!(best_receipt.is_none());
 
         // Now, if there are events I've written too...
-        events.push_back(sync_timeline_message(&myself, "$6", "A mulatto, an albino"));
-        events.push_back(sync_timeline_message(bob, "$7", "A mosquito, my libido"));
+        let f = EventFactory::new();
+        events.push_back(
+            f.text_msg("A mulatto, an albino")
+                .sender(&myself)
+                .event_id(event_id!("$6"))
+                .into_event(),
+        );
+        events.push_back(
+            f.text_msg("A mosquito, my libido").sender(bob).event_id(event_id!("$7")).into_event(),
+        );
 
         let mut selector = ReceiptSelector::new(&events, None);
         // And I search for my implicit read receipt,
@@ -1579,7 +1511,7 @@ mod tests {
 
     #[test]
     fn test_compute_unread_counts_with_implicit_receipt() {
-        let user_id = owned_user_id!("@alice:example.org");
+        let user_id = user_id!("@alice:example.org");
         let bob = user_id!("@bob:example.org");
         let room_id = room_id!("!room:example.org");
 
@@ -1587,28 +1519,36 @@ mod tests {
         let mut events = make_test_events(bob);
 
         // One by me,
-        events.push_back(sync_timeline_message(&user_id, "$6", "A mulatto, an albino"));
+        let f = EventFactory::new();
+        events.push_back(
+            f.text_msg("A mulatto, an albino")
+                .sender(user_id)
+                .event_id(event_id!("$6"))
+                .into_event(),
+        );
 
         // And others by Bob,
-        events.push_back(sync_timeline_message(bob, "$7", "A mosquito, my libido"));
-        events.push_back(sync_timeline_message(bob, "$8", "A denial, a denial"));
+        events.push_back(
+            f.text_msg("A mosquito, my libido").sender(bob).event_id(event_id!("$7")).into_event(),
+        );
+        events.push_back(
+            f.text_msg("A denial, a denial").sender(bob).event_id(event_id!("$8")).into_event(),
+        );
 
         let events: Vec<_> = events.into_iter().collect();
 
         // I have a read receipt attached to one of Bob's event sent before my message,
-        let receipt_event = EventBuilder::new().make_receipt_event_content([(
-            owned_event_id!("$3"),
-            ReceiptType::Read,
-            user_id.clone(),
-            ReceiptThread::Unthreaded,
-        )]);
+        let receipt_event = f
+            .read_receipts()
+            .add(event_id!("$3"), user_id, ReceiptType::Read, ReceiptThread::Unthreaded)
+            .into_content();
 
         let mut read_receipts = RoomReadReceipts::default();
 
         // And I compute the unread counts for all those new events (no previous events
         // in that room),
         compute_unread_counts(
-            &user_id,
+            user_id,
             room_id,
             Some(&receipt_event),
             Vector::new(),

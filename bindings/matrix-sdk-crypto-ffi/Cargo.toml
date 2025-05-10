@@ -12,16 +12,21 @@ publish = false
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[[bin]]
+name = "matrix_sdk_crypto_ffi"
+path = "uniffi-bindgen.rs"
+
 [features]
 default = ["bundled-sqlite"]
 bundled-sqlite = ["matrix-sdk-sqlite/bundled"]
 
 [dependencies]
 anyhow = { workspace = true }
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 hmac = "0.12.1"
 http = { workspace = true }
-matrix-sdk-common = { workspace = true }
+matrix-sdk-common = { workspace = true, features = ["uniffi"] }
+matrix-sdk-ffi-macros = { workspace = true }
 pbkdf2 = "0.12.2"
 rand = { workspace = true }
 ruma = { workspace = true }
@@ -29,9 +34,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # keep in sync with uniffi dependency in matrix-sdk-ffi, and uniffi_bindgen in ffi CI job
-uniffi = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
 vodozemac = { workspace = true }
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 
@@ -49,12 +54,19 @@ features = ["crypto-store"]
 
 [dependencies.tokio]
 version = "1.33.0"
-default_features = false
+default-features = false
 features = ["rt-multi-thread"]
 
 [build-dependencies]
 vergen = { version = "8.2.5", features = ["build", "git", "gitcl"] }
+uniffi = { workspace = true, features = ["build"] }
 
 [dev-dependencies]
 tempfile = "3.8.0"
 assert_matches2 = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.release]
+release = false

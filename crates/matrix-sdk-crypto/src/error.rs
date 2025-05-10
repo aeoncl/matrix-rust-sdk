@@ -12,16 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
+use matrix_sdk_common::deserialized_responses::{VerificationLevel, WithheldCode};
 use ruma::{CanonicalJsonError, IdParseError, OwnedDeviceId, OwnedRoomId, OwnedUserId};
+use serde::{ser::SerializeMap, Serializer};
 use serde_json::Error as SerdeError;
 use thiserror::Error;
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
 use super::store::CryptoStoreError;
-use crate::{
-    olm::SessionExportError,
-    types::{events::room_key_withheld::WithheldCode, SignedKey},
-};
+use crate::{olm::SessionExportError, types::SignedKey};
+#[cfg(doc)]
+use crate::{CollectStrategy, Device, LocalTrust, OtherUserIdentity};
 
 pub type OlmResult<T> = Result<T, OlmError>;
 pub type MegolmResult<T> = Result<T, MegolmError>;
@@ -37,10 +40,6 @@ pub enum OlmError {
     /// The received decrypted event couldn't be deserialized.
     #[error(transparent)]
     JsonError(#[from] SerdeError),
-
-    /// The event could not have been decrypted.
-    #[error(transparent)]
-    Decryption(#[from] vodozemac::olm::DecryptionError),
 
     /// The received room key couldn't be converted into a valid Megolm session.
     #[error(transparent)]
@@ -73,6 +72,10 @@ pub enum OlmError {
             have a valid Olm session with us"
     )]
     MissingSession,
+
+    /// Encryption failed due to an error collecting the recipient devices.
+    #[error("encryption failed due to an error collecting the recipient devices: {0}")]
+    SessionRecipientCollectionError(SessionRecipientCollectionError),
 }
 
 /// Error representing a failure during a group encryption operation.
@@ -97,16 +100,7 @@ pub enum MegolmError {
     #[error(
         "decryption failed because of mismatched identity keys of the sending device and those recorded in the to-device message"
     )]
-    MismatchedIdentityKeys {
-        /// The Ed25519 key recorded in the room key's to-device message.
-        key_ed25519: Box<Ed25519PublicKey>,
-        /// The Ed25519 identity key of the device sending the room key.
-        device_ed25519: Option<Box<Ed25519PublicKey>>,
-        /// The Curve25519 key recorded in the room key's to-device message.
-        key_curve25519: Box<Curve25519PublicKey>,
-        /// The Curve25519 identity key of the device sending the room key.
-        device_curve25519: Option<Box<Curve25519PublicKey>>,
-    },
+    MismatchedIdentityKeys(MismatchedIdentityKeysError),
 
     /// The encrypted megolm message couldn't be decoded.
     #[error(transparent)]
@@ -119,6 +113,52 @@ pub enum MegolmError {
     /// The storage layer returned an error.
     #[error(transparent)]
     Store(#[from] CryptoStoreError),
+
+    /// An encrypted message wasn't decrypted, because the sender's
+    /// cross-signing identity did not satisfy the requested
+    /// [`crate::TrustRequirement`].
+    ///
+    /// The nested value is the sender's current verification level.
+    #[error("decryption failed because trust requirement not satisfied: {0}")]
+    SenderIdentityNotTrusted(VerificationLevel),
+}
+
+/// Decryption failed because of a mismatch between the identity keys of the
+/// device we received the room key from and the identity keys recorded in
+/// the plaintext of the room key to-device message.
+#[derive(Error, Debug, PartialEq)]
+pub struct MismatchedIdentityKeysError {
+    /// The Ed25519 key recorded in the room key's to-device message.
+    pub key_ed25519: Box<Ed25519PublicKey>,
+    /// The Ed25519 identity key of the device sending the room key.
+    pub device_ed25519: Option<Box<Ed25519PublicKey>>,
+    /// The Curve25519 key recorded in the room key's to-device message.
+    pub key_curve25519: Box<Curve25519PublicKey>,
+    /// The Curve25519 identity key of the device sending the room key.
+    pub device_curve25519: Option<Box<Curve25519PublicKey>>,
+}
+
+impl std::fmt::Display for MismatchedIdentityKeysError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ser = f.serialize_struct("MismatchedIdentityKeysError", 4)?;
+        ser.serialize_entry("key_ed25519", &self.key_ed25519)?;
+        ser.serialize_entry("device_ed25519", &self.device_ed25519)?;
+        ser.serialize_entry("key_curve25519", &self.key_curve25519)?;
+        ser.serialize_entry("device_curve25519", &self.device_curve25519)?;
+        ser.end()
+    }
+}
+
+impl From<MismatchedIdentityKeysError> for MegolmError {
+    fn from(value: MismatchedIdentityKeysError) -> Self {
+        MegolmError::MismatchedIdentityKeys(value)
+    }
+}
+
+impl From<MismatchedIdentityKeysError> for SessionCreationError {
+    fn from(value: MismatchedIdentityKeysError) -> Self {
+        SessionCreationError::MismatchedIdentityKeys(value)
+    }
 }
 
 /// Error that occurs when decrypting an event that is malformed.
@@ -167,6 +207,27 @@ pub enum EventError {
         decrypted event: expected {0}, got {1:?}"
     )]
     MismatchedRoom(OwnedRoomId, Option<OwnedRoomId>),
+
+    /// The event includes `sender_device_keys` as per [MSC4147], but the
+    /// signature was invalid, or the ed25519 or curve25519 key did not
+    /// match other data in the event.
+    ///
+    /// [MSC4147]: https://github.com/matrix-org/matrix-spec-proposals/pull/4147
+    #[error("the event included sender_device_keys which were invalid in some way")]
+    InvalidSenderDeviceKeys,
+}
+
+/// Error type describing different errors that can happen when we create an
+/// Olm session from a pickle.
+#[derive(Error, Debug)]
+pub enum SessionUnpickleError {
+    /// The device keys are missing the signing key
+    #[error("the device keys are missing the signing key")]
+    MissingSigningKey,
+
+    /// The device keys are missing the identity key
+    #[error("the device keys are missing the identity key")]
+    MissingIdentityKey,
 }
 
 /// Error type describing different errors that happen when we check or create
@@ -249,13 +310,6 @@ pub enum SessionCreationError {
     )]
     OneTimeKeyMissing(OwnedUserId, OwnedDeviceId),
 
-    /// The one-time key algorithm is unsupported.
-    #[error(
-        "Tried to create a new Olm session for {0} {1}, but the one-time \
-        key algorithm is unsupported"
-    )]
-    OneTimeKeyUnknown(OwnedUserId, OwnedDeviceId),
-
     /// Failed to verify the one-time key signatures.
     #[error(
         "Failed to verify the signature of a one-time key, key: {one_time_key:?}, \
@@ -288,6 +342,19 @@ pub enum SessionCreationError {
     /// Error when creating an Olm Session from an incoming Olm message.
     #[error(transparent)]
     InboundCreation(#[from] vodozemac::olm::SessionCreationError),
+
+    /// The given device keys are invalid.
+    #[error("The given device keys are invalid")]
+    InvalidDeviceKeys(#[from] SignatureError),
+
+    /// There was a mismatch between the identity keys of the device we received
+    /// the room key from and the identity keys recorded in the plaintext of the
+    /// room key to-device message.
+    #[error(
+        "There was a mismatch between the identity keys of the sending device \
+        and those recorded in the to-device message"
+    )]
+    MismatchedIdentityKeys(MismatchedIdentityKeysError),
 }
 
 /// Errors that can be returned by
@@ -307,4 +374,61 @@ pub enum SetRoomSettingsError {
     /// The store ran into an error.
     #[error(transparent)]
     Store(#[from] CryptoStoreError),
+}
+
+/// Error representing a problem when collecting the recipient devices for the
+/// room key, during an encryption operation.
+#[derive(Error, Debug)]
+pub enum SessionRecipientCollectionError {
+    /// One or more verified users has one or more unsigned devices.
+    ///
+    /// Happens only with [`CollectStrategy::ErrorOnVerifiedUserProblem`].
+    ///
+    /// In order to resolve this, the caller can set the trust level of the
+    /// affected devices to [`LocalTrust::Ignored`] or
+    /// [`LocalTrust::BlackListed`] (see [`Device::set_local_trust`]), and
+    /// then retry the encryption operation.
+    #[error("one or more verified users have unsigned devices")]
+    VerifiedUserHasUnsignedDevice(BTreeMap<OwnedUserId, Vec<OwnedDeviceId>>),
+
+    /// One or more users was previously verified, but they have changed their
+    /// identity.
+    ///
+    /// Happens only with [`CollectStrategy::ErrorOnVerifiedUserProblem`] or
+    /// [`CollectStrategy::IdentityBasedStrategy`].
+    ///
+    /// In order to resolve this, the user can:
+    ///
+    /// * re-verify the problematic recipients, or
+    ///
+    /// * withdraw verification of the problematic recipients with
+    ///   [`OtherUserIdentity::withdraw_verification`], or
+    ///
+    /// * set the trust level of all of the devices belonging to the problematic
+    ///   recipients to [`LocalTrust::Ignored`] or [`LocalTrust::BlackListed`]
+    ///   (see [`Device::set_local_trust`]).
+    ///
+    /// The caller can then retry the encryption operation.
+    #[error("one or more users that were verified have changed their identity")]
+    VerifiedUserChangedIdentity(Vec<OwnedUserId>),
+
+    /// Cross-signing has not been configured on our own identity.
+    ///
+    /// Happens only with [`CollectStrategy::IdentityBasedStrategy`].
+    /// (Cross-signing is required for encryption when using
+    /// `IdentityBasedStrategy`.) Apps should detect this condition and prevent
+    /// sending in the UI rather than waiting for this error to be returned when
+    /// encrypting.
+    #[error("Encryption failed because cross-signing is not set up on your account")]
+    CrossSigningNotSetup,
+
+    /// The current device has not been cross-signed by our own identity.
+    ///
+    /// Happens only with [`CollectStrategy::IdentityBasedStrategy`].
+    /// (Cross-signing is required for encryption when using
+    /// `IdentityBasedStrategy`.) Apps should detect this condition and prevent
+    /// sending in the UI rather than waiting for this error to be returned when
+    /// encrypting.
+    #[error("Encryption failed because your device is not verified")]
+    SendingFromUnverifiedDevice,
 }

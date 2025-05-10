@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 
+use js_option::JsOption;
 use ruma::{
     serde::Raw, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedDeviceKeyId, OwnedUserId,
 };
@@ -29,8 +30,22 @@ use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
 use super::{EventEncryptionAlgorithm, Signatures};
 
-/// Identity keys for a device.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Represents a Matrix cryptographic device
+///
+/// This struct models a Matrix cryptographic device involved in end-to-end
+/// encrypted messaging, specifically for to-device communication. It aligns
+/// with the [`DeviceKeys` struct][device_keys_spec] in the Matrix
+/// Specification, encapsulating essential elements such as the public device
+/// identity keys.
+///
+/// See also [`ruma::encryption::DeviceKeys`] which is similar, but slightly
+/// less comprehensive (it lacks some fields, and  the `keys` are represented as
+/// base64 strings rather than type-safe [`DeviceKey`]s). We always use this
+/// struct to build `/keys/upload` requests and to deserialize `/keys/query`
+/// responses.
+///
+/// [device_keys_spec]: https://spec.matrix.org/v1.10/client-server-api/#_matrixclientv3keysupload_devicekeys
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(try_from = "DeviceKeyHelper", into = "DeviceKeyHelper")]
 pub struct DeviceKeys {
     /// The ID of the user the device belongs to.
@@ -51,6 +66,10 @@ pub struct DeviceKeys {
 
     /// Signatures for the device key object.
     pub signatures: Signatures,
+
+    /// Whether the device is a dehydrated device or not
+    #[serde(default, skip_serializing_if = "JsOption::is_undefined")]
+    pub dehydrated: JsOption<bool>,
 
     /// Additional data added to the device key information by intermediate
     /// servers, and not covered by the signatures.
@@ -77,6 +96,7 @@ impl DeviceKeys {
             algorithms,
             keys,
             signatures,
+            dehydrated: JsOption::Undefined,
             unsigned: Default::default(),
             other: BTreeMap::new(),
         }
@@ -116,7 +136,7 @@ impl DeviceKeys {
 }
 
 /// Additional data added to device key information by intermediate servers.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct UnsignedDeviceInfo {
     /// The display name which the user set on the device.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,12 +196,16 @@ impl From<Ed25519PublicKey> for DeviceKey {
     }
 }
 
+/// A de/serialization helper for [`DeviceKeys`] which maps the `keys` to/from
+/// [`DeviceKey`]s.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DeviceKeyHelper {
     pub user_id: OwnedUserId,
     pub device_id: OwnedDeviceId,
     pub algorithms: Vec<EventEncryptionAlgorithm>,
     pub keys: BTreeMap<OwnedDeviceKeyId, String>,
+    #[serde(default, skip_serializing_if = "JsOption::is_undefined")]
+    pub dehydrated: JsOption<bool>,
     pub signatures: Signatures,
     #[serde(default, skip_serializing_if = "UnsignedDeviceInfo::is_empty")]
     pub unsigned: UnsignedDeviceInfo,
@@ -216,6 +240,7 @@ impl TryFrom<DeviceKeyHelper> for DeviceKeys {
             device_id: value.device_id,
             algorithms: value.algorithms,
             keys: keys?,
+            dehydrated: value.dehydrated,
             signatures: value.signatures,
             unsigned: value.unsigned,
             other: value.other,
@@ -233,6 +258,7 @@ impl From<DeviceKeys> for DeviceKeyHelper {
             device_id: value.device_id,
             algorithms: value.algorithms,
             keys,
+            dehydrated: value.dehydrated,
             signatures: value.signatures,
             unsigned: value.unsigned,
             other: value.other,

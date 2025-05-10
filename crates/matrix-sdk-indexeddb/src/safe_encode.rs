@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+//! Helpers for wasm32/browser environments
+
 use base64::{
     alphabet,
     engine::{general_purpose, GeneralPurpose},
@@ -14,8 +15,6 @@ use ruma::{
 };
 use wasm_bindgen::JsValue;
 use web_sys::IdbKeyRange;
-
-/// Helpers for wasm32/browser environments
 
 /// ASCII Group Separator, for elements in the keys
 pub const KEY_SEPARATOR: &str = "\u{001D}";
@@ -49,23 +48,6 @@ pub trait SafeEncode {
     fn as_secure_string(&self, table_name: &str, store_cipher: &StoreCipher) -> String {
         STANDARD_NO_PAD
             .encode(store_cipher.hash_key(table_name, self.as_encoded_string().as_bytes()))
-    }
-
-    /// encode self into a JsValue, internally using `as_encoded_string`
-    /// to escape the value of self, and append the given counter
-    fn encode_with_counter(&self, i: usize) -> JsValue {
-        format!("{}{KEY_SEPARATOR}{i:016x}", self.as_encoded_string()).into()
-    }
-
-    /// encode self into a JsValue, internally using `as_secure_string`
-    /// to escape the value of self, and append the given counter
-    fn encode_with_counter_secure(
-        &self,
-        table_name: &str,
-        store_cipher: &StoreCipher,
-        i: usize,
-    ) -> JsValue {
-        format!("{}{KEY_SEPARATOR}{i:016x}", self.as_secure_string(table_name, store_cipher)).into()
     }
 
     /// Encode self into a IdbKeyRange for searching all keys that are

@@ -3,32 +3,32 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use assert_matches2::assert_matches;
+use futures_util::FutureExt;
 use imbl::HashSet;
 use matrix_sdk::{
+    authentication::matrix::MatrixSession,
     config::RequestConfig,
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
+    encryption::VerificationState,
+    test_utils::{client::mock_session_tokens, logged_in_client_with_server},
     Client,
 };
-use matrix_sdk_base::{crypto::EncryptionSyncChanges, SessionMeta};
+use matrix_sdk_base::SessionMeta;
 use matrix_sdk_test::{async_test, SyncResponseBuilder};
 use ruma::{
-    api::{
-        client::{keys::upload_signatures::v3::SignedKeys, sync::sync_events::DeviceLists},
-        MatrixVersion,
-    },
-    assign,
+    api::{client::keys::upload_signatures::v3::SignedKeys, MatrixVersion},
     encryption::{CrossSigningKey, DeviceKeys},
     owned_device_id, owned_user_id,
     serde::Raw,
-    DeviceId, DeviceKeyId, OwnedDeviceId, OwnedUserId,
+    user_id, CrossSigningKeyId, DeviceId, OwnedDeviceId, OwnedUserId,
 };
 use serde_json::json;
 use wiremock::{
-    matchers::{method, path},
+    matchers::{body_json, method, path},
     Mock, MockServer, Request, ResponseTemplate,
 };
 
-use crate::mock_sync;
+use crate::mock_sync_scoped;
 
 #[derive(Debug, Default)]
 struct Keys {
@@ -239,8 +239,10 @@ fn mock_keys_signature_upload(keys: Arc<Mutex<Keys>>) -> impl Fn(&Request) -> Re
                 if let Some(existing_master_key) = keys.master.get_mut(&user) {
                     let mut existing = existing_master_key.deserialize().unwrap();
 
-                    let target =
-                        DeviceKeyId::from_parts(ruma::DeviceKeyAlgorithm::Ed25519, key_id.into());
+                    let target = CrossSigningKeyId::from_parts(
+                        ruma::SigningKeyAlgorithm::Ed25519,
+                        key_id.try_into().unwrap(),
+                    );
 
                     if existing.keys.contains_key(&target) {
                         let param: CrossSigningKey = serde_json::from_str(raw_key.get()).unwrap();
@@ -331,20 +333,32 @@ async fn test_own_verification() {
     alice
         .restore_session(MatrixSession {
             meta: SessionMeta { user_id: user_id.clone(), device_id: device_id.clone() },
-            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+            tokens: mock_session_tokens(),
         })
         .await
         .unwrap();
+
+    // Subscribe to verification state updates
+    let mut verification_state_subscriber = alice.encryption().verification_state();
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Unknown);
 
     server.add_known_device(&device_id);
 
     // Have Alice bootstrap cross-signing.
     bootstrap_cross_signing(&alice).await;
 
-    // The local device is considered verified by default.
+    // The local device is considered verified by default, we need a keys query to
+    // run
     let own_device = alice.encryption().get_device(&user_id, &device_id).await.unwrap().unwrap();
     assert!(own_device.is_verified());
     assert!(!own_device.is_deleted());
+
+    // The device is not considered cross signed yet
+    assert_eq!(
+        verification_state_subscriber.next().now_or_never().flatten().unwrap(),
+        VerificationState::Unverified
+    );
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Unverified);
 
     // Manually re-verifying doesn't change the outcome.
     own_device.verify().await.unwrap();
@@ -364,6 +378,124 @@ async fn test_own_verification() {
     // Manually re-verifying doesn't change the outcome.
     user_identity.verify().await.unwrap();
     assert!(user_identity.is_verified());
+
+    // Force a keys query to pick up the cross-signing state
+    let mut sync_response_builder = SyncResponseBuilder::new();
+    sync_response_builder.add_change_device(&user_id);
+
+    {
+        let _scope = mock_sync_scoped(
+            &server.server,
+            sync_response_builder.build_json_sync_response(),
+            None,
+        )
+        .await;
+        alice.sync_once(Default::default()).await.unwrap();
+    }
+
+    // The device should now be cross-signed
+    assert_eq!(
+        verification_state_subscriber.next().now_or_never().unwrap().unwrap(),
+        VerificationState::Verified
+    );
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Verified);
+}
+
+#[async_test]
+async fn test_reset_cross_signing_resets_verification() {
+    let mut server = MockedServer::new().await;
+
+    let user_id = owned_user_id!("@alice:example.org");
+    let device_id = owned_device_id!("4L1C3");
+    let alice = Client::builder()
+        .homeserver_url(server.server.uri())
+        .server_versions([MatrixVersion::V1_0])
+        .request_config(RequestConfig::new().disable_retry())
+        .build()
+        .await
+        .unwrap();
+    alice
+        .restore_session(MatrixSession {
+            meta: SessionMeta { user_id: user_id.clone(), device_id: device_id.clone() },
+            tokens: mock_session_tokens(),
+        })
+        .await
+        .unwrap();
+
+    // Subscribe to verification state updates
+    let mut verification_state_subscriber = alice.encryption().verification_state();
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Unknown);
+
+    server.add_known_device(&device_id);
+
+    // Have Alice bootstrap cross-signing.
+    bootstrap_cross_signing(&alice).await;
+
+    // The device is not considered cross signed yet
+    assert_eq!(
+        verification_state_subscriber.next().await.unwrap_or(VerificationState::Unknown),
+        VerificationState::Unverified
+    );
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Unverified);
+
+    // Force a keys query to pick up the cross-signing state
+    let mut sync_response_builder = SyncResponseBuilder::new();
+    sync_response_builder.add_change_device(&user_id);
+
+    {
+        let _scope = mock_sync_scoped(
+            &server.server,
+            sync_response_builder.build_json_sync_response(),
+            None,
+        )
+        .await;
+        alice.sync_once(Default::default()).await.unwrap();
+    }
+
+    // The device should now be cross-signed
+    assert_eq!(
+        verification_state_subscriber.next().now_or_never().unwrap().unwrap(),
+        VerificationState::Verified
+    );
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Verified);
+
+    let device_id = owned_device_id!("AliceDevice2");
+    let alice2 = Client::builder()
+        .homeserver_url(server.server.uri())
+        .server_versions([MatrixVersion::V1_0])
+        .request_config(RequestConfig::new().disable_retry())
+        .build()
+        .await
+        .unwrap();
+    alice2
+        .restore_session(MatrixSession {
+            meta: SessionMeta { user_id: user_id.clone(), device_id: device_id.clone() },
+            tokens: mock_session_tokens(),
+        })
+        .await
+        .unwrap();
+
+    server.add_known_device(&device_id);
+
+    // Have Alice bootstrap cross-signing again, this time on her second device.
+    bootstrap_cross_signing(&alice2).await;
+
+    {
+        let _scope = mock_sync_scoped(
+            &server.server,
+            sync_response_builder.build_json_sync_response(),
+            None,
+        )
+        .await;
+        alice.sync_once(Default::default()).await.unwrap();
+    }
+
+    // The device shouldn't be cross-signed anymore.
+    assert_eq!(alice.encryption().verification_state().get(), VerificationState::Unverified);
+    assert_eq!(
+        verification_state_subscriber.next().now_or_never().unwrap().unwrap(),
+        VerificationState::Unverified
+    );
 }
 
 #[async_test]
@@ -385,7 +517,7 @@ async fn test_unchecked_mutual_verification() {
                 user_id: alice_user_id.clone(),
                 device_id: alice_device_id.clone(),
             },
-            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+            tokens: mock_session_tokens(),
         })
         .await
         .unwrap();
@@ -402,7 +534,7 @@ async fn test_unchecked_mutual_verification() {
     let bob_device_id = owned_device_id!("B0B0B0B0B");
     bob.restore_session(MatrixSession {
         meta: SessionMeta { user_id: bob_user_id.clone(), device_id: bob_device_id.clone() },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        tokens: mock_session_tokens(),
     })
     .await
     .unwrap();
@@ -429,8 +561,13 @@ async fn test_unchecked_mutual_verification() {
     // Have Alice and Bob upload their signed device keys.
     {
         let mut sync_response_builder = SyncResponseBuilder::new();
-        mock_sync(&server.server, sync_response_builder.build_json_sync_response(), None).await;
-        alice.sync_once(Default::default()).await.unwrap();
+        let response_body = sync_response_builder.build_json_sync_response();
+        let _scope = mock_sync_scoped(&server.server, response_body, None).await;
+
+        alice
+            .sync_once(Default::default())
+            .await
+            .expect("We should be able to sync with Alice so we upload the device keys");
         bob.sync_once(Default::default()).await.unwrap();
     }
 
@@ -444,8 +581,19 @@ async fn test_unchecked_mutual_verification() {
     // Run a sync so we do send outgoing requests, including the /keys/query for
     // getting bob's identity.
     let mut sync_response_builder = SyncResponseBuilder::new();
-    mock_sync(&server.server, sync_response_builder.build_json_sync_response(), None).await;
-    alice.sync_once(Default::default()).await.unwrap();
+
+    {
+        let _scope = mock_sync_scoped(
+            &server.server,
+            sync_response_builder.build_json_sync_response(),
+            None,
+        )
+        .await;
+        alice
+            .sync_once(Default::default())
+            .await
+            .expect("We should be able to sync so we get theinitial set of devices");
+    }
 
     // From the point of view of Alice, Bob now has a device.
     let alice_bob_device = alice
@@ -468,28 +616,20 @@ async fn test_unchecked_mutual_verification() {
 
     alice_bob_ident.verify().await.unwrap();
 
-    // Notify Alice's devices that some identify changed, so it does another
-    // /keys/query request.
     {
-        let alice_olm = alice.olm_machine_for_testing().await;
-        let alice_olm = alice_olm.as_ref().unwrap();
-        let changed_devices = &assign!(DeviceLists::default(), {
-            changed: vec![bob_user_id.clone()]
-        });
-        alice_olm
-            .receive_sync_changes(EncryptionSyncChanges {
-                to_device_events: Default::default(),
-                changed_devices,
-                one_time_keys_counts: &Default::default(),
-                unused_fallback_keys: Default::default(),
-                next_batch_token: None,
-            })
+        // Notify Alice's devices that some identify changed, so it does another
+        // /keys/query request.
+        let _scope = mock_sync_scoped(
+            &server.server,
+            sync_response_builder.add_change_device(&bob_user_id).build_json_sync_response(),
+            None,
+        )
+        .await;
+        alice
+            .sync_once(Default::default())
             .await
-            .unwrap();
+            .expect("We should be able to sync to get notified about the changed device");
     }
-
-    mock_sync(&server.server, sync_response_builder.build_json_sync_response(), None).await;
-    alice.sync_once(Default::default()).await.unwrap();
 
     let alice_bob_ident = alice
         .encryption()
@@ -513,4 +653,93 @@ async fn test_unchecked_mutual_verification() {
         .expect("alice sees bob's device");
     assert!(alice_bob_device.is_verified());
     assert!(alice_bob_device.is_verified_with_cross_signing());
+}
+
+#[async_test]
+async fn test_request_user_identity() {
+    let (client, server) = logged_in_client_with_server().await;
+    let bob_id = user_id!("@bob:example.org");
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/r0/keys/query"))
+        .and(body_json(json!({ "device_keys": { bob_id: []}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "failures": {},
+            "device_keys": {
+                "@bob:example.org": {
+                    "B0B0B0B0B": {
+                        "user_id": "@bob:example.org",
+                        "device_id": "B0B0B0B0B",
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2"
+                        ],
+                        "keys": {
+                            "curve25519:B0B0B0B0B": "I3YsPwqMZQXHkSQbjFNEs7b529uac2xBpI83eN3LUXo",
+                            "ed25519:B0B0B0B0B": "qzdW3F5IMPFl0HQgz5w/L5Oi/npKUFn8Um84acIHfPY"
+                        },
+                        "signatures": {
+                            "@bob:example.org": {
+                                "ed25519:5JpU6BNHsBZbf4Y3t0IvpIWa7kKDSGy3b+DjVjUuJmc": "MpU1mqNNWymS2mWYsBH0HFxizIVWDgTRmh+qXzXZVdD0dvhwyLKaUAZF/jrbrdyPvjikBtRQGRAk/hhj7DOjDg",
+                                "ed25519:B0B0B0B0B": "jU36UPWk8rrCOUR+v1MN7CsjThmFn4doNR5rFEO2fTERku4zLpAR9oG3OLgRcs+L1Vc8Hqm5++wv9bYuJhp2Bg"
+                            }
+                        }
+                    },
+                },
+            },
+            "master_keys": {
+                "@bob:example.org": {
+                    "user_id": "@bob:example.org",
+                    "usage": ["master"],
+                    "keys": {
+                        "ed25519:3NZwYz0VjFrhONhYT2iBWCYdEYF266jn/vmZqc6QdDU": "3NZwYz0VjFrhONhYT2iBWCYdEYF266jn/vmZqc6QdDU"
+                    },
+                    "signatures": {
+                        "@bob:example.org": {
+                            "ed25519:3NZwYz0VjFrhONhYT2iBWCYdEYF266jn/vmZqc6QdDU": "TCnq8/vy6lp56cF5J9PmsqTnLjKcvsNYN7qFpD6isYWmEFLFBfml8B2ceBzlu9NLwi0xT9jpQV7SYRQt4ZnICQ",
+                            "ed25519:B0B0B0B0B": "yCQFDN+1sJQ+qhqfubOnmPOu/agHT8k17SaD886QmVDwEXCeFFDSZKY29oBDaCRJZJ2BvE2WSK+GACXv5t2FDw"
+                        }
+                    }
+                },
+            },
+            "self_signing_keys": {
+                "@bob:example.org": {
+                    "user_id": "@bob:example.org",
+                    "usage": ["self_signing"],
+                    "keys": {
+                        "ed25519:5JpU6BNHsBZbf4Y3t0IvpIWa7kKDSGy3b+DjVjUuJmc": "5JpU6BNHsBZbf4Y3t0IvpIWa7kKDSGy3b+DjVjUuJmc"
+                    },
+                    "signatures": {
+                        "@bob:example.org": {
+                            "ed25519:3NZwYz0VjFrhONhYT2iBWCYdEYF266jn/vmZqc6QdDU": "yre3bDdzSYNQweNRRB0BXSaaM8n9IA2puathxXSDGebyF6Bh1+Kd6Q8/tl271LwM4Wdar4vgPwrgExW7k2hLBg"
+                        }
+                    }
+                },
+            },
+            "user_signing_keys": {
+                "@bob:example.org": {
+                    "user_id": "@bob:example.org",
+                    "usage": ["user_signing"],
+                    "keys": {
+                        "ed25519:JIKwmV4DJMn4/OY/WuNQrJpNOT8zJSq7fWebLdBq4E8": "JIKwmV4DJMn4/OY/WuNQrJpNOT8zJSq7fWebLdBq4E8"
+                    },
+                    "signatures": {
+                        "@bob:example.org": {
+                            "ed25519:3NZwYz0VjFrhONhYT2iBWCYdEYF266jn/vmZqc6QdDU": "pd0MbRNyh9riLeA9yqEBo+Dk0TUVkdrxyEqkwExKEsP5e3LhPAd6t6f9g7fZv68rxUWjJ2lDbw2xRu3SJghaDA"
+                        }
+                    }
+                },
+            },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let encryption = client.encryption();
+
+    // We don't have Bob's identity yet.
+    assert_matches!(encryption.get_user_identity(bob_id).await, Ok(None));
+
+    assert_matches!(encryption.request_user_identity(bob_id).await, Ok(Some(_)));
+    assert_matches!(encryption.get_user_identity(bob_id).await, Ok(Some(_)));
 }

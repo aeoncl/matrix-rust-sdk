@@ -33,6 +33,8 @@ impl HttpClient {
         R: OutgoingRequest + Debug,
         HttpError: From<FromHttpResponseError<R::EndpointError>>,
     {
+        tracing::debug!("Sending request");
+
         let request = reqwest::Request::try_from(request)?;
         let response = response_to_http_response(self.inner.execute(request).await?).await?;
 
@@ -40,7 +42,7 @@ impl HttpClient {
         let response_size = ByteSize(response.body().len().try_into().unwrap_or(u64::MAX));
         tracing::Span::current()
             .record("status", status_code.as_u16())
-            .record("response_size", response_size.to_string_as(true));
+            .record("response_size", response_size.display().si_short().to_string());
 
         Ok(R::IncomingResponse::try_from_http_response(response)?)
     }

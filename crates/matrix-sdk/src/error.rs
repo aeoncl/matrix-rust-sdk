@@ -14,21 +14,25 @@
 
 //! Error conditions.
 
-use std::{io::Error as IoError, sync::Arc};
+use std::{io::Error as IoError, sync::Arc, time::Duration};
 
 use as_variant::as_variant;
+use http::StatusCode;
 #[cfg(feature = "qrcode")]
 use matrix_sdk_base::crypto::ScanError;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
-use matrix_sdk_base::{Error as SdkBaseError, RoomState, StoreError};
+use matrix_sdk_base::{
+    event_cache::store::EventCacheStoreError, Error as SdkBaseError, QueueWedgeError, RoomState,
+    StoreError,
+};
 use reqwest::Error as ReqwestError;
 use ruma::{
     api::{
         client::{
-            error::{ErrorBody, ErrorKind},
+            error::{ErrorBody, ErrorKind, RetryAfter},
             uiaa::{UiaaInfo, UiaaResponse},
         },
         error::{FromHttpResponseError, IntoHttpError},
@@ -41,7 +45,10 @@ use serde_json::Error as JsonError;
 use thiserror::Error;
 use url::ParseError as UrlParseError;
 
-use crate::store_locks::LockStoreError;
+use crate::{
+    authentication::oauth::OAuthError, event_cache::EventCacheError, media::MediaError,
+    room::reply::ReplyError, sliding_sync::Error as SlidingSyncError, store_locks::LockStoreError,
+};
 
 /// Result type of the matrix-sdk.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -84,34 +91,26 @@ impl RumaApiError {
 /// converting the raw HTTP response into a Matrix response.
 #[derive(Error, Debug)]
 pub enum HttpError {
-    /// An error at the HTTP layer.
+    /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),
-
-    /// Queried endpoint requires authentication but was called on an anonymous
-    /// client.
-    #[error("the queried endpoint requires authentication but was called before logging in")]
-    AuthenticationRequired,
 
     /// Queried endpoint is not meant for clients.
     #[error("the queried endpoint is not meant for clients")]
     NotClientRequest,
 
-    /// An error converting between ruma_*_api types and Hyper types.
+    /// API response error (deserialization, or a Matrix-specific error).
     #[error(transparent)]
-    Api(FromHttpResponseError<RumaApiError>),
+    Api(#[from] FromHttpResponseError<RumaApiError>),
 
-    /// An error converting between ruma_client_api types and Hyper types.
+    /// Error when creating an API request (e.g. serialization of
+    /// body/headers/query parameters).
     #[error(transparent)]
-    IntoHttp(#[from] IntoHttpError),
+    IntoHttp(IntoHttpError),
 
-    /// The given request can't be cloned and thus can't be retried.
-    #[error("The request cannot be cloned")]
-    UnableToCloneRequest,
-
-    /// An error occurred while refreshing the access token.
+    /// Error while refreshing the access token.
     #[error(transparent)]
-    RefreshToken(#[from] RefreshTokenError),
+    RefreshToken(RefreshTokenError),
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -130,13 +129,15 @@ impl HttpError {
     pub fn as_client_api_error(&self) -> Option<&ruma::api::client::Error> {
         self.as_ruma_api_error().and_then(RumaApiError::as_client_api_error)
     }
+}
 
+// Another impl block that's formatted with rustfmt.
+impl HttpError {
     /// If `self` is a server error in the `errcode` + `error` format expected
     /// for client-API endpoints, returns the error kind (`errcode`).
     pub fn client_api_error_kind(&self) -> Option<&ErrorKind> {
-        self.as_client_api_error().and_then(|e| {
-            as_variant!(&e.body, ErrorBody::Standard { kind, .. } => kind)
-        })
+        self.as_client_api_error()
+            .and_then(|e| as_variant!(&e.body, ErrorBody::Standard { kind, .. } => kind))
     }
 
     /// Try to destructure the error into an universal interactive auth info.
@@ -153,6 +154,105 @@ impl HttpError {
     pub fn as_uiaa_response(&self) -> Option<&UiaaInfo> {
         self.as_ruma_api_error().and_then(as_variant!(RumaApiError::Uiaa))
     }
+
+    /// Returns whether an HTTP error response should be qualified as transient
+    /// or permanent.
+    pub(crate) fn retry_kind(&self) -> RetryKind {
+        match self {
+            // If it was a plain network error, it's either that we're disconnected from the
+            // internet, or that the remote is, so retry a few times.
+            HttpError::Reqwest(_) => RetryKind::NetworkFailure,
+
+            HttpError::Api(FromHttpResponseError::Server(api_error)) => {
+                RetryKind::from_api_error(api_error)
+            }
+            _ => RetryKind::Permanent,
+        }
+    }
+}
+
+/// How should we behave with respect to retry behavior after an [`HttpError`]
+/// happened?
+pub(crate) enum RetryKind {
+    /// The request failed because of an error at the network layer.
+    NetworkFailure,
+
+    /// The request failed with a "transient" error, meaning it could be retried
+    /// either soon, or after a given amount of time expressed in
+    /// `retry_after`.
+    Transient {
+        // This is used only for attempts to retry, so on non-wasm32 code (in the `native` module).
+        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        retry_after: Option<Duration>,
+    },
+
+    /// The request failed with a non-transient error, and retrying it would
+    /// likely cause the same error again, so it's not worth retrying.
+    Permanent,
+}
+
+impl RetryKind {
+    /// Construct a [`RetryKind`] from a Ruma API error.
+    ///
+    /// The Ruma API error is for errors which have the standard error response
+    /// format defined in the [spec].
+    ///
+    /// [spec]: https://spec.matrix.org/v1.11/client-server-api/#standard-error-response
+    fn from_api_error(api_error: &RumaApiError) -> Self {
+        use ruma::api::client::Error;
+
+        match api_error {
+            RumaApiError::ClientApi(client_error) => {
+                let Error { status_code, body, .. } = client_error;
+
+                match body {
+                    ErrorBody::Standard { kind, .. } => match kind {
+                        ErrorKind::LimitExceeded { retry_after } => {
+                            RetryKind::from_retry_after(retry_after.as_ref())
+                        }
+                        ErrorKind::Unrecognized => RetryKind::Permanent,
+                        _ => RetryKind::from_status_code(*status_code),
+                    },
+                    _ => RetryKind::from_status_code(*status_code),
+                }
+            }
+            RumaApiError::Other(e) => RetryKind::from_status_code(e.status_code),
+            RumaApiError::Uiaa(_) => RetryKind::Permanent,
+        }
+    }
+
+    /// Create a [`RetryKind`] if we have found a [`RetryAfter`] defined in an
+    /// error.
+    ///
+    /// This method should be used for errors where the server explicitly tells
+    /// us how long we must wait before we retry the request again.
+    fn from_retry_after(retry_after: Option<&RetryAfter>) -> Self {
+        let retry_after = retry_after
+            .and_then(|retry_after| match retry_after {
+                RetryAfter::Delay(d) => Some(d),
+                RetryAfter::DateTime(_) => None,
+            })
+            .copied();
+
+        Self::Transient { retry_after }
+    }
+
+    /// Construct a [`RetryKind`] from a HTTP [`StatusCode`].
+    ///
+    /// This should be used if we don't have a more specific Matrix style error
+    /// which gives us more information about the nature of the error, i.e.
+    /// if we received an error from a reverse proxy while the Matrix
+    /// homeserver is down.
+    fn from_status_code(status_code: StatusCode) -> Self {
+        // If the status code is 429, this is requesting a retry in HTTP, without the
+        // custom `errcode`. Treat that as a retriable request with no specified
+        // retry_after delay.
+        if status_code == StatusCode::TOO_MANY_REQUESTS || status_code.is_server_error() {
+            RetryKind::Transient { retry_after: None }
+        } else {
+            RetryKind::Permanent
+        }
+    }
 }
 
 /// Internal representation of errors.
@@ -161,7 +261,7 @@ impl HttpError {
 pub enum Error {
     /// Error doing an HTTP request.
     #[error(transparent)]
-    Http(#[from] HttpError),
+    Http(Box<HttpError>),
 
     /// Queried endpoint requires authentication but was called on an anonymous
     /// client.
@@ -194,21 +294,21 @@ pub enum Error {
     /// An error occurred in the crypto store.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
-    CryptoStoreError(#[from] CryptoStoreError),
+    CryptoStoreError(Box<CryptoStoreError>),
 
     /// An error occurred with a cross-process store lock.
     #[error(transparent)]
-    CrossProcessLockError(#[from] LockStoreError),
+    CrossProcessLockError(Box<LockStoreError>),
 
     /// An error occurred during a E2EE operation.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
-    OlmError(#[from] OlmError),
+    OlmError(Box<OlmError>),
 
     /// An error occurred during a E2EE group operation.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
-    MegolmError(#[from] MegolmError),
+    MegolmError(Box<MegolmError>),
 
     /// An error occurred during decryption.
     #[cfg(feature = "e2e-encryption")]
@@ -217,7 +317,11 @@ pub enum Error {
 
     /// An error occurred in the state store.
     #[error(transparent)]
-    StateStore(#[from] StoreError),
+    StateStore(Box<StoreError>),
+
+    /// An error occurred in the event cache store.
+    #[error(transparent)]
+    EventCacheStore(Box<EventCacheStoreError>),
 
     /// An error encountered when trying to parse an identifier.
     #[error(transparent)]
@@ -230,51 +334,60 @@ pub enum Error {
     /// An error while scanning a QR code.
     #[cfg(feature = "qrcode")]
     #[error(transparent)]
-    QrCodeScanError(#[from] ScanError),
+    QrCodeScanError(Box<ScanError>),
 
     /// An error encountered when trying to parse a user tag name.
     #[error(transparent)]
     UserTagName(#[from] InvalidUserTagName),
 
-    /// An error while processing images.
-    #[cfg(feature = "image-proc")]
-    #[error(transparent)]
-    ImageError(#[from] ImageError),
-
     /// An error occurred within sliding-sync
-    #[cfg(feature = "experimental-sliding-sync")]
     #[error(transparent)]
-    SlidingSync(#[from] crate::sliding_sync::Error),
+    SlidingSync(Box<SlidingSyncError>),
 
     /// Attempted to call a method on a room that requires the user to have a
     /// specific membership state in the room, but the membership state is
     /// different.
     #[error("wrong room state: {0}")]
-    WrongRoomState(WrongRoomState),
-
-    /// The client is in inconsistent state. This happens when we set a room to
-    /// a specific type, but then cannot get it in this type.
-    #[error("The internal client state is inconsistent.")]
-    InconsistentState,
+    WrongRoomState(Box<WrongRoomState>),
 
     /// Session callbacks have been set multiple times.
     #[error("session callbacks have been set multiple times")]
     MultipleSessionCallbacks,
 
-    /// An error occurred interacting with the OpenID Connect API.
-    #[cfg(feature = "experimental-oidc")]
+    /// An error occurred interacting with the OAuth 2.0 API.
     #[error(transparent)]
-    Oidc(#[from] crate::oidc::OidcError),
+    OAuth(Box<OAuthError>),
 
     /// A concurrent request to a deduplicated request has failed.
     #[error("a concurrent request failed; see logs for details")]
     ConcurrentRequestFailed,
 
-    /// An other error was raised
-    /// this might happen because encryption was enabled on the base-crate
+    /// An other error was raised.
+    ///
+    /// This might happen because encryption was enabled on the base-crate
     /// but not here and that raised.
     #[error("unknown error: {0}")]
     UnknownError(Box<dyn std::error::Error + Send + Sync>),
+
+    /// An error coming from the event cache subsystem.
+    #[error(transparent)]
+    EventCache(Box<EventCacheError>),
+
+    /// An item has been wedged in the send queue.
+    #[error(transparent)]
+    SendQueueWedgeError(Box<QueueWedgeError>),
+
+    /// Backups are not enabled
+    #[error("backups are not enabled")]
+    BackupNotEnabled,
+
+    /// An error happened during handling of a media subrequest.
+    #[error(transparent)]
+    Media(#[from] MediaError),
+
+    /// An error happened while attempting to reply to an event.
+    #[error(transparent)]
+    ReplyError(#[from] ReplyError),
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -315,6 +428,82 @@ impl Error {
     /// returned on the first, failed request.
     pub fn as_uiaa_response(&self) -> Option<&UiaaInfo> {
         self.as_ruma_api_error().and_then(as_variant!(RumaApiError::Uiaa))
+    }
+}
+
+impl From<HttpError> for Error {
+    fn from(error: HttpError) -> Self {
+        Error::Http(Box::new(error))
+    }
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<CryptoStoreError> for Error {
+    fn from(error: CryptoStoreError) -> Self {
+        Error::CryptoStoreError(Box::new(error))
+    }
+}
+
+impl From<LockStoreError> for Error {
+    fn from(error: LockStoreError) -> Self {
+        Error::CrossProcessLockError(Box::new(error))
+    }
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<OlmError> for Error {
+    fn from(error: OlmError) -> Self {
+        Error::OlmError(Box::new(error))
+    }
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<MegolmError> for Error {
+    fn from(error: MegolmError) -> Self {
+        Error::MegolmError(Box::new(error))
+    }
+}
+
+impl From<StoreError> for Error {
+    fn from(error: StoreError) -> Self {
+        Error::StateStore(Box::new(error))
+    }
+}
+
+impl From<EventCacheStoreError> for Error {
+    fn from(error: EventCacheStoreError) -> Self {
+        Error::EventCacheStore(Box::new(error))
+    }
+}
+
+#[cfg(feature = "qrcode")]
+impl From<ScanError> for Error {
+    fn from(error: ScanError) -> Self {
+        Error::QrCodeScanError(Box::new(error))
+    }
+}
+
+impl From<SlidingSyncError> for Error {
+    fn from(error: SlidingSyncError) -> Self {
+        Error::SlidingSync(Box::new(error))
+    }
+}
+
+impl From<OAuthError> for Error {
+    fn from(error: OAuthError) -> Self {
+        Error::OAuth(Box::new(error))
+    }
+}
+
+impl From<EventCacheError> for Error {
+    fn from(error: EventCacheError) -> Self {
+        Error::EventCache(Box::new(error))
+    }
+}
+
+impl From<QueueWedgeError> for Error {
+    fn from(error: QueueWedgeError) -> Self {
+        Error::SendQueueWedgeError(Box::new(error))
     }
 }
 
@@ -370,13 +559,13 @@ impl From<FromHttpResponseError<ruma::api::error::MatrixError>> for HttpError {
 impl From<SdkBaseError> for Error {
     fn from(e: SdkBaseError) -> Self {
         match e {
-            SdkBaseError::StateStore(e) => Self::StateStore(e),
+            SdkBaseError::StateStore(e) => Self::StateStore(Box::new(e)),
             #[cfg(feature = "e2e-encryption")]
-            SdkBaseError::CryptoStore(e) => Self::CryptoStoreError(e),
+            SdkBaseError::CryptoStore(e) => Self::CryptoStoreError(Box::new(e)),
             #[cfg(feature = "e2e-encryption")]
             SdkBaseError::BadCryptoStoreState => Self::BadCryptoStoreState,
             #[cfg(feature = "e2e-encryption")]
-            SdkBaseError::OlmError(e) => Self::OlmError(e),
+            SdkBaseError::OlmError(e) => Self::OlmError(Box::new(e)),
             #[cfg(feature = "eyre")]
             _ => Self::UnknownError(eyre::eyre!(e).into()),
             #[cfg(all(not(feature = "eyre"), feature = "anyhow"))]
@@ -392,25 +581,46 @@ impl From<SdkBaseError> for Error {
 
 impl From<ReqwestError> for Error {
     fn from(e: ReqwestError) -> Self {
-        Error::Http(HttpError::Reqwest(e))
+        Error::Http(Box::new(HttpError::Reqwest(e)))
     }
 }
 
-/// All possible errors that can happen during image processing.
-#[cfg(feature = "image-proc")]
-#[derive(Error, Debug)]
-pub enum ImageError {
-    /// Error processing the image data.
-    #[error(transparent)]
-    Proc(#[from] image::ImageError),
+/// Errors that can happen when interacting with the beacon API.
+#[derive(Debug, Error)]
+pub enum BeaconError {
+    // A network error occurred.
+    #[error("Network error: {0}")]
+    Network(#[from] HttpError),
 
-    /// The image format is not supported.
-    #[error("the image format is not supported")]
-    FormatNotSupported,
+    // The beacon information is not found.
+    #[error("Existing beacon information not found.")]
+    NotFound,
 
-    /// The thumbnail size is bigger than the original image.
-    #[error("the thumbnail size is bigger than the original image size")]
-    ThumbnailBiggerThanOriginal,
+    // The redacted event is not an error, but it's not useful for the client.
+    #[error("Beacon event is redacted and cannot be processed.")]
+    Redacted,
+
+    // The client must join the room to access the beacon information.
+    #[error("Must join the room to access beacon information.")]
+    Stripped,
+
+    // The beacon event could not be deserialized.
+    #[error("Deserialization error: {0}")]
+    Deserialization(#[from] serde_json::Error),
+
+    // The beacon event is expired.
+    #[error("The beacon event has expired.")]
+    NotLive,
+
+    // Allow for other errors to be wrapped.
+    #[error("Other error: {0}")]
+    Other(Box<Error>),
+}
+
+impl From<Error> for BeaconError {
+    fn from(err: Error) -> Self {
+        BeaconError::Other(Box::new(err))
+    }
 }
 
 /// Errors that can happen when refreshing an access token.
@@ -430,10 +640,9 @@ pub enum RefreshTokenError {
     #[error(transparent)]
     MatrixAuth(Arc<HttpError>),
 
-    /// An error occurred interacting with the OpenID Connect API.
-    #[cfg(feature = "experimental-oidc")]
+    /// An error occurred interacting with the OAuth 2.0 API.
     #[error(transparent)]
-    Oidc(#[from] Arc<crate::oidc::OidcError>),
+    OAuth(#[from] Arc<OAuthError>),
 }
 
 /// Errors that can occur when manipulating push notification settings.

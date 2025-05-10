@@ -15,8 +15,9 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations)]
 
-#[doc(no_inline)]
-pub use instant;
+use std::pin::Pin;
+
+use futures_core::Future;
 #[doc(no_inline)]
 pub use ruma;
 
@@ -24,10 +25,14 @@ pub mod debug;
 pub mod deserialized_responses;
 pub mod executor;
 pub mod failures_cache;
+pub mod linked_chunk;
+pub mod locks;
 pub mod ring_buffer;
+pub mod sleep;
 pub mod store_locks;
 pub mod timeout;
 pub mod tracing_timer;
+pub mod ttl_cache;
 
 // We cannot currently measure test coverage in the WASM environment, so
 // js_tracing is incorrectly flagged as untested. Disable coverage checking for
@@ -88,3 +93,12 @@ macro_rules! boxed_into_future {
         >>;
     };
 }
+
+/// A `Box::pin` future that is `Send` on non-wasm, and without `Send` on wasm.
+#[cfg(target_arch = "wasm32")]
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();

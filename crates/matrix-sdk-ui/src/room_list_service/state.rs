@@ -14,23 +14,17 @@
 
 //! States and actions for the `RoomList` state machine.
 
-use std::future::ready;
+use std::{future::ready, sync::Mutex};
 
-use async_trait::async_trait;
-use matrix_sdk::{
-    sliding_sync::{Bound, Range},
-    SlidingSync, SlidingSyncList, SlidingSyncMode,
-};
-use once_cell::sync::Lazy;
-use ruma::events::StateEventType;
+use eyeball::{SharedObservable, Subscriber};
+use matrix_sdk::{sliding_sync::Range, SlidingSync, SlidingSyncMode};
+use ruma::time::{Duration, Instant};
 
 use super::Error;
 
 pub const ALL_ROOMS_LIST_NAME: &str = "all_rooms";
-pub const VISIBLE_ROOMS_LIST_NAME: &str = "visible_rooms";
-pub const INVITES_LIST_NAME: &str = "invites";
 
-/// The state of the [`super::RoomList`]' state machine.
+/// The state of the [`super::RoomList`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
     /// That's the first initial state.
@@ -44,8 +38,7 @@ pub enum State {
     /// are then slightly different.
     Recovering,
 
-    /// At this state, all rooms are syncing, and the visible rooms + invites
-    /// lists exist.
+    /// At this state, all rooms are syncing.
     Running,
 
     /// At this state, the sync has been stopped because an error happened.
@@ -55,17 +48,91 @@ pub enum State {
     Terminated { from: Box<State> },
 }
 
-impl State {
+/// Default value for `StateMachine::state_lifespan`.
+const DEFAULT_STATE_LIFESPAN: Duration = Duration::from_secs(1800);
+
+/// The state machine used to transition between the [`State`]s.
+#[derive(Debug)]
+pub struct StateMachine {
+    /// The current state of the `RoomListService`.
+    state: SharedObservable<State>,
+
+    /// Last time the state has been updated.
+    ///
+    /// When the state has not been updated since a long time, we want to enter
+    /// the [`State::Recovering`] state. Why do we need to do that? Because in
+    /// some cases, the user might have received many updates between two
+    /// distant syncs. If the sliding sync list range was too large, like
+    /// 0..=499, the next sync is likely to be heavy and potentially slow.
+    /// In this case, it's preferable to jump back onto `Recovering`, which will
+    /// reset the range, so that the next sync will be fast for the client.
+    ///
+    /// To be used in coordination with `Self::state_lifespan`.
+    ///
+    /// This mutex is only taken for short periods of time, so it's sync.
+    last_state_update_time: Mutex<Instant>,
+
+    /// The maximum time before considering the state as “too old”.
+    ///
+    /// To be used in coordination with `Self::last_state_update_time`.
+    state_lifespan: Duration,
+}
+
+impl StateMachine {
+    pub(super) fn new() -> Self {
+        StateMachine {
+            state: SharedObservable::new(State::Init),
+            last_state_update_time: Mutex::new(Instant::now()),
+            state_lifespan: DEFAULT_STATE_LIFESPAN,
+        }
+    }
+
+    /// Get the current state.
+    pub(super) fn get(&self) -> State {
+        self.state.get()
+    }
+
+    /// Set the new state.
+    ///
+    /// Setting a new state will update `Self::last_state_update`.
+    pub(super) fn set(&self, state: State) {
+        let mut last_state_update_time = self.last_state_update_time.lock().unwrap();
+        *last_state_update_time = Instant::now();
+
+        self.state.set(state);
+    }
+
+    /// Subscribe to state updates.
+    pub fn subscribe(&self) -> Subscriber<State> {
+        self.state.subscribe()
+    }
+
     /// Transition to the next state, and execute the associated transition's
     /// [`Actions`].
-    pub(super) async fn next(&self, sliding_sync: &SlidingSync) -> Result<Self, Error> {
+    pub(super) async fn next(&self, sliding_sync: &SlidingSync) -> Result<State, Error> {
         use State::*;
 
-        let (next_state, actions) = match self {
-            Init => (SettingUp, Actions::none()),
-            SettingUp => (Running, Actions::prepare_for_next_syncs_once_first_rooms_are_loaded()),
-            Recovering => (Running, Actions::prepare_for_next_syncs_once_recovered()),
-            Running => (Running, Actions::none()),
+        let next_state = match self.get() {
+            Init => SettingUp,
+
+            SettingUp | Recovering => {
+                set_all_rooms_to_growing_sync_mode(sliding_sync).await?;
+                Running
+            }
+
+            Running => {
+                // We haven't changed the state for a while, we go back to `Recovering` to avoid
+                // requesting potentially large data. See `Self::last_state_update` to learn
+                // the details.
+                if self.last_state_update_time.lock().unwrap().elapsed() > self.state_lifespan {
+                    set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
+
+                    Recovering
+                } else {
+                    Running
+                }
+            }
+
             Error { from: previous_state } | Terminated { from: previous_state } => {
                 match previous_state.as_ref() {
                     // Unreachable state.
@@ -76,253 +143,57 @@ impl State {
                     }
 
                     // If the previous state was `Running`, we enter the `Recovering` state.
-                    Running => (Recovering, Actions::prepare_to_recover()),
+                    Running => {
+                        set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
+                        Recovering
+                    }
 
                     // Jump back to the previous state that led to this termination.
-                    state => (state.to_owned(), Actions::none()),
+                    state => state.to_owned(),
                 }
             }
         };
-
-        for action in actions.iter() {
-            action.run(sliding_sync).await?;
-        }
 
         Ok(next_state)
     }
 }
 
-/// A trait to define what an `Action` is.
-#[async_trait]
-trait Action {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error>;
+async fn set_all_rooms_to_growing_sync_mode(sliding_sync: &SlidingSync) -> Result<(), Error> {
+    sliding_sync
+        .on_list(ALL_ROOMS_LIST_NAME, |list| {
+            list.set_sync_mode(SlidingSyncMode::new_growing(ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE));
+
+            ready(())
+        })
+        .await
+        .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))
 }
 
-struct AddVisibleRooms;
+async fn set_all_rooms_to_selective_sync_mode(sliding_sync: &SlidingSync) -> Result<(), Error> {
+    sliding_sync
+        .on_list(ALL_ROOMS_LIST_NAME, |list| {
+            list.set_sync_mode(
+                SlidingSyncMode::new_selective().add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
+            );
 
-/// Default timeline for the `VISIBLE_ROOMS_LIST_NAME` list.
-pub const VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT: Bound = 20;
-
-/// Default range for the `VISIBLE_ROOMS_LIST_NAME` list.
-pub const VISIBLE_ROOMS_DEFAULT_RANGE: Range = 0..=19;
-
-#[async_trait]
-impl Action for AddVisibleRooms {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .add_list(super::configure_all_or_visible_rooms_list(
-                SlidingSyncList::builder(VISIBLE_ROOMS_LIST_NAME)
-                    .sync_mode(
-                        SlidingSyncMode::new_selective().add_range(VISIBLE_ROOMS_DEFAULT_RANGE),
-                    )
-                    .timeline_limit(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
-                    .required_state(vec![
-                        (StateEventType::RoomEncryption, "".to_owned()),
-                        (StateEventType::RoomMember, "$LAZY".to_owned()),
-                    ]),
-            ))
-            .await
-            .map_err(Error::SlidingSync)?;
-
-        Ok(())
-    }
+            ready(())
+        })
+        .await
+        .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))
 }
-
-struct SetVisibleRoomsToZeroTimelineLimit;
-
-#[async_trait]
-impl Action for SetVisibleRoomsToZeroTimelineLimit {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(VISIBLE_ROOMS_LIST_NAME, |list| {
-                list.set_timeline_limit(Some(0));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(VISIBLE_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetVisibleRoomsToDefaultTimelineLimit;
-
-#[async_trait]
-impl Action for SetVisibleRoomsToDefaultTimelineLimit {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(VISIBLE_ROOMS_LIST_NAME, |list| {
-                list.set_timeline_limit(Some(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(VISIBLE_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetAllRoomsToSelectiveSyncMode;
 
 /// Default `batch_size` for the selective sync-mode of the
 /// `ALL_ROOMS_LIST_NAME` list.
 pub const ALL_ROOMS_DEFAULT_SELECTIVE_RANGE: Range = 0..=19;
 
-#[async_trait]
-impl Action for SetAllRoomsToSelectiveSyncMode {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(ALL_ROOMS_LIST_NAME, |list| {
-                list.set_sync_mode(
-                    SlidingSyncMode::new_selective().add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
-                );
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetAllRoomsToGrowingSyncMode;
-
 /// Default `batch_size` for the growing sync-mode of the `ALL_ROOMS_LIST_NAME`
 /// list.
 pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 100;
 
-#[async_trait]
-impl Action for SetAllRoomsToGrowingSyncMode {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(ALL_ROOMS_LIST_NAME, |list| {
-                list.set_sync_mode(SlidingSyncMode::new_growing(
-                    ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE,
-                ));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(ALL_ROOMS_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetInvitesToSelectiveSyncMode;
-
-/// Default `range` for the selective sync-mode of the `INVITES_LIST_NAME` list.
-pub const INVITES_DEFAULT_SELECTIVE_RANGE: Range = 0..=0;
-
-#[async_trait]
-impl Action for SetInvitesToSelectiveSyncMode {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(INVITES_LIST_NAME, |list| {
-                list.set_sync_mode(
-                    SlidingSyncMode::new_selective().add_range(INVITES_DEFAULT_SELECTIVE_RANGE),
-                );
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(INVITES_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-struct SetInvitesToGrowingSyncMode;
-
-/// Default `batch_size` for the growing sync-mode of the `INVITES_LIST_NAME`
-/// list.
-pub const INVITES_DEFAULT_GROWING_BATCH_SIZE: u32 = 20;
-
-#[async_trait]
-impl Action for SetInvitesToGrowingSyncMode {
-    async fn run(&self, sliding_sync: &SlidingSync) -> Result<(), Error> {
-        sliding_sync
-            .on_list(INVITES_LIST_NAME, |list| {
-                list.set_sync_mode(SlidingSyncMode::new_growing(
-                    INVITES_DEFAULT_GROWING_BATCH_SIZE,
-                ));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::UnknownList(INVITES_LIST_NAME.to_owned()))?;
-
-        Ok(())
-    }
-}
-
-/// Type alias to represent one action.
-type OneAction = Box<dyn Action + Send + Sync>;
-
-/// Type alias to represent many actions.
-type ManyActions = Vec<OneAction>;
-
-/// A type to represent multiple actions.
-///
-/// It contains helper methods to create pre-configured set of actions.
-struct Actions {
-    actions: &'static Lazy<ManyActions>,
-}
-
-macro_rules! actions {
-    (
-        $(
-            $action_group_name:ident => [
-                $( $action_name:ident ),* $(,)?
-            ]
-        ),*
-        $(,)?
-    ) => {
-        $(
-            fn $action_group_name () -> Self {
-                static ACTIONS: Lazy<ManyActions> = Lazy::new(|| {
-                    vec![
-                        $( Box::new( $action_name ) ),*
-                    ]
-                });
-
-                Self { actions: &ACTIONS }
-            }
-        )*
-    };
-}
-
-impl Actions {
-    actions! {
-        none => [],
-        prepare_for_next_syncs_once_first_rooms_are_loaded => [
-            SetAllRoomsToGrowingSyncMode,
-            SetInvitesToGrowingSyncMode,
-            AddVisibleRooms
-        ],
-        prepare_for_next_syncs_once_recovered => [
-            SetAllRoomsToGrowingSyncMode,
-            SetInvitesToGrowingSyncMode,
-            SetVisibleRoomsToDefaultTimelineLimit
-        ],
-        prepare_to_recover => [
-            SetAllRoomsToSelectiveSyncMode,
-            SetInvitesToSelectiveSyncMode,
-            SetVisibleRoomsToZeroTimelineLimit
-        ],
-    }
-
-    fn iter(&self) -> &[OneAction] {
-        self.actions.as_slice()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::async_test;
+    use tokio::time::sleep;
 
     use super::{super::tests::new_room_list, *};
 
@@ -331,169 +202,156 @@ mod tests {
         let room_list = new_room_list().await?;
         let sliding_sync = room_list.sliding_sync();
 
-        // First state.
-        let state = State::Init;
+        let state_machine = StateMachine::new();
 
         // Hypothetical error.
         {
-            let state = State::Error { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            state_machine.set(State::Error { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state, State::Init);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Init);
         }
 
         // Hypothetical termination.
         {
-            let state =
-                State::Terminated { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state, State::Init);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Init);
         }
 
         // Next state.
-        let state = state.next(sliding_sync).await?;
-        assert_eq!(state, State::SettingUp);
+        state_machine.set(state_machine.next(sliding_sync).await?);
+        assert_eq!(state_machine.get(), State::SettingUp);
 
         // Hypothetical error.
         {
-            let state = State::Error { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            state_machine.set(State::Error { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state, State::SettingUp);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::SettingUp);
         }
 
         // Hypothetical termination.
         {
-            let state =
-                State::Terminated { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state, State::SettingUp);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::SettingUp);
         }
 
         // Next state.
-        let state = state.next(sliding_sync).await?;
-        assert_eq!(state, State::Running);
+        state_machine.set(state_machine.next(sliding_sync).await?);
+        assert_eq!(state_machine.get(), State::Running);
 
         // Hypothetical error.
         {
-            let state = State::Error { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            state_machine.set(State::Error { from: Box::new(state_machine.get()) });
 
             // Jump to the **recovering** state!
-            assert_eq!(state, State::Recovering);
-
-            let state = state.next(sliding_sync).await?;
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
 
             // Now, back to the previous state.
-            assert_eq!(state, State::Running);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
         }
 
         // Hypothetical termination.
         {
-            let state =
-                State::Terminated { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Jump to the **recovering** state!
-            assert_eq!(state, State::Recovering);
-
-            let state = state.next(sliding_sync).await?;
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
 
             // Now, back to the previous state.
-            assert_eq!(state, State::Running);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
         }
 
         // Hypothetical error when recovering.
         {
-            let state =
-                State::Error { from: Box::new(State::Recovering) }.next(sliding_sync).await?;
+            state_machine.set(State::Error { from: Box::new(State::Recovering) });
 
             // Back to the previous state.
-            assert_eq!(state, State::Recovering);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
         }
 
         // Hypothetical termination when recovering.
         {
-            let state =
-                State::Terminated { from: Box::new(State::Recovering) }.next(sliding_sync).await?;
+            state_machine.set(State::Terminated { from: Box::new(State::Recovering) });
 
             // Back to the previous state.
-            assert_eq!(state, State::Recovering);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
         }
 
         Ok(())
     }
 
     #[async_test]
-    async fn test_action_add_visible_rooms_list() -> Result<(), Error> {
+    async fn test_recover_state_after_delay() -> Result<(), Error> {
         let room_list = new_room_list().await?;
         let sliding_sync = room_list.sliding_sync();
 
-        // List is absent.
-        assert_eq!(sliding_sync.on_list(VISIBLE_ROOMS_LIST_NAME, |_list| ready(())).await, None);
+        let mut state_machine = StateMachine::new();
+        state_machine.state_lifespan = Duration::from_millis(50);
 
-        // Run the action!
-        AddVisibleRooms.run(sliding_sync).await?;
+        {
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::SettingUp);
 
-        // List is present.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(matches!(
-                    list.sync_mode(),
-                    SlidingSyncMode::Selective { ranges } if ranges == vec![VISIBLE_ROOMS_DEFAULT_RANGE]
-                )))
-                .await,
-            Some(true)
-        );
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
 
-        Ok(())
-    }
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
 
-    #[async_test]
-    async fn test_action_set_visible_rooms_list_to_zero_or_default_timeline_limit(
-    ) -> Result<(), Error> {
-        let room_list = new_room_list().await?;
-        let sliding_sync = room_list.sliding_sync();
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+        }
 
-        // List is absent.
-        assert_eq!(sliding_sync.on_list(VISIBLE_ROOMS_LIST_NAME, |_list| ready(())).await, None);
+        // Time passes.
+        sleep(Duration::from_millis(100)).await;
 
-        // Run the action!
-        AddVisibleRooms.run(sliding_sync).await?;
+        {
+            // Time has elapsed, time to recover.
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
 
-        // List is present, and has the default `timeline_limit`.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(
-                    list.timeline_limit() == Some(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
-                ))
-                .await,
-            Some(true)
-        );
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
 
-        // Run the action!
-        SetVisibleRoomsToZeroTimelineLimit.run(sliding_sync).await?;
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
 
-        // List is present, and has a zero `timeline_limit`.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(list.timeline_limit() == Some(0)))
-                .await,
-            Some(true)
-        );
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+        }
 
-        // Run the action!
-        SetVisibleRoomsToDefaultTimelineLimit.run(sliding_sync).await?;
+        // Time passes, again. Just to test everything is going well.
+        sleep(Duration::from_millis(100)).await;
 
-        // List is present, and has the default `timeline_limit`.
-        assert_eq!(
-            sliding_sync
-                .on_list(VISIBLE_ROOMS_LIST_NAME, |list| ready(
-                    list.timeline_limit() == Some(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
-                ))
-                .await,
-            Some(true)
-        );
+        {
+            // Time has elapsed, time to recover.
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+        }
 
         Ok(())
     }
@@ -516,7 +374,7 @@ mod tests {
         );
 
         // Run the action!
-        SetAllRoomsToGrowingSyncMode.run(sliding_sync).await.unwrap();
+        set_all_rooms_to_growing_sync_mode(sliding_sync).await.unwrap();
 
         // List is still present, in Growing mode.
         assert_eq!(
@@ -532,7 +390,7 @@ mod tests {
         );
 
         // Run the other action!
-        SetAllRoomsToSelectiveSyncMode.run(sliding_sync).await.unwrap();
+        set_all_rooms_to_selective_sync_mode(sliding_sync).await.unwrap();
 
         // List is still present, in Selective mode.
         assert_eq!(
@@ -540,53 +398,6 @@ mod tests {
                 .on_list(ALL_ROOMS_LIST_NAME, |list| ready(matches!(
                     list.sync_mode(),
                     SlidingSyncMode::Selective { ranges } if ranges == vec![ALL_ROOMS_DEFAULT_SELECTIVE_RANGE]
-                )))
-                .await,
-            Some(true)
-        );
-
-        Ok(())
-    }
-
-    #[async_test]
-    async fn test_action_set_invite_list_to_growing_and_selective_sync_mode() -> Result<(), Error> {
-        let room_list = new_room_list().await?;
-        let sliding_sync = room_list.sliding_sync();
-
-        // List is present, in Selective mode.
-        assert_eq!(
-            sliding_sync
-                .on_list(INVITES_LIST_NAME, |list| ready(matches!(
-                    list.sync_mode(),
-                    SlidingSyncMode::Selective { ranges } if ranges == vec![INVITES_DEFAULT_SELECTIVE_RANGE]
-                )))
-                .await,
-            Some(true)
-        );
-
-        // Run the action!
-        SetInvitesToGrowingSyncMode.run(sliding_sync).await.unwrap();
-
-        // List is still present, in Growing mode.
-        assert_eq!(
-            sliding_sync
-                .on_list(INVITES_LIST_NAME, |list| ready(matches!(
-                    list.sync_mode(),
-                    SlidingSyncMode::Growing { batch_size, .. } if batch_size == INVITES_DEFAULT_GROWING_BATCH_SIZE
-                )))
-                .await,
-            Some(true)
-        );
-
-        // Run the other action!
-        SetInvitesToSelectiveSyncMode.run(sliding_sync).await.unwrap();
-
-        // List is still present, in Selective mode.
-        assert_eq!(
-            sliding_sync
-                .on_list(INVITES_LIST_NAME, |list| ready(matches!(
-                    list.sync_mode(),
-                    SlidingSyncMode::Selective { ranges } if ranges == vec![INVITES_DEFAULT_SELECTIVE_RANGE]
                 )))
                 .await,
             Some(true)

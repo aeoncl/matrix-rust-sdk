@@ -1,7 +1,8 @@
-use std::{collections::btree_map::Iter, sync::Arc};
+use std::collections::btree_map::Iter;
 
 use ruma::{encryption::KeyUsage, OwnedDeviceKeyId, UserId};
 use serde::{Deserialize, Serialize};
+use vodozemac::Ed25519PublicKey;
 
 use super::{CrossSigningKey, MasterPubkey, SigningKey};
 use crate::{olm::VerifyJson, types::SigningKeys, SignatureError};
@@ -11,7 +12,7 @@ use crate::{olm::VerifyJson, types::SigningKeys, SignatureError};
 /// User signing keys are used to sign the master keys of other users.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "CrossSigningKey")]
-pub struct UserSigningPubkey(pub(super) Arc<CrossSigningKey>);
+pub struct UserSigningPubkey(pub(super) CrossSigningKey);
 
 impl UserSigningPubkey {
     /// Get the user id of the user signing key's owner.
@@ -29,12 +30,20 @@ impl UserSigningPubkey {
         &self.0.keys
     }
 
+    /// Get the first available user-signing key.
+    ///
+    /// There's usually only a single key so this will usually fetch the
+    /// only key.
+    pub fn get_first_key(&self) -> Option<Ed25519PublicKey> {
+        self.0.get_first_key_and_id().map(|(_, k)| k)
+    }
+
     /// Check if the given master key is signed by this user signing key.
     ///
     /// # Arguments
     ///
     /// * `master_key` - The master key that should be checked for a valid
-    /// signature.
+    ///   signature.
     ///
     /// Returns an empty result if the signature check succeeded, otherwise a
     /// SignatureError indicating why the check failed.
@@ -64,7 +73,7 @@ impl TryFrom<CrossSigningKey> for UserSigningPubkey {
 
     fn try_from(key: CrossSigningKey) -> Result<Self, Self::Error> {
         if key.usage.contains(&KeyUsage::UserSigning) && key.usage.len() == 1 {
-            Ok(Self(key.into()))
+            Ok(Self(key))
         } else {
             Err(serde::de::Error::custom(format!(
                 "Expected cross signing key usage {} was not found",
@@ -73,8 +82,15 @@ impl TryFrom<CrossSigningKey> for UserSigningPubkey {
         }
     }
 }
+
 impl AsRef<CrossSigningKey> for UserSigningPubkey {
     fn as_ref(&self) -> &CrossSigningKey {
         &self.0
+    }
+}
+
+impl AsMut<CrossSigningKey> for UserSigningPubkey {
+    fn as_mut(&mut self) -> &mut CrossSigningKey {
+        &mut self.0
     }
 }

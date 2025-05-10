@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
-
+use as_variant::as_variant;
 use ruma::{
-    events::{AnyTimelineEvent, MessageLikeEventType, StateEventType},
+    api::client::{
+        delayed_events::{delayed_message_event, delayed_state_event, update_delayed_event},
+        error::{ErrorBody, StandardErrorBody},
+    },
+    events::AnyTimelineEvent,
     serde::Raw,
-    OwnedEventId, RoomId,
+    OwnedEventId, OwnedRoomId,
 };
 use serde::{Deserialize, Serialize};
 
-use super::SendEventRequest;
-use crate::widget::StateKeySelector;
+use super::{SendEventRequest, UpdateDelayedEventRequest};
+use crate::{widget::StateKeySelector, Error, HttpError, RumaApiError};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(tag = "action", rename_all = "snake_case", content = "data")]
 pub(super) enum FromWidgetRequest {
     SupportedApiVersions {},
@@ -34,30 +37,89 @@ pub(super) enum FromWidgetRequest {
     #[serde(rename = "org.matrix.msc2876.read_events")]
     ReadEvent(ReadEventRequest),
     SendEvent(SendEventRequest),
+    #[serde(rename = "org.matrix.msc4157.update_delayed_event")]
+    DelayedEventUpdate(UpdateDelayedEventRequest),
 }
 
+/// The full response a client sends to a [`FromWidgetRequest`] in case of an
+/// error.
 #[derive(Serialize)]
 pub(super) struct FromWidgetErrorResponse {
     error: FromWidgetError,
 }
 
 impl FromWidgetErrorResponse {
-    pub(super) fn new(e: impl fmt::Display) -> Self {
-        Self { error: FromWidgetError { message: e.to_string() } }
+    /// Create a error response to send to the widget from an http error.
+    pub(crate) fn from_http_error(error: HttpError) -> Self {
+        let message = error.to_string();
+        let matrix_api_error = as_variant!(error, HttpError::Api(ruma::api::error::FromHttpResponseError::Server(RumaApiError::ClientApi(err))) => err);
+
+        Self {
+            error: FromWidgetError {
+                message,
+                matrix_api_error: matrix_api_error.and_then(|api_error| match api_error.body {
+                    ErrorBody::Standard { kind, message } => Some(FromWidgetMatrixErrorBody {
+                        http_status: api_error.status_code.as_u16().into(),
+                        response: StandardErrorBody { kind, message },
+                    }),
+                    _ => None,
+                }),
+            },
+        }
+    }
+
+    /// Create a error response to send to the widget from a matrix sdk error.
+    pub(crate) fn from_error(error: Error) -> Self {
+        match error {
+            Error::Http(e) => FromWidgetErrorResponse::from_http_error(*e),
+            // For UnknownError's we do not want to have the `unknown error` bit in the message.
+            // Hence we only convert the inner error to a string.
+            Error::UnknownError(e) => FromWidgetErrorResponse::from_string(e.to_string()),
+            _ => FromWidgetErrorResponse::from_string(error.to_string()),
+        }
+    }
+
+    /// Create a error response to send to the widget from a string.
+    pub(crate) fn from_string<S: Into<String>>(error: S) -> Self {
+        Self { error: FromWidgetError { message: error.into(), matrix_api_error: None } }
     }
 }
 
+/// Serializable section of an error response send by the client as a
+/// response to a [`FromWidgetRequest`].
 #[derive(Serialize)]
 struct FromWidgetError {
+    /// Unspecified error message text that caused this widget action to
+    /// fail.
+    ///
+    /// This is useful to prompt the user on an issue but cannot be used to
+    /// decide on how to deal with the error.
     message: String,
+
+    /// Optional matrix error hinting at workarounds for specific errors.
+    matrix_api_error: Option<FromWidgetMatrixErrorBody>,
 }
 
+/// Serializable section of a widget response that represents a matrix error.
+#[derive(Serialize)]
+struct FromWidgetMatrixErrorBody {
+    /// Status code of the http response.
+    http_status: u32,
+
+    /// Standard error response including the `errorcode` and the `error`
+    /// message as defined in the [spec](https://spec.matrix.org/v1.12/client-server-api/#standard-error-response).
+    response: StandardErrorBody,
+}
+
+/// The serializable section of a widget response containing the supported
+/// versions.
 #[derive(Serialize)]
 pub(super) struct SupportedApiVersionsResponse {
     supported_versions: Vec<ApiVersion>,
 }
 
 impl SupportedApiVersionsResponse {
+    /// The currently supported widget api versions from the rust widget driver.
     pub(super) fn new() -> Self {
         Self {
             supported_versions: vec![
@@ -111,18 +173,17 @@ pub(super) enum ApiVersion {
     MSC3846,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub(super) enum ReadEventRequest {
     ReadStateEvent {
         #[serde(rename = "type")]
-        event_type: StateEventType,
+        event_type: String,
         state_key: StateKeySelector,
     },
-    #[allow(dead_code)]
     ReadMessageLikeEvent {
         #[serde(rename = "type")]
-        event_type: MessageLikeEventType,
+        event_type: String,
         limit: Option<u32>,
     },
 }
@@ -132,8 +193,47 @@ pub(super) struct ReadEventResponse {
     pub(super) events: Vec<Raw<AnyTimelineEvent>>,
 }
 
-#[derive(Serialize)]
-pub(super) struct SendEventResponse<'a> {
-    pub(super) room_id: &'a RoomId,
-    pub(super) event_id: OwnedEventId,
+#[derive(Serialize, Debug)]
+pub(crate) struct SendEventResponse {
+    /// The room id for the send event.
+    pub(crate) room_id: Option<OwnedRoomId>,
+    /// The event id of the send event. It's optional because if it's a delayed
+    /// event, it does not get the event_id at this point.
+    pub(crate) event_id: Option<OwnedEventId>,
+    /// The `delay_id` generated for this delayed event. Used to interact with
+    /// the delayed event.
+    pub(crate) delay_id: Option<String>,
+}
+
+impl SendEventResponse {
+    pub(crate) fn from_event_id(event_id: OwnedEventId) -> Self {
+        SendEventResponse { room_id: None, event_id: Some(event_id), delay_id: None }
+    }
+    pub(crate) fn set_room_id(&mut self, room_id: OwnedRoomId) {
+        self.room_id = Some(room_id);
+    }
+}
+
+impl From<delayed_message_event::unstable::Response> for SendEventResponse {
+    fn from(val: delayed_message_event::unstable::Response) -> Self {
+        SendEventResponse { room_id: None, event_id: None, delay_id: Some(val.delay_id) }
+    }
+}
+
+impl From<delayed_state_event::unstable::Response> for SendEventResponse {
+    fn from(val: delayed_state_event::unstable::Response) -> Self {
+        SendEventResponse { room_id: None, event_id: None, delay_id: Some(val.delay_id) }
+    }
+}
+
+/// A wrapper type for the empty okay response from
+/// [`update_delayed_event`](update_delayed_event::unstable::Response)
+/// which derives Serialize. (The response struct from Ruma does not derive
+/// serialize)
+#[derive(Serialize, Debug)]
+pub(crate) struct UpdateDelayedEventResponse {}
+impl From<update_delayed_event::unstable::Response> for UpdateDelayedEventResponse {
+    fn from(_: update_delayed_event::unstable::Response) -> Self {
+        Self {}
+    }
 }

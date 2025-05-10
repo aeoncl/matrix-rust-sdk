@@ -8,15 +8,3 @@ dictionary Mentions {
 interface RoomMessageEventContentWithoutRelation {
     RoomMessageEventContentWithoutRelation with_mentions(Mentions mentions);
 };
-
-[Error]
-interface ClientError {
-    Generic(string msg);
-};
-
-interface MediaSource {
-    [Name=from_json, Throws=ClientError]
-    constructor(string json);
-    string to_json();
-    string url();
-};

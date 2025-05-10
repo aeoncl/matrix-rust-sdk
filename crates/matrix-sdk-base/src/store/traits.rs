@@ -14,15 +14,17 @@
 
 use std::{
     borrow::Borrow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     sync::Arc,
 };
 
 use as_variant::as_variant;
 use async_trait::async_trait;
+use growable_bloom_filter::GrowableBloom;
 use matrix_sdk_common::AsyncTraitDeps;
 use ruma::{
+    api::MatrixVersion,
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
@@ -32,13 +34,21 @@ use ruma::{
         RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
     },
     serde::Raw,
-    EventId, MxcUri, OwnedEventId, OwnedUserId, RoomId, UserId,
+    time::SystemTime,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
+use serde::{Deserialize, Serialize};
 
-use super::{StateChanges, StoreError};
+use super::{
+    send_queue::SentRequestKey, ChildTransactionId, DependentQueuedRequest,
+    DependentQueuedRequestKind, QueueWedgeError, QueuedRequest, QueuedRequestKind,
+    RoomLoadSettings, StateChanges, StoreError,
+};
 use crate::{
-    deserialized_responses::{RawAnySyncOrStrippedState, RawMemberEvent, RawSyncOrStrippedState},
-    media::MediaRequest,
+    deserialized_responses::{
+        DisplayName, RawAnySyncOrStrippedState, RawMemberEvent, RawSyncOrStrippedState,
+    },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships,
 };
 
@@ -184,23 +194,11 @@ pub trait StateStore: AsyncTraitDeps {
         memberships: RoomMemberships,
     ) -> Result<Vec<OwnedUserId>, Self::Error>;
 
-    /// Get all the user ids of members that are in the invited state for a
-    /// given room, for stripped and regular rooms alike.
-    #[deprecated = "Use get_user_ids with RoomMemberships::INVITE instead."]
-    async fn get_invited_user_ids(&self, room_id: &RoomId)
-        -> Result<Vec<OwnedUserId>, Self::Error>;
-
-    /// Get all the user ids of members that are in the joined state for a
-    /// given room, for stripped and regular rooms alike.
-    #[deprecated = "Use get_user_ids with RoomMemberships::JOIN instead."]
-    async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>, Self::Error>;
-
-    /// Get all the pure `RoomInfo`s the store knows about.
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>, Self::Error>;
-
-    /// Get all the pure `RoomInfo`s the store knows about.
-    #[deprecated = "Use get_room_infos instead and filter by RoomState"]
-    async fn get_stripped_room_infos(&self) -> Result<Vec<RoomInfo>, Self::Error>;
+    /// Get a set of pure `RoomInfo`s the store knows about.
+    async fn get_room_infos(
+        &self,
+        room_load_settings: &RoomLoadSettings,
+    ) -> Result<Vec<RoomInfo>, Self::Error>;
 
     /// Get all the users that use the given display name in the given room.
     ///
@@ -213,7 +211,7 @@ pub trait StateStore: AsyncTraitDeps {
     async fn get_users_with_display_name(
         &self,
         room_id: &RoomId,
-        display_name: &str,
+        display_name: &DisplayName,
     ) -> Result<BTreeSet<OwnedUserId>, Self::Error>;
 
     /// Get all the users that use the given display names in the given room.
@@ -226,8 +224,8 @@ pub trait StateStore: AsyncTraitDeps {
     async fn get_users_with_display_names<'a>(
         &self,
         room_id: &RoomId,
-        display_names: &'a [String],
-    ) -> Result<BTreeMap<&'a str, BTreeSet<OwnedUserId>>, Self::Error>;
+        display_names: &'a [DisplayName],
+    ) -> Result<HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>, Self::Error>;
 
     /// Get an event out of the account data store.
     ///
@@ -302,7 +300,8 @@ pub trait StateStore: AsyncTraitDeps {
     /// * `key` - The key to fetch data for
     async fn get_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Put arbitrary data into the custom store
+    /// Put arbitrary data into the custom store, return the data previously
+    /// stored
     ///
     /// # Arguments
     ///
@@ -315,6 +314,27 @@ pub trait StateStore: AsyncTraitDeps {
         value: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
 
+    /// Put arbitrary data into the custom store, do not attempt to read any
+    /// previous data
+    ///
+    /// Optimization option for set_custom_values for stores that would perform
+    /// better withouts the extra read and the caller not needing that data
+    /// returned. Otherwise this just wraps around `set_custom_data` and
+    /// discards the result.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to insert data into
+    ///
+    /// * `value` - The value to insert
+    async fn set_custom_value_no_read(
+        &self,
+        key: &[u8],
+        value: Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        self.set_custom_value(key, value).await.map(|_| ())
+    }
+
     /// Remove arbitrary data from the custom store and return it if existed
     ///
     /// # Arguments
@@ -322,50 +342,137 @@ pub trait StateStore: AsyncTraitDeps {
     /// * `key` - The key to remove data from
     async fn remove_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Add a media file's content in the media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The `MediaRequest` of the file.
-    ///
-    /// * `content` - The content of the file.
-    async fn add_media_content(
-        &self,
-        request: &MediaRequest,
-        content: Vec<u8>,
-    ) -> Result<(), Self::Error>;
-
-    /// Get a media file's content out of the media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The `MediaRequest` of the file.
-    async fn get_media_content(
-        &self,
-        request: &MediaRequest,
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
-
-    /// Removes a media file's content from the media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The `MediaRequest` of the file.
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<(), Self::Error>;
-
-    /// Removes all the media files' content associated to an `MxcUri` from the
-    /// media store.
-    ///
-    /// # Arguments
-    ///
-    /// * `uri` - The `MxcUri` of the media files.
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<(), Self::Error>;
-
-    /// Removes a room and all elements associated from the state store.
+    /// Remove a room and all elements associated from the state store.
     ///
     /// # Arguments
     ///
     /// * `room_id` - The `RoomId` of the room to delete.
     async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error>;
+
+    /// Save a request to be sent by a send queue later (e.g. sending an event).
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The `RoomId` of the send queue's room.
+    /// * `transaction_id` - The unique key identifying the event to be sent
+    ///   (and its transaction). Note: this is expected to be randomly generated
+    ///   and thus unique.
+    /// * `content` - Serializable event content to be sent.
+    async fn save_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        request: QueuedRequestKind,
+        priority: usize,
+    ) -> Result<(), Self::Error>;
+
+    /// Updates a send queue request with the given content, and resets its
+    /// error status.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The `RoomId` of the send queue's room.
+    /// * `transaction_id` - The unique key identifying the request to be sent
+    ///   (and its transaction).
+    /// * `content` - Serializable event content to replace the original one.
+    ///
+    /// Returns true if a request has been updated, or false otherwise.
+    async fn update_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: QueuedRequestKind,
+    ) -> Result<bool, Self::Error>;
+
+    /// Remove a request previously inserted with
+    /// [`Self::save_send_queue_request`] from the database, based on its
+    /// transaction id.
+    ///
+    /// Returns true if something has been removed, or false otherwise.
+    async fn remove_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error>;
+
+    /// Loads all the send queue requests for the given room.
+    ///
+    /// The resulting vector of queued requests should be ordered from higher
+    /// priority to lower priority, and respect the insertion order when
+    /// priorities are equal.
+    async fn load_send_queue_requests(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedRequest>, Self::Error>;
+
+    /// Updates the send queue error status (wedge) for a given send queue
+    /// request.
+    async fn update_send_queue_request_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        error: Option<QueueWedgeError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Loads all the rooms which have any pending requests in their send queue.
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error>;
+
+    /// Add a new entry to the list of dependent send queue requests for a
+    /// parent request.
+    async fn save_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: DependentQueuedRequestKind,
+    ) -> Result<(), Self::Error>;
+
+    /// Mark a set of dependent send queue requests as ready, using a key
+    /// identifying the homeserver's response.
+    ///
+    /// ⚠ Beware! There's no verification applied that the parent key type is
+    /// compatible with the dependent event type. The invalid state may be
+    /// lazily filtered out in `load_dependent_queued_requests`.
+    ///
+    /// Returns the number of updated requests.
+    async fn mark_dependent_queued_requests_as_ready(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        sent_parent_key: SentRequestKey,
+    ) -> Result<usize, Self::Error>;
+
+    /// Update a dependent send queue request with the new content.
+    ///
+    /// Returns true if the request was found and could be updated.
+    async fn update_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool, Self::Error>;
+
+    /// Remove a specific dependent send queue request by id.
+    ///
+    /// Returns true if the dependent send queue request has been indeed
+    /// removed.
+    async fn remove_dependent_queued_request(
+        &self,
+        room: &RoomId,
+        own_txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error>;
+
+    /// List all the dependent send queue requests.
+    ///
+    /// This returns absolutely all the dependent send queue requests, whether
+    /// they have a parent event id or not. As a contract for implementors, they
+    /// must be returned in insertion order.
+    async fn load_dependent_queued_requests(
+        &self,
+        room: &RoomId,
+    ) -> Result<Vec<DependentQueuedRequest>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -470,30 +577,17 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         self.0.get_user_ids(room_id, memberships).await.map_err(Into::into)
     }
 
-    async fn get_invited_user_ids(
+    async fn get_room_infos(
         &self,
-        room_id: &RoomId,
-    ) -> Result<Vec<OwnedUserId>, Self::Error> {
-        self.0.get_user_ids(room_id, RoomMemberships::INVITE).await.map_err(Into::into)
-    }
-
-    async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>, Self::Error> {
-        self.0.get_user_ids(room_id, RoomMemberships::JOIN).await.map_err(Into::into)
-    }
-
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>, Self::Error> {
-        self.0.get_room_infos().await.map_err(Into::into)
-    }
-
-    #[allow(deprecated)]
-    async fn get_stripped_room_infos(&self) -> Result<Vec<RoomInfo>, Self::Error> {
-        self.0.get_stripped_room_infos().await.map_err(Into::into)
+        room_load_settings: &RoomLoadSettings,
+    ) -> Result<Vec<RoomInfo>, Self::Error> {
+        self.0.get_room_infos(room_load_settings).await.map_err(Into::into)
     }
 
     async fn get_users_with_display_name(
         &self,
         room_id: &RoomId,
-        display_name: &str,
+        display_name: &DisplayName,
     ) -> Result<BTreeSet<OwnedUserId>, Self::Error> {
         self.0.get_users_with_display_name(room_id, display_name).await.map_err(Into::into)
     }
@@ -501,8 +595,8 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
     async fn get_users_with_display_names<'a>(
         &self,
         room_id: &RoomId,
-        display_names: &'a [String],
-    ) -> Result<BTreeMap<&'a str, BTreeSet<OwnedUserId>>, Self::Error> {
+        display_names: &'a [DisplayName],
+    ) -> Result<HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>, Self::Error> {
         self.0.get_users_with_display_names(room_id, display_names).await.map_err(Into::into)
     }
 
@@ -563,31 +657,115 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         self.0.remove_custom_value(key).await.map_err(Into::into)
     }
 
-    async fn add_media_content(
-        &self,
-        request: &MediaRequest,
-        content: Vec<u8>,
-    ) -> Result<(), Self::Error> {
-        self.0.add_media_content(request, content).await.map_err(Into::into)
-    }
-
-    async fn get_media_content(
-        &self,
-        request: &MediaRequest,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.0.get_media_content(request).await.map_err(Into::into)
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<(), Self::Error> {
-        self.0.remove_media_content(request).await.map_err(Into::into)
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<(), Self::Error> {
-        self.0.remove_media_content_for_uri(uri).await.map_err(Into::into)
-    }
-
     async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error> {
         self.0.remove_room(room_id).await.map_err(Into::into)
+    }
+
+    async fn save_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: QueuedRequestKind,
+        priority: usize,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .save_send_queue_request(room_id, transaction_id, created_at, content, priority)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn update_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: QueuedRequestKind,
+    ) -> Result<bool, Self::Error> {
+        self.0.update_send_queue_request(room_id, transaction_id, content).await.map_err(Into::into)
+    }
+
+    async fn remove_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        self.0.remove_send_queue_request(room_id, transaction_id).await.map_err(Into::into)
+    }
+
+    async fn load_send_queue_requests(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedRequest>, Self::Error> {
+        self.0.load_send_queue_requests(room_id).await.map_err(Into::into)
+    }
+
+    async fn update_send_queue_request_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        error: Option<QueueWedgeError>,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .update_send_queue_request_status(room_id, transaction_id, error)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        self.0.load_rooms_with_unsent_requests().await.map_err(Into::into)
+    }
+
+    async fn save_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: DependentQueuedRequestKind,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .save_dependent_queued_request(room_id, parent_txn_id, own_txn_id, created_at, content)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_dependent_queued_requests_as_ready(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        sent_parent_key: SentRequestKey,
+    ) -> Result<usize, Self::Error> {
+        self.0
+            .mark_dependent_queued_requests_as_ready(room_id, parent_txn_id, sent_parent_key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        own_txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error> {
+        self.0.remove_dependent_queued_request(room_id, own_txn_id).await.map_err(Into::into)
+    }
+
+    async fn load_dependent_queued_requests(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<DependentQueuedRequest>, Self::Error> {
+        self.0.load_dependent_queued_requests(room_id).await.map_err(Into::into)
+    }
+
+    async fn update_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool, Self::Error> {
+        self.0
+            .update_dependent_queued_request(room_id, own_transaction_id, new_content)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -772,17 +950,120 @@ where
     }
 }
 
+/// Server capabilities returned by the /client/versions endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerCapabilities {
+    /// Versions supported by the remote server.
+    ///
+    /// This contains [`MatrixVersion`]s converted to strings.
+    pub versions: Vec<String>,
+
+    /// List of unstable features and their enablement status.
+    pub unstable_features: BTreeMap<String, bool>,
+
+    /// Last time we fetched this data from the server, in milliseconds since
+    /// epoch.
+    last_fetch_ts: f64,
+}
+
+impl ServerCapabilities {
+    /// The number of milliseconds after which the data is considered stale.
+    pub const STALE_THRESHOLD: f64 = (1000 * 60 * 60 * 24 * 7) as _; // seven days
+
+    /// Encode server capabilities into this serializable struct.
+    pub fn new(versions: &[MatrixVersion], unstable_features: BTreeMap<String, bool>) -> Self {
+        Self {
+            versions: versions.iter().map(|item| item.to_string()).collect(),
+            unstable_features,
+            last_fetch_ts: now_timestamp_ms(),
+        }
+    }
+
+    /// Decode server capabilities from this serializable struct.
+    ///
+    /// May return `None` if the data is considered stale, after
+    /// [`Self::STALE_THRESHOLD`] milliseconds since the last time we stored
+    /// it.
+    pub fn maybe_decode(&self) -> Option<(Vec<MatrixVersion>, BTreeMap<String, bool>)> {
+        if now_timestamp_ms() - self.last_fetch_ts >= Self::STALE_THRESHOLD {
+            None
+        } else {
+            Some((
+                self.versions.iter().filter_map(|item| item.parse().ok()).collect(),
+                self.unstable_features.clone(),
+            ))
+        }
+    }
+}
+
+/// Get the current timestamp as the number of milliseconds since Unix Epoch.
+fn now_timestamp_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("System clock was before 1970.")
+        .as_secs_f64()
+        * 1000.0
+}
+
 /// A value for key-value data that should be persisted into the store.
 #[derive(Debug, Clone)]
 pub enum StateStoreDataValue {
     /// The sync token.
     SyncToken(String),
 
+    /// The server capabilities.
+    ServerCapabilities(ServerCapabilities),
+
     /// A filter with the given ID.
     Filter(String),
 
     /// The user avatar url
-    UserAvatarUrl(String),
+    UserAvatarUrl(OwnedMxcUri),
+
+    /// A list of recently visited room identifiers for the current user
+    RecentlyVisitedRooms(Vec<OwnedRoomId>),
+
+    /// Persistent data for
+    /// `matrix_sdk_ui::unable_to_decrypt_hook::UtdHookManager`.
+    UtdHookManagerData(GrowableBloom),
+
+    /// A composer draft for the room.
+    /// To learn more, see [`ComposerDraft`].
+    ///
+    /// [`ComposerDraft`]: Self::ComposerDraft
+    ComposerDraft(ComposerDraft),
+
+    /// A list of knock request ids marked as seen in a room.
+    SeenKnockRequests(BTreeMap<OwnedEventId, OwnedUserId>),
+}
+
+/// Current draft of the composer for the room.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComposerDraft {
+    /// The draft content in plain text.
+    pub plain_text: String,
+    /// If the message is formatted in HTML, the HTML representation of the
+    /// message.
+    pub html_text: Option<String>,
+    /// The type of draft.
+    pub draft_type: ComposerDraftType,
+}
+
+/// The type of draft of the composer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ComposerDraftType {
+    /// The draft is a new message.
+    NewMessage,
+    /// The draft is a reply to an event.
+    Reply {
+        /// The ID of the event being replied to.
+        event_id: OwnedEventId,
+    },
+    /// The draft is an edit of an event.
+    Edit {
+        /// The ID of the event being edited.
+        event_id: OwnedEventId,
+    },
 }
 
 impl StateStoreDataValue {
@@ -797,8 +1078,33 @@ impl StateStoreDataValue {
     }
 
     /// Get this value if it is a user avatar url.
-    pub fn into_user_avatar_url(self) -> Option<String> {
+    pub fn into_user_avatar_url(self) -> Option<OwnedMxcUri> {
         as_variant!(self, Self::UserAvatarUrl)
+    }
+
+    /// Get this value if it is a list of recently visited rooms.
+    pub fn into_recently_visited_rooms(self) -> Option<Vec<OwnedRoomId>> {
+        as_variant!(self, Self::RecentlyVisitedRooms)
+    }
+
+    /// Get this value if it is the data for the `UtdHookManager`.
+    pub fn into_utd_hook_manager_data(self) -> Option<GrowableBloom> {
+        as_variant!(self, Self::UtdHookManagerData)
+    }
+
+    /// Get this value if it is a composer draft.
+    pub fn into_composer_draft(self) -> Option<ComposerDraft> {
+        as_variant!(self, Self::ComposerDraft)
+    }
+
+    /// Get this value if it is the server capabilities metadata.
+    pub fn into_server_capabilities(self) -> Option<ServerCapabilities> {
+        as_variant!(self, Self::ServerCapabilities)
+    }
+
+    /// Get this value if it is the data for the ignored join requests.
+    pub fn into_seen_knock_requests(self) -> Option<BTreeMap<OwnedEventId, OwnedUserId>> {
+        as_variant!(self, Self::SeenKnockRequests)
     }
 }
 
@@ -808,19 +1114,78 @@ pub enum StateStoreDataKey<'a> {
     /// The sync token.
     SyncToken,
 
+    /// The server capabilities,
+    ServerCapabilities,
+
     /// A filter with the given name.
     Filter(&'a str),
 
     /// Avatar URL
     UserAvatarUrl(&'a UserId),
+
+    /// Recently visited room identifiers
+    RecentlyVisitedRooms(&'a UserId),
+
+    /// Persistent data for
+    /// `matrix_sdk_ui::unable_to_decrypt_hook::UtdHookManager`.
+    UtdHookManagerData,
+
+    /// A composer draft for the room.
+    /// To learn more, see [`ComposerDraft`].
+    ///
+    /// [`ComposerDraft`]: Self::ComposerDraft
+    ComposerDraft(&'a RoomId),
+
+    /// A list of knock request ids marked as seen in a room.
+    SeenKnockRequests(&'a RoomId),
 }
 
 impl StateStoreDataKey<'_> {
     /// Key to use for the [`SyncToken`][Self::SyncToken] variant.
     pub const SYNC_TOKEN: &'static str = "sync_token";
+    /// Key to use for the [`ServerCapabilities`][Self::ServerCapabilities]
+    /// variant.
+    pub const SERVER_CAPABILITIES: &'static str = "server_capabilities";
     /// Key prefix to use for the [`Filter`][Self::Filter] variant.
     pub const FILTER: &'static str = "filter";
     /// Key prefix to use for the [`UserAvatarUrl`][Self::UserAvatarUrl]
     /// variant.
     pub const USER_AVATAR_URL: &'static str = "user_avatar_url";
+
+    /// Key prefix to use for the
+    /// [`RecentlyVisitedRooms`][Self::RecentlyVisitedRooms] variant.
+    pub const RECENTLY_VISITED_ROOMS: &'static str = "recently_visited_rooms";
+
+    /// Key to use for the [`UtdHookManagerData`][Self::UtdHookManagerData]
+    /// variant.
+    pub const UTD_HOOK_MANAGER_DATA: &'static str = "utd_hook_manager_data";
+
+    /// Key prefix to use for the [`ComposerDraft`][Self::ComposerDraft]
+    /// variant.
+    pub const COMPOSER_DRAFT: &'static str = "composer_draft";
+
+    /// Key prefix to use for the
+    /// [`SeenKnockRequests`][Self::SeenKnockRequests] variant.
+    pub const SEEN_KNOCK_REQUESTS: &'static str = "seen_knock_requests";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{now_timestamp_ms, ServerCapabilities};
+
+    #[test]
+    fn test_stale_server_capabilities() {
+        let mut caps = ServerCapabilities {
+            versions: Default::default(),
+            unstable_features: Default::default(),
+            last_fetch_ts: now_timestamp_ms() - ServerCapabilities::STALE_THRESHOLD - 1.0,
+        };
+
+        // Definitely stale.
+        assert!(caps.maybe_decode().is_none());
+
+        // Definitely not stale.
+        caps.last_fetch_ts = now_timestamp_ms() - 1.0;
+        assert!(caps.maybe_decode().is_some());
+    }
 }

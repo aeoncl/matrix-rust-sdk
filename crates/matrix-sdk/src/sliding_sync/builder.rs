@@ -1,27 +1,19 @@
 use std::{
     collections::BTreeMap,
     fmt::Debug,
-    num::NonZeroUsize,
     sync::{Arc, RwLock as StdRwLock},
     time::Duration,
 };
 
-use matrix_sdk_common::{ring_buffer::RingBuffer, timer};
-use ruma::{
-    api::client::sync::sync_events::v4::{
-        self, AccountDataConfig, E2EEConfig, ExtensionsConfig, ReceiptsConfig, ToDeviceConfig,
-        TypingConfig,
-    },
-    OwnedRoomId,
-};
+use matrix_sdk_common::timer;
+use ruma::{api::client::sync::sync_events::v5 as http, OwnedRoomId};
 use tokio::sync::{broadcast::channel, Mutex as AsyncMutex, RwLock as AsyncRwLock};
-use url::Url;
 
 use super::{
     cache::{format_storage_key_prefix, restore_sliding_sync_state},
     sticky_parameters::SlidingSyncStickyManager,
     Error, SlidingSync, SlidingSyncInner, SlidingSyncListBuilder, SlidingSyncPositionMarkers,
-    SlidingSyncRoom,
+    Version,
 };
 use crate::{sliding_sync::SlidingSyncStickyParameters, Client, Result};
 
@@ -33,12 +25,11 @@ use crate::{sliding_sync::SlidingSyncStickyParameters, Client, Result};
 pub struct SlidingSyncBuilder {
     id: String,
     storage_key: String,
-    sliding_sync_proxy: Option<Url>,
+    version: Option<Version>,
     client: Client,
     lists: Vec<SlidingSyncListBuilder>,
-    extensions: Option<ExtensionsConfig>,
-    subscriptions: BTreeMap<OwnedRoomId, v4::RoomSubscription>,
-    rooms: BTreeMap<OwnedRoomId, SlidingSyncRoom>,
+    extensions: Option<http::request::Extensions>,
+    subscriptions: BTreeMap<OwnedRoomId, http::request::RoomSubscription>,
     poll_timeout: Duration,
     network_timeout: Duration,
     #[cfg(feature = "e2e-encryption")]
@@ -50,19 +41,17 @@ impl SlidingSyncBuilder {
         if id.len() > 16 {
             Err(Error::InvalidSlidingSyncIdentifier)
         } else {
-            let storage_key = format_storage_key_prefix(
-                &id,
-                client.user_id().ok_or(super::Error::UnauthenticatedUser)?,
-            );
+            let storage_key =
+                format_storage_key_prefix(&id, client.user_id().ok_or(Error::UnauthenticatedUser)?);
+
             Ok(Self {
                 id,
                 storage_key,
-                sliding_sync_proxy: None,
+                version: None,
                 client,
                 lists: Vec::new(),
                 extensions: None,
                 subscriptions: BTreeMap::new(),
-                rooms: BTreeMap::new(),
                 poll_timeout: Duration::from_secs(30),
                 network_timeout: Duration::from_secs(30),
                 #[cfg(feature = "e2e-encryption")]
@@ -71,14 +60,9 @@ impl SlidingSyncBuilder {
         }
     }
 
-    /// Set the sliding sync proxy URL.
-    ///
-    /// Note you might not need that in general, since the client uses the
-    /// `.well-known` endpoint to automatically find the sliding sync proxy
-    /// URL. This method should only be called if the proxy is at a
-    /// different URL than the one publicized in the `.well-known` endpoint.
-    pub fn sliding_sync_proxy(mut self, value: Url) -> Self {
-        self.sliding_sync_proxy = Some(value);
+    /// Set a specific version that will override the one from the [`Client`].
+    pub fn version(mut self, version: Version) -> Self {
+        self.version = Some(version);
         self
     }
 
@@ -97,16 +81,10 @@ impl SlidingSyncBuilder {
     /// cache.
     ///
     /// Replace any list with the same name.
-    pub async fn add_cached_list(mut self, mut list: SlidingSyncListBuilder) -> Result<Self> {
+    pub async fn add_cached_list(self, mut list: SlidingSyncListBuilder) -> Result<Self> {
         let _timer = timer!(format!("restoring (loading+processing) list {}", list.name));
 
-        let reloaded_rooms = list.set_cached_and_reload(&self.client, &self.storage_key).await?;
-
-        for (key, frozen) in reloaded_rooms {
-            self.rooms
-                .entry(key)
-                .or_insert_with(|| SlidingSyncRoom::from_frozen(frozen, self.client.clone()));
-        }
+        list.set_cached_and_reload(&self.client, &self.storage_key).await?;
 
         Ok(self.add_list(list))
     }
@@ -143,31 +121,32 @@ impl SlidingSyncBuilder {
     }
 
     /// Set the E2EE extension configuration.
-    pub fn with_e2ee_extension(mut self, e2ee: E2EEConfig) -> Self {
+    pub fn with_e2ee_extension(mut self, e2ee: http::request::E2EE) -> Self {
         self.extensions.get_or_insert_with(Default::default).e2ee = e2ee;
         self
     }
 
     /// Unset the E2EE extension configuration.
     pub fn without_e2ee_extension(mut self) -> Self {
-        self.extensions.get_or_insert_with(Default::default).e2ee = E2EEConfig::default();
+        self.extensions.get_or_insert_with(Default::default).e2ee = http::request::E2EE::default();
         self
     }
 
     /// Set the ToDevice extension configuration.
-    pub fn with_to_device_extension(mut self, to_device: ToDeviceConfig) -> Self {
+    pub fn with_to_device_extension(mut self, to_device: http::request::ToDevice) -> Self {
         self.extensions.get_or_insert_with(Default::default).to_device = to_device;
         self
     }
 
     /// Unset the ToDevice extension configuration.
     pub fn without_to_device_extension(mut self) -> Self {
-        self.extensions.get_or_insert_with(Default::default).to_device = ToDeviceConfig::default();
+        self.extensions.get_or_insert_with(Default::default).to_device =
+            http::request::ToDevice::default();
         self
     }
 
     /// Set the account data extension configuration.
-    pub fn with_account_data_extension(mut self, account_data: AccountDataConfig) -> Self {
+    pub fn with_account_data_extension(mut self, account_data: http::request::AccountData) -> Self {
         self.extensions.get_or_insert_with(Default::default).account_data = account_data;
         self
     }
@@ -175,31 +154,33 @@ impl SlidingSyncBuilder {
     /// Unset the account data extension configuration.
     pub fn without_account_data_extension(mut self) -> Self {
         self.extensions.get_or_insert_with(Default::default).account_data =
-            AccountDataConfig::default();
+            http::request::AccountData::default();
         self
     }
 
     /// Set the Typing extension configuration.
-    pub fn with_typing_extension(mut self, typing: TypingConfig) -> Self {
+    pub fn with_typing_extension(mut self, typing: http::request::Typing) -> Self {
         self.extensions.get_or_insert_with(Default::default).typing = typing;
         self
     }
 
     /// Unset the Typing extension configuration.
     pub fn without_typing_extension(mut self) -> Self {
-        self.extensions.get_or_insert_with(Default::default).typing = TypingConfig::default();
+        self.extensions.get_or_insert_with(Default::default).typing =
+            http::request::Typing::default();
         self
     }
 
     /// Set the Receipt extension configuration.
-    pub fn with_receipt_extension(mut self, receipt: ReceiptsConfig) -> Self {
+    pub fn with_receipt_extension(mut self, receipt: http::request::Receipts) -> Self {
         self.extensions.get_or_insert_with(Default::default).receipts = receipt;
         self
     }
 
     /// Unset the Receipt extension configuration.
     pub fn without_receipt_extension(mut self) -> Self {
-        self.extensions.get_or_insert_with(Default::default).receipts = ReceiptsConfig::default();
+        self.extensions.get_or_insert_with(Default::default).receipts =
+            http::request::Receipts::default();
         self
     }
 
@@ -248,6 +229,12 @@ impl SlidingSyncBuilder {
     pub async fn build(self) -> Result<SlidingSync> {
         let client = self.client;
 
+        let version = self.version.unwrap_or_else(|| client.sliding_sync_version());
+
+        if matches!(version, Version::None) {
+            return Err(crate::error::Error::SlidingSync(Box::new(Error::VersionIsMissing)));
+        }
+
         let (internal_channel_sender, _internal_channel_receiver) = channel(8);
 
         let mut lists = BTreeMap::new();
@@ -262,15 +249,15 @@ impl SlidingSyncBuilder {
         let restored_fields =
             restore_sliding_sync_state(&client, &self.storage_key, &lists).await?;
 
-        let (delta_token, pos) = if let Some(fields) = restored_fields {
+        let (pos, rooms) = if let Some(fields) = restored_fields {
             #[cfg(feature = "e2e-encryption")]
             let pos = if self.share_pos { fields.pos } else { None };
             #[cfg(not(feature = "e2e-encryption"))]
             let pos = None;
 
-            (fields.delta_token, pos)
+            (pos, fields.rooms)
         } else {
-            (None, None)
+            (None, BTreeMap::new())
         };
 
         #[cfg(feature = "e2e-encryption")]
@@ -278,16 +265,11 @@ impl SlidingSyncBuilder {
         #[cfg(not(feature = "e2e-encryption"))]
         let share_pos = false;
 
-        let rooms = AsyncRwLock::new(self.rooms);
+        let rooms = AsyncRwLock::new(rooms);
         let lists = AsyncRwLock::new(lists);
-
-        // Use the configured sliding sync proxy, or if not set, try to use the one
-        // auto-discovered by the client, if any.
-        let sliding_sync_proxy = self.sliding_sync_proxy.or_else(|| client.sliding_sync_proxy());
 
         Ok(SlidingSync::new(SlidingSyncInner {
             id: self.id,
-            sliding_sync_proxy,
 
             client,
             storage_key: self.storage_key,
@@ -296,9 +278,7 @@ impl SlidingSyncBuilder {
             lists,
             rooms,
 
-            position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers { pos, delta_token })),
-            // SAFETY: `unwrap` is safe because 20 is not zero.
-            past_positions: StdRwLock::new(RingBuffer::new(NonZeroUsize::new(20).unwrap())),
+            position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers { pos })),
 
             sticky: StdRwLock::new(SlidingSyncStickyManager::new(
                 SlidingSyncStickyParameters::new(
@@ -306,7 +286,6 @@ impl SlidingSyncBuilder {
                     self.extensions.unwrap_or_default(),
                 ),
             )),
-            room_unsubscriptions: Default::default(),
 
             internal_channel: internal_channel_sender,
 

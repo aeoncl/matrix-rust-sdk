@@ -18,14 +18,14 @@ use anyhow::{Context as _, Result};
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::{Vector, VectorDiff};
-use futures_util::{pin_mut, FutureExt, Stream, StreamExt};
+use futures_util::{pin_mut, Stream, StreamExt};
 use matrix_sdk::{
-    test_utils::logged_in_client_with_server, SlidingSync, SlidingSyncList, SlidingSyncListBuilder,
-    SlidingSyncMode, UpdateSummary,
+    test_utils::logged_in_client_with_server, Client, SlidingSync, SlidingSyncList,
+    SlidingSyncListBuilder, SlidingSyncMode, UpdateSummary,
 };
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, mocks::mock_encryption_state};
 use matrix_sdk_ui::{
-    timeline::{TimelineItem, TimelineItemKind, VirtualTimelineItem},
+    timeline::{TimelineItem, TimelineItemKind},
     Timeline,
 };
 use ruma::{room_id, user_id, RoomId};
@@ -70,22 +70,22 @@ macro_rules! timeline_event {
 pub(crate) use timeline_event;
 
 macro_rules! assert_timeline_stream {
-    // `--- day divider ---`
-    ( @_ [ $stream:ident ] [ --- day divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    // `--- date divider ---`
+    ( @_ [ $iterator:ident ] [ --- date divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
-            [ $stream ]
+            [ $iterator ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 {
                     assert_matches!(
-                        $stream.next().now_or_never(),
-                        Some(Some(VectorDiff::PushBack { value })) => {
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::PushBack { value }) => {
                             assert_matches!(
                                 **value,
-                                TimelineItemKind::Virtual(
-                                    VirtualTimelineItem::DayDivider(_)
+                                matrix_sdk_ui::timeline::TimelineItemKind::Virtual(
+                                    matrix_sdk_ui::timeline::VirtualTimelineItem::DateDivider(_)
                                 )
                             );
                         }
@@ -96,20 +96,96 @@ macro_rules! assert_timeline_stream {
     };
 
     // `append "$event_id"`
-    ( @_ [ $stream:ident ] [ append $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $iterator:ident ] [ append $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
-            [ $stream ]
+            [ $iterator ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 {
                     assert_matches!(
-                        $stream.next().now_or_never(),
-                        Some(Some(VectorDiff::PushBack { value })) => {
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::PushBack { value }) => {
                             assert_matches!(
                                 &**value,
-                                TimelineItemKind::Event(event_timeline_item) => {
+                                matrix_sdk_ui::timeline::TimelineItemKind::Event(event_timeline_item) => {
+                                    assert_eq!(event_timeline_item.event_id().unwrap().as_str(), $event_id);
+                                }
+                            );
+                        }
+                    );
+                }
+            ]
+        )
+    };
+
+    // `prepend --- date divider ---`
+    ( @_ [ $iterator:ident ] [ prepend --- date divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+        assert_timeline_stream!(
+            @_
+            [ $iterator ]
+            [ $( $rest )* ]
+            [
+                $( $accumulator )*
+                {
+                    assert_matches!(
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::PushFront { value }) => {
+                            assert_matches!(
+                                &**value,
+                                matrix_sdk_ui::timeline::TimelineItemKind::Virtual(
+                                    matrix_sdk_ui::timeline::VirtualTimelineItem::DateDivider(_)
+                                ) => {}
+                            );
+                        }
+                    );
+                }
+            ]
+        )
+    };
+
+
+    // `prepend --- timeline start ---`
+    ( @_ [ $iterator:ident ] [ prepend --- timeline start --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+        assert_timeline_stream!(
+            @_
+            [ $iterator ]
+            [ $( $rest )* ]
+            [
+                $( $accumulator )*
+                {
+                    assert_matches!(
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::PushFront { value }) => {
+                            assert_matches!(
+                                &**value,
+                                matrix_sdk_ui::timeline::TimelineItemKind::Virtual(
+                                    matrix_sdk_ui::timeline::VirtualTimelineItem::TimelineStart
+                                ) => {}
+                            );
+                        }
+                    );
+                }
+            ]
+        )
+    };
+
+    // `prepend "$event_id"`
+    ( @_ [ $iterator:ident ] [ prepend $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+        assert_timeline_stream!(
+            @_
+            [ $iterator ]
+            [ $( $rest )* ]
+            [
+                $( $accumulator )*
+                {
+                    assert_matches!(
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::PushFront { value }) => {
+                            assert_matches!(
+                                &**value,
+                                matrix_sdk_ui::timeline::TimelineItemKind::Event(event_timeline_item) => {
                                     assert_eq!(event_timeline_item.event_id().unwrap().as_str(), $event_id);
                                 }
                             );
@@ -121,20 +197,20 @@ macro_rules! assert_timeline_stream {
     };
 
     // `insert [$nth] "$event_id"`
-    ( @_ [ $stream:ident ] [ insert [$index:literal] $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $iterator:ident ] [ insert [$index:literal] $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
-            [ $stream ]
+            [ $iterator ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 {
                     assert_matches!(
-                        $stream.next().now_or_never(),
-                        Some(Some(VectorDiff::Insert { index: $index, value })) => {
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::Insert { index: $index, value }) => {
                             assert_matches!(
                                 &**value,
-                                TimelineItemKind::Event(event_timeline_item) => {
+                                matrix_sdk_ui::timeline::TimelineItemKind::Event(event_timeline_item) => {
                                     assert_eq!(event_timeline_item.event_id().unwrap().as_str(), $event_id);
                                 }
                             );
@@ -146,20 +222,20 @@ macro_rules! assert_timeline_stream {
     };
 
     // `update [$nth] "$event_id"`
-    ( @_ [ $stream:ident ] [ update [$index:literal] $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $iterator:ident ] [ update [$index:literal] $event_id:literal ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
-            [ $stream ]
+            [ $iterator ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 {
                     assert_matches!(
-                        $stream.next().now_or_never(),
-                        Some(Some(VectorDiff::Set { index: $index, value })) => {
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::Set { index: $index, value }) => {
                             assert_matches!(
                                 &**value,
-                                TimelineItemKind::Event(event_timeline_item) => {
+                                matrix_sdk_ui::timeline::TimelineItemKind::Event(event_timeline_item) => {
                                     assert_eq!(event_timeline_item.event_id().unwrap().as_str(), $event_id);
                                 }
                             );
@@ -171,35 +247,63 @@ macro_rules! assert_timeline_stream {
     };
 
     // `remove [$nth]`
-    ( @_ [ $stream:ident ] [ remove [$index:literal] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    ( @_ [ $iterator:ident ] [ remove [$index:literal] ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
-            [ $stream ]
+            [ $iterator ]
             [ $( $rest )* ]
             [
                 $( $accumulator )*
                 {
                     assert_matches!(
-                        $stream.next().now_or_never(),
-                        Some(Some(VectorDiff::Remove { index: $index }))
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::Remove { index: $index })
                     );
                 }
             ]
         )
     };
 
-    ( @_ [ $stream:ident ] [] [ $( $accumulator:tt )* ] ) => {
+    // `clear`
+    ( @_ [ $iterator:ident ] [ clear ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+        assert_timeline_stream!(
+            @_
+            [ $iterator ]
+            [ $( $rest )* ]
+            [
+                $( $accumulator )*
+                {
+                    assert_matches!(
+                        $iterator .next(),
+                        Some(eyeball_im::VectorDiff::Clear)
+                    );
+                }
+            ]
+        )
+    };
+
+    ( @_ [ $iterator:ident ] [] [ $( $accumulator:tt )* ] ) => {
         $( $accumulator )*
+
+        assert!($iterator .next().is_none(), concat!(stringify!($iterator), " has not been entirely read"));
     };
 
     ( [ $stream:ident ] $( $all:tt )* ) => {
-        assert_timeline_stream!( @_ [ $stream ] [ $( $all )* ] [] )
+        let mut timeline_updates = $stream
+            .next()
+            .await
+            .expect("Failed to poll the stream")
+            .into_iter();
+
+        assert_timeline_stream!( @_ [ timeline_updates ] [ $( $all )* ] [] )
     };
 }
 
 pub(crate) use assert_timeline_stream;
 
-async fn new_sliding_sync(lists: Vec<SlidingSyncListBuilder>) -> Result<(MockServer, SlidingSync)> {
+async fn new_sliding_sync(
+    lists: Vec<SlidingSyncListBuilder>,
+) -> Result<(Client, MockServer, SlidingSync)> {
     let (client, server) = logged_in_client_with_server().await;
 
     let mut sliding_sync_builder = client.sliding_sync("integration-test")?;
@@ -210,7 +314,7 @@ async fn new_sliding_sync(lists: Vec<SlidingSyncListBuilder>) -> Result<(MockSer
 
     let sliding_sync = sliding_sync_builder.build().await?;
 
-    Ok((server, sliding_sync))
+    Ok((client, server, sliding_sync))
 }
 
 async fn create_one_room(
@@ -244,28 +348,18 @@ async fn create_one_room(
 }
 
 async fn timeline_test_helper(
+    client: &Client,
     sliding_sync: &SlidingSync,
     room_id: &RoomId,
-) -> Result<(Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>)> {
+) -> Result<(Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>>)> {
     let sliding_sync_room = sliding_sync.get_room(room_id).await.unwrap();
 
     let room_id = sliding_sync_room.room_id();
-    let client = sliding_sync_room.client();
     let sdk_room = client.get_room(room_id).ok_or_else(|| {
         anyhow::anyhow!("Room {room_id} not found in client. Can't provide a timeline for it")
     })?;
 
-    // TODO: when the event cache handles its own cache, we can remove this.
-    client
-        .event_cache()
-        .add_initial_events(room_id, sliding_sync_room.timeline_queue().iter().cloned().collect())
-        .await?;
-
-    let timeline = Timeline::builder(&sdk_room)
-        .with_pagination_token(sliding_sync_room.prev_batch())
-        .track_read_marker_and_receipts()
-        .build()
-        .await?;
+    let timeline = Timeline::builder(&sdk_room).track_read_marker_and_receipts().build().await?;
 
     Ok(timeline.subscribe().await)
 }
@@ -274,14 +368,14 @@ struct SlidingSyncMatcher;
 
 impl Match for SlidingSyncMatcher {
     fn matches(&self, request: &Request) -> bool {
-        request.url.path() == "/_matrix/client/unstable/org.matrix.msc3575/sync"
-            && request.method == Method::Post
+        request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
+            && request.method == Method::POST
     }
 }
 
 #[async_test]
 async fn test_timeline_basic() -> Result<()> {
-    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+    let (client, server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
         .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
     .await?;
 
@@ -292,8 +386,10 @@ async fn test_timeline_basic() -> Result<()> {
 
     create_one_room(&server, &sliding_sync, &mut stream, room_id, "Room Name".to_owned()).await?;
 
+    mock_encryption_state(&server, false).await;
+
     let (timeline_items, mut timeline_stream) =
-        timeline_test_helper(&sliding_sync, room_id).await?;
+        timeline_test_helper(&client, &sliding_sync, room_id).await?;
     assert!(timeline_items.is_empty());
 
     // Receiving a bunch of events.
@@ -316,10 +412,10 @@ async fn test_timeline_basic() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            --- day divider ---;
             append    "$x1:bar.org";
-            update[1] "$x1:bar.org";
+            update[0] "$x1:bar.org";
             append    "$x2:bar.org";
+            prepend   --- date divider ---;
         };
     }
 
@@ -328,7 +424,7 @@ async fn test_timeline_basic() -> Result<()> {
 
 #[async_test]
 async fn test_timeline_duplicated_events() -> Result<()> {
-    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+    let (client, server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
         .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
     .await?;
 
@@ -339,7 +435,9 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
     create_one_room(&server, &sliding_sync, &mut stream, room_id, "Room Name".to_owned()).await?;
 
-    let (_, mut timeline_stream) = timeline_test_helper(&sliding_sync, room_id).await?;
+    mock_encryption_state(&server, false).await;
+
+    let (_, mut timeline_stream) = timeline_test_helper(&client, &sliding_sync, room_id).await?;
 
     // Receiving events.
     {
@@ -362,12 +460,12 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            --- day divider ---;
             append    "$x1:bar.org";
-            update[1] "$x1:bar.org";
+            update[0] "$x1:bar.org";
             append    "$x2:bar.org";
-            update[2] "$x2:bar.org";
+            update[1] "$x2:bar.org";
             append    "$x3:bar.org";
+            prepend    --- date divider ---;
         };
     }
 
@@ -391,9 +489,8 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            update[3] "$x3:bar.org";
-            update[1] "$x1:bar.org";
             remove[1];
+            update[2] "$x3:bar.org";
             append    "$x1:bar.org";
             update[3] "$x1:bar.org";
             append    "$x4:bar.org";
@@ -405,7 +502,7 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
 #[async_test]
 async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
-    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+    let (client, server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
         .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
     .await?;
 
@@ -416,8 +513,10 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
 
     create_one_room(&server, &sliding_sync, &mut stream, room_id, "Room Name".to_owned()).await?;
 
+    mock_encryption_state(&server, false).await;
+
     let (timeline_items, mut timeline_stream) =
-        timeline_test_helper(&sliding_sync, room_id).await?;
+        timeline_test_helper(&client, &sliding_sync, room_id).await?;
     assert!(timeline_items.is_empty());
 
     // Receiving initial events.
@@ -440,10 +539,10 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            --- day divider ---;
             append    "$x1:bar.org";
-            update[1] "$x1:bar.org";
+            update[0] "$x1:bar.org";
             append    "$x2:bar.org";
+            prepend   --- date divider ---;
         };
     }
 
@@ -477,11 +576,12 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
             }
         };
 
-        assert_let!(
-            Some(Some(VectorDiff::Set { index: 2, value })) = timeline_stream.next().now_or_never()
-        );
+        assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+        assert_eq!(timeline_updates.len(), 1);
 
-        assert_let!(TimelineItemKind::Event(event_timeline_item) = &**value);
+        assert_let!(VectorDiff::Set { index: 2, value } = &timeline_updates[0]);
+
+        assert_let!(TimelineItemKind::Event(event_timeline_item) = &***value);
         assert_eq!(event_timeline_item.event_id().unwrap().as_str(), "$x2:bar.org");
 
         let read_receipts = event_timeline_item.read_receipts();

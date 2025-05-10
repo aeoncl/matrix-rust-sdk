@@ -19,19 +19,21 @@ use matrix_sdk_common::AsyncTraitDeps;
 use ruma::{
     events::secret::request::SecretName, DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId,
 };
-use tokio::sync::Mutex;
+use vodozemac::Curve25519PublicKey;
 
 use super::{
-    BackupKeys, Changes, CryptoStoreError, PendingChanges, Result, RoomKeyCounts, RoomSettings,
+    BackupKeys, Changes, CryptoStoreError, DehydratedDeviceKey, PendingChanges, Result,
+    RoomKeyCounts, RoomSettings, StoredRoomKeyBundleData,
 };
+#[cfg(doc)]
+use crate::olm::SenderData;
 use crate::{
     olm::{
         InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
-        Session,
+        SenderDataType, Session,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
-    Account, GossipRequest, GossippedSecret, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
-    TrackedUser,
+    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
 
 /// Represents a store that the `OlmMachine` uses to store E2EE data (such as
@@ -65,15 +67,28 @@ pub trait CryptoStore: AsyncTraitDeps {
     /// * `changes` - The set of changes that should be stored.
     async fn save_pending_changes(&self, changes: PendingChanges) -> Result<(), Self::Error>;
 
+    /// Save a list of inbound group sessions to the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `sessions` - The sessions to be saved.
+    /// * `backed_up_to_version` - If the keys should be marked as having been
+    ///   backed up, the version of the backup.
+    ///
+    /// Note: some implementations ignore `backup_version` and assume the
+    /// current backup version, which is normally the same.
+    async fn save_inbound_group_sessions(
+        &self,
+        sessions: Vec<InboundGroupSession>,
+        backed_up_to_version: Option<&str>,
+    ) -> Result<(), Self::Error>;
+
     /// Get all the sessions that belong to the given sender key.
     ///
     /// # Arguments
     ///
     /// * `sender_key` - The sender key that was used to establish the sessions.
-    async fn get_sessions(
-        &self,
-        sender_key: &str,
-    ) -> Result<Option<Arc<Mutex<Vec<Session>>>>, Self::Error>;
+    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Vec<Session>>, Self::Error>;
 
     /// Get the inbound group session from our store.
     ///
@@ -105,26 +120,89 @@ pub trait CryptoStore: AsyncTraitDeps {
 
     /// Get the number inbound group sessions we have and how many of them are
     /// backed up.
-    async fn inbound_group_session_counts(&self) -> Result<RoomKeyCounts, Self::Error>;
-
-    /// Get all the inbound group sessions we have not backed up yet.
-    async fn inbound_group_sessions_for_backup(
+    async fn inbound_group_session_counts(
         &self,
+        backup_version: Option<&str>,
+    ) -> Result<RoomKeyCounts, Self::Error>;
+
+    /// Get a batch of inbound group sessions for the device with the supplied
+    /// curve key, whose sender data is of the supplied type.
+    ///
+    /// Sessions are not necessarily returned in any specific order, but the
+    /// returned batches are consistent: if this function is called repeatedly
+    /// with `after_session_id` set to the session ID from the last result
+    /// from the previous call, until an empty result is returned, then
+    /// eventually all matching sessions are returned. (New sessions that are
+    /// added in the course of iteration may or may not be returned.)
+    ///
+    /// This function is used when the device information is updated via a
+    /// `/keys/query` response and we want to update the sender data based
+    /// on the new information.
+    ///
+    /// # Arguments
+    ///
+    /// * `curve_key` - only return sessions created by the device with this
+    ///   curve key.
+    ///
+    /// * `sender_data_type` - only return sessions whose [`SenderData`] record
+    ///   is in this state.
+    ///
+    /// * `after_session_id` - return the sessions after this id, or start at
+    ///   the earliest if this is None.
+    ///
+    /// * `limit` - return a maximum of this many sessions.
+    async fn get_inbound_group_sessions_for_device_batch(
+        &self,
+        curve_key: Curve25519PublicKey,
+        sender_data_type: SenderDataType,
+        after_session_id: Option<String>,
         limit: usize,
     ) -> Result<Vec<InboundGroupSession>, Self::Error>;
 
-    /// Mark the inbound group sessions with the supplied room and session IDs
-    /// as backed up
+    /// Return a batch of ['InboundGroupSession'] ("room keys") that have not
+    /// yet been backed up in the supplied backup version.
+    ///
+    /// The size of the returned `Vec` is <= `limit`.
+    ///
+    /// Note: some implementations ignore `backup_version` and assume the
+    /// current backup version, which is normally the same.
+    async fn inbound_group_sessions_for_backup(
+        &self,
+        backup_version: &str,
+        limit: usize,
+    ) -> Result<Vec<InboundGroupSession>, Self::Error>;
+
+    /// Store the fact that the supplied sessions were backed up into the backup
+    /// with version `backup_version`.
+    ///
+    /// Note: some implementations ignore `backup_version` and assume the
+    /// current backup version, which is normally the same.
     async fn mark_inbound_group_sessions_as_backed_up(
         &self,
+        backup_version: &str,
         room_and_session_ids: &[(&RoomId, &str)],
     ) -> Result<(), Self::Error>;
 
     /// Reset the backup state of all the stored inbound group sessions.
+    ///
+    /// Note: this is mostly implemented by stores that ignore the
+    /// `backup_version` argument on `inbound_group_sessions_for_backup` and
+    /// `mark_inbound_group_sessions_as_backed_up`. Implementations that
+    /// pay attention to the supplied backup version probably don't need to
+    /// update their storage when the current backup version changes, so have
+    /// empty implementations of this method.
     async fn reset_backup_state(&self) -> Result<(), Self::Error>;
 
     /// Get the backup keys we have stored.
     async fn load_backup_keys(&self) -> Result<BackupKeys, Self::Error>;
+
+    /// Get the dehydrated device pickle key we have stored.
+    async fn load_dehydrated_device_pickle_key(
+        &self,
+    ) -> Result<Option<DehydratedDeviceKey>, Self::Error>;
+
+    /// Deletes the previously stored dehydrated device pickle key.
+    async fn delete_dehydrated_device_pickle_key(&self) -> Result<(), Self::Error>;
 
     /// Get the outbound group session we have stored that is used for the
     /// given room.
@@ -133,11 +211,14 @@ pub trait CryptoStore: AsyncTraitDeps {
         room_id: &RoomId,
     ) -> Result<Option<OutboundGroupSession>, Self::Error>;
 
-    /// Load the list of users whose devices we are keeping track of.
+    /// Provide the list of users whose devices we are keeping track of, and
+    /// whether they are considered dirty/outdated.
     async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>, Self::Error>;
 
-    /// Save a list of users and their respective dirty/outdated flags to the
-    /// store.
+    /// Update the list of users whose devices we are keeping track of, and
+    /// whether they are considered dirty/outdated.
+    ///
+    /// Replaces any existing entry with a matching user ID.
     async fn save_tracked_users(&self, users: &[(&UserId, bool)]) -> Result<(), Self::Error>;
 
     /// Get the device for the given user with the given device ID.
@@ -151,7 +232,7 @@ pub trait CryptoStore: AsyncTraitDeps {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>, Self::Error>;
+    ) -> Result<Option<DeviceData>, Self::Error>;
 
     /// Get all the devices of the given user.
     ///
@@ -161,7 +242,13 @@ pub trait CryptoStore: AsyncTraitDeps {
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>, Self::Error>;
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>, Self::Error>;
+
+    /// Get the device for the current client.
+    ///
+    /// Since our own device is set when the store is created, this will always
+    /// return a device (unless there is an error).
+    async fn get_own_device(&self) -> Result<DeviceData, Self::Error>;
 
     /// Get the user identity that is attached to the given user id.
     ///
@@ -171,7 +258,7 @@ pub trait CryptoStore: AsyncTraitDeps {
     async fn get_user_identity(
         &self,
         user_id: &UserId,
-    ) -> Result<Option<ReadOnlyUserIdentities>, Self::Error>;
+    ) -> Result<Option<UserIdentityData>, Self::Error>;
 
     /// Check if a hash for an Olm message stored in the database.
     async fn is_message_known(&self, message_hash: &OlmMessageHash) -> Result<bool, Self::Error>;
@@ -235,6 +322,14 @@ pub trait CryptoStore: AsyncTraitDeps {
         &self,
         room_id: &RoomId,
     ) -> Result<Option<RoomSettings>, Self::Error>;
+
+    /// Get the details about the room key bundle data received from the given
+    /// user for the given room.
+    async fn get_received_room_key_bundle_data(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<Option<StoredRoomKeyBundleData>, Self::Error>;
 
     /// Get arbitrary data from the store
     ///
@@ -312,7 +407,15 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         self.0.save_pending_changes(changes).await.map_err(Into::into)
     }
 
-    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
+    async fn save_inbound_group_sessions(
+        &self,
+        sessions: Vec<InboundGroupSession>,
+        backed_up_to_version: Option<&str>,
+    ) -> Result<()> {
+        self.0.save_inbound_group_sessions(sessions, backed_up_to_version).await.map_err(Into::into)
+    }
+
+    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Vec<Session>>> {
         self.0.get_sessions(sender_key).await.map_err(Into::into)
     }
 
@@ -328,23 +431,45 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         self.0.get_inbound_group_sessions().await.map_err(Into::into)
     }
 
-    async fn inbound_group_session_counts(&self) -> Result<RoomKeyCounts> {
-        self.0.inbound_group_session_counts().await.map_err(Into::into)
-    }
-
-    async fn inbound_group_sessions_for_backup(
+    async fn get_inbound_group_sessions_for_device_batch(
         &self,
+        curve_key: Curve25519PublicKey,
+        sender_data_type: SenderDataType,
+        after_session_id: Option<String>,
         limit: usize,
     ) -> Result<Vec<InboundGroupSession>> {
-        self.0.inbound_group_sessions_for_backup(limit).await.map_err(Into::into)
+        self.0
+            .get_inbound_group_sessions_for_device_batch(
+                curve_key,
+                sender_data_type,
+                after_session_id,
+                limit,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn inbound_group_session_counts(
+        &self,
+        backup_version: Option<&str>,
+    ) -> Result<RoomKeyCounts> {
+        self.0.inbound_group_session_counts(backup_version).await.map_err(Into::into)
+    }
+    async fn inbound_group_sessions_for_backup(
+        &self,
+        backup_version: &str,
+        limit: usize,
+    ) -> Result<Vec<InboundGroupSession>> {
+        self.0.inbound_group_sessions_for_backup(backup_version, limit).await.map_err(Into::into)
     }
 
     async fn mark_inbound_group_sessions_as_backed_up(
         &self,
+        backup_version: &str,
         room_and_session_ids: &[(&RoomId, &str)],
     ) -> Result<()> {
         self.0
-            .mark_inbound_group_sessions_as_backed_up(room_and_session_ids)
+            .mark_inbound_group_sessions_as_backed_up(backup_version, room_and_session_ids)
             .await
             .map_err(Into::into)
     }
@@ -355,6 +480,14 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
 
     async fn load_backup_keys(&self) -> Result<BackupKeys> {
         self.0.load_backup_keys().await.map_err(Into::into)
+    }
+
+    async fn load_dehydrated_device_pickle_key(&self) -> Result<Option<DehydratedDeviceKey>> {
+        self.0.load_dehydrated_device_pickle_key().await.map_err(Into::into)
+    }
+
+    async fn delete_dehydrated_device_pickle_key(&self) -> Result<(), Self::Error> {
+        self.0.delete_dehydrated_device_pickle_key().await.map_err(Into::into)
     }
 
     async fn get_outbound_group_session(
@@ -376,18 +509,22 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         self.0.get_device(user_id, device_id).await.map_err(Into::into)
     }
 
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         self.0.get_user_devices(user_id).await.map_err(Into::into)
     }
 
-    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<ReadOnlyUserIdentities>> {
+    async fn get_own_device(&self) -> Result<DeviceData> {
+        self.0.get_own_device().await.map_err(Into::into)
+    }
+
+    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
         self.0.get_user_identity(user_id).await.map_err(Into::into)
     }
 
@@ -438,6 +575,14 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
 
     async fn get_room_settings(&self, room_id: &RoomId) -> Result<Option<RoomSettings>> {
         self.0.get_room_settings(room_id).await.map_err(Into::into)
+    }
+
+    async fn get_received_room_key_bundle_data(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<Option<StoredRoomKeyBundleData>> {
+        self.0.get_received_room_key_bundle_data(room_id, user_id).await.map_err(Into::into)
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {

@@ -28,7 +28,7 @@
 //! this file is the secret storage key.
 //!
 //! You should configure your client to bootstrap cross-signing automatically
-//! and may chose to let your client automatically create a backup, if it
+//! and may choose to let your client automatically create a backup, if it
 //! doesn't exist, as well:
 //!
 //! ```no_run
@@ -90,14 +90,18 @@
 //!
 //! [`Recovery key`]: https://spec.matrix.org/v1.8/client-server-api/#recovery-key
 
-use futures_core::Stream;
+use futures_core::{Future, Stream};
+use futures_util::StreamExt as _;
 use ruma::{
     api::client::keys::get_keys,
     events::{
-        secret::send::ToDeviceSecretSendEvent,
-        secret_storage::default_key::SecretStorageDefaultKeyEvent,
+        secret::{request::SecretName, send::ToDeviceSecretSendEvent},
+        secret_storage::{default_key::SecretStorageDefaultKeyEvent, secret::SecretEventContent},
+        GlobalAccountDataEventType,
     },
+    serde::Raw,
 };
+use serde_json::{json, value::to_raw_value};
 use tracing::{error, info, instrument, warn};
 
 #[cfg(doc)]
@@ -105,7 +109,7 @@ use crate::encryption::{
     backups::Backups,
     secret_storage::{SecretStorage, SecretStore},
 };
-use crate::Client;
+use crate::{client::WeakClient, encryption::backups::BackupState, Client};
 
 pub mod futures;
 mod types;
@@ -114,6 +118,7 @@ use self::{
     futures::{Enable, RecoverAndReset, Reset},
     types::{BackupDisabledContent, SecretStorageDisabledContent},
 };
+use crate::encryption::{AuthData, CrossSigningResetAuthType, CrossSigningResetHandle};
 
 /// The recovery manager for the [`Client`].
 #[derive(Debug)]
@@ -122,6 +127,15 @@ pub struct Recovery {
 }
 
 impl Recovery {
+    /// The list of known secrets that are contained in secret storage once
+    /// recover is enabled.
+    pub const KNOWN_SECRETS: &[SecretName] = &[
+        SecretName::CrossSigningMasterKey,
+        SecretName::CrossSigningUserSigningKey,
+        SecretName::CrossSigningSelfSigningKey,
+        SecretName::RecoveryKey,
+    ];
+
     /// Get the current [`RecoveryState`] for this [`Client`].
     pub fn state(&self) -> RecoveryState {
         self.client.inner.e2ee.recovery_state.get()
@@ -241,7 +255,7 @@ impl Recovery {
     /// ```
     #[instrument(skip_all)]
     pub async fn enable_backup(&self) -> Result<()> {
-        if !self.client.encryption().backups().exists_on_server().await? {
+        if !self.client.encryption().backups().fetch_exists_on_server().await? {
             self.mark_backup_as_enabled().await?;
 
             self.client.encryption().backups().create().await?;
@@ -283,11 +297,36 @@ impl Recovery {
     #[instrument(skip_all)]
     pub async fn disable(&self) -> Result<()> {
         self.client.encryption().backups().disable().await?;
+
         // Why oh why, can't we delete account data events?
+        //
+        // Alright, let's attempt to "delete" the content of our current default key,
+        // for this we first need to check if there is a default key, then
+        // deserialize the content and find out the key ID.
+        //
+        // Then we finally set the event to an empty JSON content.
+        if let Ok(Some(default_event)) =
+            self.client.encryption().secret_storage().fetch_default_key_id().await
+        {
+            if let Ok(default_event) = default_event.deserialize() {
+                let key_id = default_event.key_id;
+                let event_type = GlobalAccountDataEventType::SecretStorageKey(key_id);
+
+                self.client
+                    .account()
+                    .set_account_data_raw(event_type, Raw::new(&json!({})).expect("").cast())
+                    .await?;
+            }
+        }
+
+        // Now let's "delete" the actual `m.secret.storage.default_key` event.
         self.client.account().set_account_data(SecretStorageDisabledContent {}).await?;
+        // Make sure that we don't re-enable backups automatically.
         self.client.account().set_account_data(BackupDisabledContent { disabled: true }).await?;
+        // Finally, "delete" all the known secrets we have in the account data.
+        self.delete_all_known_secrets().await?;
+
         self.update_recovery_state().await?;
-        // TODO: Do we want to "delete" the known secrets as well?
 
         Ok(())
     }
@@ -339,8 +378,81 @@ impl Recovery {
     /// # anyhow::Ok(()) };
     /// ```
     #[instrument(skip_all)]
-    pub fn recover_and_reset<'a>(&'a self, old_key: &'a str) -> RecoverAndReset<'_> {
+    pub fn recover_and_reset<'a>(&'a self, old_key: &'a str) -> RecoverAndReset<'a> {
         RecoverAndReset::new(self, old_key)
+    }
+
+    /// Completely reset the current user's crypto identity.
+    /// This method will go through the following steps:
+    ///
+    /// 1. Disable backing up room keys and delete the active backup
+    /// 2. Disable recovery and delete secret storage
+    /// 3. Go through the cross-signing key reset flow
+    /// 4. Finally, re-enable key backups (only if they were already enabled)
+    ///
+    /// Disclaimer: failures in this flow will potentially leave the user in
+    /// an inconsistent state but they're expected to just run the reset flow
+    /// again as presumably the reason they started it to begin with was
+    /// that they no longer had access to any of their data.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{
+    ///     encryption::recovery, encryption::CrossSigningResetAuthType, ruma::api::client::uiaa,
+    ///     Client,
+    ///   };
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// # let user_id = unimplemented!();
+    /// let encryption = client.encryption();
+    ///       
+    /// if let Some(handle) = encryption.recovery().reset_identity().await? {
+    ///     match handle.auth_type() {
+    ///         CrossSigningResetAuthType::Uiaa(uiaa) => {
+    ///             let password = "1234".to_owned();
+    ///             let mut password = uiaa::Password::new(user_id, password);
+    ///             password.session = uiaa.session;
+    ///
+    ///             handle.reset(Some(uiaa::AuthData::Password(password))).await?;
+    ///         }
+    ///         CrossSigningResetAuthType::OAuth(o) => {
+    ///             println!(
+    ///                 "To reset your end-to-end encryption cross-signing identity, \
+    ///                 you first need to approve it at {}",
+    ///                 o.approval_url
+    ///             );
+    ///             handle.reset(None).await?;
+    ///         }
+    ///     }
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn reset_identity(&self) -> Result<Option<IdentityResetHandle>> {
+        self.client.encryption().backups().disable_and_delete().await?; // 1.
+
+        // 2. (We can't delete account data events)
+        self.client.account().set_account_data(SecretStorageDisabledContent {}).await?;
+        self.client.encryption().recovery().update_recovery_state().await?;
+
+        let cross_signing_reset_handle = self.client.encryption().reset_cross_signing().await?;
+
+        if let Some(handle) = cross_signing_reset_handle {
+            // Authentication required, backups will be re-enabled after the reset
+            Ok(Some(IdentityResetHandle {
+                client: self.client.clone(),
+                cross_signing_reset_handle: handle,
+            }))
+        } else {
+            // No authentication required, re-enable backups
+            if self.client.encryption().recovery().should_auto_enable_backups().await? {
+                self.client.encryption().recovery().enable_backup().await?; // 4.
+            }
+
+            Ok(None)
+        }
     }
 
     /// Recover all the secrets from the homeserver.
@@ -387,7 +499,7 @@ impl Recovery {
     /// If the user does not enable recovery before logging out of their last
     /// device, they will not be able to decrypt historic messages once they
     /// create a new device.
-    pub async fn are_we_the_last_man_standing(&self) -> Result<bool> {
+    pub async fn is_last_device(&self) -> Result<bool> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
         let user_id = olm_machine.user_id();
@@ -428,7 +540,7 @@ impl Recovery {
         // disabled, then we can automatically enable them.
         Ok(self.client.inner.e2ee.encryption_settings.auto_enable_backups
             && !self.client.encryption().backups().are_enabled().await
-            && !self.client.encryption().backups().exists_on_server().await?
+            && !self.client.encryption().backups().fetch_exists_on_server().await?
             && !self.are_backups_marked_as_disabled().await?)
     }
 
@@ -437,6 +549,7 @@ impl Recovery {
 
         self.client.add_event_handler(Self::default_key_event_handler);
         self.client.add_event_handler(Self::secret_send_event_handler);
+        self.client.inner.e2ee.initialize_recovery_state_update_task(&self.client);
 
         self.update_recovery_state().await?;
 
@@ -446,6 +559,28 @@ impl Recovery {
             if let Err(e) = self.enable_backup().await {
                 warn!("Could not automatically enable backups: {e:?}");
             }
+        }
+
+        Ok(())
+    }
+
+    /// Delete all the known secrets we are keeping in secret storage.
+    ///
+    /// The exact list of secrets is defined in [`Recovery::KNOWN_SECRETS`] and
+    /// might change over time.
+    ///
+    /// Since account data events can't actually be deleted, due to a missing
+    /// DELETE API, we're replacing the events with an empty
+    /// [`SecretEventContent`].
+    async fn delete_all_known_secrets(&self) -> Result<()> {
+        for secret_name in Self::KNOWN_SECRETS {
+            let event_type = GlobalAccountDataEventType::from(secret_name.to_owned());
+            let content = SecretEventContent::new(Default::default());
+            let secret_content = Raw::from_json(
+                to_raw_value(&content)
+                    .expect("We should be able to serialize a raw empty secret event content"),
+            );
+            self.client.account().set_account_data_raw(event_type, secret_content).await?;
         }
 
         Ok(())
@@ -488,14 +623,18 @@ impl Recovery {
 
     async fn update_recovery_state(&self) -> Result<()> {
         let new_state = self.check_recovery_state().await?;
-        self.client.inner.e2ee.recovery_state.set(new_state);
+        let old_state = self.client.inner.e2ee.recovery_state.set(new_state);
+
+        if new_state != old_state {
+            info!("Recovery state changed from {old_state:?} to {new_state:?}");
+        }
 
         Ok(())
     }
 
     async fn update_recovery_state_no_fail(&self) {
         if let Err(e) = self.update_recovery_state().await {
-            error!("Coulnd't update the recovery state: {e:?}");
+            error!("Couldn't update the recovery state: {e:?}");
         }
     }
 
@@ -509,15 +648,47 @@ impl Recovery {
         client.encryption().recovery().update_recovery_state_no_fail().await;
     }
 
-    #[instrument]
-    pub(crate) async fn update_state_after_backup_disabling(&self) {
-        // TODO: This is quite ugly, this method is called by the backups subsystem.
-        // Backups shouldn't depend on recovery, recovery should listen to the
-        // backup state change.
-        self.update_recovery_state_no_fail().await;
+    /// Listen for changes in the [`BackupState`] and, if necessary, update the
+    /// [`RecoveryState`] accordingly.
+    ///
+    /// This should not be called directly, this method is put into a background
+    /// task which is always listening for updates in the [`BackupState`].
+    pub(crate) fn update_state_after_backup_state_change(
+        client: &Client,
+    ) -> impl Future<Output = ()> {
+        let mut stream = client.encryption().backups().state_stream();
+        let weak = WeakClient::from_client(client);
+
+        async move {
+            while let Some(update) = stream.next().await {
+                if let Some(client) = weak.get() {
+                    match update {
+                        Ok(update) => {
+                            // The recovery state only cares about these two states, the
+                            // intermediate states that tell us that
+                            // we're creating a backup are not interesting.
+                            if matches!(update, BackupState::Unknown | BackupState::Enabled) {
+                                client
+                                    .encryption()
+                                    .recovery()
+                                    .update_recovery_state_no_fail()
+                                    .await;
+                            }
+                        }
+                        Err(_) => {
+                            // We missed some updates, let's update our state in case something
+                            // changed.
+                            client.encryption().recovery().update_recovery_state_no_fail().await;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {
         if let Some(user_id) = self.client.user_id() {
             if response.master_keys.contains_key(user_id) {
@@ -527,5 +698,39 @@ impl Recovery {
                 self.update_recovery_state_no_fail().await;
             }
         }
+    }
+}
+
+/// A helper struct that handles continues resetting a user's crypto identity
+/// after authentication was required and re-enabling backups (if necessary) at
+/// the end of it
+#[derive(Debug)]
+pub struct IdentityResetHandle {
+    client: Client,
+    cross_signing_reset_handle: CrossSigningResetHandle,
+}
+
+impl IdentityResetHandle {
+    /// Get the underlying [`CrossSigningResetAuthType`] this identity reset
+    /// process is using.
+    pub fn auth_type(&self) -> &CrossSigningResetAuthType {
+        &self.cross_signing_reset_handle.auth_type
+    }
+
+    /// This method will retry to upload the device keys after the previous try
+    /// failed due to required authentication
+    pub async fn reset(&self, auth: Option<AuthData>) -> Result<()> {
+        self.cross_signing_reset_handle.auth(auth).await?;
+
+        if self.client.encryption().recovery().should_auto_enable_backups().await? {
+            self.client.encryption().recovery().enable_backup().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Cancel the ongoing identity reset process
+    pub async fn cancel(&self) {
+        self.cross_signing_reset_handle.cancel().await;
     }
 }

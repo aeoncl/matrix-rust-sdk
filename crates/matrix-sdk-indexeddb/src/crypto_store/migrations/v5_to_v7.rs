@@ -26,17 +26,17 @@ use web_sys::{DomException, IdbTransactionMode};
 
 use crate::{
     crypto_store::{
-        indexeddb_serializer::IndexeddbSerializer,
         keys,
         migrations::{add_nonunique_index, do_schema_upgrade, old_keys, v7, MigrationDb},
         Result,
     },
+    serializer::IndexeddbSerializer,
     IndexeddbCryptoStoreError,
 };
 
 /// Perform the schema upgrade v5 to v6, creating `inbound_group_sessions2`.
 pub(crate) async fn schema_add(name: &str) -> Result<(), DomException> {
-    do_schema_upgrade(name, 6, |db, _| {
+    do_schema_upgrade(name, 6, |db, _, _| {
         let object_store = db.create_object_store(old_keys::INBOUND_GROUP_SESSIONS_V2)?;
 
         add_nonunique_index(
@@ -109,7 +109,7 @@ pub(crate) async fn data_migrate(name: &str, serializer: &IndexeddbSerializer) -
 
 /// Perform the schema upgrade v6 to v7, deleting `inbound_group_sessions`.
 pub(crate) async fn schema_delete(name: &str) -> Result<(), DomException> {
-    do_schema_upgrade(name, 7, |db, _| {
+    do_schema_upgrade(name, 7, |db, _, _| {
         db.delete_object_store(old_keys::INBOUND_GROUP_SESSIONS_V1)?;
         Ok(())
     })

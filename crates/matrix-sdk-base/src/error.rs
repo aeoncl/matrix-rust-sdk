@@ -15,9 +15,12 @@
 
 //! Error conditions.
 
+use matrix_sdk_common::store_locks::LockStoreError;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{CryptoStoreError, MegolmError, OlmError};
 use thiserror::Error;
+
+use crate::event_cache::store::EventCacheStoreError;
 
 /// Result type of the rust-sdk.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -42,6 +45,14 @@ pub enum Error {
     #[error(transparent)]
     StateStore(#[from] crate::store::StoreError),
 
+    /// An error happened while manipulating the event cache store.
+    #[error(transparent)]
+    EventCacheStore(#[from] EventCacheStoreError),
+
+    /// An error happened while attempting to lock the event cache store.
+    #[error(transparent)]
+    EventCacheLock(#[from] LockStoreError),
+
     /// An error occurred in the crypto store.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
@@ -56,4 +67,17 @@ pub enum Error {
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
     MegolmError(#[from] MegolmError),
+
+    /// An error caused by calling the `BaseClient::receive_all_members`
+    /// function with invalid parameters
+    #[error("receive_all_members function was called with invalid parameters")]
+    InvalidReceiveMembersParameters,
+
+    /// This request failed because the local data wasn't sufficient.
+    #[error("Local cache doesn't contain all necessary data to perform the action.")]
+    InsufficientData,
+
+    /// There was a [`serde_json`] deserialization error.
+    #[error(transparent)]
+    DeserializationError(#[from] serde_json::error::Error),
 }

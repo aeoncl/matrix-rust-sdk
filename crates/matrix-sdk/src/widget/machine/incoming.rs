@@ -13,13 +13,18 @@
 // limitations under the License.
 
 use ruma::{
-    api::client::account::request_openid_token, events::AnyTimelineEvent, serde::Raw, OwnedEventId,
+    api::client::{account::request_openid_token, delayed_events},
+    events::AnyTimelineEvent,
+    serde::Raw,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_json::value::RawValue as RawJsonValue;
 use uuid::Uuid;
 
-use super::{from_widget::FromWidgetRequest, to_widget::ToWidgetResponse};
+use super::{
+    from_widget::{FromWidgetRequest, SendEventResponse},
+    to_widget::ToWidgetResponse,
+};
 use crate::widget::Capabilities;
 
 /// Incoming event that the client API must process.
@@ -32,14 +37,17 @@ pub(crate) enum IncomingMessage {
         /// The ID of the request that this response corresponds to.
         request_id: Uuid,
 
-        /// The result of the request: response data or error message.
-        response: Result<MatrixDriverResponse, String>,
+        /// Result of the request: the response data, or a matrix sdk error.
+        ///
+        /// Http errors will be forwarded to the widget in a specified format so
+        /// the widget can parse the error.
+        response: Result<MatrixDriverResponse, crate::Error>,
     },
 
     /// The `MatrixDriver` notified the `WidgetMachine` of a new matrix event.
     ///
     /// This means that the machine previously subscribed to some events
-    /// (`Action::Subscribe` request).
+    /// ([`crate::widget::Action::Subscribe`] request).
     MatrixEventReceived(Raw<AnyTimelineEvent>),
 }
 
@@ -56,7 +64,8 @@ pub(crate) enum MatrixDriverResponse {
     MatrixEventRead(Vec<Raw<AnyTimelineEvent>>),
     /// Client sent some matrix event. The response contains the event ID.
     /// A response to an `Action::SendMatrixEvent` command.
-    MatrixEventSent(OwnedEventId),
+    MatrixEventSent(SendEventResponse),
+    MatrixDelayedEventUpdate(delayed_events::update_delayed_event::unstable::Response),
 }
 
 pub(super) struct IncomingWidgetMessage {
@@ -65,6 +74,7 @@ pub(super) struct IncomingWidgetMessage {
     pub(super) kind: IncomingWidgetMessageKind,
 }
 
+#[derive(Debug)]
 pub(super) enum IncomingWidgetMessageKind {
     Request(Raw<FromWidgetRequest>),
     Response(ToWidgetResponse),

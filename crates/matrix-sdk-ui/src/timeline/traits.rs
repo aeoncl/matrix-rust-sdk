@@ -12,25 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
+use std::future::Future;
+
+use eyeball::Subscriber;
 use indexmap::IndexMap;
-#[cfg(feature = "e2e-encryption")]
-use matrix_sdk::{deserialized_responses::TimelineEvent, Result};
-use matrix_sdk::{event_cache, Room};
-use matrix_sdk_base::latest_event::LatestEvent;
-use ruma::{
-    events::receipt::{Receipt, ReceiptThread, ReceiptType},
-    push::{PushConditionRoomCtx, Ruleset},
-    EventId, OwnedEventId, OwnedUserId, RoomVersionId, UserId,
+#[cfg(test)]
+use matrix_sdk::crypto::{DecryptionSettings, RoomEventDecryptionResult, TrustRequirement};
+use matrix_sdk::{
+    crypto::types::events::CryptoContextInfo,
+    deserialized_responses::{EncryptionInfo, TimelineEvent},
+    event_cache::paginator::PaginableRoom,
+    room::PushContext,
+    AsyncTraitDeps, Result, Room, SendOutsideWasm,
 };
-#[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw};
-use tracing::{debug, error, warn};
+use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo};
+use ruma::{
+    events::{
+        fully_read::FullyReadEventContent,
+        receipt::{Receipt, ReceiptThread, ReceiptType},
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+    },
+    serde::Raw,
+    EventId, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId, UserId,
+};
+use tracing::error;
 
-use super::{Profile, TimelineBuilder};
-use crate::timeline::Timeline;
+use super::{Profile, RedactError, TimelineBuilder};
+use crate::timeline::{self, pinned_events_loader::PinnedEventsRoom, Timeline};
 
-#[async_trait]
 pub trait RoomExt {
     /// Get a [`Timeline`] for this room.
     ///
@@ -39,7 +48,8 @@ pub trait RoomExt {
     /// independent events.
     ///
     /// This is the same as using `room.timeline_builder().build()`.
-    async fn timeline(&self) -> event_cache::Result<Timeline>;
+    fn timeline(&self)
+        -> impl Future<Output = Result<Timeline, timeline::Error>> + SendOutsideWasm;
 
     /// Get a [`TimelineBuilder`] for this room.
     ///
@@ -52,9 +62,8 @@ pub trait RoomExt {
     fn timeline_builder(&self) -> TimelineBuilder;
 }
 
-#[async_trait]
 impl RoomExt for Room {
-    async fn timeline(&self) -> event_cache::Result<Timeline> {
+    async fn timeline(&self) -> Result<Timeline, timeline::Error> {
         self.timeline_builder().build().await
     }
 
@@ -63,41 +72,79 @@ impl RoomExt for Room {
     }
 }
 
-#[async_trait]
-pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static {
+pub(super) trait RoomDataProvider:
+    Clone + PaginableRoom + PinnedEventsRoom + 'static
+{
     fn own_user_id(&self) -> &UserId;
     fn room_version(&self) -> RoomVersionId;
-    async fn profile_from_user_id(&self, user_id: &UserId) -> Option<Profile>;
-    async fn profile_from_latest_event(&self, latest_event: &LatestEvent) -> Option<Profile>;
+
+    fn crypto_context_info(&self)
+        -> impl Future<Output = CryptoContextInfo> + SendOutsideWasm + '_;
+
+    fn profile_from_user_id<'a>(
+        &'a self,
+        user_id: &'a UserId,
+    ) -> impl Future<Output = Option<Profile>> + SendOutsideWasm + 'a;
+    fn profile_from_latest_event(&self, latest_event: &LatestEvent) -> Option<Profile>;
 
     /// Loads a user receipt from the storage backend.
-    async fn load_user_receipt(
-        &self,
+    fn load_user_receipt<'a>(
+        &'a self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
-        user_id: &UserId,
-    ) -> Option<(OwnedEventId, Receipt)>;
+        user_id: &'a UserId,
+    ) -> impl Future<Output = Option<(OwnedEventId, Receipt)>> + SendOutsideWasm + 'a;
 
     /// Loads read receipts for an event from the storage backend.
-    async fn load_event_receipts(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt>;
+    fn load_event_receipts<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> impl Future<Output = IndexMap<OwnedUserId, Receipt>> + SendOutsideWasm + 'a;
 
-    async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)>;
+    /// Load the current fully-read event id, from storage.
+    fn load_fully_read_marker(&self) -> impl Future<Output = Option<OwnedEventId>> + '_;
+
+    fn push_context(&self) -> impl Future<Output = Option<PushContext>> + SendOutsideWasm + '_;
+
+    /// Send an event to that room.
+    fn send(
+        &self,
+        content: AnyMessageLikeEventContent,
+    ) -> impl Future<Output = Result<(), super::Error>> + SendOutsideWasm + '_;
+
+    /// Redact an event from that room.
+    fn redact<'a>(
+        &'a self,
+        event_id: &'a EventId,
+        reason: Option<&'a str>,
+        transaction_id: Option<OwnedTransactionId>,
+    ) -> impl Future<Output = Result<(), super::Error>> + SendOutsideWasm + 'a;
+
+    fn room_info(&self) -> Subscriber<RoomInfo>;
+
+    /// Return the encryption info for the Megolm session with the supplied
+    /// session ID.
+    fn get_encryption_info(
+        &self,
+        session_id: &str,
+        sender: &UserId,
+    ) -> impl Future<Output = Option<EncryptionInfo>> + SendOutsideWasm;
 }
 
-#[async_trait]
 impl RoomDataProvider for Room {
     fn own_user_id(&self) -> &UserId {
         (**self).own_user_id()
     }
 
     fn room_version(&self) -> RoomVersionId {
-        (**self).clone_info().room_version().cloned().unwrap_or_else(|| {
-            warn!("Unknown room version, falling back to v10");
-            RoomVersionId::V10
-        })
+        (**self).clone_info().room_version_or_default()
     }
 
-    async fn profile_from_user_id(&self, user_id: &UserId) -> Option<Profile> {
+    async fn crypto_context_info(&self) -> CryptoContextInfo {
+        self.crypto_context_info().await
+    }
+
+    async fn profile_from_user_id<'a>(&'a self, user_id: &'a UserId) -> Option<Profile> {
         match self.get_member_no_sync(user_id).await {
             Ok(Some(member)) => Some(Profile {
                 display_name: member.display_name().map(ToOwned::to_owned),
@@ -113,7 +160,7 @@ impl RoomDataProvider for Room {
         }
     }
 
-    async fn profile_from_latest_event(&self, latest_event: &LatestEvent) -> Option<Profile> {
+    fn profile_from_latest_event(&self, latest_event: &LatestEvent) -> Option<Profile> {
         if !latest_event.has_sender_profile() {
             return None;
         }
@@ -125,11 +172,11 @@ impl RoomDataProvider for Room {
         })
     }
 
-    async fn load_user_receipt(
-        &self,
+    async fn load_user_receipt<'a>(
+        &'a self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
-        user_id: &UserId,
+        user_id: &'a UserId,
     ) -> Option<(OwnedEventId, Receipt)> {
         match self.load_user_receipt(receipt_type.clone(), thread.clone(), user_id).await {
             Ok(receipt) => receipt,
@@ -145,7 +192,10 @@ impl RoomDataProvider for Room {
         }
     }
 
-    async fn load_event_receipts(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt> {
+    async fn load_event_receipts<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> IndexMap<OwnedUserId, Receipt> {
         let mut unthreaded_receipts = match self
             .load_event_receipts(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
             .await
@@ -172,49 +222,104 @@ impl RoomDataProvider for Room {
         unthreaded_receipts
     }
 
-    async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)> {
-        match self.push_context().await {
-            Ok(Some(push_context)) => match self.client().account().push_rules().await {
-                Ok(push_rules) => Some((push_rules, push_context)),
+    async fn push_context(&self) -> Option<PushContext> {
+        self.push_context().await.ok().flatten()
+    }
+
+    async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
+        match self.account_data_static::<FullyReadEventContent>().await {
+            Ok(Some(fully_read)) => match fully_read.deserialize() {
+                Ok(fully_read) => Some(fully_read.content.event_id),
                 Err(e) => {
-                    error!("Could not get push rules: {e}");
+                    error!("Failed to deserialize fully-read account data: {e}");
                     None
                 }
             },
-            Ok(None) => {
-                debug!("Could not aggregate push context");
-                None
-            }
             Err(e) => {
-                error!("Could not get push context: {e}");
+                error!("Failed to get fully-read account data from the store: {e}");
                 None
             }
+            _ => None,
         }
+    }
+
+    async fn send(&self, content: AnyMessageLikeEventContent) -> Result<(), super::Error> {
+        let _ = self.send_queue().send(content).await?;
+        Ok(())
+    }
+
+    async fn redact<'a>(
+        &'a self,
+        event_id: &'a EventId,
+        reason: Option<&'a str>,
+        transaction_id: Option<OwnedTransactionId>,
+    ) -> Result<(), super::Error> {
+        let _ = self
+            .redact(event_id, reason, transaction_id)
+            .await
+            .map_err(RedactError::HttpError)
+            .map_err(super::Error::RedactError)?;
+        Ok(())
+    }
+
+    fn room_info(&self) -> Subscriber<RoomInfo> {
+        self.subscribe_info()
+    }
+
+    async fn get_encryption_info(
+        &self,
+        session_id: &str,
+        sender: &UserId,
+    ) -> Option<EncryptionInfo> {
+        // Pass directly on to `Room::get_encryption_info`
+        self.get_encryption_info(session_id, sender).await
     }
 }
 
 // Internal helper to make most of retry_event_decryption independent of a room
 // object, which is annoying to create for testing and not really needed
-#[cfg(feature = "e2e-encryption")]
-#[async_trait]
-pub(super) trait Decryptor: Clone + Send + Sync + 'static {
-    async fn decrypt_event_impl(&self, raw: &Raw<AnySyncTimelineEvent>) -> Result<TimelineEvent>;
+pub(super) trait Decryptor: AsyncTraitDeps + Clone + 'static {
+    fn decrypt_event_impl(
+        &self,
+        raw: &Raw<AnySyncTimelineEvent>,
+        push_ctx: Option<&PushContext>,
+    ) -> impl Future<Output = Result<TimelineEvent>> + SendOutsideWasm;
 }
 
-#[cfg(feature = "e2e-encryption")]
-#[async_trait]
 impl Decryptor for Room {
-    async fn decrypt_event_impl(&self, raw: &Raw<AnySyncTimelineEvent>) -> Result<TimelineEvent> {
-        self.decrypt_event(raw.cast_ref()).await
+    async fn decrypt_event_impl(
+        &self,
+        raw: &Raw<AnySyncTimelineEvent>,
+        push_ctx: Option<&PushContext>,
+    ) -> Result<TimelineEvent> {
+        self.decrypt_event(raw.cast_ref(), push_ctx).await
     }
 }
 
-#[cfg(all(test, feature = "e2e-encryption"))]
-#[async_trait]
+#[cfg(test)]
 impl Decryptor for (matrix_sdk_base::crypto::OlmMachine, ruma::OwnedRoomId) {
-    async fn decrypt_event_impl(&self, raw: &Raw<AnySyncTimelineEvent>) -> Result<TimelineEvent> {
+    async fn decrypt_event_impl(
+        &self,
+        raw: &Raw<AnySyncTimelineEvent>,
+        push_ctx: Option<&PushContext>,
+    ) -> Result<TimelineEvent> {
         let (olm_machine, room_id) = self;
-        let event = olm_machine.decrypt_room_event(raw.cast_ref(), room_id).await?;
-        Ok(event)
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+        let mut timeline_event = match olm_machine
+            .try_decrypt_room_event(raw.cast_ref(), room_id, &decryption_settings)
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => decrypted.into(),
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                TimelineEvent::new_utd_event(raw.clone(), utd_info)
+            }
+        };
+
+        // Fill the push actions here, to mimic what `Room::decrypt_event` does.
+        timeline_event.push_actions = push_ctx.map(|ctx| ctx.for_event(timeline_event.raw()));
+
+        Ok(timeline_event)
     }
 }

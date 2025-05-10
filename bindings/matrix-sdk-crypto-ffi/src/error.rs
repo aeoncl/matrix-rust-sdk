@@ -1,8 +1,9 @@
 #![allow(missing_docs)]
 
 use matrix_sdk_crypto::{
-    store::CryptoStoreError as InnerStoreError, KeyExportError, MegolmError, OlmError,
-    SecretImportError as RustSecretImportError, SignatureError as InnerSignatureError,
+    store::{CryptoStoreError as InnerStoreError, DehydrationError as InnerDehydrationError},
+    KeyExportError, MegolmError, OlmError, SecretImportError as RustSecretImportError,
+    SignatureError as InnerSignatureError,
 };
 use matrix_sdk_sqlite::OpenStoreError;
 use ruma::{IdParseError, OwnedUserId};
@@ -57,6 +58,8 @@ pub enum CryptoStoreError {
     InvalidUserId(String, IdParseError),
     #[error(transparent)]
     Identifier(#[from] IdParseError),
+    #[error(transparent)]
+    DehydrationError(#[from] InnerDehydrationError),
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -75,10 +78,10 @@ pub enum DecryptionError {
 
 impl From<MegolmError> for DecryptionError {
     fn from(value: MegolmError) -> Self {
-        match value {
+        match &value {
             MegolmError::MissingRoomKey(withheld_code) => Self::MissingRoomKey {
-                error: "Withheld Inbound group session".to_owned(),
-                withheld_code: withheld_code.map(|w| w.as_str().to_owned()),
+                error: value.to_string(),
+                withheld_code: withheld_code.as_ref().map(|w| w.as_str().to_owned()),
             },
             _ => Self::Megolm { error: value.to_string() },
         }
@@ -112,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_withheld_error_mapping() {
-        use matrix_sdk_crypto::types::events::room_key_withheld::WithheldCode;
+        use matrix_sdk_common::deserialized_responses::WithheldCode;
 
         let inner_error = MegolmError::MissingRoomKey(Some(WithheldCode::Unverified));
 

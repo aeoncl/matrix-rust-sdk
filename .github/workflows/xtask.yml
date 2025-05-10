@@ -35,7 +35,7 @@ jobs:
             os-name: 🐧
             cachekey-id: linux
 
-          - os: macos-12
+          - os: macos-15
             os-name: 🍏
             cachekey-id: macos
 
@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Calculate cache key
         id: cachekey
@@ -53,11 +53,11 @@ jobs:
           echo "cachekey-${{ matrix.cachekey-id }}=xtask-${{ matrix.cachekey-id }}-${{ hashFiles('Cargo.toml', 'xtask/**') }}" >> $GITHUB_OUTPUT
 
       - name: Check xtask cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         id: xtask-cache
         with:
           path: target/debug/xtask
-          # use the cache key calculated in the step above. Bit of an awkard
+          # use the cache key calculated in the step above. Bit of an awkward
           # syntax
           key: |
             ${{ steps.cachekey.outputs[format('cachekey-{0}', matrix.cachekey-id)] }}

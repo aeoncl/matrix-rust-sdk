@@ -56,7 +56,7 @@ impl<'a, R: 'a + Read + std::fmt::Debug> std::fmt::Debug for AttachmentDecryptor
     }
 }
 
-impl<'a, R: Read> Read for AttachmentDecryptor<'a, R> {
+impl<R: Read> Read for AttachmentDecryptor<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let read_bytes = self.inner.read(buf)?;
 
@@ -104,7 +104,7 @@ impl<'a, R: Read + 'a> AttachmentDecryptor<'a, R> {
     /// * `reader` - The `Reader` that should be wrapped and decrypted.
     ///
     /// * `info` - The encryption info that is necessary to decrypt data from
-    /// the reader.
+    ///   the reader.
     ///
     /// # Examples
     /// ```

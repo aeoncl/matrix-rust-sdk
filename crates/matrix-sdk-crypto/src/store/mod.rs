@@ -17,9 +17,9 @@
 //! The storage layer for the [`OlmMachine`] can be customized using a trait.
 //! Implementing your own [`CryptoStore`]
 //!
-//! An in-memory only store is provided as well as a SQLite-based one, depending
-//! on your needs and targets a custom store may be implemented, e.g. for
-//! `wasm-unknown-unknown` an indexeddb store would be needed
+//! An in-memory only store is provided as well as an SQLite-based one,
+//! depending on your needs and targets a custom store may be implemented, e.g.
+//! for `wasm-unknown-unknown` an indexeddb store would be needed
 //!
 //! ```
 //! # use std::sync::Arc;
@@ -32,7 +32,7 @@
 //! # let device_id = device_id!("TEST");
 //! let store = Arc::new(MemoryStore::new());
 //!
-//! let machine = OlmMachine::with_store(user_id, device_id, store);
+//! let machine = OlmMachine::with_store(user_id, device_id, store, None);
 //! ```
 //!
 //! [`OlmMachine`]: /matrix_sdk_crypto/struct.OlmMachine.html
@@ -43,35 +43,41 @@ use std::{
     fmt::Debug,
     ops::Deref,
     pin::pin,
-    sync::{atomic::Ordering, Arc, RwLock as StdRwLock},
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
 use as_variant::as_variant;
 use futures_core::Stream;
 use futures_util::StreamExt;
+use matrix_sdk_common::locks::RwLock as StdRwLock;
 use ruma::{
-    events::secret::request::SecretName, DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, UserId,
+    encryption::KeyUsage, events::secret::request::SecretName, DeviceId, OwnedDeviceId,
+    OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{info, warn};
 use vodozemac::{base64_encode, megolm::SessionOrdering, Curve25519PublicKey};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[cfg(doc)]
+use crate::{backups::BackupMachine, identities::OwnUserIdentity};
 use crate::{
     gossiping::GossippedSecret,
-    identities::{
-        user::UserIdentities, Device, ReadOnlyDevice, ReadOnlyUserIdentities, UserDevices,
-    },
+    identities::{user::UserIdentity, Device, DeviceData, UserDevices, UserIdentityData},
     olm::{
         Account, ExportedRoomKey, InboundGroupSession, OlmMessageHash, OutboundGroupSession,
-        PrivateCrossSigningIdentity, Session, StaticAccountData,
+        PrivateCrossSigningIdentity, SenderData, Session, StaticAccountData,
     },
-    types::{events::room_key_withheld::RoomKeyWithheldEvent, EventEncryptionAlgorithm},
+    types::{
+        events::room_key_withheld::RoomKeyWithheldEvent, BackupSecrets, CrossSigningSecrets,
+        EventEncryptionAlgorithm, MegolmBackupV1Curve25519AesSha2Secrets, SecretsBundle,
+    },
     verification::VerificationMachine,
-    CrossSigningStatus, ReadOnlyOwnUserIdentity, RoomKeyImportResult,
+    CrossSigningStatus, OwnUserIdentityData, RoomKeyImportResult,
 };
 
 pub mod caches;
@@ -88,11 +94,20 @@ pub mod integration_tests;
 use caches::{SequenceNumber, UsersForKeyQuery};
 pub(crate) use crypto_store_wrapper::CryptoStoreWrapper;
 pub use error::{CryptoStoreError, Result};
-use matrix_sdk_common::{store_locks::CrossProcessStoreLock, timeout::timeout};
+use matrix_sdk_common::{
+    deserialized_responses::WithheldCode, store_locks::CrossProcessStoreLock, timeout::timeout,
+};
 pub use memorystore::MemoryStore;
 pub use traits::{CryptoStore, DynCryptoStore, IntoCryptoStore};
 
-pub use crate::gossiping::{GossipRequest, SecretInfo};
+use crate::types::{
+    events::{room_key_bundle::RoomKeyBundleContent, room_key_withheld::RoomKeyWithheldContent},
+    room_history::RoomKeyBundle,
+};
+pub use crate::{
+    dehydrated_devices::DehydrationError,
+    gossiping::{GossipRequest, SecretInfo},
+};
 
 /// A wrapper for our CryptoStore trait object.
 ///
@@ -147,7 +162,7 @@ impl KeyQueryManager {
         let tracked_users = cache.store.load_tracked_users().await?;
 
         let mut query_users_lock = self.users_for_key_query.lock().await;
-        let mut tracked_users_cache = cache.tracked_users.write().unwrap();
+        let mut tracked_users_cache = cache.tracked_users.write();
         for user in tracked_users {
             tracked_users_cache.insert(user.user_id.to_owned());
 
@@ -211,7 +226,7 @@ impl KeyQueryManager {
             Err(_) => {
                 warn!(
                     user_id = ?user,
-                    "The user has a pending `/key/query` request which did \
+                    "The user has a pending `/keys/query` request which did \
                     not finish yet, some devices might be missing."
                 );
 
@@ -227,7 +242,7 @@ pub(crate) struct SyncedKeyQueryManager<'a> {
     manager: &'a KeyQueryManager,
 }
 
-impl<'a> SyncedKeyQueryManager<'a> {
+impl SyncedKeyQueryManager<'_> {
     /// Add entries to the list of users being tracked for device changes
     ///
     /// Any users not already on the list are flagged as awaiting a key query.
@@ -237,7 +252,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
         let mut key_query_lock = self.manager.users_for_key_query.lock().await;
 
         {
-            let mut tracked_users = self.cache.tracked_users.write().unwrap();
+            let mut tracked_users = self.cache.tracked_users.write();
             for user_id in users {
                 if tracked_users.insert(user_id.to_owned()) {
                     key_query_lock.insert_user(user_id);
@@ -263,7 +278,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
         let mut key_query_lock = self.manager.users_for_key_query.lock().await;
 
         {
-            let tracked_users = &self.cache.tracked_users.read().unwrap();
+            let tracked_users = &self.cache.tracked_users.read();
             for user_id in users {
                 if tracked_users.contains(user_id) {
                     key_query_lock.insert_user(user_id);
@@ -289,7 +304,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
         let mut key_query_lock = self.manager.users_for_key_query.lock().await;
 
         {
-            let tracked_users = self.cache.tracked_users.read().unwrap();
+            let tracked_users = self.cache.tracked_users.read();
             for user_id in users {
                 if tracked_users.contains(user_id) {
                     let clean = key_query_lock.maybe_remove_user(user_id, sequence_number);
@@ -322,7 +337,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
 
     /// See the docs for [`crate::OlmMachine::tracked_users()`].
     pub fn tracked_users(&self) -> HashSet<OwnedUserId> {
-        self.cache.tracked_users.read().unwrap().iter().cloned().collect()
+        self.cache.tracked_users.read().iter().cloned().collect()
     }
 
     /// Mark the given user as being tracked for device lists, and mark that it
@@ -332,7 +347,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
     /// next time [`Store::users_for_key_query()`] is called.
     pub async fn mark_user_as_changed(&self, user: &UserId) -> Result<()> {
         self.manager.users_for_key_query.lock().await.insert_user(user);
-        self.cache.tracked_users.write().unwrap().insert(user.to_owned());
+        self.cache.tracked_users.write().insert(user.to_owned());
 
         self.cache.store.save_tracked_users(&[(user, true)]).await
     }
@@ -341,13 +356,16 @@ impl<'a> SyncedKeyQueryManager<'a> {
 #[derive(Debug)]
 pub(crate) struct StoreCache {
     store: Arc<CryptoStoreWrapper>,
-
     tracked_users: StdRwLock<BTreeSet<OwnedUserId>>,
     loaded_tracked_users: RwLock<bool>,
     account: Mutex<Option<Account>>,
 }
 
 impl StoreCache {
+    pub(crate) fn store_wrapper(&self) -> &CryptoStoreWrapper {
+        self.store.as_ref()
+    }
+
     /// Returns a reference to the `Account`.
     ///
     /// Either load the account from the cache, or the store if missing from
@@ -511,6 +529,7 @@ pub struct Changes {
     pub private_identity: Option<PrivateCrossSigningIdentity>,
     pub backup_version: Option<String>,
     pub backup_decryption_key: Option<BackupDecryptionKey>,
+    pub dehydrated_device_pickle_key: Option<DehydratedDeviceKey>,
     pub sessions: Vec<Session>,
     pub message_hashes: Vec<OlmMessageHash>,
     pub inbound_group_sessions: Vec<InboundGroupSession>,
@@ -523,10 +542,30 @@ pub struct Changes {
     pub room_settings: HashMap<OwnedRoomId, RoomSettings>,
     pub secrets: Vec<GossippedSecret>,
     pub next_batch_token: Option<String>,
+
+    /// Historical room key history bundles that we have received and should
+    /// store.
+    pub received_room_key_bundles: Vec<StoredRoomKeyBundleData>,
+}
+
+/// Information about an [MSC4268] room key bundle.
+///
+/// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredRoomKeyBundleData {
+    /// The user that sent us this data.
+    pub sender_user: OwnedUserId,
+
+    /// Information about the sender of this data and how much we trust that
+    /// information.
+    pub sender_data: SenderData,
+
+    /// The room key bundle data itself.
+    pub bundle_data: RoomKeyBundleContent,
 }
 
 /// A user for which we are tracking the list of devices.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackedUser {
     /// The user ID of the user.
     pub user_id: OwnedUserId,
@@ -543,6 +582,7 @@ impl Changes {
         self.private_identity.is_none()
             && self.backup_version.is_none()
             && self.backup_decryption_key.is_none()
+            && self.dehydrated_device_pickle_key.is_none()
             && self.sessions.is_empty()
             && self.message_hashes.is_empty()
             && self.inbound_group_sessions.is_empty()
@@ -554,6 +594,7 @@ impl Changes {
             && self.room_settings.is_empty()
             && self.secrets.is_empty()
             && self.next_batch_token.is_none()
+            && self.received_room_key_bundles.is_empty()
     }
 }
 
@@ -570,9 +611,9 @@ impl Changes {
 #[derive(Debug, Clone, Default)]
 #[allow(missing_docs)]
 pub struct IdentityChanges {
-    pub new: Vec<ReadOnlyUserIdentities>,
-    pub changed: Vec<ReadOnlyUserIdentities>,
-    pub unchanged: Vec<ReadOnlyUserIdentities>,
+    pub new: Vec<UserIdentityData>,
+    pub changed: Vec<UserIdentityData>,
+    pub unchanged: Vec<UserIdentityData>,
 }
 
 impl IdentityChanges {
@@ -585,9 +626,9 @@ impl IdentityChanges {
     fn into_maps(
         self,
     ) -> (
-        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
-        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
-        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
+        BTreeMap<OwnedUserId, UserIdentityData>,
+        BTreeMap<OwnedUserId, UserIdentityData>,
+        BTreeMap<OwnedUserId, UserIdentityData>,
     ) {
         let new: BTreeMap<_, _> = self
             .new
@@ -614,19 +655,19 @@ impl IdentityChanges {
 #[derive(Debug, Clone, Default)]
 #[allow(missing_docs)]
 pub struct DeviceChanges {
-    pub new: Vec<ReadOnlyDevice>,
-    pub changed: Vec<ReadOnlyDevice>,
-    pub deleted: Vec<ReadOnlyDevice>,
+    pub new: Vec<DeviceData>,
+    pub changed: Vec<DeviceData>,
+    pub deleted: Vec<DeviceData>,
 }
 
 /// Convert the devices and vectors contained in the [`DeviceChanges`] into
 /// a [`DeviceUpdates`] struct.
 ///
-/// The [`DeviceChanges`] will contain vectors of [`ReadOnlyDevice`]s which
+/// The [`DeviceChanges`] will contain vectors of [`DeviceData`]s which
 /// we want to convert to a [`Device`].
 fn collect_device_updates(
     verification_machine: VerificationMachine,
-    own_identity: Option<ReadOnlyOwnUserIdentity>,
+    own_identity: Option<OwnUserIdentityData>,
     identities: IdentityChanges,
     devices: DeviceChanges,
 ) -> DeviceUpdates {
@@ -635,7 +676,7 @@ fn collect_device_updates(
 
     let (new_identities, changed_identities, unchanged_identities) = identities.into_maps();
 
-    let map_device = |device: ReadOnlyDevice| {
+    let map_device = |device: DeviceData| {
         let device_owner_identity = new_identities
             .get(device.user_id())
             .or_else(|| changed_identities.get(device.user_id()))
@@ -684,7 +725,7 @@ pub struct DeviceUpdates {
     pub changed: BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, Device>>,
 }
 
-/// Updates about [`UserIdentities`] which got received over the `/keys/query`
+/// Updates about [`UserIdentity`]s which got received over the `/keys/query`
 /// endpoint.
 #[derive(Clone, Debug, Default)]
 pub struct IdentityUpdates {
@@ -693,11 +734,11 @@ pub struct IdentityUpdates {
     /// A identity being in this list does not necessarily mean that the
     /// identity was just created, it just means that it's the first time
     /// we're seeing this identity.
-    pub new: BTreeMap<OwnedUserId, UserIdentities>,
+    pub new: BTreeMap<OwnedUserId, UserIdentity>,
     /// The list of changed identities.
-    pub changed: BTreeMap<OwnedUserId, UserIdentities>,
+    pub changed: BTreeMap<OwnedUserId, UserIdentity>,
     /// The list of unchanged identities.
-    pub unchanged: BTreeMap<OwnedUserId, UserIdentities>,
+    pub unchanged: BTreeMap<OwnedUserId, UserIdentity>,
 }
 
 /// The private part of a backup key.
@@ -709,8 +750,7 @@ pub struct IdentityUpdates {
 /// secret storage (SSSS), whence it can be retrieved when it is needed for a
 /// recovery operation. Alternatively, the key can be "gossiped" between devices
 /// via "secret sharing".
-#[derive(Clone, Zeroize, Deserialize, Serialize)]
-#[zeroize(drop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct BackupDecryptionKey {
     pub(crate) inner: Box<[u8; BackupDecryptionKey::KEY_SIZE]>,
@@ -739,7 +779,77 @@ impl BackupDecryptionKey {
 #[cfg(not(tarpaulin_include))]
 impl Debug for BackupDecryptionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BackupDecryptionKey").finish()
+        f.debug_tuple("BackupDecryptionKey").field(&"...").finish()
+    }
+}
+
+/// The pickle key used to safely store the dehydrated device pickle.
+///
+/// This input key material will be expanded using HKDF into an AES key, MAC
+/// key, and an initialization vector (IV).
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct DehydratedDeviceKey {
+    pub(crate) inner: Box<[u8; DehydratedDeviceKey::KEY_SIZE]>,
+}
+
+impl DehydratedDeviceKey {
+    /// The number of bytes the encryption key will hold.
+    pub const KEY_SIZE: usize = 32;
+
+    /// Generates a new random pickle key.
+    pub fn new() -> Result<Self, rand::Error> {
+        let mut rng = rand::thread_rng();
+
+        let mut key = Box::new([0u8; Self::KEY_SIZE]);
+        rand::Fill::try_fill(key.as_mut_slice(), &mut rng)?;
+
+        Ok(Self { inner: key })
+    }
+
+    /// Creates a new dehydration pickle key from the given slice.
+    ///
+    /// Fail if the slice length is not 32.
+    pub fn from_slice(slice: &[u8]) -> Result<Self, DehydrationError> {
+        if slice.len() == 32 {
+            let mut key = Box::new([0u8; 32]);
+            key.copy_from_slice(slice);
+            Ok(DehydratedDeviceKey { inner: key })
+        } else {
+            Err(DehydrationError::PickleKeyLength(slice.len()))
+        }
+    }
+
+    /// Creates a dehydration pickle key from the given bytes.
+    pub fn from_bytes(raw_key: &[u8; 32]) -> Self {
+        let mut inner = Box::new([0u8; Self::KEY_SIZE]);
+        inner.copy_from_slice(raw_key);
+
+        Self { inner }
+    }
+
+    /// Export the [`DehydratedDeviceKey`] as a base64 encoded string.
+    pub fn to_base64(&self) -> String {
+        base64_encode(self.inner.as_slice())
+    }
+}
+
+impl From<&[u8; 32]> for DehydratedDeviceKey {
+    fn from(value: &[u8; 32]) -> Self {
+        DehydratedDeviceKey { inner: Box::new(*value) }
+    }
+}
+
+impl From<DehydratedDeviceKey> for Vec<u8> {
+    fn from(key: DehydratedDeviceKey) -> Self {
+        key.inner.to_vec()
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl Debug for DehydratedDeviceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DehydratedDeviceKey").field(&"...").finish()
     }
 }
 
@@ -776,8 +886,7 @@ pub struct BackupKeys {
 
 /// A struct containing private cross signing keys that can be backed up or
 /// uploaded to the secret store.
-#[derive(Default, Zeroize)]
-#[zeroize(drop)]
+#[derive(Default, Zeroize, ZeroizeOnDrop)]
 pub struct CrossSigningKeyExport {
     /// The seed of the master key encoded as unpadded base64.
     pub master_key: Option<String>,
@@ -815,6 +924,27 @@ pub enum SecretImportError {
     /// The new version of the identity couldn't be stored.
     #[error(transparent)]
     Store(#[from] CryptoStoreError),
+}
+
+/// Error describing what went wrong when exporting a [`SecretsBundle`].
+///
+/// The [`SecretsBundle`] can only be exported if we have all cross-signing
+/// private keys in the store.
+#[derive(Debug, Error)]
+pub enum SecretsBundleExportError {
+    /// The store itself had an error.
+    #[error(transparent)]
+    Store(#[from] CryptoStoreError),
+    /// We're missing one or multiple cross-signing keys.
+    #[error("The store is missing one or multiple cross-signing keys")]
+    MissingCrossSigningKey(KeyUsage),
+    /// We're missing all cross-signing keys.
+    #[error("The store doesn't contain any cross-signing keys")]
+    MissingCrossSigningKeys,
+    /// We have a backup key stored, but we don't know the version of the
+    /// backup.
+    #[error("The store contains a backup key, but no backup version")]
+    MissingBackupVersion,
 }
 
 /// Result type telling us if a `/keys/query` response was expected for a given
@@ -886,6 +1016,20 @@ impl From<&InboundGroupSession> for RoomKeyInfo {
             session_id: group_session.session_id().to_owned(),
         }
     }
+}
+
+/// Information on a room key that has been withheld
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoomKeyWithheldInfo {
+    /// The room where the key is used.
+    pub room_id: OwnedRoomId,
+
+    /// The ID of the session that the key is for.
+    pub session_id: String,
+
+    /// The `m.room_key.withheld` event that notified us that the key is being
+    /// withheld.
+    pub withheld_event: RoomKeyWithheldEvent,
 }
 
 impl Store {
@@ -973,6 +1117,13 @@ impl Store {
         self.save_changes(changes).await
     }
 
+    pub(crate) async fn get_sessions(
+        &self,
+        sender_key: &str,
+    ) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
+        self.inner.store.get_sessions(sender_key).await
+    }
+
     pub(crate) async fn save_changes(&self, changes: Changes) -> Result<()> {
         self.inner.store.save_changes(changes).await
     }
@@ -1002,7 +1153,7 @@ impl Store {
 
     #[cfg(test)]
     /// Testing helper to allow to save only a set of devices
-    pub(crate) async fn save_devices(&self, devices: &[ReadOnlyDevice]) -> Result<()> {
+    pub(crate) async fn save_device_data(&self, devices: &[DeviceData]) -> Result<()> {
         let changes = Changes {
             devices: DeviceChanges { changed: devices.to_vec(), ..Default::default() },
             ..Default::default()
@@ -1031,22 +1182,29 @@ impl Store {
             .and_then(|d| d.display_name().map(|d| d.to_owned())))
     }
 
-    /// Get the read-only device associated with `device_id` for `user_id`
-    pub(crate) async fn get_readonly_device(
+    /// Get the device data for the given [`UserId`] and [`DeviceId`].
+    ///
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
+    pub(crate) async fn get_device_data(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         self.inner.store.get_device(user_id, device_id).await
     }
 
-    /// Get the read-only version of all the devices that the given user has.
+    /// Get the device data for the given [`UserId`] and [`DeviceId`].
     ///
-    /// *Note*: This doesn't return our own device.
-    pub(crate) async fn get_readonly_devices_filtered(
+    /// *Note*: This method will **not** include our own device.
+    ///
+    /// Use this method if you need a list of recipients for a given user, since
+    /// we don't want to encrypt for our own device, otherwise take a look at
+    /// the [`Store::get_device_data_for_user`] method.
+    pub(crate) async fn get_device_data_for_user_filtered(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         self.inner.store.get_user_devices(user_id).await.map(|mut d| {
             if user_id == self.user_id() {
                 d.remove(self.device_id());
@@ -1055,19 +1213,26 @@ impl Store {
         })
     }
 
-    /// Get the read-only version of all the devices that the given user has.
+    /// Get the [`DeviceData`] for all the devices a user has.
     ///
-    /// *Note*: This does also return our own device.
-    pub(crate) async fn get_readonly_devices_unfiltered(
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
+    ///
+    /// Use this method if you need to operate on or update all devices of a
+    /// user, otherwise take a look at the
+    /// [`Store::get_device_data_for_user_filtered`] method.
+    pub(crate) async fn get_device_data_for_user(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         self.inner.store.get_user_devices(user_id).await
     }
 
-    /// Get a device for the given user with the given curve25519 key.
+    /// Get a [`Device`] for the given user with the given
+    /// [`Curve25519PublicKey`] key.
     ///
-    /// *Note*: This doesn't return our own device.
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
     pub(crate) async fn get_device_from_curve_key(
         &self,
         user_id: &UserId,
@@ -1078,11 +1243,17 @@ impl Store {
             .map(|d| d.devices().find(|d| d.curve25519_key() == Some(curve_key)))
     }
 
-    /// Get all devices associated with the given `user_id`
+    /// Get all devices associated with the given [`UserId`].
     ///
-    /// *Note*: This does also return our own device.
+    /// This method is more expensive than the
+    /// [`Store::get_device_data_for_user`] method, since a [`Device`]
+    /// requires the [`OwnUserIdentityData`] and the [`UserIdentityData`] of the
+    /// device owner to be fetched from the store as well.
+    ///
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
     pub(crate) async fn get_user_devices(&self, user_id: &UserId) -> Result<UserDevices> {
-        let devices = self.get_readonly_devices_unfiltered(user_id).await?;
+        let devices = self.get_device_data_for_user(user_id).await?;
 
         let own_identity = self
             .inner
@@ -1100,39 +1271,61 @@ impl Store {
         })
     }
 
-    /// Get a Device copy associated with `device_id` for `user_id`
+    /// Get a [`Device`] for the given user with the given [`DeviceId`].
+    ///
+    /// This method is more expensive than the [`Store::get_device_data`] method
+    /// since a [`Device`] requires the [`OwnUserIdentityData`] and the
+    /// [`UserIdentityData`] of the device owner to be fetched from the
+    /// store as well.
+    ///
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
     pub(crate) async fn get_device(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
     ) -> Result<Option<Device>> {
+        if let Some(device_data) = self.inner.store.get_device(user_id, device_id).await? {
+            Ok(Some(self.wrap_device_data(device_data).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create a new device using the supplied [`DeviceData`]. Normally we would
+    /// call [`Self::get_device`] to find an existing device inside this
+    /// store. Only call this if you have some existing DeviceData and want
+    /// to wrap it with the extra information provided by a [`Device`].
+    pub(crate) async fn wrap_device_data(&self, device_data: DeviceData) -> Result<Device> {
         let own_identity = self
             .inner
             .store
             .get_user_identity(self.user_id())
             .await?
             .and_then(|i| i.own().cloned());
-        let device_owner_identity = self.inner.store.get_user_identity(user_id).await?;
 
-        Ok(self.inner.store.get_device(user_id, device_id).await?.map(|d| Device {
-            inner: d,
+        let device_owner_identity =
+            self.inner.store.get_user_identity(device_data.user_id()).await?;
+
+        Ok(Device {
+            inner: device_data,
             verification_machine: self.inner.verification_machine.clone(),
             own_identity,
             device_owner_identity,
-        }))
+        })
     }
 
     ///  Get the Identity of `user_id`
-    pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentities>> {
+    pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentity>> {
         let own_identity = self
             .inner
             .store
             .get_user_identity(self.user_id())
             .await?
-            .and_then(as_variant!(ReadOnlyUserIdentities::Own));
+            .and_then(as_variant!(UserIdentityData::Own));
 
         Ok(self.inner.store.get_user_identity(user_id).await?.map(|i| {
-            UserIdentities::new(
+            UserIdentity::new(
                 self.clone(),
                 i,
                 self.inner.verification_machine.to_owned(),
@@ -1174,8 +1367,32 @@ impl Store {
         })
     }
 
-    /// Import the Cross Signing Keys
-    pub(crate) async fn import_cross_signing_keys(
+    /// Export all the private cross signing keys we have.
+    ///
+    /// The export will contain the seed for the ed25519 keys as a unpadded
+    /// base64 encoded string.
+    ///
+    /// This method returns `None` if we don't have any private cross signing
+    /// keys.
+    pub async fn export_cross_signing_keys(
+        &self,
+    ) -> Result<Option<CrossSigningKeyExport>, CryptoStoreError> {
+        let master_key = self.export_secret(&SecretName::CrossSigningMasterKey).await?;
+        let self_signing_key = self.export_secret(&SecretName::CrossSigningSelfSigningKey).await?;
+        let user_signing_key = self.export_secret(&SecretName::CrossSigningUserSigningKey).await?;
+
+        Ok(if master_key.is_none() && self_signing_key.is_none() && user_signing_key.is_none() {
+            None
+        } else {
+            Some(CrossSigningKeyExport { master_key, self_signing_key, user_signing_key })
+        })
+    }
+
+    /// Import our private cross signing keys.
+    ///
+    /// The export needs to contain the seed for the Ed25519 keys as an unpadded
+    /// base64 encoded string.
+    pub async fn import_cross_signing_keys(
         &self,
         export: CrossSigningKeyExport,
     ) -> Result<CrossSigningStatus, SecretImportError> {
@@ -1202,7 +1419,7 @@ impl Store {
 
             if diff.none_differ() {
                 public_identity.mark_as_verified();
-                changes.identities.changed.push(ReadOnlyUserIdentities::Own(public_identity.inner));
+                changes.identities.changed.push(UserIdentityData::Own(public_identity.inner));
             }
 
             info!(?status, "Successfully imported the private cross-signing keys");
@@ -1213,6 +1430,102 @@ impl Store {
         }
 
         Ok(self.inner.identity.lock().await.status().await)
+    }
+
+    /// Export all the secrets we have in the store into a [`SecretsBundle`].
+    ///
+    /// This method will export all the private cross-signing keys and, if
+    /// available, the private part of a backup key and its accompanying
+    /// version.
+    ///
+    /// The method will fail if we don't have all three private cross-signing
+    /// keys available.
+    ///
+    /// **Warning**: Only export this and share it with a trusted recipient,
+    /// i.e. if an existing device is sharing this with a new device.
+    pub async fn export_secrets_bundle(&self) -> Result<SecretsBundle, SecretsBundleExportError> {
+        let Some(cross_signing) = self.export_cross_signing_keys().await? else {
+            return Err(SecretsBundleExportError::MissingCrossSigningKeys);
+        };
+
+        let Some(master_key) = cross_signing.master_key.clone() else {
+            return Err(SecretsBundleExportError::MissingCrossSigningKey(KeyUsage::Master));
+        };
+
+        let Some(user_signing_key) = cross_signing.user_signing_key.clone() else {
+            return Err(SecretsBundleExportError::MissingCrossSigningKey(KeyUsage::UserSigning));
+        };
+
+        let Some(self_signing_key) = cross_signing.self_signing_key.clone() else {
+            return Err(SecretsBundleExportError::MissingCrossSigningKey(KeyUsage::SelfSigning));
+        };
+
+        let backup_keys = self.load_backup_keys().await?;
+
+        let backup = if let Some(key) = backup_keys.decryption_key {
+            if let Some(backup_version) = backup_keys.backup_version {
+                Some(BackupSecrets::MegolmBackupV1Curve25519AesSha2(
+                    MegolmBackupV1Curve25519AesSha2Secrets { key, backup_version },
+                ))
+            } else {
+                return Err(SecretsBundleExportError::MissingBackupVersion);
+            }
+        } else {
+            None
+        };
+
+        Ok(SecretsBundle {
+            cross_signing: CrossSigningSecrets { master_key, user_signing_key, self_signing_key },
+            backup,
+        })
+    }
+
+    /// Import and persists secrets from a [`SecretsBundle`].
+    ///
+    /// This method will import all the private cross-signing keys and, if
+    /// available, the private part of a backup key and its accompanying
+    /// version into the store.
+    ///
+    /// **Warning**: Only import this from a trusted source, i.e. if an existing
+    /// device is sharing this with a new device. The imported cross-signing
+    /// keys will create a [`OwnUserIdentity`] and mark it as verified.
+    ///
+    /// The backup key will be persisted in the store and can be enabled using
+    /// the [`BackupMachine`].
+    pub async fn import_secrets_bundle(
+        &self,
+        bundle: &SecretsBundle,
+    ) -> Result<(), SecretImportError> {
+        let mut changes = Changes::default();
+
+        if let Some(backup_bundle) = &bundle.backup {
+            match backup_bundle {
+                BackupSecrets::MegolmBackupV1Curve25519AesSha2(bundle) => {
+                    changes.backup_decryption_key = Some(bundle.key.clone());
+                    changes.backup_version = Some(bundle.backup_version.clone());
+                }
+            }
+        }
+
+        let identity = self.inner.identity.lock().await;
+
+        identity
+            .import_secrets_unchecked(
+                Some(&bundle.cross_signing.master_key),
+                Some(&bundle.cross_signing.self_signing_key),
+                Some(&bundle.cross_signing.user_signing_key),
+            )
+            .await?;
+
+        let public_identity = identity.to_public_identity().await.expect(
+            "We should be able to create a new public identity since we just imported \
+             all the private cross-signing keys",
+        );
+
+        changes.private_identity = Some(identity.clone());
+        changes.identities.new.push(UserIdentityData::Own(public_identity));
+
+        Ok(self.save_changes(changes).await?)
     }
 
     /// Import the given `secret` named `secret_name` into the keystore.
@@ -1309,13 +1622,29 @@ impl Store {
     /// the stream. Updates that happen at the same time are batched into a
     /// [`Vec`].
     ///
-    /// If the reader of the stream lags too far behind, a warning will be
-    /// logged and items will be dropped.
+    /// If the reader of the stream lags too far behind an error will be sent to
+    /// the reader.
     ///
     /// The stream will terminate once all references to the underlying
     /// `CryptoStoreWrapper` are dropped.
-    pub fn room_keys_received_stream(&self) -> impl Stream<Item = Vec<RoomKeyInfo>> {
+    pub fn room_keys_received_stream(
+        &self,
+    ) -> impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> {
         self.inner.store.room_keys_received_stream()
+    }
+
+    /// Receive notifications of received `m.room_key.withheld` messages.
+    ///
+    /// Each time an `m.room_key.withheld` is received and stored, an update
+    /// will be sent to the stream. Updates that happen at the same time are
+    /// batched into a [`Vec`].
+    ///
+    /// If the reader of the stream lags too far behind, a warning will be
+    /// logged and items will be dropped.
+    pub fn room_keys_withheld_received_stream(
+        &self,
+    ) -> impl Stream<Item = Vec<RoomKeyWithheldInfo>> {
+        self.inner.store.room_keys_withheld_received_stream()
     }
 
     /// Returns a stream of user identity updates, allowing users to listen for
@@ -1358,7 +1687,7 @@ impl Store {
             let map_identity = |(user_id, identity)| {
                 (
                     user_id,
-                    UserIdentities::new(
+                    UserIdentity::new(
                         this.clone(),
                         identity,
                         verification_machine.to_owned(),
@@ -1485,10 +1814,22 @@ impl Store {
         self.inner.store.secrets_stream()
     }
 
-    pub(crate) async fn import_room_keys(
+    /// Import the given room keys into the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `exported_keys` - The keys to be imported.
+    /// * `from_backup_version` - If the keys came from key backup, the key
+    ///   backup version. This will cause the keys to be marked as already
+    ///   backed up, and therefore not requiring another backup.
+    /// * `progress_listener` - Callback which will be called after each key is
+    ///   processed. Called with arguments `(processed, total)` where
+    ///   `processed` is the number of keys processed so far, and `total` is the
+    ///   total number of keys (i.e., `exported_keys.len()`).
+    pub async fn import_room_keys(
         &self,
         exported_keys: Vec<ExportedRoomKey>,
-        from_backup: bool,
+        from_backup_version: Option<&str>,
         progress_listener: impl Fn(usize, usize),
     ) -> Result<RoomKeyImportResult> {
         let mut sessions = Vec::new();
@@ -1519,7 +1860,7 @@ impl Store {
                     // Only import the session if we didn't have this session or
                     // if it's a better version of the same session.
                     if new_session_better(&session, old_session).await {
-                        if from_backup {
+                        if from_backup_version.is_some() {
                             session.mark_as_backed_up();
                         }
 
@@ -1548,9 +1889,7 @@ impl Store {
 
         let imported_count = sessions.len();
 
-        let changes = Changes { inbound_group_sessions: sessions, ..Default::default() };
-
-        self.save_changes(changes).await?;
+        self.inner.store.save_inbound_group_sessions(sessions, from_backup_version).await?;
 
         info!(total_count, imported_count, room_keys = ?keys, "Successfully imported room keys");
 
@@ -1562,8 +1901,8 @@ impl Store {
     /// # Arguments
     ///
     /// * `exported_keys` - A list of previously exported keys that should be
-    /// imported into our store. If we already have a better version of a key
-    /// the key will *not* be imported.
+    ///   imported into our store. If we already have a better version of a key
+    ///   the key will *not* be imported.
     ///
     /// Returns a tuple of numbers that represent the number of sessions that
     /// were imported and the total number of sessions that were found in the
@@ -1580,7 +1919,7 @@ impl Store {
     /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
     /// # let export = Cursor::new("".to_owned());
     /// let exported_keys = decrypt_room_key_export(export, "1234").unwrap();
-    /// machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
+    /// machine.store().import_exported_room_keys(exported_keys, |_, _| {}).await.unwrap();
     /// # };
     /// ```
     pub async fn import_exported_room_keys(
@@ -1588,7 +1927,7 @@ impl Store {
         exported_keys: Vec<ExportedRoomKey>,
         progress_listener: impl Fn(usize, usize),
     ) -> Result<RoomKeyImportResult> {
-        self.import_room_keys(exported_keys, false, progress_listener).await
+        self.import_room_keys(exported_keys, None, progress_listener).await
     }
 
     pub(crate) fn crypto_store(&self) -> Arc<CryptoStoreWrapper> {
@@ -1600,9 +1939,9 @@ impl Store {
     /// # Arguments
     ///
     /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSession` will be included in the export,
-    /// if the closure returns `false` it will not be included.
+    ///   `InboundGroupSession`, which represents a room key. If the closure
+    ///   returns `true` the `InboundGroupSession` will be included in the
+    ///   export, if the closure returns `false` it will not be included.
     ///
     /// # Examples
     ///
@@ -1640,9 +1979,9 @@ impl Store {
     /// # Arguments
     ///
     /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSession` will be included in the export,
-    /// if the closure returns `false` it will not be included.
+    ///   `InboundGroupSession`, which represents a room key. If the closure
+    ///   returns `true` the `InboundGroupSession` will be included in the
+    ///   export, if the closure returns `false` it will not be included.
     ///
     /// # Examples
     ///
@@ -1675,6 +2014,38 @@ impl Store {
         Ok(futures_util::stream::iter(sessions.into_iter().filter(predicate))
             .then(|session| async move { session.export().await }))
     }
+
+    /// Assemble a room key bundle for sharing encrypted history, as per
+    /// [MSC4268].
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub async fn build_room_key_bundle(
+        &self,
+        room_id: &RoomId,
+    ) -> std::result::Result<RoomKeyBundle, CryptoStoreError> {
+        // TODO: make this WAY more efficient. We should only fetch sessions for the
+        //   correct room.
+        let mut sessions = self.get_inbound_group_sessions().await?;
+        sessions.retain(|session| session.room_id == room_id);
+
+        let mut bundle = RoomKeyBundle::default();
+        for session in sessions {
+            if session.shared_history() {
+                bundle.room_keys.push(session.export().await.into());
+            } else {
+                bundle.withheld.push(RoomKeyWithheldContent::new(
+                    session.algorithm().to_owned(),
+                    WithheldCode::Unauthorised,
+                    session.room_id().to_owned(),
+                    session.session_id().to_owned(),
+                    session.sender_key().to_owned(),
+                    self.device_id().to_owned(),
+                ));
+            }
+        }
+
+        Ok(bundle)
+    }
 }
 
 impl Deref for Store {
@@ -1692,14 +2063,14 @@ pub struct LockableCryptoStore(Arc<dyn CryptoStore<Error = CryptoStoreError>>);
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl matrix_sdk_common::store_locks::BackingStore for LockableCryptoStore {
-    type Error = CryptoStoreError;
+    type LockError = CryptoStoreError;
 
     async fn try_lock(
         &self,
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> std::result::Result<bool, Self::Error> {
+    ) -> std::result::Result<bool, Self::LockError> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await
     }
 }
@@ -1709,13 +2080,45 @@ mod tests {
     use std::pin::pin;
 
     use futures_util::StreamExt;
+    use insta::{_macro_support::Content, assert_json_snapshot, internals::ContentPath};
     use matrix_sdk_test::async_test;
-    use ruma::{room_id, user_id};
+    use ruma::{device_id, room_id, user_id, RoomId};
+    use vodozemac::megolm::SessionKey;
 
-    use crate::{machine::tests::get_machine_pair, types::EventEncryptionAlgorithm};
+    use crate::{
+        machine::test_helpers::get_machine_pair,
+        olm::{InboundGroupSession, SenderData},
+        store::DehydratedDeviceKey,
+        types::EventEncryptionAlgorithm,
+        OlmMachine,
+    };
 
     #[async_test]
-    async fn export_room_keys_provides_selected_keys() {
+    async fn test_import_room_keys_notifies_stream() {
+        use futures_util::FutureExt;
+
+        let (alice, bob, _) =
+            get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
+
+        let room1_id = room_id!("!room1:localhost");
+        alice.create_outbound_group_session_with_defaults_test_helper(room1_id).await.unwrap();
+        let exported_sessions = alice.store().export_room_keys(|_| true).await.unwrap();
+
+        let mut room_keys_received_stream = Box::pin(bob.store().room_keys_received_stream());
+        bob.store().import_room_keys(exported_sessions, None, |_, _| {}).await.unwrap();
+
+        let room_keys = room_keys_received_stream
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("We should have received an update of room key infos")
+            .unwrap();
+        assert_eq!(room_keys.len(), 1);
+        assert_eq!(room_keys[0].room_id, "!room1:localhost");
+    }
+
+    #[async_test]
+    async fn test_export_room_keys_provides_selected_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1743,7 +2146,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_stream_can_provide_all_keys() {
+    async fn test_export_room_keys_stream_can_provide_all_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1771,7 +2174,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_stream_can_provide_a_subset_of_keys() {
+    async fn test_export_room_keys_stream_can_provide_a_subset_of_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1794,5 +2197,161 @@ mod tests {
         assert_eq!(collected[0].algorithm, EventEncryptionAlgorithm::MegolmV1AesSha2);
         assert_eq!(collected[0].room_id, "!room1:localhost");
         assert_eq!(collected[0].session_key.to_base64().len(), 220);
+    }
+
+    #[async_test]
+    async fn test_export_secrets_bundle() {
+        let user_id = user_id!("@alice:example.com");
+        let (first, second, _) = get_machine_pair(user_id, user_id, false).await;
+
+        let _ = first
+            .bootstrap_cross_signing(false)
+            .await
+            .expect("We should be able to bootstrap cross-signing");
+
+        let bundle = first.store().export_secrets_bundle().await.expect(
+            "We should be able to export the secrets bundle, now that we \
+             have the cross-signing keys",
+        );
+
+        assert!(bundle.backup.is_none(), "The bundle should not contain a backup key");
+
+        second
+            .store()
+            .import_secrets_bundle(&bundle)
+            .await
+            .expect("We should be able to import the secrets bundle");
+
+        let status = second.cross_signing_status().await;
+        let identity = second.get_identity(user_id, None).await.unwrap().unwrap().own().unwrap();
+
+        assert!(identity.is_verified(), "The public identity should be marked as verified.");
+
+        assert!(status.is_complete(), "We should have imported all the cross-signing keys");
+    }
+
+    #[async_test]
+    async fn test_create_dehydrated_device_key() {
+        let pickle_key = DehydratedDeviceKey::new()
+            .expect("Should be able to create a random dehydrated device key");
+
+        let to_vec = pickle_key.inner.to_vec();
+        let pickle_key_from_slice = DehydratedDeviceKey::from_slice(to_vec.as_slice())
+            .expect("Should be able to create a dehydrated device key from slice");
+
+        assert_eq!(pickle_key_from_slice.to_base64(), pickle_key.to_base64());
+    }
+
+    #[async_test]
+    async fn test_create_dehydrated_errors() {
+        let too_small = [0u8; 22];
+        let pickle_key = DehydratedDeviceKey::from_slice(&too_small);
+
+        assert!(pickle_key.is_err());
+
+        let too_big = [0u8; 40];
+        let pickle_key = DehydratedDeviceKey::from_slice(&too_big);
+
+        assert!(pickle_key.is_err());
+    }
+
+    #[async_test]
+    async fn test_build_room_key_bundle() {
+        // Given: Alice has sent a number of room keys to Bob, including some in the
+        // wrong room, and some that are not marked as shared...
+        let alice = OlmMachine::new(user_id!("@a:s.co"), device_id!("ALICE")).await;
+        let bob = OlmMachine::new(user_id!("@b:s.co"), device_id!("BOB")).await;
+
+        let room1_id = room_id!("!room1:localhost");
+        let room2_id = room_id!("!room2:localhost");
+
+        /* We use hardcoded megolm session data, to get a stable output snapshot. These were all created with:
+
+           println!("{}", vodozemac::megolm::GroupSession::new(Default::default()).session_key().to_base64());
+        */
+        let session_key1 = "AgAAAAC2XHVzsMBKs4QCRElJ92CJKyGtknCSC8HY7cQ7UYwndMKLQAejXLh5UA0l6s736mgctcUMNvELScUWrObdflrHo+vth/gWreXOaCnaSxmyjjKErQwyIYTkUfqbHy40RJfEesLwnN23on9XAkch/iy8R2+Jz7B8zfG01f2Ow2SxPQFnAndcO1ZSD2GmXgedy6n4B20MWI1jGP2wiexOWbFSya8DO/VxC9m5+/mF+WwYqdpKn9g4Y05Yw4uz7cdjTc3rXm7xK+8E7hI//5QD1nHPvuKYbjjM9u2JSL+Bzp61Cw";
+        let session_key2 = "AgAAAAC1BXreFTUQQSBGekTEuYxhdytRKyv4JgDGcG+VOBYdPNGgs807SdibCGJky4lJ3I+7ZDGHoUzZPZP/4ogGu4kxni0PWdtWuN7+5zsuamgoFF/BkaGeUUGv6kgIkx8pyPpM5SASTUEP9bN2loDSpUPYwfiIqz74DgC4WQ4435sTBctYvKz8n+TDJwdLXpyT6zKljuqADAioud+s/iqx9LYn9HpbBfezZcvbg67GtE113pLrvde3IcPI5s6dNHK2onGO2B2eoaobcen18bbEDnlUGPeIivArLya7Da6us14jBQ";
+        let session_key3 = "AgAAAAAM9KFsliaUUhGSXgwOzM5UemjkNH4n8NHgvC/y8hhw13zTF+ooGD4uIYEXYX630oNvQm/EvgZo+dkoc0re+vsqsx4sQeNODdSjcBsWOa0oDF+irQn9oYoLUDPI1IBtY1rX+FV99Zm/xnG7uFOX7aTVlko2GSdejy1w9mfobmfxu5aUc04A9zaKJP1pOthZvRAlhpymGYHgsDtWPrrjyc/yypMflE4kIUEEEtu1kT6mrAmcl615XYRAHYK9G2+fZsGvokwzbkl4nulGwcZMpQEoM0nD2o3GWgX81HW3nGfKBg";
+        let session_key4 = "AgAAAAA4Kkesxq2h4v9PLD6Sm3Smxspz1PXTqytQPCMQMkkrHNmzV2bHlJ+6/Al9cu8vh1Oj69AK0WUAeJOJuaiskEeg/PI3P03+UYLeC379RzgqwSHdBgdQ41G2vD6zpgmE/8vYToe+qpCZACtPOswZxyqxHH+T/Iq0nv13JmlFGIeA6fEPfr5Y28B49viG74Fs9rxV9EH5PfjbuPM/p+Sz5obShuaBPKQBX1jT913nEXPoIJ06exNZGr0285nw/LgVvNlmWmbqNnbzO2cNZjQWA+xZYz5FSfyCxwqEBbEdUCuRCQ";
+
+        let sessions = [
+            create_inbound_group_session_with_visibility(
+                &alice,
+                room1_id,
+                &SessionKey::from_base64(session_key1).unwrap(),
+                true,
+            ),
+            create_inbound_group_session_with_visibility(
+                &alice,
+                room1_id,
+                &SessionKey::from_base64(session_key2).unwrap(),
+                true,
+            ),
+            create_inbound_group_session_with_visibility(
+                &alice,
+                room1_id,
+                &SessionKey::from_base64(session_key3).unwrap(),
+                false,
+            ),
+            create_inbound_group_session_with_visibility(
+                &alice,
+                room2_id,
+                &SessionKey::from_base64(session_key4).unwrap(),
+                true,
+            ),
+        ];
+        bob.store().save_inbound_group_sessions(&sessions).await.unwrap();
+
+        // When I build the bundle
+        let mut bundle = bob.store().build_room_key_bundle(room1_id).await.unwrap();
+
+        // Then the bundle matches the snapshot.
+
+        // We sort the sessions in the bundle, so that the snapshot is stable.
+        bundle.room_keys.sort_by_key(|session| session.session_id.clone());
+
+        // We also substitute alice's keys in the snapshot with placeholders
+        let alice_curve_key = alice.identity_keys().curve25519.to_base64();
+        let map_alice_curve_key = move |value: Content, _path: ContentPath<'_>| {
+            assert_eq!(value.as_str().unwrap(), alice_curve_key);
+            "[alice curve key]"
+        };
+        let alice_ed25519_key = alice.identity_keys().ed25519.to_base64();
+        let map_alice_ed25519_key = move |value: Content, _path: ContentPath<'_>| {
+            assert_eq!(value.as_str().unwrap(), alice_ed25519_key);
+            "[alice ed25519 key]"
+        };
+
+        insta::with_settings!({ sort_maps => true }, {
+            assert_json_snapshot!(bundle, {
+                ".room_keys[].sender_key" => insta::dynamic_redaction(map_alice_curve_key.clone()),
+                ".withheld[].sender_key" => insta::dynamic_redaction(map_alice_curve_key),
+                ".room_keys[].sender_claimed_keys.ed25519" => insta::dynamic_redaction(map_alice_ed25519_key),
+            });
+        });
+    }
+
+    /// Create an inbound Megolm session for the given room.
+    ///
+    /// `olm_machine` is used to set the `sender_key` and `signing_key`
+    /// fields of the resultant session.
+    fn create_inbound_group_session_with_visibility(
+        olm_machine: &OlmMachine,
+        room_id: &RoomId,
+        session_key: &SessionKey,
+        shared_history: bool,
+    ) -> InboundGroupSession {
+        let identity_keys = &olm_machine.store().static_account().identity_keys;
+        InboundGroupSession::new(
+            identity_keys.curve25519,
+            identity_keys.ed25519,
+            room_id,
+            session_key,
+            SenderData::unknown(),
+            EventEncryptionAlgorithm::MegolmV1AesSha2,
+            None,
+            shared_history,
+        )
+        .unwrap()
     }
 }

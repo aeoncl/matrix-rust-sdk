@@ -44,7 +44,7 @@ async fn mock_tag_api(
 
 async fn mock_sync_with_tags(
     server: &MockServer,
-    ev_builder: &mut SyncResponseBuilder,
+    sync_builder: &mut SyncResponseBuilder,
     room_id: &RoomId,
     tags: Tags,
 ) {
@@ -54,10 +54,10 @@ async fn mock_sync_with_tags(
         },
         "type": "m.tag"
     });
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id).add_account_data(RoomAccountDataTestEvent::Custom(json)),
     );
-    mock_sync(server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(server, sync_builder.build_json_sync_response(), None).await;
 }
 
 async fn sync_once(client: &Client, server: &MockServer) {
@@ -67,13 +67,13 @@ async fn sync_once(client: &Client, server: &MockServer) {
 }
 
 async fn synced_client_with_room(
-    ev_builder: &mut SyncResponseBuilder,
+    sync_builder: &mut SyncResponseBuilder,
     room_id: &RoomId,
 ) -> (Client, Room, MockServer) {
     let (client, server) = logged_in_client_with_server().await;
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     sync_once(&client, &server).await;
 
     let room = client.get_room(room_id).unwrap();
@@ -83,8 +83,8 @@ async fn synced_client_with_room(
 #[async_test]
 async fn test_set_favourite() {
     let room_id = room_id!("!test:example.org");
-    let mut ev_builder = SyncResponseBuilder::new();
-    let (client, room, server) = synced_client_with_room(&mut ev_builder, room_id).await;
+    let mut sync_builder = SyncResponseBuilder::new();
+    let (client, room, server) = synced_client_with_room(&mut sync_builder, room_id).await;
 
     // Not favourite.
     assert!(room.is_favourite().not());
@@ -92,11 +92,11 @@ async fn test_set_favourite() {
     // Server will be called to set the room as favourite.
     mock_tag_api(&server, TagName::Favorite, TagOperation::Set, 1).await;
 
-    room.set_is_favourite(true, Option::default()).await.unwrap();
+    room.set_is_favourite(true, None).await.unwrap();
 
     // Mock the response from the server.
     let tags = BTreeMap::from([(TagName::Favorite, TagInfo::default())]);
-    mock_sync_with_tags(&server, &mut ev_builder, room_id, tags).await;
+    mock_sync_with_tags(&server, &mut sync_builder, room_id, tags).await;
     sync_once(&client, &server).await;
 
     // Favourite!
@@ -108,12 +108,12 @@ async fn test_set_favourite() {
 #[async_test]
 async fn test_set_favourite_on_low_priority_room() {
     let room_id = room_id!("!test:example.org");
-    let mut ev_builder = SyncResponseBuilder::new();
-    let (client, room, server) = synced_client_with_room(&mut ev_builder, room_id).await;
+    let mut sync_builder = SyncResponseBuilder::new();
+    let (client, room, server) = synced_client_with_room(&mut sync_builder, room_id).await;
 
     // Mock a response from the server setting the room as low priority.
     let tags = BTreeMap::from([(TagName::LowPriority, TagInfo::default())]);
-    mock_sync_with_tags(&server, &mut ev_builder, room_id, tags).await;
+    mock_sync_with_tags(&server, &mut sync_builder, room_id, tags).await;
     sync_once(&client, &server).await;
 
     // Not favourite, but low priority!
@@ -125,11 +125,11 @@ async fn test_set_favourite_on_low_priority_room() {
     mock_tag_api(&server, TagName::Favorite, TagOperation::Set, 1).await;
     mock_tag_api(&server, TagName::LowPriority, TagOperation::Remove, 1).await;
 
-    room.set_is_favourite(true, Option::default()).await.unwrap();
+    room.set_is_favourite(true, None).await.unwrap();
 
     // Mock the response from the server.
     let tags = BTreeMap::from([(TagName::Favorite, TagInfo::default())]);
-    mock_sync_with_tags(&server, &mut ev_builder, room_id, tags).await;
+    mock_sync_with_tags(&server, &mut sync_builder, room_id, tags).await;
     sync_once(&client, &server).await;
 
     // Favourite, and not low priority!
@@ -142,13 +142,13 @@ async fn test_set_favourite_on_low_priority_room() {
 #[async_test]
 async fn test_unset_favourite() {
     let room_id = room_id!("!test:example.org");
-    let mut ev_builder = SyncResponseBuilder::new();
-    let (_client, room, server) = synced_client_with_room(&mut ev_builder, room_id).await;
+    let mut sync_builder = SyncResponseBuilder::new();
+    let (_client, room, server) = synced_client_with_room(&mut sync_builder, room_id).await;
 
     // Server will be called to unset the room as favourite.
     mock_tag_api(&server, TagName::Favorite, TagOperation::Remove, 1).await;
 
-    room.set_is_favourite(false, Option::default()).await.unwrap();
+    room.set_is_favourite(false, None).await.unwrap();
 
     server.verify().await;
 }
@@ -156,8 +156,8 @@ async fn test_unset_favourite() {
 #[async_test]
 async fn test_set_low_priority() {
     let room_id = room_id!("!test:example.org");
-    let mut ev_builder = SyncResponseBuilder::new();
-    let (client, room, server) = synced_client_with_room(&mut ev_builder, room_id).await;
+    let mut sync_builder = SyncResponseBuilder::new();
+    let (client, room, server) = synced_client_with_room(&mut sync_builder, room_id).await;
 
     // Not low prioriry.
     assert!(room.is_low_priority().not());
@@ -165,11 +165,11 @@ async fn test_set_low_priority() {
     // Server will be called to set the room as favourite.
     mock_tag_api(&server, TagName::LowPriority, TagOperation::Set, 1).await;
 
-    room.set_is_low_priority(true, Option::default()).await.unwrap();
+    room.set_is_low_priority(true, None).await.unwrap();
 
     // Mock the response from the server.
     let tags = BTreeMap::from([(TagName::LowPriority, TagInfo::default())]);
-    mock_sync_with_tags(&server, &mut ev_builder, room_id, tags).await;
+    mock_sync_with_tags(&server, &mut sync_builder, room_id, tags).await;
     sync_once(&client, &server).await;
 
     // Low priority!
@@ -181,12 +181,12 @@ async fn test_set_low_priority() {
 #[async_test]
 async fn test_set_low_priority_on_favourite_room() {
     let room_id = room_id!("!test:example.org");
-    let mut ev_builder = SyncResponseBuilder::new();
-    let (client, room, server) = synced_client_with_room(&mut ev_builder, room_id).await;
+    let mut sync_builder = SyncResponseBuilder::new();
+    let (client, room, server) = synced_client_with_room(&mut sync_builder, room_id).await;
 
     // Mock a response from the server setting the room as favourite.
     let tags = BTreeMap::from([(TagName::Favorite, TagInfo::default())]);
-    mock_sync_with_tags(&server, &mut ev_builder, room_id, tags).await;
+    mock_sync_with_tags(&server, &mut sync_builder, room_id, tags).await;
     sync_once(&client, &server).await;
 
     // Favourite, but not low priority!
@@ -198,11 +198,11 @@ async fn test_set_low_priority_on_favourite_room() {
     mock_tag_api(&server, TagName::LowPriority, TagOperation::Set, 1).await;
     mock_tag_api(&server, TagName::Favorite, TagOperation::Remove, 1).await;
 
-    room.set_is_low_priority(true, Option::default()).await.unwrap();
+    room.set_is_low_priority(true, None).await.unwrap();
 
     // Mock the response from the server.
     let tags = BTreeMap::from([(TagName::LowPriority, TagInfo::default())]);
-    mock_sync_with_tags(&server, &mut ev_builder, room_id, tags).await;
+    mock_sync_with_tags(&server, &mut sync_builder, room_id, tags).await;
     sync_once(&client, &server).await;
 
     // Not favourite, and low priority!
@@ -215,13 +215,13 @@ async fn test_set_low_priority_on_favourite_room() {
 #[async_test]
 async fn test_unset_low_priority() {
     let room_id = room_id!("!test:example.org");
-    let mut ev_builder = SyncResponseBuilder::new();
-    let (_client, room, server) = synced_client_with_room(&mut ev_builder, room_id).await;
+    let mut sync_builder = SyncResponseBuilder::new();
+    let (_client, room, server) = synced_client_with_room(&mut sync_builder, room_id).await;
 
     // Server will be called to unset the room as favourite.
     mock_tag_api(&server, TagName::LowPriority, TagOperation::Remove, 1).await;
 
-    room.set_is_low_priority(false, Option::default()).await.unwrap();
+    room.set_is_low_priority(false, None).await.unwrap();
 
     server.verify().await;
 }

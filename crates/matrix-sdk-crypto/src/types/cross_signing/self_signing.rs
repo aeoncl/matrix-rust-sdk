@@ -1,13 +1,14 @@
-use std::{collections::btree_map::Iter, sync::Arc};
+use std::collections::btree_map::Iter;
 
 use ruma::{encryption::KeyUsage, OwnedDeviceKeyId, UserId};
 use serde::{Deserialize, Serialize};
+use vodozemac::Ed25519PublicKey;
 
 use super::{CrossSigningKey, SigningKey};
 use crate::{
     olm::VerifyJson,
     types::{DeviceKeys, SigningKeys},
-    ReadOnlyDevice, SignatureError,
+    DeviceData, SignatureError,
 };
 
 /// Wrapper for a cross signing key marking it as a self signing key.
@@ -15,7 +16,7 @@ use crate::{
 /// Self signing keys are used to sign the user's own devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "CrossSigningKey")]
-pub struct SelfSigningPubkey(pub(super) Arc<CrossSigningKey>);
+pub struct SelfSigningPubkey(pub(super) CrossSigningKey);
 
 impl SelfSigningPubkey {
     /// Get the user id of the self signing key's owner.
@@ -31,6 +32,14 @@ impl SelfSigningPubkey {
     /// Get the list of `KeyUsage` that is set for this key.
     pub fn usage(&self) -> &[KeyUsage] {
         &self.0.usage
+    }
+
+    /// Get the first available self signing key.
+    ///
+    /// There's usually only a single key so this will usually fetch the
+    /// only key.
+    pub fn get_first_key(&self) -> Option<Ed25519PublicKey> {
+        self.0.get_first_key_and_id().map(|(_, k)| k)
     }
 
     /// Verify that the [`DeviceKeys`] have a valid signature from this
@@ -51,7 +60,7 @@ impl SelfSigningPubkey {
     ///
     /// Returns an empty result if the signature check succeeded, otherwise a
     /// SignatureError indicating why the check failed.
-    pub(crate) fn verify_device(&self, device: &ReadOnlyDevice) -> Result<(), SignatureError> {
+    pub(crate) fn verify_device(&self, device: &DeviceData) -> Result<(), SignatureError> {
         self.verify_device_keys(device.as_device_keys())
     }
 }
@@ -70,7 +79,7 @@ impl TryFrom<CrossSigningKey> for SelfSigningPubkey {
 
     fn try_from(key: CrossSigningKey) -> Result<Self, Self::Error> {
         if key.usage.contains(&KeyUsage::SelfSigning) && key.usage.len() == 1 {
-            Ok(Self(key.into()))
+            Ok(Self(key))
         } else {
             Err(serde::de::Error::custom(format!(
                 "Expected cross signing key usage {} was not found",
@@ -83,5 +92,11 @@ impl TryFrom<CrossSigningKey> for SelfSigningPubkey {
 impl AsRef<CrossSigningKey> for SelfSigningPubkey {
     fn as_ref(&self) -> &CrossSigningKey {
         &self.0
+    }
+}
+
+impl AsMut<CrossSigningKey> for SelfSigningPubkey {
+    fn as_mut(&mut self) -> &mut CrossSigningKey {
+        &mut self.0
     }
 }

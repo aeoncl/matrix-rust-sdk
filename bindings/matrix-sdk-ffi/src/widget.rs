@@ -1,13 +1,15 @@
 use std::sync::{Arc, Mutex};
 
+use async_compat::get_runtime_handle;
 use language_tags::LanguageTag;
 use matrix_sdk::{
     async_trait,
     widget::{MessageLikeEventFilter, StateEventFilter},
 };
+use ruma::events::MessageLikeEventType;
 use tracing::error;
 
-use crate::{room::Room, RUNTIME};
+use crate::room::Room;
 
 #[derive(uniffi::Record)]
 pub struct WidgetDriverAndHandle {
@@ -15,7 +17,7 @@ pub struct WidgetDriverAndHandle {
     pub handle: Arc<WidgetDriverHandle>,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn make_widget_driver(settings: WidgetSettings) -> Result<WidgetDriverAndHandle, ParseError> {
     let (driver, handle) = matrix_sdk::widget::WidgetDriver::new(settings.try_into()?);
     Ok(WidgetDriverAndHandle {
@@ -29,7 +31,7 @@ pub fn make_widget_driver(settings: WidgetSettings) -> Result<WidgetDriverAndHan
 #[derive(uniffi::Object)]
 pub struct WidgetDriver(Mutex<Option<matrix_sdk::widget::WidgetDriver>>);
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl WidgetDriver {
     pub async fn run(
         &self,
@@ -96,7 +98,7 @@ impl From<matrix_sdk::widget::WidgetSettings> for WidgetSettings {
 /// * `room` - A matrix room which is used to query the logged in username
 /// * `props` - Properties from the client that can be used by a widget to adapt
 ///   to the client. e.g. language, font-scale...
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 pub async fn generate_webview_url(
     widget_settings: WidgetSettings,
     room: Arc<Room>,
@@ -139,12 +141,31 @@ impl From<EncryptionSystem> for matrix_sdk::widget::EncryptionSystem {
     }
 }
 
+/// Defines the intent of showing the call.
+///
+/// This controls whether to show or skip the lobby.
+#[derive(uniffi::Enum, Clone)]
+pub enum Intent {
+    /// The user wants to start a call.
+    StartCall,
+    /// The user wants to join an existing call.
+    JoinExisting,
+}
+impl From<Intent> for matrix_sdk::widget::Intent {
+    fn from(value: Intent) -> Self {
+        match value {
+            Intent::StartCall => Self::StartCall,
+            Intent::JoinExisting => Self::JoinExisting,
+        }
+    }
+}
+
 /// Properties to create a new virtual Element Call widget.
 #[derive(uniffi::Record, Clone)]
 pub struct VirtualElementCallWidgetOptions {
-    /// The url to the app.
+    /// The url to the Element Call app including any `/room` path if required.
     ///
-    /// E.g. <https://call.element.io>, <https://call.element.dev>
+    /// E.g. <https://call.element.io>, <https://call.element.dev>, <https://call.element.dev/room>
     pub element_call_url: String,
 
     /// The widget id.
@@ -187,11 +208,6 @@ pub struct VirtualElementCallWidgetOptions {
     /// Default: `false`
     pub app_prompt: Option<bool>,
 
-    /// Don't show the lobby and join the call immediately.
-    ///
-    /// Default: `false`
-    pub skip_lobby: Option<bool>,
-
     /// Make it not possible to get to the calls list in the webview.
     ///
     /// Default: `true`
@@ -200,13 +216,38 @@ pub struct VirtualElementCallWidgetOptions {
     /// The font to use, to adapt to the system font.
     pub font: Option<String>,
 
-    /// Can be used to pass a PostHog id to element call.
-    pub analytics_id: Option<String>,
-
     /// The encryption system to use.
     ///
     /// Use `EncryptionSystem::Unencrypted` to disable encryption.
     pub encryption: EncryptionSystem,
+
+    /// The intent of showing the call.
+    /// If the user wants to start a call or join an existing one.
+    /// Controls if the lobby is skipped or not.
+    pub intent: Option<Intent>,
+
+    /// Do not show the screenshare button.
+    pub hide_screensharing: bool,
+
+    /// Can be used to pass a PostHog id to element call.
+    pub posthog_user_id: Option<String>,
+    /// The host of the posthog api.
+    /// Supported since Element Call v0.9.0. Only used by the embedded package.
+    pub posthog_api_host: Option<String>,
+    /// The key for the posthog api.
+    /// Supported since Element Call v0.9.0. Only used by the embedded package.
+    pub posthog_api_key: Option<String>,
+
+    /// The url to use for submitting rageshakes.
+    /// Supported since Element Call v0.9.0. Only used by the embedded package.
+    pub rageshake_submit_url: Option<String>,
+
+    /// Sentry [DSN](https://docs.sentry.io/concepts/key-terms/dsn-explainer/)
+    /// Supported since Element Call v0.9.0. Only used by the embedded package.
+    pub sentry_dsn: Option<String>,
+    /// Sentry [environment](https://docs.sentry.io/concepts/key-terms/key-terms/)
+    /// Supported since Element Call v0.9.0. Only used by the embedded package.
+    pub sentry_environment: Option<String>,
 }
 
 impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElementCallWidgetOptions {
@@ -219,11 +260,17 @@ impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElemen
             preload: value.preload,
             font_scale: value.font_scale,
             app_prompt: value.app_prompt,
-            skip_lobby: value.skip_lobby,
             confine_to_room: value.confine_to_room,
             font: value.font,
-            analytics_id: value.analytics_id,
+            posthog_user_id: value.posthog_user_id,
             encryption: value.encryption.into(),
+            intent: value.intent.map(Into::into),
+            hide_screensharing: value.hide_screensharing,
+            posthog_api_host: value.posthog_api_host,
+            posthog_api_key: value.posthog_api_key,
+            rageshake_submit_url: value.rageshake_submit_url,
+            sentry_dsn: value.sentry_dsn,
+            sentry_environment: value.sentry_environment,
         }
     }
 }
@@ -236,10 +283,12 @@ impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElemen
 /// This function returns a `WidgetSettings` object which can be used
 /// to setup a widget using `run_client_widget_api`
 /// and to generate the correct url for the widget.
-///  # Arguments
-/// * - `props` A struct containing the configuration parameters for a element
+///
+/// # Arguments
+///
+/// * `props` - A struct containing the configuration parameters for a element
 ///   call widget.
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn new_virtual_element_call_widget(
     props: VirtualElementCallWidgetOptions,
 ) -> Result<WidgetSettings, ParseError> {
@@ -259,31 +308,84 @@ pub fn new_virtual_element_call_widget(
 /// Editing and extending the capabilities from this function is also possible,
 /// but should only be done as temporal workarounds until this function is
 /// adjusted
-#[uniffi::export]
-pub fn get_element_call_required_permissions() -> WidgetCapabilities {
+#[matrix_sdk_ffi_macros::export]
+pub fn get_element_call_required_permissions(
+    own_user_id: String,
+    own_device_id: String,
+) -> WidgetCapabilities {
     use ruma::events::StateEventType;
+
+    let read_send = vec![
+        // To read and send rageshake requests from other room members
+        WidgetEventFilter::MessageLikeWithType {
+            event_type: "org.matrix.rageshake_request".to_owned(),
+        },
+        // To read and send encryption keys
+        // TODO change this to the appropriate to-device version once ready
+        WidgetEventFilter::MessageLikeWithType {
+            event_type: "io.element.call.encryption_keys".to_owned(),
+        },
+        // To read and send custom EC reactions. They are different to normal `m.reaction`
+        // because they can be send multiple times to the same event.
+        WidgetEventFilter::MessageLikeWithType {
+            event_type: "io.element.call.reaction".to_owned(),
+        },
+        // This allows send raise hand reactions.
+        WidgetEventFilter::MessageLikeWithType {
+            event_type: MessageLikeEventType::Reaction.to_string(),
+        },
+        // This allows to detect if someone does not raise their hand anymore.
+        WidgetEventFilter::MessageLikeWithType {
+            event_type: MessageLikeEventType::RoomRedaction.to_string(),
+        },
+    ];
 
     WidgetCapabilities {
         read: vec![
+            // To compute the current state of the matrixRTC session.
             WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
+            // To detect leaving/kicked room members during a call.
             WidgetEventFilter::StateWithType { event_type: StateEventType::RoomMember.to_string() },
-            WidgetEventFilter::MessageLikeWithType {
-                event_type: "org.matrix.rageshake_request".to_owned(),
+            // To decide whether to encrypt the call streams based on the room encryption setting.
+            WidgetEventFilter::StateWithType {
+                event_type: StateEventType::RoomEncryption.to_string(),
             },
-            WidgetEventFilter::MessageLikeWithType {
-                event_type: "io.element.call.encryption_keys".to_owned(),
-            },
-        ],
+            // This allows the widget to check the room version, so it can know about
+            // version-specific auth rules (namely MSC3779).
+            WidgetEventFilter::StateWithType { event_type: StateEventType::RoomCreate.to_string() },
+        ]
+        .into_iter()
+        .chain(read_send.clone())
+        .collect(),
         send: vec![
-            WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
-            WidgetEventFilter::StateWithType {
-                event_type: "org.matrix.rageshake_request".to_owned(),
+            // To send the call participation state event (main MatrixRTC event).
+            // This is required for legacy state events (using only one event for all devices with
+            // a membership array). TODO: remove once legacy call member events are
+            // sunset.
+            WidgetEventFilter::StateWithTypeAndStateKey {
+                event_type: StateEventType::CallMember.to_string(),
+                state_key: own_user_id.clone(),
             },
-            WidgetEventFilter::StateWithType {
-                event_type: "io.element.call.encryption_keys".to_owned(),
+            // `delayed_event`` version for session memberhips
+            // [MSC3779](https://github.com/matrix-org/matrix-spec-proposals/pull/3779), with no leading underscore.
+            WidgetEventFilter::StateWithTypeAndStateKey {
+                event_type: StateEventType::CallMember.to_string(),
+                state_key: format!("{own_user_id}_{own_device_id}"),
             },
-        ],
+            // The same as above but with an underscore.
+            // To work around the issue that state events starting with `@` have to be matrix id's
+            // but we use mxId+deviceId.
+            WidgetEventFilter::StateWithTypeAndStateKey {
+                event_type: StateEventType::CallMember.to_string(),
+                state_key: format!("_{own_user_id}_{own_device_id}"),
+            },
+        ]
+        .into_iter()
+        .chain(read_send)
+        .collect(),
         requires_client: true,
+        update_delayed_event: true,
+        send_delayed_event: true,
     }
 }
 
@@ -313,7 +415,7 @@ impl From<ClientProperties> for matrix_sdk::widget::ClientProperties {
 #[derive(uniffi::Object)]
 pub struct WidgetDriverHandle(matrix_sdk::widget::WidgetDriverHandle);
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl WidgetDriverHandle {
     /// Receive a message from the widget driver.
     ///
@@ -345,6 +447,10 @@ pub struct WidgetCapabilities {
     /// This means clients should not offer to open the widget in a separate
     /// browser/tab/webview that is not connected to the postmessage widget-api.
     pub requires_client: bool,
+    /// This allows the widget to ask the client to update delayed events.
+    pub update_delayed_event: bool,
+    /// This allows the widget to send events with a delay.
+    pub send_delayed_event: bool,
 }
 
 impl From<WidgetCapabilities> for matrix_sdk::widget::Capabilities {
@@ -353,6 +459,8 @@ impl From<WidgetCapabilities> for matrix_sdk::widget::Capabilities {
             read: value.read.into_iter().map(Into::into).collect(),
             send: value.send.into_iter().map(Into::into).collect(),
             requires_client: value.requires_client,
+            update_delayed_event: value.update_delayed_event,
+            send_delayed_event: value.send_delayed_event,
         }
     }
 }
@@ -363,12 +471,14 @@ impl From<matrix_sdk::widget::Capabilities> for WidgetCapabilities {
             read: value.read.into_iter().map(Into::into).collect(),
             send: value.send.into_iter().map(Into::into).collect(),
             requires_client: value.requires_client,
+            update_delayed_event: value.update_delayed_event,
+            send_delayed_event: value.send_delayed_event,
         }
     }
 }
 
 /// Different kinds of filters that could be applied to the timeline events.
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone)]
 pub enum WidgetEventFilter {
     /// Matches message-like events with the given `type`.
     MessageLikeWithType { event_type: String },
@@ -380,7 +490,7 @@ pub enum WidgetEventFilter {
     StateWithTypeAndStateKey { event_type: String, state_key: String },
 }
 
-impl From<WidgetEventFilter> for matrix_sdk::widget::EventFilter {
+impl From<WidgetEventFilter> for matrix_sdk::widget::Filter {
     fn from(value: WidgetEventFilter) -> Self {
         match value {
             WidgetEventFilter::MessageLikeWithType { event_type } => {
@@ -399,9 +509,9 @@ impl From<WidgetEventFilter> for matrix_sdk::widget::EventFilter {
     }
 }
 
-impl From<matrix_sdk::widget::EventFilter> for WidgetEventFilter {
-    fn from(value: matrix_sdk::widget::EventFilter) -> Self {
-        use matrix_sdk::widget::EventFilter as F;
+impl From<matrix_sdk::widget::Filter> for WidgetEventFilter {
+    fn from(value: matrix_sdk::widget::Filter) -> Self {
+        use matrix_sdk::widget::Filter as F;
 
         match value {
             F::MessageLike(MessageLikeEventFilter::WithType(event_type)) => {
@@ -420,7 +530,7 @@ impl From<matrix_sdk::widget::EventFilter> for WidgetEventFilter {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait WidgetCapabilitiesProvider: Send + Sync {
     fn acquire_capabilities(&self, capabilities: WidgetCapabilities) -> WidgetCapabilities;
 }
@@ -437,7 +547,7 @@ impl matrix_sdk::widget::CapabilitiesProvider for CapabilitiesProviderWrap {
         // This could require a prompt to the user. Ideally the callback
         // interface would just be async, but that's not supported yet so use
         // one of tokio's blocking task threads instead.
-        RUNTIME
+        get_runtime_handle()
             .spawn_blocking(move || this.acquire_capabilities(capabilities.into()).into())
             .await
             // propagate panics from the blocking task
@@ -489,5 +599,56 @@ impl From<url::ParseError> for ParseError {
             url::ParseError::Overflow => Self::Overflow,
             _ => Self::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk::widget::Capabilities;
+
+    use super::get_element_call_required_permissions;
+
+    #[test]
+    fn element_call_permissions_are_correct() {
+        let widget_cap = get_element_call_required_permissions(
+            "@my_user:my_domain.org".to_owned(),
+            "ABCDEFGHI".to_owned(),
+        );
+
+        // We test two things:
+
+        // Converting the WidgetCapability (ffi struct) to Capabilities (rust sdk
+        // struct)
+        let cap = Into::<Capabilities>::into(widget_cap);
+        // Converting Capabilities (rust sdk struct) to a json list.
+        let cap_json_repr = serde_json::to_string(&cap).unwrap();
+
+        // Converting to a Vec<String> allows to check if the required elements exist
+        // without breaking the test each time the order of permissions might
+        // change.
+        let permission_array: Vec<String> = serde_json::from_str(&cap_json_repr).unwrap();
+
+        let cap_assert = |capability: &str| {
+            assert!(
+                permission_array.contains(&capability.to_owned()),
+                "The \"{}\" capability was missing from the element call capability list.",
+                capability
+            );
+        };
+
+        cap_assert("io.element.requires_client");
+        cap_assert("org.matrix.msc4157.update_delayed_event");
+        cap_assert("org.matrix.msc4157.send.delayed_event");
+        cap_assert("org.matrix.msc2762.receive.state_event:org.matrix.msc3401.call.member");
+        cap_assert("org.matrix.msc2762.receive.state_event:m.room.member");
+        cap_assert("org.matrix.msc2762.receive.state_event:m.room.encryption");
+        cap_assert("org.matrix.msc2762.receive.event:org.matrix.rageshake_request");
+        cap_assert("org.matrix.msc2762.receive.event:io.element.call.encryption_keys");
+        cap_assert("org.matrix.msc2762.receive.state_event:m.room.create");
+        cap_assert("org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org");
+        cap_assert("org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org_ABCDEFGHI");
+        cap_assert("org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#_@my_user:my_domain.org_ABCDEFGHI");
+        cap_assert("org.matrix.msc2762.send.event:org.matrix.rageshake_request");
+        cap_assert("org.matrix.msc2762.send.event:io.element.call.encryption_keys");
     }
 }

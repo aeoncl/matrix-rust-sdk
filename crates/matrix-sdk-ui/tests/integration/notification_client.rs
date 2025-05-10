@@ -5,7 +5,10 @@ use std::{
 
 use assert_matches::assert_matches;
 use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
-use matrix_sdk_test::{async_test, sync_timeline_event, JoinedRoomBuilder, SyncResponseBuilder};
+use matrix_sdk_test::{
+    async_test, mocks::mock_encryption_state, sync_timeline_event, JoinedRoomBuilder,
+    SyncResponseBuilder,
+};
 use matrix_sdk_ui::{
     notification_client::{
         NotificationClient, NotificationEvent, NotificationProcessSetup, NotificationStatus,
@@ -20,7 +23,7 @@ use wiremock::{
 };
 
 use crate::{
-    mock_encryption_state, mock_sync,
+    mock_sync,
     sliding_sync::{check_requests, PartialSlidingSyncRequest, SlidingSyncMatcher},
 };
 
@@ -45,13 +48,13 @@ async fn test_notification_client_with_context() {
         "type": "m.room.message",
     });
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id).add_timeline_event(sync_timeline_event!(event_json)),
     );
 
     // First, mock a sync that contains a text message.
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -59,8 +62,7 @@ async fn test_notification_client_with_context() {
     let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
     let process_setup =
         NotificationProcessSetup::SingleProcess { sync_service: dummy_sync_service };
-    let notification_client =
-        NotificationClient::builder(client, process_setup).await.unwrap().build();
+    let notification_client = NotificationClient::new(client, process_setup).await.unwrap();
 
     {
         // The notification client retrieves the event via `/rooms/*/context/`.
@@ -190,7 +192,7 @@ async fn test_notification_client_sliding_sync() {
                             },
 
                             // Power levels.
-                            json!({
+                            {
                                 "content": {
                                     "ban": 50,
                                     "events": {
@@ -199,7 +201,7 @@ async fn test_notification_client_sliding_sync() {
                                         "m.room.history_visibility": 100,
                                         "m.room.name": 50,
                                         "m.room.power_levels": 100,
-                                        "m.room.message": 25
+                                        "m.room.message": 25,
                                     },
                                     "events_default": 0,
                                     "invite": 0,
@@ -208,9 +210,9 @@ async fn test_notification_client_sliding_sync() {
                                     "state_default": 50,
                                     "users": {
                                         "@example:localhost": 100,
-                                        sender: 0
+                                        sender: 0,
                                     },
-                                    "users_default": 0
+                                    "users_default": 0,
                                 },
                                 "event_id": "$15139375512JaHAW:localhost",
                                 "origin_server_ts": 151393755,
@@ -218,9 +220,9 @@ async fn test_notification_client_sliding_sync() {
                                 "state_key": "",
                                 "type": "m.room.power_levels",
                                 "unsigned": {
-                                    "age": 703422
-                                }
-                            })
+                                    "age": 703422,
+                                },
+                            },
                         ],
 
                         "timeline": [
@@ -242,8 +244,7 @@ async fn test_notification_client_sliding_sync() {
     let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
     let process_setup =
         NotificationProcessSetup::SingleProcess { sync_service: dummy_sync_service };
-    let notification_client =
-        NotificationClient::builder(client, process_setup).await.unwrap().build();
+    let notification_client = NotificationClient::new(client, process_setup).await.unwrap();
     let item =
         notification_client.get_notification_with_sliding_sync(room_id, event_id).await.unwrap();
 
@@ -257,33 +258,31 @@ async fn test_notification_client_sliding_sync() {
                         [0, 16]
                     ],
                     "required_state": [
-                        ["m.room.avatar", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.canonical_alias", ""],
                         ["m.room.name", ""],
                         ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
                     ],
                     "filters": {
                         "is_invite": true,
-                        "is_tombstoned": false,
                         "not_room_types": ["m.space"],
                     },
-                    "sort": ["by_recency", "by_name"],
                     "timeline_limit": 8,
                 }
             },
             "room_subscriptions": {
                 "!a98sd12bjh:example.org": {
                     "required_state": [
-                        ["m.room.avatar", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.canonical_alias", ""],
                         ["m.room.name", ""],
                         ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
                     ],
                     "timeline_limit": 16,
                 },
@@ -306,6 +305,6 @@ async fn test_notification_client_sliding_sync() {
     });
     assert_eq!(item.sender_display_name.as_deref(), Some(sender_display_name));
     assert_eq!(item.sender_avatar_url.as_deref(), Some(sender_avatar_url));
-    assert_eq!(item.room_display_name, room_name);
+    assert_eq!(item.room_computed_display_name, sender_display_name);
     assert_eq!(item.is_noisy, Some(false));
 }

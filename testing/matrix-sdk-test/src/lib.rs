@@ -2,7 +2,9 @@ use http::Response;
 pub use matrix_sdk_test_macros::async_test;
 use once_cell::sync::Lazy;
 use ruma::{
-    api::{client::sync::sync_events::v3::Response as SyncResponse, IncomingResponse},
+    api::{
+        client::sync::sync_events::v3::Response as SyncResponse, IncomingResponse, OutgoingResponse,
+    },
     room_id, user_id, RoomId, UserId,
 };
 use serde_json::Value as JsonValue;
@@ -109,18 +111,18 @@ pub mod __macro_support {
     pub use tracing_subscriber;
 }
 
-mod event_builder;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mocks;
+
+pub mod event_factory;
 pub mod notification_settings;
 mod sync_builder;
 pub mod test_json;
 
-pub use self::{
-    event_builder::EventBuilder,
-    sync_builder::{
-        bulk_room_members, EphemeralTestEvent, GlobalAccountDataTestEvent, InvitedRoomBuilder,
-        JoinedRoomBuilder, LeftRoomBuilder, PresenceTestEvent, RoomAccountDataTestEvent,
-        StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
-    },
+pub use self::sync_builder::{
+    bulk_room_members, GlobalAccountDataTestEvent, InvitedRoomBuilder, JoinedRoomBuilder,
+    KnockedRoomBuilder, LeftRoomBuilder, PresenceTestEvent, RoomAccountDataTestEvent,
+    StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
 };
 
 pub static ALICE: Lazy<&UserId> = Lazy::new(|| user_id!("@alice:server.name"));
@@ -152,10 +154,25 @@ pub fn sync_response(kind: SyncResponseFile) -> SyncResponse {
         SyncResponseFile::Voip => &test_json::VOIP_SYNC,
     };
 
-    let response = Response::builder().body(data.to_string().as_bytes().to_vec()).unwrap();
-    SyncResponse::try_from_http_response(response).unwrap()
+    ruma_response_from_json(data)
 }
 
-pub fn response_from_file(json: &JsonValue) -> Response<Vec<u8>> {
-    Response::builder().status(200).body(json.to_string().as_bytes().to_vec()).unwrap()
+/// Build a typed Ruma [`IncomingResponse`] object from a json body.
+pub fn ruma_response_from_json<ResponseType: IncomingResponse>(
+    json: &serde_json::Value,
+) -> ResponseType {
+    let json_bytes = serde_json::to_vec(json).expect("JSON-serialization of response value failed");
+    let http_response =
+        Response::builder().status(200).body(json_bytes).expect("Failed to build HTTP response");
+    ResponseType::try_from_http_response(http_response).expect("Can't parse the response json")
+}
+
+/// Serialise a typed Ruma [`OutgoingResponse`] object to JSON.
+pub fn ruma_response_to_json<ResponseType: OutgoingResponse>(
+    response: ResponseType,
+) -> serde_json::Value {
+    let http_response: Response<Vec<u8>> =
+        response.try_into_http_response().expect("Failed to build HTTP response");
+    let json_bytes = http_response.into_body();
+    serde_json::from_slice(&json_bytes).expect("Can't parse the response JSON")
 }

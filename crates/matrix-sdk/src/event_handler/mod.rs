@@ -40,16 +40,20 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering::SeqCst},
-        RwLock,
+        Arc, RwLock, Weak,
     },
+    task::{Context, Poll},
 };
 
 use anymap2::any::CloneAnySendSync;
+use eyeball::{SharedObservable, Subscriber};
+use futures_core::Stream;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use matrix_sdk_base::{
-    deserialized_responses::{EncryptionInfo, SyncTimelineEvent},
+    deserialized_responses::{EncryptionInfo, TimelineEvent},
     SendOutsideWasm, SyncOutsideWasm,
 };
+use pin_project_lite::pin_project;
 use ruma::{events::AnySyncStateEvent, push::Action, serde::Raw, OwnedRoomId};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::value::RawValue as RawJsonValue;
@@ -287,7 +291,7 @@ impl Client {
         room_id: Option<OwnedRoomId>,
     ) -> EventHandlerHandle
     where
-        Ev: SyncEvent + DeserializeOwned + Send + 'static,
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + 'static,
         H: EventHandler<Ev, Ctx>,
     {
         let handler_fn: Box<EventHandlerFn> = Box::new(move |data| {
@@ -376,7 +380,7 @@ impl Client {
     pub(crate) async fn handle_sync_timeline_events(
         &self,
         room: Option<&Room>,
-        timeline_events: &[SyncTimelineEvent],
+        timeline_events: &[TimelineEvent],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
         struct TimelineEventDetails<'a> {
@@ -388,7 +392,7 @@ impl Client {
 
         for item in timeline_events {
             let TimelineEventDetails { event_type, state_key, unsigned } =
-                item.event.deserialize_as()?;
+                item.raw().deserialize_as()?;
 
             let redacted = unsigned.and_then(|u| u.redacted_because).is_some();
             let (handler_kind_g, handler_kind_r) = match state_key {
@@ -396,9 +400,9 @@ impl Client {
                 None => (HandlerKind::MessageLike, HandlerKind::message_like_redacted(redacted)),
             };
 
-            let raw_event = item.event.json();
-            let encryption_info = item.encryption_info.as_ref();
-            let push_actions = &item.push_actions;
+            let raw_event = item.raw().json();
+            let encryption_info = item.encryption_info();
+            let push_actions = item.push_actions.as_deref().unwrap_or(&[]);
 
             // Event handlers for possibly-redacted timeline events
             self.call_event_handlers(
@@ -535,11 +539,144 @@ impl_event_handler!(A, B, C, D, E, F);
 impl_event_handler!(A, B, C, D, E, F, G);
 impl_event_handler!(A, B, C, D, E, F, G, H);
 
+/// An observer of events (may be tailored to a room).
+///
+/// Only the most recent value can be observed. Subscribers are notified when a
+/// new value is sent, but there is no guarantee that they will see all values.
+///
+/// To create such observer, use [`Client::observe_events`] or
+/// [`Client::observe_room_events`].
+#[derive(Debug)]
+pub struct ObservableEventHandler<T> {
+    /// This type is actually nothing more than a thin glue layer between the
+    /// [`EventHandler`] mechanism and the reactive programming types from
+    /// [`eyeball`]. Here, we use a [`SharedObservable`] that is updated by the
+    /// [`EventHandler`].
+    shared_observable: SharedObservable<Option<T>>,
+
+    /// This type owns the [`EventHandlerDropGuard`]. As soon as this type goes
+    /// out of scope, the event handler is unregistered/removed.
+    ///
+    /// [`EventHandlerSubscriber`] holds a weak, non-owning reference, to this
+    /// guard. It is useful to detect when to close the [`Stream`]: as soon as
+    /// this type goes out of scope, the subscriber will close itself on poll.
+    event_handler_guard: Arc<EventHandlerDropGuard>,
+}
+
+impl<T> ObservableEventHandler<T> {
+    pub(crate) fn new(
+        shared_observable: SharedObservable<Option<T>>,
+        event_handler_guard: EventHandlerDropGuard,
+    ) -> Self {
+        Self { shared_observable, event_handler_guard: Arc::new(event_handler_guard) }
+    }
+
+    /// Subscribe to this observer.
+    ///
+    /// It returns an [`EventHandlerSubscriber`], which implements [`Stream`].
+    /// See its documentation to learn more.
+    pub fn subscribe(&self) -> EventHandlerSubscriber<T> {
+        EventHandlerSubscriber::new(
+            self.shared_observable.subscribe(),
+            // The subscriber holds a weak non-owning reference to the event handler guard, so that
+            // it can detect when this observer is dropped, and can close the subscriber's stream.
+            Arc::downgrade(&self.event_handler_guard),
+        )
+    }
+}
+
+pin_project! {
+    /// The subscriber of an [`ObservableEventHandler`].
+    ///
+    /// To create such subscriber, use [`ObservableEventHandler::subscribe`].
+    ///
+    /// This type implements [`Stream`], which means it is possible to poll the
+    /// next value asynchronously. In other terms, polling this type will return
+    /// the new event as soon as they are synced. See [`Client::observe_events`]
+    /// to learn more.
+    #[derive(Debug)]
+    pub struct EventHandlerSubscriber<T> {
+        // The `Subscriber` associated to the `SharedObservable` inside
+        // `ObservableEventHandle`.
+        //
+        // Keep in mind all this API is just a thin glue layer between
+        // `EventHandle` and `SharedObservable`, that's… maagiic!
+        #[pin]
+        subscriber: Subscriber<Option<T>>,
+
+        // A weak non-owning reference to the event handler guard from
+        // `ObservableEventHandler`. When this type is polled (via its `Stream`
+        // implementation), it is possible to detect whether the observable has
+        // been dropped by upgrading this weak reference, and close the `Stream`
+        // if it needs to.
+        event_handler_guard: Weak<EventHandlerDropGuard>,
+    }
+}
+
+impl<T> EventHandlerSubscriber<T> {
+    fn new(
+        subscriber: Subscriber<Option<T>>,
+        event_handler_handle: Weak<EventHandlerDropGuard>,
+    ) -> Self {
+        Self { subscriber, event_handler_guard: event_handler_handle }
+    }
+}
+
+impl<T> Stream for EventHandlerSubscriber<T>
+where
+    T: Clone,
+{
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        let Some(_) = this.event_handler_guard.upgrade() else {
+            // The `EventHandlerHandle` has been dropped via `EventHandlerDropGuard`. It
+            // means the `ObservableEventHandler` has been dropped. It's time to
+            // close this stream.
+            return Poll::Ready(None);
+        };
+
+        // First off, the subscriber is of type `Subscriber<Option<T>>` because the
+        // `SharedObservable` starts with a `None` value to indicate it has no yet
+        // received any update. We want the `Stream` to return `T`, not `Option<T>`. We
+        // then filter out all `None` value.
+        //
+        // Second, when a `None` value is met, we want to poll again (hence the `loop`).
+        // At best, there is a new value to return. At worst, the subscriber will return
+        // `Poll::Pending` and will register the wakers accordingly.
+
+        loop {
+            match this.subscriber.as_mut().poll_next(context) {
+                // Stream has been closed somehow.
+                Poll::Ready(None) => return Poll::Ready(None),
+
+                // The initial value (of the `SharedObservable` behind `self.subscriber`) has been
+                // polled. We want to filter it out.
+                Poll::Ready(Some(None)) => {
+                    // Loop over.
+                    continue;
+                }
+
+                // We have a new value!
+                Poll::Ready(Some(Some(value))) => return Poll::Ready(Some(value)),
+
+                // Classical pending.
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
-        async_test, InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
+        async_test,
+        event_factory::{EventFactory, PreviousMembership},
+        InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
     };
+    use stream_assert::{assert_closed, assert_pending, assert_ready};
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
     use std::{
@@ -550,15 +687,13 @@ mod tests {
         },
     };
 
-    use matrix_sdk_test::{
-        sync_timeline_event, EphemeralTestEvent, StateTestEvent, StrippedStateTestEvent,
-        SyncResponseBuilder,
-    };
+    use matrix_sdk_test::{StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder};
     use once_cell::sync::Lazy;
     use ruma::{
+        event_id,
         events::{
             room::{
-                member::{OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
+                member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
                 name::OriginalSyncRoomNameEvent,
                 power_levels::OriginalSyncRoomPowerLevelsEvent,
             },
@@ -567,6 +702,7 @@ mod tests {
         },
         room_id,
         serde::Raw,
+        user_id,
     };
     use serde_json::json;
 
@@ -577,32 +713,17 @@ mod tests {
     };
 
     static MEMBER_EVENT: Lazy<Raw<AnySyncTimelineEvent>> = Lazy::new(|| {
-        sync_timeline_event!({
-            "content": {
-                "avatar_url": null,
-                "displayname": "example",
-                "membership": "join"
-            },
-            "event_id": "$151800140517rfvjc:localhost",
-            "membership": "join",
-            "origin_server_ts": 151800140,
-            "sender": "@example:localhost",
-            "state_key": "@example:localhost",
-            "type": "m.room.member",
-            "prev_content": {
-                "avatar_url": null,
-                "displayname": "example",
-                "membership": "invite"
-            },
-            "unsigned": {
-                "age": 297036,
-                "replaces_state": "$151800111315tsynI:localhost"
-            }
-        })
+        EventFactory::new()
+            .member(user_id!("@example:localhost"))
+            .membership(MembershipState::Join)
+            .display_name("example")
+            .event_id(event_id!("$151800140517rfvjc:localhost"))
+            .previous(PreviousMembership::new(MembershipState::Invite).display_name("example"))
+            .into()
     });
 
     #[async_test]
-    async fn add_event_handler() -> crate::Result<()> {
+    async fn test_add_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
 
         let member_count = Arc::new(AtomicU8::new(0));
@@ -635,11 +756,14 @@ mod tests {
             }
         });
 
+        let f = EventFactory::new();
         let response = SyncResponseBuilder::default()
             .add_joined_room(
                 JoinedRoomBuilder::default()
                     .add_timeline_event(MEMBER_EVENT.clone())
-                    .add_ephemeral_event(EphemeralTestEvent::Typing)
+                    .add_typing(
+                        f.typing(vec![user_id!("@alice:matrix.org"), user_id!("@bob:example.com")]),
+                    )
                     .add_state_event(StateTestEvent::PowerLevels),
             )
             .add_invited_room(
@@ -692,7 +816,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn add_room_event_handler() -> crate::Result<()> {
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_add_room_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
 
         let room_id_a = room_id!("!foo:example.org");
@@ -753,7 +878,22 @@ mod tests {
     }
 
     #[async_test]
-    async fn remove_event_handler() -> crate::Result<()> {
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_add_event_handler_with_tuples() -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+
+        client.add_event_handler(
+            |_ev: OriginalSyncRoomMemberEvent, (_room, _client): (Room, Client)| future::ready(()),
+        );
+
+        // If it compiles, it works. No need to assert anything.
+
+        Ok(())
+    }
+
+    #[async_test]
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_remove_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
 
         let member_count = Arc::new(AtomicU8::new(0));
@@ -798,7 +938,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn event_handler_drop_guard() {
+    async fn test_event_handler_drop_guard() {
         let client = no_retry_test_client(None).await;
 
         let handle = client.add_event_handler(|_ev: OriginalSyncRoomMemberEvent| async {});
@@ -814,7 +954,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn use_client_in_handler() {
+    async fn test_use_client_in_handler() {
         // This used to not work because we were requiring `Send` of event
         // handler futures even on WASM, where practically all futures that do
         // I/O aren't.
@@ -830,7 +970,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn raw_event_handler() -> crate::Result<()> {
+    async fn test_raw_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
         let counter = Arc::new(AtomicU8::new(0));
         client.add_event_handler_context(counter.clone());
@@ -850,7 +990,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn enum_event_handler() -> crate::Result<()> {
+    async fn test_enum_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
         let counter = Arc::new(AtomicU8::new(0));
         client.add_event_handler_context(counter.clone());
@@ -866,6 +1006,228 @@ mod tests {
         client.process_sync(response).await?;
 
         assert_eq!(counter.load(SeqCst), 1);
+        Ok(())
+    }
+
+    #[async_test]
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_observe_events() -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+
+        let room_id_0 = room_id!("!r0.matrix.org");
+        let room_id_1 = room_id!("!r1.matrix.org");
+
+        let observable = client.observe_events::<OriginalSyncRoomNameEvent, Room>();
+
+        let mut subscriber = observable.subscribe();
+
+        assert_pending!(subscriber);
+
+        let mut response_builder = SyncResponseBuilder::new();
+        let response = response_builder
+            .add_joined_room(JoinedRoomBuilder::new(room_id_0).add_state_event(
+                StateTestEvent::Custom(json!({
+                    "content": {
+                        "name": "Name 0"
+                    },
+                    "event_id": "$ev0",
+                    "origin_server_ts": 1,
+                    "sender": "@mnt_io:matrix.org",
+                    "state_key": "",
+                    "type": "m.room.name",
+                    "unsigned": {
+                        "age": 1,
+                    }
+                })),
+            ))
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let (room_name, room) = assert_ready!(subscriber);
+
+        assert_eq!(room_name.event_id.as_str(), "$ev0");
+        assert_eq!(room.room_id(), room_id_0);
+        assert_eq!(room.name().unwrap(), "Name 0");
+
+        assert_pending!(subscriber);
+
+        let response = response_builder
+            .add_joined_room(JoinedRoomBuilder::new(room_id_1).add_state_event(
+                StateTestEvent::Custom(json!({
+                    "content": {
+                        "name": "Name 1"
+                    },
+                    "event_id": "$ev1",
+                    "origin_server_ts": 2,
+                    "sender": "@mnt_io:matrix.org",
+                    "state_key": "",
+                    "type": "m.room.name",
+                    "unsigned": {
+                        "age": 2,
+                    }
+                })),
+            ))
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let (room_name, room) = assert_ready!(subscriber);
+
+        assert_eq!(room_name.event_id.as_str(), "$ev1");
+        assert_eq!(room.room_id(), room_id_1);
+        assert_eq!(room.name().unwrap(), "Name 1");
+
+        assert_pending!(subscriber);
+
+        drop(observable);
+        assert_closed!(subscriber);
+
+        Ok(())
+    }
+
+    #[async_test]
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_observe_room_events() -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+
+        let room_id = room_id!("!r0.matrix.org");
+
+        let observable_for_room =
+            client.observe_room_events::<OriginalSyncRoomNameEvent, (Room, Client)>(room_id);
+
+        let mut subscriber_for_room = observable_for_room.subscribe();
+
+        assert_pending!(subscriber_for_room);
+
+        let mut response_builder = SyncResponseBuilder::new();
+        let response = response_builder
+            .add_joined_room(JoinedRoomBuilder::new(room_id).add_state_event(
+                StateTestEvent::Custom(json!({
+                    "content": {
+                        "name": "Name 0"
+                    },
+                    "event_id": "$ev0",
+                    "origin_server_ts": 1,
+                    "sender": "@mnt_io:matrix.org",
+                    "state_key": "",
+                    "type": "m.room.name",
+                    "unsigned": {
+                        "age": 1,
+                    }
+                })),
+            ))
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let (room_name, (room, _client)) = assert_ready!(subscriber_for_room);
+
+        assert_eq!(room_name.event_id.as_str(), "$ev0");
+        assert_eq!(room.name().unwrap(), "Name 0");
+
+        assert_pending!(subscriber_for_room);
+
+        let response = response_builder
+            .add_joined_room(JoinedRoomBuilder::new(room_id).add_state_event(
+                StateTestEvent::Custom(json!({
+                    "content": {
+                        "name": "Name 1"
+                    },
+                    "event_id": "$ev1",
+                    "origin_server_ts": 2,
+                    "sender": "@mnt_io:matrix.org",
+                    "state_key": "",
+                    "type": "m.room.name",
+                    "unsigned": {
+                        "age": 2,
+                    }
+                })),
+            ))
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let (room_name, (room, _client)) = assert_ready!(subscriber_for_room);
+
+        assert_eq!(room_name.event_id.as_str(), "$ev1");
+        assert_eq!(room.name().unwrap(), "Name 1");
+
+        assert_pending!(subscriber_for_room);
+
+        drop(observable_for_room);
+        assert_closed!(subscriber_for_room);
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_observe_several_room_events() -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+
+        let room_id = room_id!("!r0.matrix.org");
+
+        let observable_for_room =
+            client.observe_room_events::<OriginalSyncRoomNameEvent, (Room, Client)>(room_id);
+
+        let mut subscriber_for_room = observable_for_room.subscribe();
+
+        assert_pending!(subscriber_for_room);
+
+        let mut response_builder = SyncResponseBuilder::new();
+        let response = response_builder
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id)
+                    .add_state_event(StateTestEvent::Custom(json!({
+                        "content": {
+                            "name": "Name 0"
+                        },
+                        "event_id": "$ev0",
+                        "origin_server_ts": 1,
+                        "sender": "@mnt_io:matrix.org",
+                        "state_key": "",
+                        "type": "m.room.name",
+                        "unsigned": {
+                            "age": 1,
+                        }
+                    })))
+                    .add_state_event(StateTestEvent::Custom(json!({
+                        "content": {
+                            "name": "Name 1"
+                        },
+                        "event_id": "$ev1",
+                        "origin_server_ts": 2,
+                        "sender": "@mnt_io:matrix.org",
+                        "state_key": "",
+                        "type": "m.room.name",
+                        "unsigned": {
+                            "age": 1,
+                        }
+                    })))
+                    .add_state_event(StateTestEvent::Custom(json!({
+                        "content": {
+                            "name": "Name 2"
+                        },
+                        "event_id": "$ev2",
+                        "origin_server_ts": 3,
+                        "sender": "@mnt_io:matrix.org",
+                        "state_key": "",
+                        "type": "m.room.name",
+                        "unsigned": {
+                            "age": 1,
+                        }
+                    }))),
+            )
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let (room_name, (room, _client)) = assert_ready!(subscriber_for_room);
+
+        // Check we only get notified about the latest received event
+        assert_eq!(room_name.event_id.as_str(), "$ev2");
+        assert_eq!(room.name().unwrap(), "Name 2");
+
+        assert_pending!(subscriber_for_room);
+
+        drop(observable_for_room);
+        assert_closed!(subscriber_for_room);
+
         Ok(())
     }
 }

@@ -15,6 +15,7 @@
 use std::{
     any::type_name,
     fmt::Debug,
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -30,6 +31,7 @@ use ruma::api::{
     error::{FromHttpResponseError, IntoHttpError},
     AuthScheme, MatrixVersion, OutgoingRequest, SendAccessToken,
 };
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, field::debug, instrument, trace};
 
 use crate::{config::RequestConfig, error::HttpError};
@@ -45,15 +47,47 @@ pub(crate) use native::HttpSettings;
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
+struct MaybeSemaphore(Arc<Option<Semaphore>>);
+
+#[allow(dead_code)] // false-positive lint: we never use it but only hold it for the drop
+struct MaybeSemaphorePermit<'a>(Option<SemaphorePermit<'a>>);
+
+impl MaybeSemaphore {
+    fn new(max: Option<NonZeroUsize>) -> Self {
+        let inner = max.map(|i| Semaphore::new(i.into()));
+        MaybeSemaphore(Arc::new(inner))
+    }
+
+    async fn acquire(&self) -> MaybeSemaphorePermit<'_> {
+        match self.0.as_ref() {
+            Some(inner) => {
+                // This can only ever error if the semaphore was closed,
+                // which we never do, so we can safely ignore any error case
+                MaybeSemaphorePermit(inner.acquire().await.ok())
+            }
+            None => MaybeSemaphorePermit(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct HttpClient {
     pub(crate) inner: reqwest::Client,
     pub(crate) request_config: RequestConfig,
+    concurrent_request_semaphore: MaybeSemaphore,
     next_request_id: Arc<AtomicU64>,
 }
 
 impl HttpClient {
     pub(crate) fn new(inner: reqwest::Client, request_config: RequestConfig) -> Self {
-        HttpClient { inner, request_config, next_request_id: AtomicU64::new(0).into() }
+        HttpClient {
+            inner,
+            request_config,
+            concurrent_request_semaphore: MaybeSemaphore::new(
+                request_config.max_concurrent_requests,
+            ),
+            next_request_id: AtomicU64::new(0).into(),
+        }
     }
 
     fn get_request_id(&self) -> String {
@@ -73,6 +107,12 @@ impl HttpClient {
         R: OutgoingRequest + Debug,
     {
         trace!(request_type = type_name::<R>(), "Serializing request");
+
+        let server_versions = if config.force_matrix_version.is_some() {
+            config.force_matrix_version.as_slice()
+        } else {
+            server_versions
+        };
 
         let send_access_token = match access_token {
             Some(access_token) => {
@@ -94,18 +134,8 @@ impl HttpClient {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, request, config, homeserver, access_token, send_progress),
-        fields(
-            config,
-            uri,
-            method,
-            request_size,
-            request_body,
-            request_id,
-            status,
-            response_size,
-            sentry_event_id,
-        )
+        skip(self, request, config, homeserver, access_token, server_versions, send_progress),
+        fields(uri, method, request_size, request_id, status, response_size, sentry_event_id)
     )]
     pub async fn send<R>(
         &self,
@@ -136,12 +166,19 @@ impl HttpClient {
             span.record("config", debug(config)).record("request_id", request_id);
 
             let auth_scheme = R::METADATA.authentication;
-            if !matches!(auth_scheme, AuthScheme::AccessToken | AuthScheme::None) {
-                return Err(HttpError::NotClientRequest);
+            match auth_scheme {
+                AuthScheme::AccessToken
+                | AuthScheme::AccessTokenOptional
+                | AuthScheme::AppserviceToken
+                | AuthScheme::None => {}
+                AuthScheme::ServerSignatures => {
+                    return Err(HttpError::NotClientRequest);
+                }
             }
 
-            let request =
-                self.serialize_request(request, config, homeserver, access_token, server_versions)?;
+            let request = self
+                .serialize_request(request, config, homeserver, access_token, server_versions)
+                .map_err(HttpError::IntoHttp)?;
 
             let method = request.method();
 
@@ -158,22 +195,17 @@ impl HttpClient {
             // in conjunction with request bodies
             if [Method::POST, Method::PUT, Method::PATCH].contains(method) {
                 let request_size = request.body().len().try_into().unwrap_or(u64::MAX);
-                span.record("request_size", ByteSize(request_size).to_string_as(true));
-            }
-
-            // Since sliding sync is experimental, and the proxy might not do what we expect
-            // it to do given a specific request body, it's useful to log the
-            // request body here. This doesn't contain any personal information.
-            // TODO: Remove this once sliding sync isn't experimental anymore.
-            #[cfg(feature = "experimental-sliding-sync")]
-            if type_name::<R>() == "ruma_client_api::sync::sync_events::v4::Request" {
-                span.record("request_body", debug(request.body()));
+                span.record(
+                    "request_size",
+                    ByteSize(request_size).display().si_short().to_string(),
+                );
             }
 
             request
         };
 
-        debug!("Sending request");
+        // will be automatically dropped at the end of this function
+        let _handle = self.concurrent_request_semaphore.acquire().await;
 
         // There's a bunch of state in send_request, factor out a pinned inner
         // future to reduce this size of futures that await this function.
@@ -218,27 +250,110 @@ async fn response_to_http_response(
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
 }
 
-#[cfg(feature = "experimental-oidc")]
-impl tower::Service<http::Request<Bytes>> for HttpClient {
-    type Response = http::Response<Bytes>;
-    type Error = tower::BoxError;
-    type Future = futures_core::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            atomic::{AtomicU8, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    use matrix_sdk_test::{async_test, test_json};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, Request, ResponseTemplate,
+    };
+
+    use crate::{
+        http_client::RequestConfig,
+        test_utils::{set_client_session, test_client_builder_with_server},
+    };
+
+    #[async_test]
+    async fn test_ensure_concurrent_request_limit_is_observed() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder
+            .request_config(RequestConfig::default().max_concurrent_requests(NonZeroUsize::new(5)))
+            .build()
+            .await
+            .unwrap();
+
+        set_client_session(&client).await;
+
+        let counter = Arc::new(AtomicU8::new(0));
+        let inner_counter = counter.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/r0/account/whoami"))
+            .respond_with(move |_req: &Request| {
+                inner_counter.fetch_add(1, Ordering::SeqCst);
+                // we stall the requests
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(60))
+            })
+            .mount(&server)
+            .await;
+
+        let bg_task = tokio::spawn(async move {
+            futures_util::future::join_all((0..10).map(|_| client.whoami())).await
+        });
+
+        // give it some time to issue the requests
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            5,
+            "More requests passed than the limit we configured"
+        );
+        bg_task.abort();
     }
 
-    fn call(&mut self, req: http::Request<Bytes>) -> Self::Future {
-        let inner = self.inner.clone();
+    #[async_test]
+    async fn test_ensure_no_max_concurrent_request_does_not_limit() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder
+            .request_config(RequestConfig::default().max_concurrent_requests(None))
+            .build()
+            .await
+            .unwrap();
 
-        let fut = async move {
-            native::send_request(&inner, &req, DEFAULT_REQUEST_TIMEOUT, Default::default())
-                .await
-                .map_err(Into::into)
-        };
-        Box::pin(fut)
+        set_client_session(&client).await;
+
+        let counter = Arc::new(AtomicU8::new(0));
+        let inner_counter = counter.clone();
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/r0/account/whoami"))
+            .respond_with(move |_req: &Request| {
+                inner_counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(60))
+            })
+            .mount(&server)
+            .await;
+
+        let bg_task = tokio::spawn(async move {
+            futures_util::future::join_all((0..254).map(|_| client.whoami())).await
+        });
+
+        // give it some time to issue the requests
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 254, "Not all requests passed through");
+        bg_task.abort();
     }
 }

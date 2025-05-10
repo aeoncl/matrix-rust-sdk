@@ -17,8 +17,6 @@
 #![deny(unreachable_pub)]
 
 use std::future::IntoFuture;
-#[cfg(feature = "image-proc")]
-use std::io::Cursor;
 
 use eyeball::SharedObservable;
 use matrix_sdk_common::boxed_into_future;
@@ -32,17 +30,12 @@ use ruma::{
     serde::Raw,
     OwnedTransactionId, TransactionId,
 };
-use tracing::{debug, Instrument, Span};
+use tracing::{info, trace, Instrument, Span};
 
 use super::Room;
 use crate::{
-    attachment::AttachmentConfig, utils::IntoRawMessageLikeEventContent, Result,
-    TransmissionProgress,
-};
-#[cfg(feature = "image-proc")]
-use crate::{
-    attachment::{generate_image_thumbnail, Thumbnail},
-    error::ImageError,
+    attachment::AttachmentConfig, config::RequestConfig, utils::IntoRawMessageLikeEventContent,
+    Result, TransmissionProgress,
 };
 
 /// Future returned by [`Room::send`].
@@ -52,13 +45,14 @@ pub struct SendMessageLikeEvent<'a> {
     event_type: String,
     content: serde_json::Result<serde_json::Value>,
     transaction_id: Option<OwnedTransactionId>,
+    request_config: Option<RequestConfig>,
 }
 
 impl<'a> SendMessageLikeEvent<'a> {
     pub(crate) fn new(room: &'a Room, content: impl MessageLikeEventContent) -> Self {
         let event_type = content.event_type().to_string();
         let content = serde_json::to_value(&content);
-        Self { room, event_type, content, transaction_id: None }
+        Self { room, event_type, content, transaction_id: None, request_config: None }
     }
 
     /// Set a transaction ID for this event.
@@ -78,8 +72,15 @@ impl<'a> SendMessageLikeEvent<'a> {
     ///   corresponding [`SyncMessageLikeEvent`], but only for the *sending*
     ///   device. Other devices will not see it. This is then used to ignore
     ///   events sent by our own device and/or to implement local echo.
-    pub fn with_transaction_id(mut self, txn_id: &TransactionId) -> Self {
-        self.transaction_id = Some(txn_id.to_owned());
+    pub fn with_transaction_id(mut self, txn_id: OwnedTransactionId) -> Self {
+        self.transaction_id = Some(txn_id);
+        self
+    }
+
+    /// Assign a given [`RequestConfig`] to configure how this request should
+    /// behave with respect to the network.
+    pub fn with_request_config(mut self, request_config: RequestConfig) -> Self {
+        self.request_config = Some(request_config);
         self
     }
 }
@@ -89,10 +90,10 @@ impl<'a> IntoFuture for SendMessageLikeEvent<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, event_type, content, transaction_id } = self;
+        let Self { room, event_type, content, transaction_id, request_config } = self;
         Box::pin(async move {
             let content = content?;
-            assign!(room.send_raw(&event_type, content), { transaction_id }).await
+            assign!(room.send_raw(&event_type, content), { transaction_id, request_config }).await
         })
     }
 }
@@ -105,6 +106,7 @@ pub struct SendRawMessageLikeEvent<'a> {
     content: Raw<AnyMessageLikeEventContent>,
     tracing_span: Span,
     transaction_id: Option<OwnedTransactionId>,
+    request_config: Option<RequestConfig>,
 }
 
 impl<'a> SendRawMessageLikeEvent<'a> {
@@ -114,7 +116,14 @@ impl<'a> SendRawMessageLikeEvent<'a> {
         content: impl IntoRawMessageLikeEventContent,
     ) -> Self {
         let content = content.into_raw_message_like_event_content();
-        Self { room, event_type, content, tracing_span: Span::current(), transaction_id: None }
+        Self {
+            room,
+            event_type,
+            content,
+            tracing_span: Span::current(),
+            transaction_id: None,
+            request_config: None,
+        }
     }
 
     /// Set a transaction ID for this event.
@@ -135,6 +144,13 @@ impl<'a> SendRawMessageLikeEvent<'a> {
         self.transaction_id = Some(txn_id.to_owned());
         self
     }
+
+    /// Assign a given [`RequestConfig`] to configure how this request should
+    /// behave with respect to the network.
+    pub fn with_request_config(mut self, request_config: RequestConfig) -> Self {
+        self.request_config = Some(request_config);
+        self
+    }
 }
 
 impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
@@ -143,25 +159,33 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         #[cfg_attr(not(feature = "e2e-encryption"), allow(unused_mut))]
-        let Self { room, mut event_type, mut content, tracing_span, transaction_id } = self;
+        let Self {
+            room,
+            mut event_type,
+            mut content,
+            tracing_span,
+            transaction_id,
+            request_config,
+        } = self;
+
         let fut = async move {
             room.ensure_room_joined()?;
 
             let txn_id = transaction_id.unwrap_or_else(TransactionId::new);
-            tracing::Span::current().record("transaction_id", tracing::field::debug(&txn_id));
+            Span::current().record("transaction_id", tracing::field::debug(&txn_id));
 
             #[cfg(not(feature = "e2e-encryption"))]
-            debug!("Sending plaintext event to room because we don't have encryption support.");
+            trace!("Sending plaintext event to room because we don't have encryption support.");
 
             #[cfg(feature = "e2e-encryption")]
-            if room.is_encrypted().await? {
-                tracing::Span::current().record("encrypted", true);
+            if room.latest_encryption_state().await?.is_encrypted() {
+                Span::current().record("is_room_encrypted", true);
                 // Reactions are currently famously not encrypted, skip encrypting
                 // them until they are.
                 if event_type == "m.reaction" {
-                    debug!("Sending plaintext event because of the event type.");
+                    trace!("Sending plaintext event because of the event type.");
                 } else {
-                    debug!(
+                    trace!(
                         room_id = ?room.room_id(),
                         "Sending encrypted event because the room is encrypted.",
                     );
@@ -175,7 +199,7 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                     // Note we do it all the time, because we might have sync'd members before
                     // sending a message (so didn't enter the above branch), but
                     // could have not query their keys ever.
-                    room.query_keys_for_untracked_users().await?;
+                    room.query_keys_for_untracked_or_dirty_users().await?;
 
                     room.preshare_room_key().await?;
 
@@ -189,8 +213,8 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                     event_type = "m.room.encrypted";
                 }
             } else {
-                tracing::Span::current().record("encrypted", false);
-                debug!("Sending plaintext event because the room is NOT encrypted.",);
+                Span::current().record("is_room_encrypted", false);
+                trace!("Sending plaintext event because the room is NOT encrypted.",);
             };
 
             let request = send_message_event::v3::Request::new_raw(
@@ -200,7 +224,11 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                 content,
             );
 
-            let response = room.client.send(request, None).await?;
+            let response = room.client.send(request).with_request_config(request_config).await?;
+
+            Span::current().record("event_id", tracing::field::debug(&response.event_id));
+            info!("Sent event in room");
+
             Ok(response)
         };
 
@@ -212,41 +240,51 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 #[allow(missing_debug_implementations)]
 pub struct SendAttachment<'a> {
     room: &'a Room,
-    body: &'a str,
+    filename: String,
     content_type: &'a Mime,
     data: Vec<u8>,
     config: AttachmentConfig,
     tracing_span: Span,
     send_progress: SharedObservable<TransmissionProgress>,
+    store_in_cache: bool,
 }
 
 impl<'a> SendAttachment<'a> {
     pub(crate) fn new(
         room: &'a Room,
-        body: &'a str,
+        filename: String,
         content_type: &'a Mime,
         data: Vec<u8>,
         config: AttachmentConfig,
     ) -> Self {
         Self {
             room,
-            body,
+            filename,
             content_type,
             data,
             config,
             tracing_span: Span::current(),
             send_progress: Default::default(),
+            store_in_cache: false,
         }
     }
 
     /// Replace the default `SharedObservable` used for tracking upload
     /// progress.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_send_progress_observable(
         mut self,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Self {
         self.send_progress = send_progress;
+        self
+    }
+
+    /// Whether the sent attachment should be stored in the cache or not.
+    ///
+    /// If set to true, then retrieving the data for the attachment will result
+    /// in a cache hit immediately after upload.
+    pub fn store_in_cache(mut self) -> Self {
+        self.store_in_cache = true;
         self
     }
 }
@@ -256,71 +294,26 @@ impl<'a> IntoFuture for SendAttachment<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, body, content_type, data, config, tracing_span, send_progress } = self;
+        let Self {
+            room,
+            filename,
+            content_type,
+            data,
+            config,
+            tracing_span,
+            send_progress,
+            store_in_cache,
+        } = self;
         let fut = async move {
-            if config.thumbnail.is_some() {
-                room.prepare_and_send_attachment(body, content_type, data, config, send_progress)
-                    .await
-            } else {
-                #[cfg(not(feature = "image-proc"))]
-                let thumbnail = None;
-
-                #[cfg(feature = "image-proc")]
-                let data_slot;
-                #[cfg(feature = "image-proc")]
-                let (data, thumbnail) = if config.generate_thumbnail {
-                    let content_type = content_type.clone();
-                    let make_thumbnail = move |data| {
-                        let res = generate_image_thumbnail(
-                            &content_type,
-                            Cursor::new(&data),
-                            config.thumbnail_size,
-                        );
-                        (data, res)
-                    };
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let (data, res) = tokio::task::spawn_blocking(move || make_thumbnail(data))
-                        .await
-                        .expect("Task join error");
-
-                    #[cfg(target_arch = "wasm32")]
-                    let (data, res) = make_thumbnail(data);
-
-                    let thumbnail = match res {
-                        Ok((thumbnail_data, thumbnail_info)) => {
-                            data_slot = thumbnail_data;
-                            Some(Thumbnail {
-                                data: data_slot,
-                                content_type: mime::IMAGE_JPEG,
-                                info: Some(thumbnail_info),
-                            })
-                        }
-                        Err(
-                            ImageError::ThumbnailBiggerThanOriginal
-                            | ImageError::FormatNotSupported,
-                        ) => None,
-                        Err(error) => return Err(error.into()),
-                    };
-
-                    (data, thumbnail)
-                } else {
-                    (data, None)
-                };
-
-                let config = AttachmentConfig {
-                    txn_id: config.txn_id,
-                    info: config.info,
-                    thumbnail,
-                    #[cfg(feature = "image-proc")]
-                    generate_thumbnail: false,
-                    #[cfg(feature = "image-proc")]
-                    thumbnail_size: None,
-                };
-
-                room.prepare_and_send_attachment(body, content_type, data, config, send_progress)
-                    .await
-            }
+            room.prepare_and_send_attachment(
+                filename,
+                content_type,
+                data,
+                config,
+                send_progress,
+                store_in_cache,
+            )
+            .await
         };
 
         Box::pin(fut.instrument(tracing_span))

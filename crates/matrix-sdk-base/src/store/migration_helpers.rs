@@ -14,12 +14,15 @@
 
 //! Data migration helpers for StateStore implementations.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
-#[cfg(feature = "experimental-sliding-sync")]
-use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk_common::deserialized_responses::TimelineEvent;
 use ruma::{
     events::{
+        direct::OwnedDirectUserIdentifier,
         room::{
             avatar::RoomAvatarEventContent,
             canonical_alias::RoomCanonicalAliasEventContent,
@@ -38,10 +41,9 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "experimental-sliding-sync")]
-use crate::latest_event::LatestEvent;
 use crate::{
     deserialized_responses::SyncOrStrippedState,
+    latest_event::LatestEvent,
     rooms::{
         normal::{RoomSummary, SyncInfo},
         BaseRoomInfo, RoomNotableTags,
@@ -74,8 +76,7 @@ pub struct RoomInfoV1 {
     sync_info: SyncInfo,
     #[serde(default = "encryption_state_default")] // see fn docs for why we use this default
     encryption_state_synced: bool,
-    #[cfg(feature = "experimental-sliding-sync")]
-    latest_event: Option<SyncTimelineEvent>,
+    latest_event: Option<TimelineEvent>,
     base_info: BaseRoomInfoV1,
 }
 
@@ -102,24 +103,28 @@ impl RoomInfoV1 {
             last_prev_batch,
             sync_info,
             encryption_state_synced,
-            #[cfg(feature = "experimental-sliding-sync")]
             latest_event,
             base_info,
         } = self;
 
         RoomInfo {
+            version: 0,
             room_id,
             room_state: room_type,
+            prev_room_state: None,
             notification_counts,
             summary,
             members_synced,
             last_prev_batch,
             sync_info,
             encryption_state_synced,
-            #[cfg(feature = "experimental-sliding-sync")]
             latest_event: latest_event.map(|ev| Box::new(LatestEvent::new(ev))),
             read_receipts: Default::default(),
             base_info: base_info.migrate(create),
+            warned_about_unknown_room_version: Arc::new(false.into()),
+            cached_display_name: None,
+            cached_user_defined_notification_mode: None,
+            recency_stamp: None,
         }
     }
 }
@@ -190,11 +195,17 @@ impl BaseRoomInfoV1 {
             MinimalStateEvent::Redacted(ev) => MinimalStateEvent::Redacted(ev),
         });
 
+        let mut converted_dm_targets = HashSet::new();
+        for dm_target in dm_targets {
+            converted_dm_targets.insert(OwnedDirectUserIdentifier::from(dm_target));
+        }
+
         Box::new(BaseRoomInfo {
             avatar,
+            beacons: BTreeMap::new(),
             canonical_alias,
             create,
-            dm_targets,
+            dm_targets: converted_dm_targets,
             encryption,
             guest_access,
             history_visibility,
@@ -203,9 +214,10 @@ impl BaseRoomInfoV1 {
             name,
             tombstone,
             topic,
-            rtc_member: BTreeMap::new(),
+            rtc_member_events: BTreeMap::new(),
             is_marked_unread: false,
             notable_tags: RoomNotableTags::empty(),
+            pinned_events: None,
         })
     }
 }

@@ -15,7 +15,7 @@ use crate::{CryptoStoreError, OutgoingVerificationRequest, SignatureUploadReques
 
 /// Listener that will be passed over the FFI to report changes to a SAS
 /// verification.
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait SasListener: Send {
     /// The callback that should be called on the Rust side
     ///
@@ -28,8 +28,11 @@ pub trait SasListener: Send {
 /// An Enum describing the state the SAS verification is in.
 #[derive(uniffi::Enum)]
 pub enum SasState {
-    /// The verification has been started, the protocols that should be used
-    /// have been proposed and can be accepted.
+    /// The verification has been created, the protocols that should be used
+    /// have been proposed to the other party.
+    Created,
+    /// The verification has been started, the other party proposed the
+    /// protocols that should be used and that can be accepted.
     Started,
     /// The verification has been accepted and both sides agreed to a set of
     /// protocols that will be used for the verification process.
@@ -58,6 +61,7 @@ pub enum SasState {
 impl From<RustSasState> for SasState {
     fn from(s: RustSasState) -> Self {
         match s {
+            RustSasState::Created { .. } => Self::Created,
             RustSasState::Started { .. } => Self::Started,
             RustSasState::Accepted { .. } => Self::Accepted,
             RustSasState::KeysExchanged { emojis, decimals } => Self::KeysExchanged {
@@ -78,7 +82,7 @@ pub struct Verification {
     pub(crate) runtime: Handle,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl Verification {
     /// Try to represent the `Verification` as an `Sas` verification object,
     /// returns `None` if the verification is not a `Sas` verification.
@@ -108,7 +112,7 @@ pub struct Sas {
     pub(crate) runtime: Handle,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl Sas {
     /// Get the user id of the other side.
     pub fn other_user_id(&self) -> String {
@@ -165,8 +169,8 @@ impl Sas {
     /// # Arguments
     ///
     /// * `cancel_code` - The error code for why the verification was cancelled,
-    /// manual cancellatio usually happens with `m.user` cancel code. The full
-    /// list of cancel codes can be found in the [spec]
+    ///   manual cancellatio usually happens with `m.user` cancel code. The full
+    ///   list of cancel codes can be found in the [spec]
     ///
     /// [spec]: https://spec.matrix.org/unstable/client-server-api/#mkeyverificationcancel
     pub fn cancel(&self, cancel_code: String) -> Option<OutgoingVerificationRequest> {
@@ -272,7 +276,7 @@ impl Sas {
 
 /// Listener that will be passed over the FFI to report changes to a QrCode
 /// verification.
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait QrCodeListener: Send {
     /// The callback that should be called on the Rust side
     ///
@@ -324,7 +328,7 @@ pub struct QrCode {
     pub(crate) runtime: Handle,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl QrCode {
     /// Get the user id of the other side.
     pub fn other_user_id(&self) -> String {
@@ -387,8 +391,8 @@ impl QrCode {
     /// # Arguments
     ///
     /// * `cancel_code` - The error code for why the verification was cancelled,
-    /// manual cancellatio usually happens with `m.user` cancel code. The full
-    /// list of cancel codes can be found in the [spec]
+    ///   manual cancellatio usually happens with `m.user` cancel code. The full
+    ///   list of cancel codes can be found in the [spec]
     ///
     /// [spec]: https://spec.matrix.org/unstable/client-server-api/#mkeyverificationcancel
     pub fn cancel(&self, cancel_code: String) -> Option<OutgoingVerificationRequest> {
@@ -518,7 +522,7 @@ pub struct ConfirmVerificationResult {
 
 /// Listener that will be passed over the FFI to report changes to a
 /// verification request.
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait VerificationRequestListener: Send {
     /// The callback that should be called on the Rust side
     ///
@@ -558,7 +562,7 @@ pub struct VerificationRequest {
     pub(crate) runtime: Handle,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl VerificationRequest {
     /// The id of the other user that is participating in this verification
     /// request.
@@ -636,12 +640,12 @@ impl VerificationRequest {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user for which we would like to accept the
-    /// verification requests.
+    ///   verification requests.
     ///
     /// * `flow_id` - The ID that uniquely identifies the verification flow.
     ///
     /// * `methods` - A list of verification methods that we want to advertise
-    /// as supported.
+    ///   as supported.
     pub fn accept(&self, methods: Vec<String>) -> Option<OutgoingVerificationRequest> {
         let methods = methods.into_iter().map(VerificationMethod::from).collect();
         self.inner.accept_with_methods(methods).map(|r| r.into())
@@ -659,10 +663,10 @@ impl VerificationRequest {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user for which we would like to start the
-    /// SAS verification.
+    ///   SAS verification.
     ///
     /// * `flow_id` - The ID of the verification request that initiated the
-    /// verification flow.
+    ///   verification flow.
     pub fn start_sas_verification(&self) -> Result<Option<StartSasResult>, CryptoStoreError> {
         Ok(self.runtime.block_on(self.inner.start_sas())?.map(|(sas, r)| StartSasResult {
             sas: Arc::new(Sas { inner: sas, runtime: self.runtime.clone() }),
@@ -677,11 +681,11 @@ impl VerificationRequest {
     ///
     /// # Arguments
     ///
-    /// * `user_id` - The ID of the user for which we would like to start the
-    /// QR code verification.
+    /// * `user_id` - The ID of the user for which we would like to start the QR
+    ///   code verification.
     ///
     /// * `flow_id` - The ID of the verification request that initiated the
-    /// verification flow.
+    ///   verification flow.
     pub fn start_qr_verification(&self) -> Result<Option<Arc<QrCode>>, CryptoStoreError> {
         Ok(self
             .runtime
@@ -697,14 +701,14 @@ impl VerificationRequest {
     ///
     /// # Arguments
     ///
-    /// * `user_id` - The ID of the user for which we would like to start the
-    /// QR code verification.
+    /// * `user_id` - The ID of the user for which we would like to start the QR
+    ///   code verification.
     ///
     /// * `flow_id` - The ID of the verification request that initiated the
-    /// verification flow.
+    ///   verification flow.
     ///
     /// * `data` - The data that was extracted from the scanned QR code as an
-    /// base64 encoded string, without padding.
+    ///   base64 encoded string, without padding.
     pub fn scan_qr_code(&self, data: String) -> Option<ScanResult> {
         let data = base64_decode(data).ok()?;
         let data = QrVerificationData::from_bytes(data).ok()?;
@@ -748,7 +752,7 @@ impl VerificationRequest {
             RustVerificationRequestState::Ready {
                 their_methods,
                 our_methods,
-                other_device_id: _,
+                other_device_data: _,
             } => VerificationRequestState::Ready {
                 their_methods: their_methods.iter().map(|m| m.to_string()).collect(),
                 our_methods: our_methods.iter().map(|m| m.to_string()).collect(),
@@ -787,8 +791,7 @@ impl VerificationRequest {
             // task.
             let should_break = matches!(
                 state,
-                RustVerificationRequestState::Done { .. }
-                    | RustVerificationRequestState::Cancelled { .. }
+                RustVerificationRequestState::Done | RustVerificationRequestState::Cancelled { .. }
             );
 
             let state = Self::convert_verification_request(&request, state);

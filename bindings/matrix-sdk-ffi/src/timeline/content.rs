@@ -12,42 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use matrix_sdk::room::power_levels::power_level_user_changes;
-use matrix_sdk_ui::timeline::{PollResult, TimelineDetails};
-use tracing::warn;
+use matrix_sdk_ui::timeline::RoomPinnedEventsChange;
+use ruma::events::FullStateEventContent;
 
-use super::ProfileDetails;
-use crate::ruma::{ImageInfo, MessageType, PollKind};
+use crate::{timeline::msg_like::MsgLikeContent, utils::Timestamp};
 
-#[derive(Clone, uniffi::Object)]
-pub struct TimelineItemContent(pub(crate) matrix_sdk_ui::timeline::TimelineItemContent);
-
-#[uniffi::export]
-impl TimelineItemContent {
-    pub fn kind(&self) -> TimelineItemContentKind {
+impl From<matrix_sdk_ui::timeline::TimelineItemContent> for TimelineItemContent {
+    fn from(value: matrix_sdk_ui::timeline::TimelineItemContent) -> Self {
         use matrix_sdk_ui::timeline::TimelineItemContent as Content;
 
-        match &self.0 {
-            Content::Message(_) => TimelineItemContentKind::Message,
-            Content::RedactedMessage => TimelineItemContentKind::RedactedMessage,
-            Content::Sticker(sticker) => {
-                let content = sticker.content();
-                TimelineItemContentKind::Sticker {
-                    body: content.body.clone(),
-                    info: (&content.info).into(),
-                    url: content.url.to_string(),
+        match value {
+            Content::MsgLike(msg_like) => match msg_like.try_into() {
+                Ok(content) => TimelineItemContent::MsgLike { content },
+                Err((error, event_type)) => TimelineItemContent::FailedToParseMessageLike {
+                    event_type,
+                    error: error.to_string(),
+                },
+            },
+
+            Content::CallInvite => TimelineItemContent::CallInvite,
+
+            Content::CallNotify => TimelineItemContent::CallNotify,
+
+            Content::MembershipChange(membership) => {
+                let reason = match membership.content() {
+                    FullStateEventContent::Original { content, .. } => content.reason.clone(),
+                    _ => None,
+                };
+                TimelineItemContent::RoomMembership {
+                    user_id: membership.user_id().to_string(),
+                    user_display_name: membership.display_name(),
+                    change: membership.change().map(Into::into),
+                    reason,
                 }
             }
-            Content::Poll(poll_state) => TimelineItemContentKind::from(poll_state.results()),
-            Content::UnableToDecrypt(msg) => {
-                TimelineItemContentKind::UnableToDecrypt { msg: EncryptedMessage::new(msg) }
-            }
-            Content::MembershipChange(membership) => TimelineItemContentKind::RoomMembership {
-                user_id: membership.user_id().to_string(),
-                change: membership.change().map(Into::into),
-            },
+
             Content::ProfileChange(profile) => {
                 let (display_name, prev_display_name) = profile
                     .displayname_change()
@@ -62,63 +64,49 @@ impl TimelineItemContent {
                         )
                     })
                     .unzip();
-                TimelineItemContentKind::ProfileChange {
+                TimelineItemContent::ProfileChange {
                     display_name: display_name.flatten(),
                     prev_display_name: prev_display_name.flatten(),
                     avatar_url: avatar_url.flatten(),
                     prev_avatar_url: prev_avatar_url.flatten(),
                 }
             }
-            Content::OtherState(state) => TimelineItemContentKind::State {
+
+            Content::OtherState(state) => TimelineItemContent::State {
                 state_key: state.state_key().to_owned(),
                 content: state.content().into(),
             },
+
             Content::FailedToParseMessageLike { event_type, error } => {
-                TimelineItemContentKind::FailedToParseMessageLike {
+                TimelineItemContent::FailedToParseMessageLike {
                     event_type: event_type.to_string(),
                     error: error.to_string(),
                 }
             }
+
             Content::FailedToParseState { event_type, state_key, error } => {
-                TimelineItemContentKind::FailedToParseState {
+                TimelineItemContent::FailedToParseState {
                     event_type: event_type.to_string(),
-                    state_key: state_key.to_string(),
+                    state_key,
                     error: error.to_string(),
                 }
             }
         }
     }
-
-    pub fn as_message(self: Arc<Self>) -> Option<Arc<Message>> {
-        use matrix_sdk_ui::timeline::TimelineItemContent as Content;
-        unwrap_or_clone_arc_into_variant!(self, .0, Content::Message(msg) => Arc::new(Message(msg)))
-    }
 }
 
-#[derive(uniffi::Enum)]
-pub enum TimelineItemContentKind {
-    Message,
-    RedactedMessage,
-    Sticker {
-        body: String,
-        info: ImageInfo,
-        url: String,
+#[derive(Clone, uniffi::Enum)]
+pub enum TimelineItemContent {
+    MsgLike {
+        content: MsgLikeContent,
     },
-    Poll {
-        question: String,
-        kind: PollKind,
-        max_selections: u64,
-        answers: Vec<PollAnswer>,
-        votes: HashMap<String, Vec<String>>,
-        end_time: Option<u64>,
-        has_been_edited: bool,
-    },
-    UnableToDecrypt {
-        msg: EncryptedMessage,
-    },
+    CallInvite,
+    CallNotify,
     RoomMembership {
         user_id: String,
+        user_display_name: Option<String>,
         change: Option<MembershipChange>,
+        reason: Option<String>,
     },
     ProfileChange {
         display_name: Option<String>,
@@ -141,110 +129,16 @@ pub enum TimelineItemContentKind {
     },
 }
 
-#[derive(Clone, uniffi::Object)]
-pub struct Message(matrix_sdk_ui::timeline::Message);
-
-#[uniffi::export]
-impl Message {
-    pub fn msgtype(&self) -> MessageType {
-        self.0.msgtype().clone().into()
-    }
-
-    pub fn body(&self) -> String {
-        self.0.msgtype().body().to_owned()
-    }
-
-    pub fn in_reply_to(&self) -> Option<InReplyToDetails> {
-        self.0.in_reply_to().map(InReplyToDetails::from)
-    }
-
-    pub fn is_threaded(&self) -> bool {
-        self.0.is_threaded()
-    }
-
-    pub fn is_edited(&self) -> bool {
-        self.0.is_edited()
-    }
-}
-
-#[derive(uniffi::Record)]
-pub struct InReplyToDetails {
-    event_id: String,
-    event: RepliedToEventDetails,
-}
-
-impl From<&matrix_sdk_ui::timeline::InReplyToDetails> for InReplyToDetails {
-    fn from(inner: &matrix_sdk_ui::timeline::InReplyToDetails) -> Self {
-        let event_id = inner.event_id.to_string();
-        let event = match &inner.event {
-            TimelineDetails::Unavailable => RepliedToEventDetails::Unavailable,
-            TimelineDetails::Pending => RepliedToEventDetails::Pending,
-            TimelineDetails::Ready(event) => RepliedToEventDetails::Ready {
-                content: Arc::new(TimelineItemContent(event.content().to_owned())),
-                sender: event.sender().to_string(),
-                sender_profile: event.sender_profile().into(),
-            },
-            TimelineDetails::Error(err) => {
-                RepliedToEventDetails::Error { message: err.to_string() }
-            }
-        };
-
-        Self { event_id, event }
-    }
-}
-
-#[derive(uniffi::Enum)]
-pub enum RepliedToEventDetails {
-    Unavailable,
-    Pending,
-    Ready { content: Arc<TimelineItemContent>, sender: String, sender_profile: ProfileDetails },
-    Error { message: String },
-}
-
-#[derive(Clone, uniffi::Enum)]
-pub enum EncryptedMessage {
-    OlmV1Curve25519AesSha2 {
-        /// The Curve25519 key of the sender.
-        sender_key: String,
-    },
-    // Other fields not included because UniFFI doesn't have the concept of
-    // deprecated fields right now.
-    MegolmV1AesSha2 {
-        /// The ID of the session used to encrypt the message.
-        session_id: String,
-    },
-    Unknown,
-}
-
-impl EncryptedMessage {
-    fn new(msg: &matrix_sdk_ui::timeline::EncryptedMessage) -> Self {
-        use matrix_sdk_ui::timeline::EncryptedMessage as Message;
-
-        match msg {
-            Message::OlmV1Curve25519AesSha2 { sender_key } => {
-                let sender_key = sender_key.clone();
-                Self::OlmV1Curve25519AesSha2 { sender_key }
-            }
-            Message::MegolmV1AesSha2 { session_id, .. } => {
-                let session_id = session_id.clone();
-                Self::MegolmV1AesSha2 { session_id }
-            }
-            Message::Unknown => Self::Unknown,
-        }
-    }
-}
-
 #[derive(Clone, uniffi::Record)]
 pub struct Reaction {
     pub key: String,
-    pub count: u64,
     pub senders: Vec<ReactionSenderData>,
 }
 
 #[derive(Clone, uniffi::Record)]
 pub struct ReactionSenderData {
     pub sender_id: String,
-    pub timestamp: u64,
+    pub timestamp: Timestamp,
 }
 
 #[derive(Clone, uniffi::Enum)]
@@ -307,8 +201,8 @@ pub enum OtherState {
     RoomHistoryVisibility,
     RoomJoinRules,
     RoomName { name: Option<String> },
-    RoomPinnedEvents,
-    RoomPowerLevels { users: HashMap<String, i64> },
+    RoomPinnedEvents { change: RoomPinnedEventsChange },
+    RoomPowerLevels { users: HashMap<String, i64>, previous: Option<HashMap<String, i64>> },
     RoomServerAcl,
     RoomThirdPartyInvite { display_name: Option<String> },
     RoomTombstone,
@@ -350,19 +244,21 @@ impl From<&matrix_sdk_ui::timeline::AnyOtherFullStateEventContent> for OtherStat
                 };
                 Self::RoomName { name }
             }
-            Content::RoomPinnedEvents(_) => Self::RoomPinnedEvents,
-            Content::RoomPowerLevels(c) => {
-                let changes = match c {
-                    FullContent::Original { content, prev_content } => {
-                        power_level_user_changes(content, prev_content)
-                            .iter()
-                            .map(|(k, v)| (k.to_string(), *v))
-                            .collect()
-                    }
-                    FullContent::Redacted(_) => Default::default(),
-                };
-                Self::RoomPowerLevels { users: changes }
-            }
+            Content::RoomPinnedEvents(c) => Self::RoomPinnedEvents { change: c.into() },
+            Content::RoomPowerLevels(c) => match c {
+                FullContent::Original { content, prev_content } => Self::RoomPowerLevels {
+                    users: power_level_user_changes(content, prev_content)
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), *v))
+                        .collect(),
+                    previous: prev_content.as_ref().map(|prev_content| {
+                        prev_content.users.iter().map(|(k, &v)| (k.to_string(), v.into())).collect()
+                    }),
+                },
+                FullContent::Redacted(_) => {
+                    Self::RoomPowerLevels { users: Default::default(), previous: None }
+                }
+            },
             Content::RoomServerAcl(_) => Self::RoomServerAcl,
             Content::RoomThirdPartyInvite(c) => {
                 let display_name = match c {
@@ -382,30 +278,6 @@ impl From<&matrix_sdk_ui::timeline::AnyOtherFullStateEventContent> for OtherStat
             Content::SpaceChild(_) => Self::SpaceChild,
             Content::SpaceParent(_) => Self::SpaceParent,
             Content::_Custom { event_type, .. } => Self::Custom { event_type: event_type.clone() },
-        }
-    }
-}
-
-#[derive(uniffi::Record)]
-pub struct PollAnswer {
-    pub id: String,
-    pub text: String,
-}
-
-impl From<PollResult> for TimelineItemContentKind {
-    fn from(value: PollResult) -> Self {
-        TimelineItemContentKind::Poll {
-            question: value.question,
-            kind: PollKind::from(value.kind),
-            max_selections: value.max_selections,
-            answers: value
-                .answers
-                .into_iter()
-                .map(|i| PollAnswer { id: i.id, text: i.text })
-                .collect(),
-            votes: value.votes,
-            end_time: value.end_time,
-            has_been_edited: value.has_been_edited,
         }
     }
 }

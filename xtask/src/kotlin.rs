@@ -2,10 +2,10 @@ use std::fs::create_dir_all;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand, ValueEnum};
-use uniffi_bindgen::{bindings::TargetLanguage, library_mode::generate_bindings};
-use xshell::{cmd, pushd};
+use uniffi_bindgen::{bindings::KotlinBindingGenerator, library_mode::generate_bindings};
+use xshell::cmd;
 
-use crate::{workspace, Result};
+use crate::{sh, workspace, Result};
 
 struct PackageValues {
     name: &'static str,
@@ -59,7 +59,8 @@ enum KotlinCommand {
 
 impl KotlinArgs {
     pub fn run(self) -> Result<()> {
-        let _p = pushd(workspace::root_path()?)?;
+        let sh = sh();
+        let _p = sh.push_dir(workspace::root_path()?);
 
         match self.cmd {
             KotlinCommand::BuildAndroidLibrary {
@@ -70,7 +71,7 @@ impl KotlinArgs {
                 package,
             } => {
                 let profile = profile.as_deref().unwrap_or(if release { "release" } else { "dev" });
-                build_android_library(profile, only_target, src_dir, package)
+                build_android_library(profile, only_target, &src_dir, package)
             }
         }
     }
@@ -79,7 +80,7 @@ impl KotlinArgs {
 fn build_android_library(
     profile: &str,
     only_target: Option<String>,
-    src_dir: Utf8PathBuf,
+    src_dir: &Utf8Path,
     package: Package,
 ) -> Result<()> {
     let package_values = package.values();
@@ -120,14 +121,7 @@ fn build_android_library(
 fn generate_uniffi_bindings(library_path: &Utf8Path, ffi_generated_dir: &Utf8Path) -> Result<()> {
     println!("-- library_path = {library_path}");
 
-    generate_bindings(
-        library_path,
-        None,
-        &[TargetLanguage::Kotlin],
-        None,
-        ffi_generated_dir,
-        false,
-    )?;
+    generate_bindings(library_path, None, &KotlinBindingGenerator, None, ffi_generated_dir, false)?;
     Ok(())
 }
 
@@ -137,8 +131,12 @@ fn build_for_android_target(
     dest_dir: &str,
     package_name: &str,
 ) -> Result<Utf8PathBuf> {
-    cmd!("cargo ndk --target {target} -o {dest_dir} build --profile {profile} -p {package_name}")
-        .run()?;
+    let sh = sh();
+    cmd!(
+        sh,
+        "cargo ndk --target {target} -o {dest_dir} build --profile {profile} -p {package_name}"
+    )
+    .run()?;
 
     // The builtin dev profile has its files stored under target/debug, all
     // other targets have matching directory names

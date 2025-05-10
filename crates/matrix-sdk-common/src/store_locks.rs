@@ -46,11 +46,12 @@ use std::{
     time::Duration,
 };
 
-use tokio::{sync::Mutex, time::sleep};
-use tracing::instrument;
+use tokio::sync::Mutex;
+use tracing::{debug, error, instrument, trace};
 
 use crate::{
     executor::{spawn, JoinHandle},
+    sleep::sleep,
     SendOutsideWasm,
 };
 
@@ -58,7 +59,7 @@ use crate::{
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait BackingStore {
-    type Error: Error + Send + Sync;
+    type LockError: Error + Send + Sync;
 
     /// Try to take a lock using the given store.
     async fn try_lock(
@@ -66,7 +67,7 @@ pub trait BackingStore {
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> Result<bool, Self::Error>;
+    ) -> Result<bool, Self::LockError>;
 }
 
 /// Small state machine to handle wait times.
@@ -180,7 +181,7 @@ impl<S: BackingStore + Clone + SendOutsideWasm + 'static> CrossProcessStoreLock<
             // decrement `num_holders`. That's fine because that means the lock
             // was taken by at least one thread, and after this call it will be
             // taken by at least one thread.
-            tracing::trace!("We already had the lock, incrementing holder count");
+            trace!("We already had the lock, incrementing holder count");
             self.num_holders.fetch_add(1, atomic::Ordering::SeqCst);
             let guard = CrossProcessStoreLockGuard { num_holders: self.num_holders.clone() };
             return Ok(Some(guard));
@@ -193,11 +194,11 @@ impl<S: BackingStore + Clone + SendOutsideWasm + 'static> CrossProcessStoreLock<
             .map_err(|err| LockStoreError::BackingStoreError(Box::new(err)))?;
 
         if !acquired {
-            tracing::trace!("Couldn't acquire the lock immediately.");
+            trace!("Couldn't acquire the lock immediately.");
             return Ok(None);
         }
 
-        tracing::trace!("Acquired the lock, spawning the lease extension task.");
+        trace!("Acquired the lock, spawning the lease extension task.");
 
         // This is the first time we've acquired the lock. We're going to spawn the task
         // that will renew the lease.
@@ -214,7 +215,10 @@ impl<S: BackingStore + Clone + SendOutsideWasm + 'static> CrossProcessStoreLock<
 
         if let Some(_prev) = renew_task.take() {
             #[cfg(not(target_arch = "wasm32"))]
-            _prev.abort();
+            if !_prev.is_finished() {
+                trace!("aborting the previous renew task");
+                _prev.abort();
+            }
         }
 
         // Restart a new one.
@@ -234,7 +238,7 @@ impl<S: BackingStore + Clone + SendOutsideWasm + 'static> CrossProcessStoreLock<
 
                     // If there are no more users, we can quit.
                     if this.num_holders.load(atomic::Ordering::SeqCst) == 0 {
-                        tracing::info!("exiting the lease extension loop");
+                        trace!("exiting the lease extension loop");
 
                         // Cancel the lease with another 0ms lease.
                         // If we don't get the lock, that's (weird but) fine.
@@ -250,7 +254,7 @@ impl<S: BackingStore + Clone + SendOutsideWasm + 'static> CrossProcessStoreLock<
 
                 let fut = this.store.try_lock(LEASE_DURATION_MS, &this.lock_key, &this.lock_holder);
                 if let Err(err) = fut.await {
-                    tracing::error!("error when extending lock lease: {err:#}");
+                    error!("error when extending lock lease: {err:#}");
                     // Exit the loop.
                     break;
                 }
@@ -307,7 +311,7 @@ impl<S: BackingStore + Clone + SendOutsideWasm + 'static> CrossProcessStoreLock<
                 }
             };
 
-            tracing::debug!("Waiting {wait} before re-attempting to take the lock");
+            debug!("Waiting {wait} before re-attempting to take the lock");
             sleep(Duration::from_millis(wait.into())).await;
         }
     }
@@ -335,59 +339,30 @@ pub enum LockStoreError {
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{atomic, Arc, Mutex},
+        sync::{atomic, Arc, RwLock},
         time::Instant,
     };
 
     use assert_matches::assert_matches;
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_test_macros::async_test;
     use tokio::{
         spawn,
         time::{sleep, Duration},
     };
 
     use super::{
-        BackingStore, CrossProcessStoreLock, CrossProcessStoreLockGuard, LockStoreError,
-        EXTEND_LEASE_EVERY_MS,
+        memory_store_helper::try_take_leased_lock, BackingStore, CrossProcessStoreLock,
+        CrossProcessStoreLockGuard, LockStoreError, EXTEND_LEASE_EVERY_MS,
     };
 
     #[derive(Clone, Default)]
     struct TestStore {
-        leases: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+        leases: Arc<RwLock<HashMap<String, (String, Instant)>>>,
     }
 
     impl TestStore {
         fn try_take_leased_lock(&self, lease_duration_ms: u32, key: &str, holder: &str) -> bool {
-            let now = Instant::now();
-            let expiration = now + Duration::from_millis(lease_duration_ms.into());
-            let mut leases = self.leases.lock().unwrap();
-            if let Some(prev) = leases.get_mut(key) {
-                if prev.0 == holder {
-                    // We had the lease before, extend it.
-                    prev.1 = expiration;
-                    true
-                } else {
-                    // We didn't have it.
-                    if prev.1 < now {
-                        // Steal it!
-                        prev.0 = holder.to_owned();
-                        prev.1 = expiration;
-                        true
-                    } else {
-                        // We tried our best.
-                        false
-                    }
-                }
-            } else {
-                leases.insert(
-                    key.to_owned(),
-                    (
-                        holder.to_owned(),
-                        Instant::now() + Duration::from_millis(lease_duration_ms.into()),
-                    ),
-                );
-                true
-            }
+            try_take_leased_lock(&mut self.leases.write().unwrap(), lease_duration_ms, key, holder)
         }
     }
 
@@ -397,7 +372,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl BackingStore for TestStore {
-        type Error = DummyError;
+        type LockError = DummyError;
 
         /// Try to take a lock using the given store.
         async fn try_lock(
@@ -405,7 +380,7 @@ mod tests {
             lease_duration_ms: u32,
             key: &str,
             holder: &str,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<bool, Self::LockError> {
             Ok(self.try_take_leased_lock(lease_duration_ms, key, holder))
         }
     }
@@ -520,5 +495,59 @@ mod tests {
         assert_matches!(lock1.spin_lock(Some(200)).await, Err(LockStoreError::LockTimeout));
 
         Ok(())
+    }
+}
+
+/// Some code that is shared by almost all `MemoryStore` implementations out
+/// there.
+pub mod memory_store_helper {
+    use std::collections::{hash_map::Entry, HashMap};
+
+    use ruma::time::{Duration, Instant};
+
+    pub fn try_take_leased_lock(
+        leases: &mut HashMap<String, (String, Instant)>,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> bool {
+        let now = Instant::now();
+        let expiration = now + Duration::from_millis(lease_duration_ms.into());
+
+        match leases.entry(key.to_owned()) {
+            // There is an existing holder.
+            Entry::Occupied(mut entry) => {
+                let (current_holder, current_expiration) = entry.get_mut();
+
+                if current_holder == holder {
+                    // We had the lease before, extend it.
+                    *current_expiration = expiration;
+
+                    true
+                } else {
+                    // We didn't have it.
+                    if *current_expiration < now {
+                        // Steal it!
+                        *current_holder = holder.to_owned();
+                        *current_expiration = expiration;
+
+                        true
+                    } else {
+                        // We tried our best.
+                        false
+                    }
+                }
+            }
+
+            // There is no holder, easy.
+            Entry::Vacant(entry) => {
+                entry.insert((
+                    holder.to_owned(),
+                    Instant::now() + Duration::from_millis(lease_duration_ms.into()),
+                ));
+
+                true
+            }
+        }
     }
 }

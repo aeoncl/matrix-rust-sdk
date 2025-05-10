@@ -4,8 +4,8 @@ use std::{
 };
 
 use matrix_sdk::{
+    authentication::matrix::MatrixSession,
     config::SyncSettings,
-    matrix_auth::MatrixSession,
     ruma::{
         api::client::filter::FilterDefinition,
         events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         (login(&data_dir, &session_file).await?, None)
     };
 
-    sync(client, sync_token, &session_file).await.map_err(Into::into)
+    sync(client, sync_token, &session_file).await
 }
 
 /// Restore a previous session.

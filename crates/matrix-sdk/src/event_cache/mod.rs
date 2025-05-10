@@ -18,54 +18,53 @@
 //! doesn't require subscribing to a specific room to get access to this
 //! information.
 //!
-//! It's intended to be fast, robust and easy to maintain.
+//! It's intended to be fast, robust and easy to maintain, having learned from
+//! previous endeavours at implementing middle to high level features elsewhere
+//! in the SDK, notably in the UI's Timeline object.
 //!
-//! See the [github issue](https://github.com/matrix-org/matrix-rust-sdk/issues/3058) for more details about the historical reasons that led us to start writing this.
-//!
-//! Most of it is still a work-in-progress, as of 2024-01-22.
-//!
-//! The desired set of features it may eventually implement is the following:
-//!
-//! - [ ] compute proper unread room counts, and use backpagination to get
-//!   missing messages/notifications/mentions, if needs be.
-//! - [ ] expose that information with a new data structure similar to the
-//!   `RoomInfo`, and that may update a `RoomListService`.
-//! - [ ] provide read receipts for each message.
-//! - [ ] backwards and forward pagination, and reconcile results with cached
-//!   timelines.
-//! - [ ] retry decryption upon receiving new keys (from an encryption sync
-//!   service or from a key backup).
-//! - [ ] expose the latest event for a given room.
-//! - [ ] caching of events on-disk.
+//! See the [github issue](https://github.com/matrix-org/matrix-rust-sdk/issues/3058) for more
+//! details about the historical reasons that led us to start writing this.
 
 #![forbid(missing_docs)]
 
 use std::{
     collections::BTreeMap,
     fmt::Debug,
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, OnceLock},
 };
 
+use eyeball::{SharedObservable, Subscriber};
+use eyeball_im::VectorDiff;
+use futures_util::future::{join_all, try_join_all};
 use matrix_sdk_base::{
-    deserialized_responses::{AmbiguityChange, SyncTimelineEvent},
-    sync::{JoinedRoomUpdate, LeftRoomUpdate, RoomUpdates, Timeline},
+    deserialized_responses::{AmbiguityChange, TimelineEvent},
+    event_cache::store::{EventCacheStoreError, EventCacheStoreLock},
+    linked_chunk::lazy_loader::LazyLoaderError,
+    store_locks::LockStoreError,
+    sync::RoomUpdates,
 };
 use matrix_sdk_common::executor::{spawn, JoinHandle};
+use once_cell::sync::OnceCell;
+use room::RoomEventCacheState;
 use ruma::{
-    events::{AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent},
-    serde::Raw,
-    OwnedEventId, OwnedRoomId, RoomId,
+    events::AnySyncEphemeralRoomEvent, serde::Raw, OwnedEventId, OwnedRoomId, RoomId, RoomVersionId,
 };
 use tokio::sync::{
-    broadcast::{error::RecvError, Receiver, Sender},
-    Mutex, RwLock,
+    broadcast::{error::RecvError, Receiver},
+    mpsc, Mutex, RwLock,
 };
-use tracing::{error, trace};
+use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument as _, Span};
 
-use self::store::{EventCacheStore, MemoryStore};
-use crate::{client::ClientInner, Client, Room};
+use self::paginator::PaginatorError;
+use crate::{client::WeakClient, Client};
 
-mod store;
+mod deduplicator;
+mod pagination;
+mod room;
+
+pub mod paginator;
+pub use pagination::{PaginationToken, RoomPagination, RoomPaginationStatus};
+pub use room::{RoomEventCache, RoomEventCacheListener};
 
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Debug)]
@@ -77,18 +76,35 @@ pub enum EventCacheError {
     )]
     NotSubscribedYet,
 
-    /// The room hasn't been found in the client.
-    ///
-    /// Technically, it's possible to request a `RoomEventCache` for a room that
-    /// is not known to the client, leading to this error.
-    #[error("Room {0} hasn't been found in the Client.")]
-    RoomNotFound(OwnedRoomId),
+    /// An error has been observed while back-paginating.
+    #[error(transparent)]
+    BackpaginationError(#[from] PaginatorError),
+
+    /// Back-pagination was already happening in a given room, where we tried to
+    /// back-paginate again.
+    #[error("We were already back-paginating.")]
+    AlreadyBackpaginating,
+
+    /// An error happening when interacting with storage.
+    #[error(transparent)]
+    Storage(#[from] EventCacheStoreError),
+
+    /// An error happening when attempting to (cross-process) lock storage.
+    #[error(transparent)]
+    LockingStorage(#[from] LockStoreError),
 
     /// The [`EventCache`] owns a weak reference to the [`Client`] it pertains
     /// to. It's possible this weak reference points to nothing anymore, at
     /// times where we try to use the client.
     #[error("The owning client of the event cache has been dropped.")]
     ClientDropped,
+
+    /// An error happening when interacting with the [`LinkedChunk`]'s lazy
+    /// loader.
+    ///
+    /// [`LinkedChunk`]: matrix_sdk_common::linked_chunk::LinkedChunk
+    #[error(transparent)]
+    LinkedChunkLoader(#[from] LazyLoaderError),
 }
 
 /// A result using the [`EventCacheError`].
@@ -96,7 +112,14 @@ pub type Result<T> = std::result::Result<T, EventCacheError>;
 
 /// Hold handles to the tasks spawn by a [`RoomEventCache`].
 pub struct EventCacheDropHandles {
+    /// Task that listens to room updates.
     listen_updates_task: JoinHandle<()>,
+
+    /// Task that listens to updates to the user's ignored list.
+    ignore_user_list_update_task: JoinHandle<()>,
+
+    /// The task used to automatically shrink the linked chunks.
+    auto_shrink_linked_chunk_task: JoinHandle<()>,
 }
 
 impl Debug for EventCacheDropHandles {
@@ -108,6 +131,8 @@ impl Debug for EventCacheDropHandles {
 impl Drop for EventCacheDropHandles {
     fn drop(&mut self) {
         self.listen_updates_task.abort();
+        self.ignore_user_list_update_task.abort();
+        self.auto_shrink_linked_chunk_task.abort();
     }
 }
 
@@ -130,17 +155,34 @@ impl Debug for EventCache {
 
 impl EventCache {
     /// Create a new [`EventCache`] for the given client.
-    pub(crate) fn new(client: &Arc<ClientInner>) -> Self {
-        let store = Arc::new(MemoryStore::new());
-        let inner = Arc::new(EventCacheInner {
-            client: Arc::downgrade(client),
-            by_room: Default::default(),
-            store,
-            process_lock: Default::default(),
-            drop_handles: Default::default(),
-        });
+    pub(crate) fn new(client: WeakClient) -> Self {
+        Self {
+            inner: Arc::new(EventCacheInner {
+                client,
+                store: Default::default(),
+                multiple_room_updates_lock: Default::default(),
+                by_room: Default::default(),
+                drop_handles: Default::default(),
+                auto_shrink_sender: Default::default(),
+            }),
+        }
+    }
 
-        Self { inner }
+    /// Enable storing updates to storage, and reload events from storage.
+    ///
+    /// Has an effect only the first time it's called. It's safe to call it
+    /// multiple times.
+    pub fn enable_storage(&self) -> Result<()> {
+        let _ = self.inner.store.get_or_try_init::<_, EventCacheError>(|| {
+            let client = self.inner.client()?;
+            Ok(client.event_cache_store().clone())
+        })?;
+        Ok(())
+    }
+
+    /// Check whether the storage is enabled or not.
+    pub fn has_storage(&self) -> bool {
+        self.inner.has_storage()
     }
 
     /// Starts subscribing the [`EventCache`] to sync responses, if not done
@@ -153,16 +195,56 @@ impl EventCache {
 
         let _ = self.inner.drop_handles.get_or_init(|| {
             // Spawn the task that will listen to all the room updates at once.
-            let room_updates_feed = client.subscribe_to_all_room_updates();
-            let listen_updates_task =
-                spawn(Self::listen_task(self.inner.clone(), room_updates_feed));
+            let listen_updates_task = spawn(Self::listen_task(
+                self.inner.clone(),
+                client.subscribe_to_all_room_updates(),
+            ));
 
-            Arc::new(EventCacheDropHandles { listen_updates_task })
+            let ignore_user_list_update_task = spawn(Self::ignore_user_list_update_task(
+                self.inner.clone(),
+                client.subscribe_to_ignore_user_list_changes(),
+            ));
+
+            let (tx, rx) = mpsc::channel(32);
+
+            // Force-initialize the sender in the [`RoomEventCacheInner`].
+            self.inner.auto_shrink_sender.get_or_init(|| tx);
+
+            let auto_shrink_linked_chunk_tasks =
+                spawn(Self::auto_shrink_linked_chunk_task(self.inner.clone(), rx));
+
+            Arc::new(EventCacheDropHandles {
+                listen_updates_task,
+                ignore_user_list_update_task,
+                auto_shrink_linked_chunk_task: auto_shrink_linked_chunk_tasks,
+            })
         });
 
         Ok(())
     }
 
+    #[instrument(skip_all)]
+    async fn ignore_user_list_update_task(
+        inner: Arc<EventCacheInner>,
+        mut ignore_user_list_stream: Subscriber<Vec<String>>,
+    ) {
+        let span = info_span!(parent: Span::none(), "ignore_user_list_update_task");
+        span.follows_from(Span::current());
+
+        async move {
+            while ignore_user_list_stream.next().await.is_some() {
+                info!("Received an ignore user list change");
+                if let Err(err) = inner.clear_all_rooms().await {
+                    error!("when clearing room storage after ignore user list change: {err}");
+                }
+            }
+            info!("Ignore user list stream has closed");
+        }
+        .instrument(span)
+        .await;
+    }
+
+    #[instrument(skip_all)]
     async fn listen_task(
         inner: Arc<EventCacheInner>,
         mut room_updates_feed: Receiver<RoomUpdates>,
@@ -175,6 +257,7 @@ impl EventCache {
                         match err {
                             EventCacheError::ClientDropped => {
                                 // The client has dropped, exit the listen task.
+                                info!("Closing the event cache global listen task because client dropped");
                                 break;
                             }
                             err => {
@@ -184,29 +267,89 @@ impl EventCache {
                     }
                 }
 
-                Err(RecvError::Lagged(_)) => {
+                Err(RecvError::Lagged(num_skipped)) => {
                     // Forget everything we know; we could have missed events, and we have
                     // no way to reconcile at the moment!
                     // TODO: implement Smart Matching™,
-                    let mut by_room = inner.by_room.write().await;
-                    for room_id in by_room.keys() {
-                        if let Err(err) = inner.store.clear_room_events(room_id).await {
-                            error!("unable to clear room after room updates lag: {err}");
-                        }
+                    warn!(num_skipped, "Lagged behind room updates, clearing all rooms");
+                    if let Err(err) = inner.clear_all_rooms().await {
+                        error!("when clearing storage after lag in listen_task: {err}");
                     }
-                    by_room.clear();
                 }
 
                 Err(RecvError::Closed) => {
                     // The sender has shut down, exit.
+                    info!("Closing the event cache global listen task because receiver closed");
                     break;
                 }
             }
         }
     }
 
+    /// Spawns the task that will listen to auto-shrink notifications.
+    ///
+    /// The auto-shrink mechanism works this way:
+    ///
+    /// - Each time there's a new subscriber to a [`RoomEventCache`], it will
+    ///   increment the active number of listeners to that room, aka
+    ///   [`RoomEventCacheState::listener_count`].
+    /// - When that subscriber is dropped, it will decrement that count; and
+    ///   notify the task below if it reached 0.
+    /// - The task spawned here, owned by the [`EventCacheInner`], will listen
+    ///   to such notifications that a room may be shrunk. It will attempt an
+    ///   auto-shrink, by letting the inner state decide whether this is a good
+    ///   time to do so (new listeners might have spawned in the meanwhile).
+    #[instrument(skip_all)]
+    async fn auto_shrink_linked_chunk_task(
+        inner: Arc<EventCacheInner>,
+        mut rx: mpsc::Receiver<AutoShrinkChannelPayload>,
+    ) {
+        while let Some(room_id) = rx.recv().await {
+            trace!(for_room = %room_id, "received notification to shrink");
+
+            let room = match inner.for_room(&room_id).await {
+                Ok(room) => room,
+                Err(err) => {
+                    warn!(for_room = %room_id, "error when getting a RoomEventCache: {err}");
+                    continue;
+                }
+            };
+
+            trace!("waiting for state lock…");
+            let mut state = room.inner.state.write().await;
+
+            match state.auto_shrink_if_no_listeners().await {
+                Ok(diffs) => {
+                    if let Some(diffs) = diffs {
+                        // Hey, fun stuff: we shrunk the linked chunk, so there shouldn't be any
+                        // listeners, right? RIGHT? Especially because the state is guarded behind
+                        // a lock.
+                        //
+                        // However, better safe than sorry, and it's cheap to send an update here,
+                        // so let's do it!
+                        if !diffs.is_empty() {
+                            let _ = room.inner.sender.send(
+                                RoomEventCacheUpdate::UpdateTimelineEvents {
+                                    diffs,
+                                    origin: EventsOrigin::Cache,
+                                },
+                            );
+                        }
+                    } else {
+                        debug!("auto-shrinking didn't happen");
+                    }
+                }
+
+                Err(err) => {
+                    // There's not much we can do here, unfortunately.
+                    warn!(for_room = %room_id, "error when attempting to shrink linked chunk: {err}");
+                }
+            }
+        }
+    }
+
     /// Return a room-specific view over the [`EventCache`].
-    pub async fn for_room(
+    pub(crate) async fn for_room(
         &self,
         room_id: &RoomId,
     ) -> Result<(RoomEventCache, Arc<EventCacheDropHandles>)> {
@@ -219,24 +362,51 @@ impl EventCache {
         Ok((room, drop_handles))
     }
 
+    /// Cleanly clear all the rooms' event caches.
+    ///
+    /// This will notify any live observers that the room has been cleared.
+    pub async fn clear_all_rooms(&self) -> Result<()> {
+        self.inner.clear_all_rooms().await
+    }
+
     /// Add an initial set of events to the event cache, reloaded from a cache.
     ///
     /// TODO: temporary for API compat, as the event cache should take care of
     /// its own store.
+    #[instrument(skip(self, events))]
     pub async fn add_initial_events(
         &self,
         room_id: &RoomId,
-        events: Vec<SyncTimelineEvent>,
+        events: Vec<TimelineEvent>,
+        prev_batch: Option<String>,
     ) -> Result<()> {
+        // If the event cache's storage has been enabled, do nothing.
+        if self.inner.has_storage() {
+            return Ok(());
+        }
+
         let room_cache = self.inner.for_room(room_id).await?;
+
+        // If the linked chunked already has at least one event, ignore this request, as
+        // it should happen at most once per room.
+        if !room_cache.inner.state.read().await.events().is_empty() {
+            return Ok(());
+        }
 
         // We could have received events during a previous sync; remove them all, since
         // we can't know where to insert the "initial events" with respect to
         // them.
-        self.inner.store.clear_room_events(room_id).await?;
-        let _ = room_cache.inner.sender.send(RoomEventCacheUpdate::Clear);
 
-        room_cache.inner.append_events(events).await?;
+        room_cache
+            .inner
+            .replace_all_events_by(
+                events,
+                prev_batch,
+                Default::default(),
+                Default::default(),
+                EventsOrigin::Cache,
+            )
+            .await?;
 
         Ok(())
     }
@@ -245,53 +415,149 @@ impl EventCache {
 struct EventCacheInner {
     /// A weak reference to the inner client, useful when trying to get a handle
     /// on the owning client.
-    client: Weak<ClientInner>,
+    client: WeakClient,
+
+    /// Reference to the underlying store.
+    ///
+    /// Set to none if we shouldn't use storage for reading / writing linked
+    /// chunks.
+    store: Arc<OnceCell<EventCacheStoreLock>>,
+
+    /// A lock used when many rooms must be updated at once.
+    ///
+    /// [`Mutex`] is “fair”, as it is implemented as a FIFO. It is important to
+    /// ensure that multiple updates will be applied in the correct order, which
+    /// is enforced by taking this lock when handling an update.
+    // TODO: that's the place to add a cross-process lock!
+    multiple_room_updates_lock: Mutex<()>,
 
     /// Lazily-filled cache of live [`RoomEventCache`], once per room.
     by_room: RwLock<BTreeMap<OwnedRoomId, RoomEventCache>>,
 
-    /// Backend used for storage.
-    store: Arc<dyn EventCacheStore>,
-
-    /// A lock to make sure that despite multiple updates coming to the
-    /// `EventCache`, it will only handle one at a time.
-    ///
-    /// [`Mutex`] is “fair”, as it is implemented as a FIFO. It is important to
-    /// ensure that multiple updates will be applied in the correct order.
-    process_lock: Mutex<()>,
-
     /// Handles to keep alive the task listening to updates.
     drop_handles: OnceLock<Arc<EventCacheDropHandles>>,
+
+    /// A sender for notifications that a room *may* need to be auto-shrunk.
+    ///
+    /// Needs to live here, so it may be passed to each [`RoomEventCache`]
+    /// instance.
+    ///
+    /// See doc comment of [`EventCache::auto_shrink_linked_chunk_task`].
+    auto_shrink_sender: OnceLock<mpsc::Sender<AutoShrinkChannelPayload>>,
 }
+
+type AutoShrinkChannelPayload = OwnedRoomId;
 
 impl EventCacheInner {
     fn client(&self) -> Result<Client> {
-        Ok(Client { inner: self.client.upgrade().ok_or(EventCacheError::ClientDropped)? })
+        self.client.get().ok_or(EventCacheError::ClientDropped)
+    }
+
+    /// Has persistent storage been enabled for the event cache?
+    fn has_storage(&self) -> bool {
+        self.store.get().is_some()
+    }
+
+    /// Clears all the room's data.
+    async fn clear_all_rooms(&self) -> Result<()> {
+        // Okay, here's where things get complicated.
+        //
+        // On the one hand, `by_room` may include storage for *some* rooms that we know
+        // about, but not *all* of them. Any room that hasn't been loaded in the
+        // client, or touched by a sync, will remain unloaded in memory, so it
+        // will be missing from `self.by_room`. As a result, we need to make
+        // sure that we're hitting the storage backend to *really* clear all the
+        // rooms, including those that haven't been loaded yet.
+        //
+        // On the other hand, one must NOT clear the `by_room` map, because if someone
+        // subscribed to a room update, they would never get any new update for
+        // that room, since re-creating the `RoomEventCache` would create a new,
+        // unrelated sender.
+        //
+        // So we need to *keep* the rooms in `by_room` alive, while clearing them in the
+        // store backend.
+        //
+        // As a result, for a short while, the in-memory linked chunks
+        // will be desynchronized from the storage. We need to be careful then. During
+        // that short while, we don't want *anyone* to touch the linked chunk
+        // (be it in memory or in the storage).
+        //
+        // And since that requirement applies to *any* room in `by_room` at the same
+        // time, we'll have to take the locks for *all* the live rooms, so as to
+        // properly clear the underlying storage.
+        //
+        // At this point, you might be scared about the potential for deadlocking. I am
+        // as well, but I'm convinced we're fine:
+        // 1. the lock for `by_room` is usually held only for a short while, and
+        //    independently of the other two kinds.
+        // 2. the state may acquire the store cross-process lock internally, but only
+        //    while the state's methods are called (so it's always transient). As a
+        //    result, as soon as we've acquired the state locks, the store lock ought to
+        //    be free.
+        // 3. The store lock is held explicitly only in a small scoped area below.
+        // 4. Then the store lock will be held internally when calling `reset()`, but at
+        //    this point it's only held for a short while each time, so rooms will take
+        //    turn to acquire it.
+
+        let rooms = self.by_room.write().await;
+
+        // Collect all the rooms' state locks, first: we can clear the storage only when
+        // nobody will touch it at the same time.
+        let room_locks = join_all(
+            rooms.values().map(|room| async move { (room, room.inner.state.write().await) }),
+        )
+        .await;
+
+        // Clear the storage for all the rooms, using the storage facility.
+        if let Some(store) = self.store.get() {
+            let store_guard = store.lock().await?;
+            store_guard.clear_all_rooms_chunks().await?;
+        }
+
+        // At this point, all the in-memory linked chunks are desynchronized from the
+        // storage. Resynchronize them manually by calling reset(), and
+        // propagate updates to observers.
+        try_join_all(room_locks.into_iter().map(|(room, mut state_guard)| async move {
+            let updates_as_vector_diffs = state_guard.reset().await?;
+            let _ = room.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
+                diffs: updates_as_vector_diffs,
+                origin: EventsOrigin::Cache,
+            });
+            Ok::<_, EventCacheError>(())
+        }))
+        .await?;
+
+        Ok(())
     }
 
     /// Handles a single set of room updates at once.
+    #[instrument(skip(self, updates))]
     async fn handle_room_updates(&self, updates: RoomUpdates) -> Result<()> {
         // First, take the lock that indicates we're processing updates, to avoid
         // handling multiple updates concurrently.
-        let _process_lock = self.process_lock.lock().await;
+        let _lock = self.multiple_room_updates_lock.lock().await;
 
         // Left rooms.
-        for (room_id, left_room_update) in updates.leave {
+        for (room_id, left_room_update) in updates.left {
             let room = self.for_room(&room_id).await?;
 
-            if let Err(err) = room.inner.handle_left_room_update(left_room_update).await {
+            if let Err(err) =
+                room.inner.handle_left_room_update(self.has_storage(), left_room_update).await
+            {
                 // Non-fatal error, try to continue to the next room.
                 error!("handling left room update: {err}");
             }
         }
 
         // Joined rooms.
-        for (room_id, joined_room_update) in updates.join {
+        for (room_id, joined_room_update) in updates.joined {
             let room = self.for_room(&room_id).await?;
 
-            if let Err(err) = room.inner.handle_joined_room_update(joined_room_update).await {
+            if let Err(err) =
+                room.inner.handle_joined_room_update(self.has_storage(), joined_room_update).await
+            {
                 // Non-fatal error, try to continue to the next room.
-                error!("handling joined room update: {err}");
+                error!(%room_id, "handling joined room update: {err}");
             }
         }
 
@@ -303,7 +569,8 @@ impl EventCacheInner {
 
     /// Return a room-specific view over the [`EventCache`].
     ///
-    /// It may not be found, if the room isn't known to the client.
+    /// It may not be found, if the room isn't known to the client, in which
+    /// case it'll return None.
     async fn for_room(&self, room_id: &RoomId) -> Result<RoomEventCache> {
         // Fast path: the entry exists; let's acquire a read lock, it's cheaper than a
         // write lock.
@@ -323,12 +590,42 @@ impl EventCacheInner {
                     return Ok(room.clone());
                 }
 
-                let room = self
-                    .client()?
-                    .get_room(room_id)
-                    .ok_or_else(|| EventCacheError::RoomNotFound(room_id.to_owned()))?;
+                let pagination_status =
+                    SharedObservable::new(RoomPaginationStatus::Idle { hit_timeline_start: false });
 
-                let room_event_cache = RoomEventCache::new(room, self.store.clone());
+                let room_version = self
+                    .client
+                    .get()
+                    .and_then(|client| client.get_room(room_id))
+                    .as_ref()
+                    .map(|room| room.clone_info().room_version_or_default())
+                    .unwrap_or_else(|| {
+                        warn!("unknown room version for {room_id}, using default V1");
+                        RoomVersionId::V1
+                    });
+
+                let room_state = RoomEventCacheState::new(
+                    room_id.to_owned(),
+                    room_version,
+                    self.store.clone(),
+                    pagination_status.clone(),
+                )
+                .await?;
+
+                // SAFETY: we must have subscribed before reaching this coed, otherwise
+                // something is very wrong.
+                let auto_shrink_sender =
+                    self.auto_shrink_sender.get().cloned().expect(
+                        "we must have called `EventCache::subscribe()` before calling here.",
+                    );
+
+                let room_event_cache = RoomEventCache::new(
+                    self.client.clone(),
+                    room_state,
+                    pagination_status,
+                    room_id.to_owned(),
+                    auto_shrink_sender,
+                );
 
                 by_room_guard.insert(room_id.to_owned(), room_event_cache.clone());
 
@@ -338,148 +635,247 @@ impl EventCacheInner {
     }
 }
 
-/// A subset of an event cache, for a room.
-///
-/// Cloning is shallow, and thus is cheap to do.
-#[derive(Clone)]
-pub struct RoomEventCache {
-    inner: Arc<RoomEventCacheInner>,
-}
+/// The result of a single back-pagination request.
+#[derive(Debug)]
+pub struct BackPaginationOutcome {
+    /// Did the back-pagination reach the start of the timeline?
+    pub reached_start: bool,
 
-impl Debug for RoomEventCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoomEventCache").finish_non_exhaustive()
-    }
-}
-
-impl RoomEventCache {
-    /// Create a new [`RoomEventCache`] using the given room and store.
-    fn new(room: Room, store: Arc<dyn EventCacheStore>) -> Self {
-        Self { inner: Arc::new(RoomEventCacheInner::new(room, store)) }
-    }
-
-    /// Subscribe to room updates for this room, after getting the initial list
-    /// of events. XXX: Could/should it use some kind of `Observable`
-    /// instead? Or not something async, like explicit handlers as our event
-    /// handlers?
-    pub async fn subscribe(
-        &self,
-    ) -> Result<(Vec<SyncTimelineEvent>, Receiver<RoomEventCacheUpdate>)> {
-        Ok((
-            self.inner.store.room_events(self.inner.room.room_id()).await?,
-            self.inner.sender.subscribe(),
-        ))
-    }
-}
-
-/// The (non-clonable) details of the `RoomEventCache`.
-struct RoomEventCacheInner {
-    /// Sender part for subscribers to this room.
-    sender: Sender<RoomEventCacheUpdate>,
-
-    /// A pointer to the store implementation used for this event cache.
-    store: Arc<dyn EventCacheStore>,
-
-    /// The Client [`Room`] this event cache pertains to.
-    room: Room,
-}
-
-impl RoomEventCacheInner {
-    /// Creates a new cache for a room, and subscribes to room updates, so as
-    /// to handle new timeline events.
-    fn new(room: Room, store: Arc<dyn EventCacheStore>) -> Self {
-        let sender = Sender::new(32);
-        Self { room, store, sender }
-    }
-
-    async fn handle_joined_room_update(&self, updates: JoinedRoomUpdate) -> Result<()> {
-        self.handle_timeline(
-            updates.timeline,
-            updates.ephemeral.clone(),
-            updates.account_data,
-            updates.ambiguity_changes,
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn handle_timeline(
-        &self,
-        timeline: Timeline,
-        ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
-        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
-        ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
-    ) -> Result<()> {
-        if timeline.limited {
-            // Ideally we'd try to reconcile existing events against those received in the
-            // timeline, but we're not there yet. In the meanwhile, clear the
-            // items from the room. TODO: implement Smart Matching™.
-            trace!("limited timeline, clearing all previous events");
-            self.store.clear_room_events(self.room.room_id()).await?;
-            let _ = self.sender.send(RoomEventCacheUpdate::Clear);
-        }
-
-        // Add all the events to the backend.
-        trace!("adding new events");
-        self.store.add_room_events(self.room.room_id(), timeline.events.clone()).await?;
-
-        // Propagate events to observers.
-        let _ = self.sender.send(RoomEventCacheUpdate::Append {
-            events: timeline.events,
-            prev_batch: timeline.prev_batch,
-            ephemeral,
-            account_data,
-            ambiguity_changes,
-        });
-
-        Ok(())
-    }
-
-    async fn handle_left_room_update(&self, updates: LeftRoomUpdate) -> Result<()> {
-        self.handle_timeline(updates.timeline, Vec::new(), Vec::new(), updates.ambiguity_changes)
-            .await?;
-        Ok(())
-    }
-
-    /// Append a set of events to the room cache and storage, notifying
-    /// observers.
-    async fn append_events(&self, events: Vec<SyncTimelineEvent>) -> Result<()> {
-        self.store.add_room_events(self.room.room_id(), events.clone()).await?;
-
-        let _ = self.sender.send(RoomEventCacheUpdate::Append {
-            events,
-            prev_batch: None,
-            account_data: Default::default(),
-            ephemeral: Default::default(),
-            ambiguity_changes: Default::default(),
-        });
-
-        Ok(())
-    }
+    /// All the events that have been returned in the back-pagination
+    /// request.
+    ///
+    /// Events are presented in reverse order: the first element of the vec,
+    /// if present, is the most "recent" event from the chunk (or
+    /// technically, the last one in the topological ordering).
+    pub events: Vec<TimelineEvent>,
 }
 
 /// An update related to events happened in a room.
 #[derive(Debug, Clone)]
 pub enum RoomEventCacheUpdate {
-    /// The room has been cleared from events.
-    Clear,
-    /// The room has new events.
-    Append {
-        /// All the new events that have been added to the room.
-        events: Vec<SyncTimelineEvent>,
-        /// XXX: this is temporary, until backpagination lives in the event
-        /// cache.
-        prev_batch: Option<String>,
-        /// XXX: this is temporary, until account data lives in the event cache
-        /// — or will it live there?
-        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
-        /// XXX: this is temporary, until read receipts are handled in the event
-        /// cache
-        ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+    /// The fully read marker has moved to a different event.
+    MoveReadMarkerTo {
+        /// Event at which the read marker is now pointing.
+        event_id: OwnedEventId,
+    },
+
+    /// The members have changed.
+    UpdateMembers {
         /// Collection of ambiguity changes that room member events trigger.
         ///
         /// This is a map of event ID of the `m.room.member` event to the
         /// details of the ambiguity change.
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
     },
+
+    /// The room has received updates for the timeline as _diffs_.
+    UpdateTimelineEvents {
+        /// Diffs to apply to the timeline.
+        diffs: Vec<VectorDiff<TimelineEvent>>,
+
+        /// Where the diffs are coming from.
+        origin: EventsOrigin,
+    },
+
+    /// The room has received new ephemeral events.
+    AddEphemeralEvents {
+        /// XXX: this is temporary, until read receipts are handled in the event
+        /// cache
+        events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
+    },
+}
+
+/// Indicate where events are coming from.
+#[derive(Debug, Clone)]
+pub enum EventsOrigin {
+    /// Events are coming from a sync.
+    Sync,
+
+    /// Events are coming from pagination.
+    Pagination,
+
+    /// The cause of the change is purely internal to the cache.
+    Cache,
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+    use futures_util::FutureExt as _;
+    use matrix_sdk_base::sync::{JoinedRoomUpdate, RoomUpdates, Timeline};
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+    use ruma::{event_id, room_id, serde::Raw, user_id};
+    use serde_json::json;
+
+    use super::{EventCacheError, RoomEventCacheUpdate};
+    use crate::test_utils::{assert_event_matches_msg, logged_in_client};
+
+    #[async_test]
+    async fn test_must_explicitly_subscribe() {
+        let client = logged_in_client(None).await;
+
+        let event_cache = client.event_cache();
+
+        // If I create a room event subscriber for a room before subscribing the event
+        // cache,
+        let room_id = room_id!("!omelette:fromage.fr");
+        let result = event_cache.for_room(room_id).await;
+
+        // Then it fails, because one must explicitly call `.subscribe()` on the event
+        // cache.
+        assert_matches!(result, Err(EventCacheError::NotSubscribedYet));
+    }
+
+    #[async_test]
+    async fn test_uniq_read_marker() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!galette:saucisse.bzh");
+        client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+
+        let event_cache = client.event_cache();
+
+        event_cache.subscribe().unwrap();
+
+        let (room_event_cache, _drop_handles) = event_cache.for_room(room_id).await.unwrap();
+
+        let (events, mut stream) = room_event_cache.subscribe().await;
+
+        assert!(events.is_empty());
+
+        // When sending multiple times the same read marker event,…
+        let read_marker_event = Raw::from_json_string(
+            json!({
+                "content": {
+                    "event_id": "$crepe:saucisse.bzh"
+                },
+                "room_id": "!galette:saucisse.bzh",
+                "type": "m.fully_read"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let account_data = vec![read_marker_event; 100];
+
+        room_event_cache
+            .inner
+            .handle_joined_room_update(
+                event_cache.inner.has_storage(),
+                JoinedRoomUpdate { account_data, ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        // … there's only one read marker update.
+        assert_matches!(
+            stream.recv().await.unwrap(),
+            RoomEventCacheUpdate::MoveReadMarkerTo { .. }
+        );
+
+        assert!(stream.recv().now_or_never().is_none());
+    }
+
+    #[async_test]
+    async fn test_get_event_by_id() {
+        let client = logged_in_client(None).await;
+        let room_id1 = room_id!("!galette:saucisse.bzh");
+        let room_id2 = room_id!("!crepe:saucisse.bzh");
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        // Insert two rooms with a few events.
+        let f = EventFactory::new().room(room_id1).sender(user_id!("@ben:saucisse.bzh"));
+
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let eid3 = event_id!("$3");
+
+        let joined_room_update1 = JoinedRoomUpdate {
+            timeline: Timeline {
+                events: vec![
+                    f.text_msg("hey").event_id(eid1).into(),
+                    f.text_msg("you").event_id(eid2).into(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let joined_room_update2 = JoinedRoomUpdate {
+            timeline: Timeline {
+                events: vec![f.text_msg("bjr").event_id(eid3).into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut updates = RoomUpdates::default();
+        updates.joined.insert(room_id1.to_owned(), joined_room_update1);
+        updates.joined.insert(room_id2.to_owned(), joined_room_update2);
+
+        // Have the event cache handle them.
+        event_cache.inner.handle_room_updates(updates).await.unwrap();
+
+        // We can find the events in a single room.
+        client.base_client().get_or_create_room(room_id1, matrix_sdk_base::RoomState::Joined);
+        let room1 = client.get_room(room_id1).unwrap();
+
+        let (room_event_cache, _drop_handles) = room1.event_cache().await.unwrap();
+
+        let found1 = room_event_cache.event(eid1).await.unwrap();
+        assert_event_matches_msg(&found1, "hey");
+
+        let found2 = room_event_cache.event(eid2).await.unwrap();
+        assert_event_matches_msg(&found2, "you");
+
+        // Retrieving the event with id3 from the room which doesn't contain it will
+        // fail…
+        assert!(room_event_cache.event(eid3).await.is_none());
+    }
+
+    #[async_test]
+    async fn test_save_event() {
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!galette:saucisse.bzh");
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+        event_cache.enable_storage().unwrap();
+
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let event_id = event_id!("$1");
+
+        client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        room_event_cache.save_events([f.text_msg("hey there").event_id(event_id).into()]).await;
+
+        // Retrieving the event at the room-wide cache works.
+        assert!(room_event_cache.event(event_id).await.is_some());
+    }
+
+    #[async_test]
+    async fn test_add_initial_events() {
+        // TODO: remove this test when the event cache uses its own persistent storage.
+        let client = logged_in_client(None).await;
+        let room_id = room_id!("!galette:saucisse.bzh");
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        event_cache
+            .add_initial_events(room_id, vec![f.text_msg("hey").into()], None)
+            .await
+            .unwrap();
+
+        client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+        let (initial_events, _) = room_event_cache.subscribe().await;
+        // `add_initial_events` had an effect.
+        assert_eq!(initial_events.len(), 1);
+    }
 }

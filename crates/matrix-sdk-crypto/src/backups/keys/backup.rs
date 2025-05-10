@@ -12,16 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use matrix_sdk_common::locks::Mutex;
 use ruma::{
     api::client::backup::{EncryptedSessionDataInit, KeyBackupData, KeyBackupDataInit},
     serde::Base64,
 };
-use vodozemac::Curve25519PublicKey;
+use vodozemac::{pk_encryption::PkEncryption, Curve25519PublicKey};
 use zeroize::Zeroizing;
 
-use super::{compat::PkEncryption, decryption::DecodeError};
+use super::decryption::DecodeError;
 use crate::{olm::InboundGroupSession, types::Signatures};
 
 #[derive(Debug)]
@@ -87,7 +88,7 @@ impl MegolmV1BackupKey {
 
     /// Get the backup version that this key is used with, if any.
     pub fn backup_version(&self) -> Option<String> {
-        self.inner.version.lock().unwrap().clone()
+        self.inner.version.lock().clone()
     }
 
     /// Set the backup version that this `MegolmV1BackupKey` will be used with.
@@ -95,10 +96,12 @@ impl MegolmV1BackupKey {
     /// The key won't be able to encrypt room keys unless a version has been
     /// set.
     pub fn set_version(&self, version: String) {
-        *self.inner.version.lock().unwrap() = Some(version);
+        *self.inner.version.lock() = Some(version);
     }
 
-    pub(crate) async fn encrypt(&self, session: InboundGroupSession) -> KeyBackupData {
+    /// Export the given inbound group session, and encrypt the data, ready for
+    /// writing to the backup.
+    pub async fn encrypt(&self, session: InboundGroupSession) -> KeyBackupData {
         let pk = PkEncryption::from_key(self.inner.key);
 
         // The forwarding chains don't mean much, we only care whether we received the

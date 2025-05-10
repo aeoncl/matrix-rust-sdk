@@ -21,7 +21,7 @@ use crate::Room;
 mod element_call;
 mod url_params;
 
-pub use self::element_call::{EncryptionSystem, VirtualElementCallWidgetOptions};
+pub use self::element_call::{EncryptionSystem, Intent, VirtualElementCallWidgetOptions};
 
 /// Settings of the widget.
 #[derive(Debug, Clone)]
@@ -91,7 +91,7 @@ impl WidgetSettings {
         props: ClientProperties,
     ) -> Result<Url, url::ParseError> {
         self._generate_webview_url(
-            room.client().account().get_profile().await.unwrap_or_default(),
+            room.client().account().fetch_user_profile().await.unwrap_or_default(),
             room.own_user_id(),
             room.room_id(),
             room.client().device_id().unwrap_or("UNKNOWN".into()),

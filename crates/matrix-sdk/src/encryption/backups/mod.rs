@@ -25,8 +25,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use matrix_sdk_base::crypto::{
-    backups::MegolmV1BackupKey, store::BackupDecryptionKey, types::RoomKeyBackupInfo,
-    KeysBackupRequest, OlmMachine, RoomKeyImportResult,
+    backups::MegolmV1BackupKey,
+    store::BackupDecryptionKey,
+    types::{requests::KeysBackupRequest, RoomKeyBackupInfo},
+    OlmMachine, RoomKeyImportResult,
 };
 use ruma::{
     api::client::{
@@ -37,7 +39,7 @@ use ruma::{
         error::ErrorKind,
     },
     events::{
-        room::encrypted::{EncryptedEventScheme, SyncRoomEncryptedEvent},
+        room::encrypted::OriginalSyncRoomEncryptedEvent,
         secret::{request::SecretName, send::ToDeviceSecretSendEvent},
     },
     serde::Raw,
@@ -52,7 +54,9 @@ pub(crate) mod types;
 pub use types::{BackupState, UploadState};
 
 use self::futures::WaitForSteadyState;
-use crate::{encryption::BackupDownloadStrategy, Client, Error, Room};
+use crate::{
+    crypto::olm::ExportedRoomKey, encryption::BackupDownloadStrategy, Client, Error, Room,
+};
 
 /// The backups manager for the [`Client`].
 #[derive(Debug, Clone)]
@@ -86,6 +90,7 @@ impl Backups {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn create(&self) -> Result<(), Error> {
+        self.client.inner.e2ee.backup_state.clear_backup_exists_on_server();
         let _guard = self.client.locks().backup_modify_lock.lock().await;
 
         self.set_state(BackupState::Creating);
@@ -131,7 +136,7 @@ impl Backups {
 
             let algorithm = Raw::new(&backup_info)?.cast();
             let request = create_backup_version::v3::Request::new(algorithm);
-            let response = self.client.send(request, Default::default()).await?;
+            let response = self.client.send(request).await?;
             let version = response.version;
 
             // Reset any state we might have had before the new backup was created.
@@ -161,7 +166,11 @@ impl Backups {
         result
     }
 
-    /// Disable and delete the currently active backup.
+    /// Disable and delete the currently active backup only if previously
+    /// enabled before, otherwise an error will be returned.
+    ///
+    /// For a more aggressive variant see [`Backups::disable_and_delete`] which
+    /// will delete the remote backup without checking the local state.
     ///
     /// # Examples
     ///
@@ -198,21 +207,72 @@ impl Backups {
                 info!("Backup successfully deleted");
 
                 olm_machine.backup_machine().disable_backup().await?;
-                self.set_state(BackupState::Unknown);
 
                 info!("Backup successfully disabled and deleted");
+
+                Ok(())
             } else {
                 info!("Backup is not enabled, can't disable it");
+                Err(Error::BackupNotEnabled)
             }
+        };
+
+        let result = future.await;
+
+        self.set_state(BackupState::Unknown);
+
+        result
+    }
+
+    /// Completely disable and delete the active backup both locally
+    /// and from the backend no matter if previously setup locally
+    /// or not.
+    ///
+    /// ⚠️ This method is mainly used when resetting the crypto identity
+    /// and for most other use cases its safer [`Backups::disable`] counterpart
+    /// should be used.
+    ///
+    /// It will fetch the current backup version from the backend and delete it
+    /// before proceeding to disabling local backups as well
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{Client, encryption::backups::BackupState};
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// let backups = client.encryption().backups();
+    /// backups.disable_and_delete().await?;
+    ///
+    /// assert_eq!(backups.state(), BackupState::Unknown);
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn disable_and_delete(&self) -> Result<(), Error> {
+        let _guard = self.client.locks().backup_modify_lock.lock().await;
+
+        self.set_state(BackupState::Disabling);
+
+        // Create a future so we can catch errors and go back to the `Unknown` state.
+        let future = async {
+            let response = self.get_current_version().await?;
+
+            if let Some(response) = response {
+                self.delete_backup_from_server(response.version).await?;
+            }
+
+            let olm_machine = self.client.olm_machine().await;
+            let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+            olm_machine.backup_machine().disable_backup().await?;
 
             Ok(())
         };
 
         let result = future.await;
 
-        if result.is_err() {
-            self.set_state(BackupState::Unknown);
-        }
+        self.set_state(BackupState::Unknown);
 
         result
     }
@@ -326,9 +386,32 @@ impl Backups {
     /// Does a backup exist on the server?
     ///
     /// This method will request info about the current backup from the
-    /// homeserver and if a backup exits return `true`, otherwise `false`.
+    /// homeserver and if a backup exists return `true`, otherwise `false`.
+    pub async fn fetch_exists_on_server(&self) -> Result<bool, Error> {
+        let exists_on_server = self.get_current_version().await?.is_some();
+        self.client.inner.e2ee.backup_state.set_backup_exists_on_server(exists_on_server);
+        Ok(exists_on_server)
+    }
+
+    /// Does a backup exist on the server?
+    ///
+    /// This method is identical to [`Self::fetch_exists_on_server`] except that
+    /// we cache the latest answer in memory and only empty the cache if the
+    /// local device adds or deletes a backup itself.
+    ///
+    /// Do not use this method if you need an accurate answer about whether a
+    /// backup exists - instead use [`Self::fetch_exists_on_server`]. This
+    /// method is useful when performance is more important than guaranteed
+    /// accuracy, such as when classifying UTDs.
     pub async fn exists_on_server(&self) -> Result<bool, Error> {
-        Ok(self.get_current_version().await?.is_some())
+        // If we have an answer cached, return it immediately
+        if let Some(cached_value) = self.client.inner.e2ee.backup_state.backup_exists_on_server() {
+            return Ok(cached_value);
+        }
+
+        // Otherwise, delegate to fetch_exists_on_server. (It will update the cached
+        // value for us.)
+        self.fetch_exists_on_server().await
     }
 
     /// Subscribe to a stream that notifies when a room key for the specified
@@ -370,8 +453,8 @@ impl Backups {
         if let Some(decryption_key) = backup_keys.decryption_key {
             if let Some(version) = backup_keys.backup_version {
                 let request =
-                    get_backup_keys_for_room::v3::Request::new(version, room_id.to_owned());
-                let response = self.client.send(request, Default::default()).await?;
+                    get_backup_keys_for_room::v3::Request::new(version.clone(), room_id.to_owned());
+                let response = self.client.send(request).await?;
 
                 // Transform response to standard format (map of room ID -> room key).
                 let response = get_backup_keys::v3::Response::new(BTreeMap::from([(
@@ -379,7 +462,8 @@ impl Backups {
                     RoomKeyBackup::new(response.sessions),
                 )]));
 
-                self.handle_downloaded_room_keys(response, decryption_key, olm_machine).await?;
+                self.handle_downloaded_room_keys(response, decryption_key, &version, olm_machine)
+                    .await?;
             }
         }
 
@@ -387,7 +471,16 @@ impl Backups {
     }
 
     /// Download a single room key from the server-side key backup.
-    pub async fn download_room_key(&self, room_id: &RoomId, session_id: &str) -> Result<(), Error> {
+    ///
+    /// Returns `true` if we managed to download a room key, `false` or an error
+    /// if we failed to download it. `false` indicates that there was no
+    /// error, we just don't have backups enabled so we can't download a
+    /// room key.
+    pub async fn download_room_key(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+    ) -> Result<bool, Error> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
@@ -396,11 +489,11 @@ impl Backups {
         if let Some(decryption_key) = backup_keys.decryption_key {
             if let Some(version) = backup_keys.backup_version {
                 let request = get_backup_keys_for_session::v3::Request::new(
-                    version,
+                    version.clone(),
                     room_id.to_owned(),
                     session_id.to_owned(),
                 );
-                let response = self.client.send(request, Default::default()).await?;
+                let response = self.client.send(request).await?;
 
                 // Transform response to standard format (map of room ID -> room key).
                 let response = get_backup_keys::v3::Response::new(BTreeMap::from([(
@@ -411,16 +504,25 @@ impl Backups {
                     )])),
                 )]));
 
-                self.handle_downloaded_room_keys(response, decryption_key, olm_machine).await?;
-            }
-        }
+                self.handle_downloaded_room_keys(response, decryption_key, &version, olm_machine)
+                    .await?;
 
-        Ok(())
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
     }
 
     /// Set the state of the backup.
-    fn set_state(&self, state: BackupState) {
-        self.client.inner.e2ee.backup_state.global_state.set(state);
+    fn set_state(&self, new_state: BackupState) {
+        let old_state = self.client.inner.e2ee.backup_state.global_state.set(new_state);
+
+        if old_state != new_state {
+            info!("Backup state changed from {old_state:?} to {new_state:?}");
+        }
     }
 
     /// Set the backup state to the `Enabled` variant and insert the backup key
@@ -445,9 +547,10 @@ impl Backups {
         &self,
         backed_up_keys: get_backup_keys::v3::Response,
         backup_decryption_key: BackupDecryptionKey,
+        backup_version: &str,
         olm_machine: &OlmMachine,
     ) -> Result<(), Error> {
-        let mut decrypted_room_keys: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+        let mut decrypted_room_keys: Vec<_> = Vec::new();
 
         for (room_id, room_keys) in backed_up_keys.rooms {
             for (session_id, room_key) in room_keys.sessions {
@@ -474,16 +577,17 @@ impl Backups {
                         }
                     };
 
-                decrypted_room_keys
-                    .entry(room_id.to_owned())
-                    .or_default()
-                    .insert(session_id, room_key);
+                decrypted_room_keys.push(ExportedRoomKey::from_backed_up_room_key(
+                    room_id.to_owned(),
+                    session_id,
+                    room_key,
+                ));
             }
         }
 
         let result = olm_machine
-            .backup_machine()
-            .import_backed_up_room_keys(decrypted_room_keys, |_, _| {})
+            .store()
+            .import_room_keys(decrypted_room_keys, Some(backup_version), |_, _| {})
             .await?;
 
         // Since we can't use the usual room keys stream from the `OlmMachine`
@@ -499,13 +603,13 @@ impl Backups {
         decryption_key: BackupDecryptionKey,
         version: String,
     ) -> Result<(), Error> {
-        let request = get_backup_keys::v3::Request::new(version);
-        let response = self.client.send(request, Default::default()).await?;
+        let request = get_backup_keys::v3::Request::new(version.clone());
+        let response = self.client.send(request).await?;
 
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        self.handle_downloaded_room_keys(response, decryption_key, olm_machine).await?;
+        self.handle_downloaded_room_keys(response, decryption_key, &version, olm_machine).await?;
 
         Ok(())
     }
@@ -522,7 +626,7 @@ impl Backups {
     ) -> Result<Option<get_latest_backup_info::v3::Response>, Error> {
         let request = get_latest_backup_info::v3::Request::new();
 
-        match self.client.send(request, None).await {
+        match self.client.send(request).await {
             Ok(r) => Ok(Some(r)),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
@@ -541,7 +645,7 @@ impl Backups {
     async fn delete_backup_from_server(&self, version: String) -> Result<(), Error> {
         let request = ruma::api::client::backup::delete_backup_version::v3::Request::new(version);
 
-        match self.client.send(request, Default::default()).await {
+        let ret = match self.client.send(request).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
@@ -554,7 +658,14 @@ impl Backups {
                     Err(e.into())
                 }
             }
-        }
+        };
+
+        // If the request succeeded, the backup is gone. If it failed, we are not really
+        // sure what the backup state is. Either way, clear the cache so we check next
+        // time we need to know.
+        self.client.inner.e2ee.backup_state.clear_backup_exists_on_server();
+
+        ret
     }
 
     #[instrument(skip(self, olm_machine, request))]
@@ -568,7 +679,7 @@ impl Backups {
 
         let add_backup_keys = add_backup_keys::v3::Request::new(request.version, request.rooms);
 
-        match self.client.send(add_backup_keys, Default::default()).await {
+        match self.client.send(add_backup_keys).await {
             Ok(response) => {
                 olm_machine.mark_request_as_sent(request_id, &response).await?;
 
@@ -581,12 +692,9 @@ impl Backups {
                     .upload_progress
                     .set(UploadState::Uploading(new_counts));
 
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let delay =
-                        self.client.inner.e2ee.backup_state.upload_delay.read().unwrap().to_owned();
-                    tokio::time::sleep(delay).await;
-                }
+                let delay =
+                    self.client.inner.e2ee.backup_state.upload_delay.read().unwrap().to_owned();
+                crate::sleep::sleep(delay).await;
 
                 Ok(())
             }
@@ -854,6 +962,7 @@ impl Backups {
 
     /// Listen for `m.secret.send` to-device messages and check the secret inbox
     /// if we do receive one.
+    #[instrument(skip_all)]
     pub(crate) async fn secret_send_event_handler(_: ToDeviceSecretSendEvent, client: Client) {
         let olm_machine = client.olm_machine().await;
 
@@ -872,33 +981,39 @@ impl Backups {
         }
     }
 
+    /// Handle UTD events by triggering download from key backup.
+    ///
+    /// This function is registered as an event handler; it exists to deal
+    /// with cases where [`Room::decrypt_event`] is not called and instead the
+    /// event should be decrypted by the time this crate sees the event, such as
+    /// for events received via `/sync` (as opposed to via `/messages`,
+    /// `/context`, etc.)
+    #[allow(clippy::unused_async)] // Because it's used as an event handler, which must be async.
     pub(crate) async fn utd_event_handler(
-        event: SyncRoomEncryptedEvent,
+        event: Raw<OriginalSyncRoomEncryptedEvent>,
         room: Room,
         client: Client,
     ) {
-        if let Some(event) = event.as_original() {
-            if let EncryptedEventScheme::MegolmV1AesSha2(c) = &event.content.scheme {
-                client
-                    .encryption()
-                    .backups()
-                    .maybe_download_room_key(room.room_id().to_owned(), c.session_id.to_owned());
-            }
-        }
+        client.encryption().backups().maybe_download_room_key(room.room_id().to_owned(), event);
     }
 
-    pub(crate) fn maybe_download_room_key(&self, room_id: OwnedRoomId, session_id: String) {
-        let tasks = self.client.inner.e2ee.tasks.lock().unwrap();
-
+    /// Send a notification to the task responsible for key backup downloads
+    /// that it should attempt to download the keys for the given event.
+    pub(crate) fn maybe_download_room_key(
+        &self,
+        room_id: OwnedRoomId,
+        event: Raw<OriginalSyncRoomEncryptedEvent>,
+    ) {
+        let tasks = self.client.inner.e2ee.tasks.lock();
         if let Some(task) = tasks.download_room_keys.as_ref() {
-            task.trigger_download((room_id, session_id))
+            task.trigger_download_for_utd_event(room_id, event);
         }
     }
 
     /// Send a notification to the task which is responsible for uploading room
     /// keys to the backup that it might have new room keys to back up.
     pub(crate) fn maybe_trigger_backup(&self) {
-        let tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+        let tasks = self.client.inner.e2ee.tasks.lock();
 
         if let Some(tasks) = tasks.upload_room_keys.as_ref() {
             tasks.trigger_upload();
@@ -909,7 +1024,6 @@ impl Backups {
     /// removed on the homeserver.
     async fn handle_deleted_backup_version(&self, olm_machine: &OlmMachine) -> Result<(), Error> {
         olm_machine.backup_machine().disable_backup().await?;
-        self.client.encryption().recovery().update_state_after_backup_disabling().await;
         self.set_state(BackupState::Unknown);
 
         Ok(())
@@ -920,7 +1034,6 @@ impl Backups {
 mod test {
     use std::time::Duration;
 
-    use matrix_sdk_base::crypto::olm::ExportedRoomKey;
     use matrix_sdk_test::async_test;
     use serde_json::json;
     use wiremock::{
@@ -929,7 +1042,7 @@ mod test {
     };
 
     use super::*;
-    use crate::test_utils::logged_in_client;
+    use crate::test_utils::{logged_in_client, mocks::MatrixMockServer};
 
     fn room_key() -> ExportedRoomKey {
         let json = json!({
@@ -994,7 +1107,7 @@ mod test {
     }
 
     #[async_test]
-    async fn backup_disabling_after_remote_deletion() {
+    async fn test_backup_disabling_after_remote_deletion() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -1034,72 +1147,122 @@ mod test {
     }
 
     #[async_test]
-    async fn exists_on_server() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+    async fn test_when_a_backup_exists_then_fetch_exists_on_server_returns_true() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_keys_version().exists().expect(1).mount().await;
+
+        let exists = client
+            .encryption()
+            .backups()
+            .fetch_exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(exists, "We should deduce that a backup exists on the server");
+    }
+
+    #[async_test]
+    async fn test_repeated_calls_to_fetch_exists_on_server_makes_repeated_requests() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        // Expect 2 requests to the server
+        server.mock_room_keys_version().exists().expect(2).mount().await;
+
+        let backups = client.encryption().backups();
+
+        // Call fetch_exists_on_server twice
+        backups.fetch_exists_on_server().await.unwrap();
+        let exists = backups.fetch_exists_on_server().await.unwrap();
+
+        assert!(exists, "We should deduce that a backup exists on the server");
+    }
+
+    #[async_test]
+    async fn test_when_no_backup_exists_then_fetch_exists_on_server_returns_false() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_keys_version().none().expect(1).mount().await;
+
+        let exists = client
+            .encryption()
+            .backups()
+            .fetch_exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(!exists, "We should deduce that no backup exists on the server");
+    }
+
+    #[async_test]
+    async fn test_when_server_returns_an_error_then_fetch_exists_on_server_returns_an_error() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
         {
-            let _scope = Mock::given(method("GET"))
-                .and(path("_matrix/client/r0/room_keys/version"))
-                .and(header("authorization", "Bearer 1234"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
-                    "auth_data": {
-                        "public_key": "abcdefg",
-                        "signatures": {},
-                    },
-                    "count": 42,
-                    "etag": "anopaquestring",
-                    "version": "1",
-                })))
-                .expect(1)
-                .mount_as_scoped(&server)
-                .await;
+            let _scope =
+                server.mock_room_keys_version().error429().expect(1).mount_as_scoped().await;
 
-            let exists = client
-                .encryption()
-                .backups()
-                .exists_on_server()
-                .await
-                .expect("We should be able to check if backups exist on the server");
-
-            assert!(exists, "We should deduce that a backup exist on the server");
+            client.encryption().backups().fetch_exists_on_server().await.expect_err(
+                "If the /version endpoint returns a non 404 error we should throw an error",
+            );
         }
 
         {
-            let _scope = Mock::given(method("GET"))
-                .and(path("_matrix/client/r0/room_keys/version"))
-                .and(header("authorization", "Bearer 1234"))
-                .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-                    "errcode": "M_NOT_FOUND",
-                    "error": "No current backup version"
-                })))
-                .expect(1)
-                .mount_as_scoped(&server)
-                .await;
+            let _scope =
+                server.mock_room_keys_version().error404().expect(1).mount_as_scoped().await;
 
-            let exists = client
-                .encryption()
-                .backups()
-                .exists_on_server()
-                .await
-                .expect("We should be able to check if backups exist on the server");
-
-            assert!(!exists, "We should deduce that no backup exist on the server");
+            client.encryption().backups().fetch_exists_on_server().await.expect_err(
+                "If the /version endpoint returns a non-Matrix 404 error we should throw an error",
+            );
         }
+    }
+
+    #[async_test]
+    async fn test_when_a_backup_exists_then_exists_on_server_returns_true() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_keys_version().exists().expect(1).mount().await;
+
+        let exists = client
+            .encryption()
+            .backups()
+            .exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(exists, "We should deduce that a backup exists on the server");
+    }
+
+    #[async_test]
+    async fn test_when_no_backup_exists_then_exists_on_server_returns_false() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_keys_version().none().expect(1).mount().await;
+
+        let exists = client
+            .encryption()
+            .backups()
+            .exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(!exists, "We should deduce that no backup exists on the server");
+    }
+
+    #[async_test]
+    async fn test_when_server_returns_an_error_then_exists_on_server_returns_an_error() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
         {
-            let _scope = Mock::given(method("GET"))
-                .and(path("_matrix/client/r0/room_keys/version"))
-                .and(header("authorization", "Bearer 1234"))
-                .respond_with(ResponseTemplate::new(429).set_body_json(json!({
-                    "errcode": "M_LIMIT_EXCEEDED",
-                    "error": "Too many requests",
-                    "retry_after_ms": 2000
-                })))
-                .expect(1)
-                .mount_as_scoped(&server)
-                .await;
+            let _scope =
+                server.mock_room_keys_version().error429().expect(1).mount_as_scoped().await;
 
             client.encryption().backups().exists_on_server().await.expect_err(
                 "If the /version endpoint returns a non 404 error we should throw an error",
@@ -1107,37 +1270,100 @@ mod test {
         }
 
         {
-            let _scope = Mock::given(method("GET"))
-                .and(path("_matrix/client/r0/room_keys/version"))
-                .and(header("authorization", "Bearer 1234"))
-                .respond_with(ResponseTemplate::new(404))
-                .expect(1)
-                .mount_as_scoped(&server)
-                .await;
+            let _scope =
+                server.mock_room_keys_version().error404().expect(1).mount_as_scoped().await;
 
             client.encryption().backups().exists_on_server().await.expect_err(
                 "If the /version endpoint returns a non-Matrix 404 error we should throw an error",
             );
         }
-
-        server.verify().await;
     }
 
     #[async_test]
-    async fn waiting_for_steady_state_resets_the_delay() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+    async fn test_repeated_calls_to_exists_on_server_do_not_make_additional_requests() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-        Mock::given(method("POST"))
-            .and(path("_matrix/client/unstable/room_keys/version"))
-            .and(header("authorization", "Bearer 1234"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-              "version": "1"
-            })))
-            .expect(1)
-            .named("POST for the backup creation")
-            .mount(&server)
-            .await;
+        // Create a mock stating that the request should only be made once
+        server.mock_room_keys_version().exists().expect(1).mount().await;
+
+        let backups = client.encryption().backups();
+
+        // Call exists_on_server several times
+        backups.exists_on_server().await.unwrap();
+        backups.exists_on_server().await.unwrap();
+        backups.exists_on_server().await.unwrap();
+
+        let exists = backups
+            .exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(exists, "We should deduce that a backup exists on the server");
+
+        // We check expectations here, confirming that only one call was made
+    }
+
+    #[async_test]
+    async fn test_adding_a_backup_invalidates_exists_on_server_cache() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+
+        {
+            let _scope = server.mock_room_keys_version().none().expect(1).mount_as_scoped().await;
+
+            // Call exists_on_server to fill the cache
+            let exists = backups.exists_on_server().await.unwrap();
+            assert!(!exists, "No backup exists at this point");
+        }
+
+        // Create a new backup. Should invalidate the cache
+        server.mock_add_room_keys_version().ok().expect(1).mount().await;
+        backups.create().await.expect("Failed to create a backup");
+
+        server.mock_room_keys_version().exists().expect(1).mount().await;
+        let exists = backups
+            .exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(exists, "But now a backup does exist");
+    }
+
+    #[async_test]
+    async fn test_removing_a_backup_invalidates_exists_on_server_cache() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let backups = client.encryption().backups();
+
+        {
+            let _scope = server.mock_room_keys_version().exists().expect(1).mount_as_scoped().await;
+
+            // Call exists_on_server to fill the cache
+            let exists = backups.exists_on_server().await.unwrap();
+            assert!(exists, "A backup exists at this point");
+        }
+
+        // Delete the backup. Should invalidate the cache
+        server.mock_delete_room_keys_version().ok().expect(1).mount().await;
+        backups.delete_backup_from_server("1".to_owned()).await.expect("Failed to delete a backup");
+
+        server.mock_room_keys_version().none().expect(1).mount().await;
+        let exists = backups
+            .exists_on_server()
+            .await
+            .expect("We should be able to check if backups exist on the server");
+
+        assert!(!exists, "But now there is no backup");
+    }
+
+    #[async_test]
+    async fn test_waiting_for_steady_state_resets_the_delay() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_add_room_keys_version().ok().expect(1).mount().await;
 
         client
             .encryption()
@@ -1194,7 +1420,5 @@ mod test {
             { client.inner.e2ee.backup_state.upload_delay.read().unwrap().to_owned() };
 
         assert_eq!(old_duration, current_duration);
-
-        server.verify().await;
     }
 }

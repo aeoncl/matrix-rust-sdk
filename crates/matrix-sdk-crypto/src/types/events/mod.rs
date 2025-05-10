@@ -23,13 +23,16 @@ pub mod forwarded_room_key;
 pub mod olm_v1;
 pub mod room;
 pub mod room_key;
+pub mod room_key_bundle;
 pub mod room_key_request;
 pub mod room_key_withheld;
 pub mod secret_send;
 mod to_device;
+mod utd_cause;
 
 use ruma::serde::Raw;
 pub use to_device::{ToDeviceCustomEvent, ToDeviceEvent, ToDeviceEvents};
+pub use utd_cause::{CryptoContextInfo, UtdCause};
 
 /// A trait for event contents to define their event type.
 pub trait EventType {
@@ -38,9 +41,10 @@ pub trait EventType {
 
     /// Get the event type of the event content.
     ///
-    /// **Note**: This should never be implemented manually, this takes the
-    /// event type from the constant.
-    fn event_type(&self) -> &'static str {
+    /// **Note**: This usually doesn't need to be implemented. The default
+    /// implementation will take the event type from the
+    /// [`EventType::EVENT_TYPE`] constant.
+    fn event_type(&self) -> &str {
         Self::EVENT_TYPE
     }
 }

@@ -1,25 +1,22 @@
 //! Sliding Sync errors.
 
+use matrix_sdk_common::executor::JoinError;
 use thiserror::Error;
-use tokio::task::JoinError;
 
 /// Internal representation of errors in Sliding Sync.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// Sliding sync has been configured with a missing version. See
+    /// [`crate::sliding_sync::Version`].
+    #[error("Sliding sync version is missing")]
+    VersionIsMissing,
+
     /// The response we've received from the server can't be parsed or doesn't
     /// match up with the current expectations on the client side. A
     /// `sync`-restart might be required.
     #[error("The sliding sync response could not be handled: {0}")]
     BadResponse(String),
-
-    /// The response we've received from the server has already been received in
-    /// the past because it has a `pos` that we have recently seen.
-    #[error("The sliding sync response has already been received: `pos={pos:?}`")]
-    ResponseAlreadyReceived {
-        /// The `pos`ition that has been received.
-        pos: Option<String>,
-    },
 
     /// A `SlidingSyncListRequestGenerator` has been used without having been
     /// initialized. It happens when a response is handled before a request has
@@ -56,4 +53,14 @@ pub enum Error {
         /// The original `JoinError`.
         error: JoinError,
     },
+
+    /// No Olm machine.
+    #[cfg(feature = "e2e-encryption")]
+    #[error("The Olm machine is missing")]
+    NoOlmMachine,
+
+    /// An error occurred during a E2EE operation.
+    #[cfg(feature = "e2e-encryption")]
+    #[error(transparent)]
+    CryptoStoreError(#[from] matrix_sdk_base::crypto::CryptoStoreError),
 }

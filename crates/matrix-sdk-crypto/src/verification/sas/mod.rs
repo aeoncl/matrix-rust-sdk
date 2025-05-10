@@ -41,11 +41,11 @@ use super::{
     CancelInfo, FlowId, IdentitiesBeingVerified, VerificationResult,
 };
 use crate::{
-    identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    identities::{DeviceData, UserIdentityData},
     olm::StaticAccountData,
-    requests::{OutgoingVerificationRequest, RoomMessageRequest},
     store::CryptoStoreError,
-    Emoji, ToDeviceRequest,
+    types::requests::{OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest},
+    Emoji,
 };
 
 /// Short authentication string object.
@@ -116,8 +116,15 @@ pub struct EmojiShortAuthString {
 /// An Enum describing the state the SAS verification is in.
 #[derive(Debug, Clone)]
 pub enum SasState {
-    /// The verification has been started, the protocols that should be used
-    /// have been proposed and can be accepted.
+    /// The verification has been created, the protocols that should be used
+    /// have been proposed to the other party.
+    Created {
+        /// The protocols that were proposed in the `m.key.verification.start`
+        /// event.
+        protocols: SasV1Content,
+    },
+    /// The verification has been started, the other party proposed the
+    /// protocols that should be used and that can be accepted.
     Started {
         /// The protocols that were proposed in the `m.key.verification.start`
         /// event.
@@ -145,9 +152,9 @@ pub enum SasState {
     /// The verification process has been successfully concluded.
     Done {
         /// The list of devices that has been verified.
-        verified_devices: Vec<ReadOnlyDevice>,
+        verified_devices: Vec<DeviceData>,
         /// The list of user identities that has been verified.
-        verified_identities: Vec<ReadOnlyUserIdentities>,
+        verified_identities: Vec<UserIdentityData>,
     },
     /// The verification process has been cancelled.
     Cancelled(CancelInfo),
@@ -157,7 +164,8 @@ impl PartialEq for SasState {
     fn eq(&self, other: &Self) -> bool {
         matches!(
             (self, other),
-            (Self::Started { .. }, Self::Started { .. })
+            (Self::Created { .. }, Self::Created { .. })
+                | (Self::Started { .. }, Self::Started { .. })
                 | (Self::Accepted { .. }, Self::Accepted { .. })
                 | (Self::KeysExchanged { .. }, Self::KeysExchanged { .. })
                 | (Self::Confirmed, Self::Confirmed)
@@ -171,7 +179,7 @@ impl From<&InnerSas> for SasState {
     fn from(value: &InnerSas) -> Self {
         match value {
             InnerSas::Created(s) => {
-                Self::Started { protocols: s.state.protocol_definitions.to_owned() }
+                Self::Created { protocols: s.state.protocol_definitions.to_owned() }
             }
             InnerSas::Started(s) => {
                 Self::Started { protocols: s.state.protocol_definitions.to_owned() }
@@ -245,7 +253,7 @@ impl Sas {
     }
 
     /// Get the device of the other user.
-    pub fn other_device(&self) -> &ReadOnlyDevice {
+    pub fn other_device(&self) -> &DeviceData {
         self.identities_being_verified.other_device()
     }
 
@@ -300,7 +308,7 @@ impl Sas {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(crate) fn set_creation_time(&self, time: matrix_sdk_common::instant::Instant) {
+    pub(crate) fn set_creation_time(&self, time: ruma::time::Instant) {
         self.inner.update(|inner| {
             inner.set_creation_time(time);
         });
@@ -391,7 +399,7 @@ impl Sas {
     /// * `other_device` - The other device which we are going to verify.
     ///
     /// * `event` - The m.key.verification.start event that was sent to us by
-    /// the other side.
+    ///   the other side.
     pub(crate) fn from_start_event(
         flow_id: FlowId,
         content: &StartContent<'_>,
@@ -658,6 +666,10 @@ impl Sas {
     ///
     /// ```text
     ///                ┌───────┐
+    ///                │Created│
+    ///                └───┬───┘
+    ///                    │
+    ///                ┌───⌄───┐
     ///                │Started│
     ///                └───┬───┘
     ///                    │
@@ -723,7 +735,8 @@ impl Sas {
     ///             );
     ///             break;
     ///         }
-    ///         SasState::Started { .. }
+    ///         SasState::Created { .. }
+    ///         | SasState::Started { .. }
     ///         | SasState::Accepted { .. }
     ///         | SasState::Confirmed => (),
     ///     }
@@ -801,11 +814,11 @@ impl Sas {
         );
     }
 
-    pub(crate) fn verified_devices(&self) -> Option<Arc<[ReadOnlyDevice]>> {
+    pub(crate) fn verified_devices(&self) -> Option<Arc<[DeviceData]>> {
         self.inner.read().verified_devices()
     }
 
-    pub(crate) fn verified_identities(&self) -> Option<Arc<[ReadOnlyUserIdentities]>> {
+    pub(crate) fn verified_identities(&self) -> Option<Arc<[UserIdentityData]>> {
         self.inner.read().verified_identities()
     }
 
@@ -870,7 +883,7 @@ mod tests {
             event_enums::{AcceptContent, KeyContent, MacContent, OutgoingContent, StartContent},
             VerificationStore,
         },
-        Account, ReadOnlyDevice, SasState,
+        Account, DeviceData, SasState,
     };
 
     fn alice_id() -> &'static UserId {
@@ -886,20 +899,24 @@ mod tests {
     }
 
     fn bob_device_id() -> &'static DeviceId {
-        device_id!("BOBDEVCIE")
+        device_id!("BOBDEVICE")
     }
 
-    fn machine_pair_test_helper(
-    ) -> (VerificationStore, ReadOnlyDevice, VerificationStore, ReadOnlyDevice) {
+    fn machine_pair_test_helper() -> (VerificationStore, DeviceData, VerificationStore, DeviceData)
+    {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
-        let alice_device = ReadOnlyDevice::from_account(&alice);
+        let alice_device = DeviceData::from_account(&alice);
 
         let bob = Account::with_device_id(bob_id(), bob_device_id());
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
         let alice_store = VerificationStore {
             account: alice.static_data.clone(),
-            inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), MemoryStore::new())),
+            inner: Arc::new(CryptoStoreWrapper::new(
+                alice.user_id(),
+                alice_device_id(),
+                MemoryStore::new(),
+            )),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())).into(),
         };
 
@@ -908,7 +925,7 @@ mod tests {
 
         let bob_store = VerificationStore {
             account: bob.static_data.clone(),
-            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
+            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_device_id(), bob_store)),
             private_identity: Mutex::new(PrivateCrossSigningIdentity::empty(bob_id())).into(),
         };
 
@@ -916,14 +933,14 @@ mod tests {
     }
 
     #[async_test]
-    async fn sas_wrapper_full() {
+    async fn test_sas_wrapper_full() {
         let (alice_store, alice_device, bob_store, bob_device) = machine_pair_test_helper();
 
         let identities = alice_store.get_identities(bob_device).await.unwrap();
 
         let (alice, content) = Sas::start(identities, TransactionId::new(), true, None, None);
 
-        assert_matches!(alice.state(), SasState::Started { .. });
+        assert_matches!(alice.state(), SasState::Created { .. });
 
         let flow_id = alice.flow_id().to_owned();
         let content = StartContent::try_from(&content).unwrap();
@@ -990,7 +1007,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn sas_with_restricted_methods() {
+    async fn test_sas_with_restricted_methods() {
         let (alice_store, alice_device, bob_store, bob_device) = machine_pair_test_helper();
         let identities = alice_store.get_identities(bob_device).await.unwrap();
 

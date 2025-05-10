@@ -1,8 +1,7 @@
 use ruma::{
-    api::client::push::RuleScope,
     push::{
-        Action, PredefinedContentRuleId, PredefinedOverrideRuleId, RemovePushRuleError, RuleKind,
-        Ruleset,
+        Action, NewPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
+        RemovePushRuleError, RuleKind, Ruleset,
     },
     RoomId,
 };
@@ -31,13 +30,8 @@ impl RuleCommands {
         notify: bool,
     ) -> Result<(), NotificationSettingsError> {
         let command = match kind {
-            RuleKind::Room => Command::SetRoomPushRule {
-                scope: RuleScope::Global,
-                room_id: room_id.to_owned(),
-                notify,
-            },
+            RuleKind::Room => Command::SetRoomPushRule { room_id: room_id.to_owned(), notify },
             RuleKind::Override => Command::SetOverridePushRule {
-                scope: RuleScope::Global,
                 rule_id: room_id.to_string(),
                 room_id: room_id.to_owned(),
                 notify,
@@ -60,9 +54,22 @@ impl RuleCommands {
         &mut self,
         keyword: String,
     ) -> Result<(), NotificationSettingsError> {
-        let command = Command::SetKeywordPushRule { scope: RuleScope::Global, keyword };
+        let command = Command::SetKeywordPushRule { keyword };
 
         self.rules.insert(command.to_push_rule()?, None, None)?;
+        self.commands.push(command);
+
+        Ok(())
+    }
+
+    /// Insert a new custom rule
+    pub(crate) fn insert_custom_rule(
+        &mut self,
+        rule: NewPushRule,
+    ) -> Result<(), NotificationSettingsError> {
+        let command = Command::SetCustomPushRule { rule: rule.clone() };
+
+        self.rules.insert(rule, None, None)?;
         self.commands.push(command);
 
         Ok(())
@@ -75,7 +82,7 @@ impl RuleCommands {
         rule_id: String,
     ) -> Result<(), RemovePushRuleError> {
         self.rules.remove(kind.clone(), &rule_id)?;
-        self.commands.push(Command::DeletePushRule { scope: RuleScope::Global, kind, rule_id });
+        self.commands.push(Command::DeletePushRule { kind, rule_id });
 
         Ok(())
     }
@@ -90,7 +97,6 @@ impl RuleCommands {
             .set_enabled(kind.clone(), rule_id, enabled)
             .map_err(|_| NotificationSettingsError::RuleNotFound(rule_id.to_owned()))?;
         self.commands.push(Command::SetPushRuleEnabled {
-            scope: RuleScope::Global,
             kind,
             rule_id: rule_id.to_owned(),
             enabled,
@@ -182,7 +188,6 @@ impl RuleCommands {
             .set_actions(kind.clone(), rule_id, actions.clone())
             .map_err(|_| NotificationSettingsError::RuleNotFound(rule_id.to_owned()))?;
         self.commands.push(Command::SetPushRuleActions {
-            scope: RuleScope::Global,
             kind,
             rule_id: rule_id.to_owned(),
             actions,
@@ -196,7 +201,6 @@ mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_test::async_test;
     use ruma::{
-        api::client::push::RuleScope,
         push::{
             Action, NewPushRule, NewSimplePushRule, PredefinedContentRuleId,
             PredefinedOverrideRuleId, PredefinedUnderrideRuleId, RemovePushRuleError, RuleKind,
@@ -229,8 +233,7 @@ mod tests {
         // Exactly one command must have been created.
         assert_eq!(rule_commands.commands.len(), 1);
         assert_matches!(&rule_commands.commands[0],
-            Command::SetRoomPushRule { scope, room_id: command_room_id, notify } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::SetRoomPushRule { room_id: command_room_id, notify } => {
                 assert_eq!(command_room_id, &room_id);
                 assert!(notify);
             }
@@ -249,8 +252,7 @@ mod tests {
         // Exactly one command must have been created.
         assert_eq!(rule_commands.commands.len(), 1);
         assert_matches!(&rule_commands.commands[0],
-            Command::SetOverridePushRule { scope, room_id: command_room_id, rule_id, notify } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::SetOverridePushRule {room_id: command_room_id, rule_id, notify } => {
                 assert_eq!(command_room_id, &room_id);
                 assert_eq!(rule_id, room_id.as_str());
                 assert!(notify);
@@ -298,8 +300,7 @@ mod tests {
         // Exactly one command must have been created.
         assert_eq!(rule_commands.commands.len(), 1);
         assert_matches!(&rule_commands.commands[0],
-            Command::DeletePushRule { scope, kind, rule_id } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::DeletePushRule { kind, rule_id } => {
                 assert_eq!(kind, &RuleKind::Room);
                 assert_eq!(rule_id, room_id.as_str());
             }
@@ -351,8 +352,7 @@ mod tests {
         // Exactly one command must have been created.
         assert_eq!(rule_commands.commands.len(), 1);
         assert_matches!(&rule_commands.commands[0],
-            Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
                 assert_eq!(kind, &RuleKind::Override);
                 assert_eq!(rule_id, PredefinedOverrideRuleId::Reaction.as_str());
                 assert!(enabled);
@@ -426,8 +426,7 @@ mod tests {
         assert_eq!(rule_commands.commands.len(), 3);
 
         assert_matches!(&rule_commands.commands[0],
-            Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
                 assert_eq!(kind, &RuleKind::Override);
                 assert_eq!(rule_id, PredefinedOverrideRuleId::IsUserMention.as_str());
                 assert!(enabled);
@@ -437,8 +436,7 @@ mod tests {
         #[allow(deprecated)]
         {
             assert_matches!(&rule_commands.commands[1],
-                Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
-                    assert_eq!(scope, &RuleScope::Global);
+                Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
                     assert_eq!(kind, &RuleKind::Content);
                     assert_eq!(rule_id, PredefinedContentRuleId::ContainsUserName.as_str());
                     assert!(enabled);
@@ -446,8 +444,7 @@ mod tests {
             );
 
             assert_matches!(&rule_commands.commands[2],
-                Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
-                    assert_eq!(scope, &RuleScope::Global);
+                Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
                     assert_eq!(kind, &RuleKind::Override);
                     assert_eq!(rule_id, PredefinedOverrideRuleId::ContainsDisplayName.as_str());
                     assert!(enabled);
@@ -499,8 +496,7 @@ mod tests {
         assert_eq!(rule_commands.commands.len(), 2);
 
         assert_matches!(&rule_commands.commands[0],
-            Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::SetPushRuleEnabled {  kind, rule_id, enabled } => {
                 assert_eq!(kind, &RuleKind::Override);
                 assert_eq!(rule_id, PredefinedOverrideRuleId::IsRoomMention.as_str());
                 assert!(enabled);
@@ -510,8 +506,7 @@ mod tests {
         #[allow(deprecated)]
         {
             assert_matches!(&rule_commands.commands[1],
-                Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
-                    assert_eq!(scope, &RuleScope::Global);
+                Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
                     assert_eq!(kind, &RuleKind::Override);
                     assert_eq!(rule_id, PredefinedOverrideRuleId::RoomNotif.as_str());
                     assert!(enabled);
@@ -550,8 +545,7 @@ mod tests {
         // and a `SetPushRuleActions` command must have been added
         assert_eq!(rule_commands.commands.len(), 1);
         assert_matches!(&rule_commands.commands[0],
-            Command::SetPushRuleActions { scope, kind, rule_id, actions } => {
-                assert_eq!(scope, &RuleScope::Global);
+            Command::SetPushRuleActions { kind, rule_id, actions } => {
                 assert_eq!(kind, &RuleKind::Underride);
                 assert_eq!(rule_id, PredefinedUnderrideRuleId::Message.as_str());
                 assert_eq!(actions.len(), 2);

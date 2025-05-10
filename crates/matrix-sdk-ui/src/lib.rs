@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 use ruma::html::HtmlSanitizerMode;
 
 mod events;
+
+pub use eyeball_im;
 
 pub mod encryption_sync_service;
 pub mod notification_client;
 pub mod room_list_service;
 pub mod sync_service;
 pub mod timeline;
+pub mod unable_to_decrypt_hook;
 
 pub use self::{room_list_service::RoomListService, timeline::Timeline};
 

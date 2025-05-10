@@ -14,14 +14,10 @@
 
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
+use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
 use ruma::{
-    assign,
-    events::{
-        relation::Replacement,
-        room::message::{self, MessageType, RoomMessageEventContent},
-        MessageLikeEventType, StateEventType,
-    },
+    events::{room::message::MessageType, MessageLikeEventType, StateEventType},
     uint, MilliSecondsSinceUnixEpoch,
 };
 use stream_assert::assert_next_matches;
@@ -30,46 +26,47 @@ use super::TestTimeline;
 use crate::timeline::TimelineItemContent;
 
 #[async_test]
-async fn invalid_edit() {
+async fn test_invalid_edit() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
-    timeline.handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("test")).await;
+    let f = &timeline.factory;
+    timeline.handle_live_event(f.text_msg("test").sender(&ALICE)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let msg = item.content().as_message().unwrap();
     assert_eq!(msg.body(), "test");
 
     let msg_event_id = item.event_id().unwrap();
 
-    let edit = assign!(RoomMessageEventContent::text_plain(" * fake"), {
-        relates_to: Some(message::Relation::Replacement(Replacement::new(
-            msg_event_id.to_owned(),
-            MessageType::text_plain("fake").into(),
-        ))),
-    });
     // Edit is from a different user than the previous event
-    timeline.handle_live_message_event(&BOB, edit).await;
+    timeline
+        .handle_live_event(
+            f.text_msg(" * fake")
+                .edit(msg_event_id, MessageType::text_plain("fake").into())
+                .sender(&BOB),
+        )
+        .await;
 
     // Can't easily test the non-arrival of an item using the stream. Instead
     // just assert that there is still just a couple items in the timeline.
-    assert_eq!(timeline.inner.items().await.len(), 2);
+    assert_eq!(timeline.controller.items().await.len(), 2);
 }
 
 #[async_test]
-async fn invalid_event_content() {
+async fn test_invalid_event_content() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
     // m.room.message events must have a msgtype and body in content, so this
     // event with an empty content object should fail to deserialize.
     timeline
-        .handle_live_custom_event(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {},
             "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 10,
             "sender": "@alice:example.org",
             "type": "m.room.message",
-        }))
+        })))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -82,14 +79,14 @@ async fn invalid_event_content() {
     // Similar to above, the m.room.member state event must also not have an
     // empty content object.
     timeline
-        .handle_live_custom_event(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {},
             "event_id": "$d5G0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 2179,
             "sender": "@alice:example.org",
             "type": "m.room.member",
             "state_key": "@alice:example.org",
-        }))
+        })))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -104,13 +101,13 @@ async fn invalid_event_content() {
 }
 
 #[async_test]
-async fn invalid_event() {
+async fn test_invalid_event() {
     let timeline = TestTimeline::new();
 
     // This event is missing the sender field which the homeserver must add to
     // all timeline events. Because the event is malformed, it will be ignored.
     timeline
-        .handle_live_custom_event(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {
                 "body": "hello world",
                 "msgtype": "m.text"
@@ -118,7 +115,7 @@ async fn invalid_event() {
             "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 10,
             "type": "m.room.message",
-        }))
+        })))
         .await;
-    assert_eq!(timeline.inner.items().await.len(), 0);
+    assert_eq!(timeline.controller.items().await.len(), 0);
 }

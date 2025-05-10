@@ -317,6 +317,22 @@ pub static NAME_STRIPPED: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
+pub static PINNED_EVENTS: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "content": {
+            "pinned": [ "$a", "$b" ]
+        },
+        "event_id": "$15139375513VdeRF:localhost",
+        "origin_server_ts": 151393755,
+        "sender": "@example:localhost",
+        "state_key": "",
+        "type": "m.room.pinned_events",
+        "unsigned": {
+            "age": 703422
+        }
+    })
+});
+
 pub static POWER_LEVELS: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "content": {
@@ -334,6 +350,9 @@ pub static POWER_LEVELS: Lazy<JsonValue> = Lazy::new(|| {
             "kick": 50,
             "redact": 50,
             "state_default": 50,
+            "notifications": {
+                "room": 0
+            },
             "users": {
                 "@example:localhost": 100,
                 "@bob:localhost": 0
@@ -577,38 +596,6 @@ pub static PUSH_RULES: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static READ_RECEIPT: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "content": {
-            "$example": {
-                "m.read": {
-                    "@example:localhost": {
-                        "ts": 1436451550
-                    }
-                }
-            }
-        },
-        "room_id": "!test:localhost",
-        "type": "m.receipt"
-    })
-});
-
-pub static READ_RECEIPT_OTHER: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "content": {
-            "$other": {
-                "m.read": {
-                    "@example:localhost": {
-                        "ts": 1436964550
-                    }
-                }
-            }
-        },
-        "room_id": "!test:localhost",
-        "type": "m.receipt"
-    })
-});
-
 pub static REDACTED_INVALID: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "content": {},
@@ -702,19 +689,6 @@ pub static TOPIC: Lazy<JsonValue> = Lazy::new(|| {
           "prev_sender": "@example:localhost",
           "replaces_state": "$151957069225EVYKm:localhost"
         }
-    })
-});
-
-pub static TYPING: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "content": {
-            "user_ids": [
-                "@alice:matrix.org",
-                "@bob:example.com"
-            ]
-        },
-        "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-        "type": "m.typing"
     })
 });
 

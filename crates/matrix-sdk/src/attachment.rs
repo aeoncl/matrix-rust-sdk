@@ -14,26 +14,24 @@
 
 //! Types and traits for attachments.
 
-#[cfg(feature = "image-proc")]
-use std::io::{BufRead, Cursor, Seek};
 use std::time::Duration;
 
-#[cfg(feature = "image-proc")]
-use image::GenericImageView;
 use ruma::{
     assign,
-    events::room::{
-        message::{AudioInfo, FileInfo, VideoInfo},
-        ImageInfo, ThumbnailInfo,
+    events::{
+        room::{
+            message::{AudioInfo, FileInfo, FormattedBody, VideoInfo},
+            ImageInfo, ThumbnailInfo,
+        },
+        Mentions,
     },
     OwnedTransactionId, TransactionId, UInt,
 };
 
-#[cfg(feature = "image-proc")]
-use crate::ImageError;
+use crate::room::reply::Reply;
 
 /// Base metadata about an image.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseImageInfo {
     /// The height of the image in pixels.
     pub height: Option<UInt>,
@@ -43,10 +41,12 @@ pub struct BaseImageInfo {
     pub size: Option<UInt>,
     /// The [BlurHash](https://blurha.sh/) for this image.
     pub blurhash: Option<String>,
+    /// Whether this image is animated.
+    pub is_animated: Option<bool>,
 }
 
 /// Base metadata about a video.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseVideoInfo {
     /// The duration of the video.
     pub duration: Option<Duration>,
@@ -61,7 +61,7 @@ pub struct BaseVideoInfo {
 }
 
 /// Base metadata about an audio clip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseAudioInfo {
     /// The duration of the audio clip.
     pub duration: Option<Duration>,
@@ -70,7 +70,7 @@ pub struct BaseAudioInfo {
 }
 
 /// Base metadata about a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseFileInfo {
     /// The size of the file in bytes.
     pub size: Option<UInt>,
@@ -104,6 +104,7 @@ impl From<AttachmentInfo> for ImageInfo {
                 width: info.width,
                 size: info.size,
                 blurhash: info.blurhash,
+                is_animated: info.is_animated,
             }),
             _ => ImageInfo::new(),
         }
@@ -152,27 +153,6 @@ impl From<AttachmentInfo> for FileInfo {
     }
 }
 
-#[derive(Debug, Clone)]
-/// Base metadata about a thumbnail.
-pub struct BaseThumbnailInfo {
-    /// The height of the thumbnail in pixels.
-    pub height: Option<UInt>,
-    /// The width of the thumbnail in pixels.
-    pub width: Option<UInt>,
-    /// The file size of the thumbnail in bytes.
-    pub size: Option<UInt>,
-}
-
-impl From<BaseThumbnailInfo> for ThumbnailInfo {
-    fn from(info: BaseThumbnailInfo) -> Self {
-        assign!(ThumbnailInfo::new(), {
-            height: info.height,
-            width: info.width,
-            size: info.size,
-        })
-    }
-}
-
 /// A thumbnail to upload and send for an attachment.
 #[derive(Debug)]
 pub struct Thumbnail {
@@ -180,78 +160,55 @@ pub struct Thumbnail {
     pub data: Vec<u8>,
     /// The type of the thumbnail, this will be used as the content-type header.
     pub content_type: mime::Mime,
-    /// The metadata of the thumbnail.
-    pub info: Option<BaseThumbnailInfo>,
+    /// The height of the thumbnail in pixels.
+    pub height: UInt,
+    /// The width of the thumbnail in pixels.
+    pub width: UInt,
+    /// The file size of the thumbnail in bytes.
+    pub size: UInt,
+}
+
+impl Thumbnail {
+    /// Convert this `Thumbnail` into a `(data, content_type, info)` tuple.
+    pub fn into_parts(self) -> (Vec<u8>, mime::Mime, Box<ThumbnailInfo>) {
+        let thumbnail_info = assign!(ThumbnailInfo::new(), {
+            height: Some(self.height),
+            width: Some(self.width),
+            size: Some(self.size),
+            mimetype: Some(self.content_type.to_string())
+        });
+        (self.data, self.content_type, Box::new(thumbnail_info))
+    }
 }
 
 /// Configuration for sending an attachment.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AttachmentConfig {
     pub(crate) txn_id: Option<OwnedTransactionId>,
     pub(crate) info: Option<AttachmentInfo>,
     pub(crate) thumbnail: Option<Thumbnail>,
-    #[cfg(feature = "image-proc")]
-    pub(crate) generate_thumbnail: bool,
-    #[cfg(feature = "image-proc")]
-    pub(crate) thumbnail_size: Option<(u32, u32)>,
+    pub(crate) caption: Option<String>,
+    pub(crate) formatted_caption: Option<FormattedBody>,
+    pub(crate) mentions: Option<Mentions>,
+    pub(crate) reply: Option<Reply>,
 }
 
 impl AttachmentConfig {
-    /// Create a new default `AttachmentConfig` without providing a thumbnail.
-    ///
-    /// To provide a thumbnail use [`AttachmentConfig::with_thumbnail()`].
+    /// Create a new empty `AttachmentConfig`.
     pub fn new() -> Self {
-        Self {
-            txn_id: Default::default(),
-            info: Default::default(),
-            thumbnail: None,
-            #[cfg(feature = "image-proc")]
-            generate_thumbnail: Default::default(),
-            #[cfg(feature = "image-proc")]
-            thumbnail_size: Default::default(),
-        }
+        Self::default()
     }
 
-    /// Generate the thumbnail to send for this media.
-    ///
-    /// Uses [`generate_image_thumbnail()`].
-    ///
-    /// Thumbnails can only be generated for supported image attachments. For
-    /// more information, see the [image](https://github.com/image-rs/image)
-    /// crate.
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - The size of the thumbnail in pixels as a `(width, height)`
-    /// tuple. If set to `None`, defaults to `(800, 600)`.
-    #[cfg(feature = "image-proc")]
-    #[must_use]
-    pub fn generate_thumbnail(mut self, size: Option<(u32, u32)>) -> Self {
-        self.generate_thumbnail = true;
-        self.thumbnail_size = size;
-        self
-    }
-
-    /// Create a new default `AttachmentConfig` with a `thumbnail`.
+    /// Set the thumbnail to send.
     ///
     /// # Arguments
     ///
     /// * `thumbnail` - The thumbnail of the media. If the `content_type` does
-    /// not support it (eg audio clips), it is ignored.
-    ///
-    /// To generate automatically a thumbnail from an image, use
-    /// [`AttachmentConfig::new()`] and
-    /// [`AttachmentConfig::generate_thumbnail()`].
-    pub fn with_thumbnail(thumbnail: Thumbnail) -> Self {
-        Self {
-            txn_id: Default::default(),
-            info: Default::default(),
-            thumbnail: Some(thumbnail),
-            #[cfg(feature = "image-proc")]
-            generate_thumbnail: Default::default(),
-            #[cfg(feature = "image-proc")]
-            thumbnail_size: Default::default(),
-        }
+    ///   not support it (e.g. audio clips), it is ignored.
+    #[must_use]
+    pub fn thumbnail(mut self, thumbnail: Option<Thumbnail>) -> Self {
+        self.thumbnail = thumbnail;
+        self
     }
 
     /// Set the transaction ID to send.
@@ -259,8 +216,8 @@ impl AttachmentConfig {
     /// # Arguments
     ///
     /// * `txn_id` - A unique ID that can be attached to a `MessageEvent` held
-    /// in its unsigned field as `transaction_id`. If not given, one is created
-    /// for the message.
+    ///   in its unsigned field as `transaction_id`. If not given, one is
+    ///   created for the message.
     #[must_use]
     pub fn txn_id(mut self, txn_id: &TransactionId) -> Self {
         self.txn_id = Some(txn_id.to_owned());
@@ -272,111 +229,50 @@ impl AttachmentConfig {
     /// # Arguments
     ///
     /// * `info` - The metadata of the media. If the `AttachmentInfo` type
-    /// doesn't match the `content_type`, it is ignored.
+    ///   doesn't match the `content_type`, it is ignored.
     #[must_use]
     pub fn info(mut self, info: AttachmentInfo) -> Self {
         self.info = Some(info);
         self
     }
-}
 
-impl Default for AttachmentConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Generate a thumbnail for an image.
-///
-/// This is a convenience method that uses the
-/// [image](https://github.com/image-rs/image) crate.
-///
-/// # Arguments
-/// * `content_type` - The type of the media, this will be used as the
-/// content-type header.
-///
-/// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
-/// media.
-///
-/// * `size` - The size of the thumbnail in pixels as a `(width, height)` tuple.
-/// If set to `None`, defaults to `(800, 600)`.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::{io::Cursor, path::PathBuf};
-///
-/// use matrix_sdk::attachment::{
-///     generate_image_thumbnail, AttachmentConfig, Thumbnail,
-/// };
-/// use mime;
-/// # use matrix_sdk::{Client, ruma::room_id };
-/// # use url::Url;
-/// #
-/// # async {
-/// # let homeserver = Url::parse("http://localhost:8080")?;
-/// # let mut client = Client::new(homeserver).await?;
-/// # let room_id = room_id!("!test:localhost");
-/// let path = PathBuf::from("/home/example/my-cat.jpg");
-/// let image = tokio::fs::read(path).await?;
-///
-/// let cursor = Cursor::new(&image);
-/// let (thumbnail_data, thumbnail_info) =
-///     generate_image_thumbnail(&mime::IMAGE_JPEG, cursor, None)?;
-/// let config = AttachmentConfig::with_thumbnail(Thumbnail {
-///     data: thumbnail_data,
-///     content_type: mime::IMAGE_JPEG,
-///     info: Some(thumbnail_info),
-/// });
-///
-/// if let Some(room) = client.get_room(&room_id) {
-///     room.send_attachment(
-///         "My favorite cat",
-///         &mime::IMAGE_JPEG,
-///         image,
-///         config,
-///     )
-///     .await?;
-/// }
-/// # anyhow::Ok(()) };
-/// ```
-#[cfg(feature = "image-proc")]
-pub fn generate_image_thumbnail<R: BufRead + Seek>(
-    content_type: &mime::Mime,
-    reader: R,
-    size: Option<(u32, u32)>,
-) -> Result<(Vec<u8>, BaseThumbnailInfo), ImageError> {
-    let image_format = image::ImageFormat::from_mime_type(content_type);
-    if image_format.is_none() {
-        return Err(ImageError::FormatNotSupported);
+    /// Set the optional caption
+    ///
+    /// # Arguments
+    ///
+    /// * `caption` - The optional caption
+    pub fn caption(mut self, caption: Option<String>) -> Self {
+        self.caption = caption;
+        self
     }
 
-    let image_format = image_format.unwrap();
-
-    let image = image::load(reader, image_format)?;
-    let (original_width, original_height) = image.dimensions();
-
-    let (width, height) = size.unwrap_or((800, 600));
-
-    // Don't generate a thumbnail if it would be bigger than or equal to the
-    // original.
-    if height >= original_height && width >= original_width {
-        return Err(ImageError::ThumbnailBiggerThanOriginal);
+    /// Set the optional formatted caption
+    ///
+    /// # Arguments
+    ///
+    /// * `formatted_caption` - The optional formatted caption
+    pub fn formatted_caption(mut self, formatted_caption: Option<FormattedBody>) -> Self {
+        self.formatted_caption = formatted_caption;
+        self
     }
 
-    let thumbnail = image.thumbnail(width, height);
-    let (thumbnail_width, thumbnail_height) = thumbnail.dimensions();
+    /// Set the mentions of the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `mentions` - The mentions of the message
+    pub fn mentions(mut self, mentions: Option<Mentions>) -> Self {
+        self.mentions = mentions;
+        self
+    }
 
-    let mut data: Vec<u8> = vec![];
-    thumbnail.write_to(&mut Cursor::new(&mut data), image_format)?;
-    let data_size = data.len() as u32;
-
-    Ok((
-        data,
-        BaseThumbnailInfo {
-            width: Some(thumbnail_width.into()),
-            height: Some(thumbnail_height.into()),
-            size: Some(data_size.into()),
-        },
-    ))
+    /// Set the reply information of the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `reply` - The reply information of the message
+    pub fn reply(mut self, reply: Option<Reply>) -> Self {
+        self.reply = reply;
+        self
+    }
 }

@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, sync::Mutex};
 
 use assert_matches::assert_matches;
 use matrix_sdk::{
+    authentication::matrix::MatrixSession,
     config::RequestConfig,
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     test_utils::{logged_in_client_with_server, no_retry_test_client_with_server},
-    AuthApi, AuthSession, Client, RumaApiError,
+    AuthApi, AuthSession, Client, RumaApiError, SessionTokens,
 };
 use matrix_sdk_base::SessionMeta;
 use matrix_sdk_test::{async_test, test_json};
@@ -73,7 +73,7 @@ async fn test_login() {
     let auth = client.matrix_auth();
     auth.login_username("example", "wordpass").send().await.unwrap();
 
-    assert!(client.logged_in(), "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
     assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
 
     assert_matches!(client.auth_api(), Some(AuthApi::Matrix(_)));
@@ -94,9 +94,7 @@ async fn test_login_with_discovery() {
 
     client.matrix_auth().login_username("example", "wordpass").send().await.unwrap();
 
-    let logged_in = client.logged_in();
-    assert!(logged_in, "Client should be logged in");
-
+    assert!(client.is_active(), "Client should be active");
     assert_eq!(client.homeserver().as_str(), "https://example.org/");
 }
 
@@ -112,9 +110,7 @@ async fn test_login_no_discovery() {
 
     client.matrix_auth().login_username("example", "wordpass").send().await.unwrap();
 
-    let logged_in = client.logged_in();
-    assert!(logged_in, "Client should be logged in");
-
+    assert!(client.is_active(), "Client should be active");
     assert_eq!(client.homeserver(), Url::parse(&server.uri()).unwrap());
 }
 
@@ -152,8 +148,7 @@ async fn test_login_with_sso() {
         .await
         .unwrap();
 
-    let logged_in = client.logged_in();
-    assert!(logged_in, "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
 }
 
 #[async_test]
@@ -187,8 +182,42 @@ async fn test_login_with_sso_token() {
 
     auth.login_token("averysmalltoken").send().await.unwrap();
 
-    let logged_in = client.logged_in();
-    assert!(logged_in, "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
+}
+
+#[async_test]
+async fn test_login_with_sso_callback() {
+    let (client, server) = no_retry_test_client_with_server().await;
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/r0/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::LOGIN_TYPES))
+        .mount(&server)
+        .await;
+
+    let auth = client.matrix_auth();
+    let can_sso = auth
+        .get_login_types()
+        .await
+        .unwrap()
+        .flows
+        .iter()
+        .any(|flow| matches!(flow, LoginType::Sso(_)));
+    assert!(can_sso);
+
+    let sso_url = auth.get_sso_login_url("http://127.0.0.1:3030", None).await;
+    sso_url.unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/r0/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::LOGIN))
+        .mount(&server)
+        .await;
+
+    let callback_url = Url::parse("http://127.0.0.1:3030?loginToken=averysmalltoken").unwrap();
+    auth.login_with_sso_callback(callback_url).unwrap().await.unwrap();
+
+    assert!(client.is_active(), "Client should be active");
 }
 
 #[async_test]
@@ -206,7 +235,7 @@ async fn test_login_error() {
             assert_eq!(api_err.status_code, http::StatusCode::from_u16(403).unwrap());
 
             if let client_api::error::ErrorBody::Standard { kind, message } = &api_err.body {
-                if *kind != client_api::error::ErrorKind::Forbidden {
+                if !matches!(*kind, client_api::error::ErrorKind::Forbidden { .. }) {
                     panic!("found the wrong `ErrorKind` {kind:?}, expected `Forbidden");
                 }
 
@@ -237,7 +266,7 @@ async fn test_register_error() {
     let user = assign!(RegistrationRequest::new(), {
         username: Some("user".to_owned()),
         password: Some("password".to_owned()),
-        auth: Some(uiaa::AuthData::FallbackAcknowledgement(
+        auth: Some(AuthData::FallbackAcknowledgement(
             uiaa::FallbackAcknowledgement::new("foobar".to_owned()),
         )),
         kind: RegistrationKind::User,
@@ -247,7 +276,7 @@ async fn test_register_error() {
         if let Some(api_err) = err.as_client_api_error() {
             assert_eq!(api_err.status_code, http::StatusCode::from_u16(403).unwrap());
             if let client_api::error::ErrorBody::Standard { kind, message } = &api_err.body {
-                if *kind != client_api::error::ErrorKind::Forbidden {
+                if !matches!(*kind, client_api::error::ErrorKind::Forbidden { .. }) {
                     panic!("found the wrong `ErrorKind` {kind:?}, expected `Forbidden");
                 }
 
@@ -299,7 +328,7 @@ fn test_serialize_session() {
             user_id: user_id!("@user:localhost").to_owned(),
             device_id: device_id!("EFGHIJ").to_owned(),
         },
-        tokens: MatrixSessionTokens { access_token: "abcd".to_owned(), refresh_token: None },
+        tokens: SessionTokens { access_token: "abcd".to_owned(), refresh_token: None },
     };
     assert_eq!(
         to_json_value(session.clone()).unwrap(),
@@ -448,7 +477,7 @@ async fn test_login_with_cross_signing_bootstrapping() {
         let auth = client.matrix_auth();
         auth.login_username("example", "hunter2").send().await.unwrap();
 
-        assert!(client.logged_in(), "Client should be logged in");
+        assert!(client.is_active(), "Client should be active");
         assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
 
         client.encryption().wait_for_e2ee_initialization_tasks().await;
@@ -501,7 +530,7 @@ async fn test_login_with_cross_signing_bootstrapping() {
         let auth = client.matrix_auth();
         auth.login_token("HUNTER2").send().await.unwrap();
 
-        assert!(client.logged_in(), "Client should be logged in");
+        assert!(client.is_active(), "Client should be active");
         assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
 
         client.encryption().wait_for_e2ee_initialization_tasks().await;
@@ -577,7 +606,7 @@ async fn test_login_doesnt_fail_if_cross_signing_bootstrapping_failed() {
     let auth = client.matrix_auth();
     auth.login_username("example", "hunter2").send().await.unwrap();
 
-    assert!(client.logged_in(), "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
     assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
 
     let me = client.user_id().expect("we are now logged in");
@@ -698,6 +727,6 @@ async fn test_login_with_cross_signing_bootstrapping_already_bootstrapped() {
     let auth = client.matrix_auth();
     auth.login_username("example", "hunter2").send().await.unwrap();
 
-    assert!(client.logged_in(), "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
     assert!(auth.logged_in(), "Client should be logged in with the MatrixAuth API");
 }

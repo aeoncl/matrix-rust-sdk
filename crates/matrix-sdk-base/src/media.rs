@@ -14,6 +14,7 @@ use ruma::{
     },
     MxcUri, UInt,
 };
+use serde::{Deserialize, Serialize};
 
 const UNIQUE_SEPARATOR: &str = "_";
 
@@ -25,27 +26,27 @@ pub trait UniqueKey {
 }
 
 /// The requested format of a media file.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MediaFormat {
     /// The file that was uploaded.
     File,
 
     /// A thumbnail of the file that was uploaded.
-    Thumbnail(MediaThumbnailSize),
+    Thumbnail(MediaThumbnailSettings),
 }
 
 impl UniqueKey for MediaFormat {
     fn unique_key(&self) -> String {
         match self {
             Self::File => "file".into(),
-            Self::Thumbnail(size) => size.unique_key(),
+            Self::Thumbnail(settings) => settings.unique_key(),
         }
     }
 }
 
-/// The requested size of a media thumbnail.
-#[derive(Clone, Debug)]
-pub struct MediaThumbnailSize {
+/// The desired settings of a media thumbnail.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MediaThumbnailSettings {
     /// The desired resizing method.
     pub method: Method,
 
@@ -56,11 +57,44 @@ pub struct MediaThumbnailSize {
     /// The desired height of the thumbnail. The actual thumbnail may not match
     /// the size specified.
     pub height: UInt,
+
+    /// If we want to request an animated thumbnail from the homeserver.
+    ///
+    /// If it is `true`, the server should return an animated thumbnail if
+    /// the media supports it.
+    ///
+    /// Defaults to `false`.
+    pub animated: bool,
 }
 
-impl UniqueKey for MediaThumbnailSize {
+impl MediaThumbnailSettings {
+    /// Constructs a new `MediaThumbnailSettings` with the given method, width
+    /// and height.
+    ///
+    /// Requests a non-animated thumbnail by default.
+    pub fn with_method(method: Method, width: UInt, height: UInt) -> Self {
+        Self { method, width, height, animated: false }
+    }
+
+    /// Constructs a new `MediaThumbnailSettings` with the given width and
+    /// height.
+    ///
+    /// Requests scaling, and a non-animated thumbnail.
+    pub fn new(width: UInt, height: UInt) -> Self {
+        Self { method: Method::Scale, width, height, animated: false }
+    }
+}
+
+impl UniqueKey for MediaThumbnailSettings {
     fn unique_key(&self) -> String {
-        format!("{}{UNIQUE_SEPARATOR}{}x{}", self.method, self.width, self.height)
+        let mut key = format!("{}{UNIQUE_SEPARATOR}{}x{}", self.method, self.width, self.height);
+
+        if self.animated {
+            key.push_str(UNIQUE_SEPARATOR);
+            key.push_str("animated");
+        }
+
+        key
     }
 }
 
@@ -73,9 +107,11 @@ impl UniqueKey for MediaSource {
     }
 }
 
-/// A request for media data.
-#[derive(Clone, Debug)]
-pub struct MediaRequest {
+/// Parameters for a request for retrieve media data.
+///
+/// This is used as a key in the media cache too.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MediaRequestParameters {
     /// The source of the media file.
     pub source: MediaSource,
 
@@ -83,7 +119,7 @@ pub struct MediaRequest {
     pub format: MediaFormat,
 }
 
-impl MediaRequest {
+impl MediaRequestParameters {
     /// Get the [`MxcUri`] from `Self`.
     pub fn uri(&self) -> &MxcUri {
         match &self.source {
@@ -93,7 +129,7 @@ impl MediaRequest {
     }
 }
 
-impl UniqueKey for MediaRequest {
+impl UniqueKey for MediaRequestParameters {
     fn unique_key(&self) -> String {
         format!("{}{UNIQUE_SEPARATOR}{}", self.source.unique_key(), self.format.unique_key())
     }
@@ -114,7 +150,7 @@ pub trait MediaEventContent {
 
 impl MediaEventContent for StickerEventContent {
     fn source(&self) -> Option<MediaSource> {
-        Some(MediaSource::Plain(self.url.clone()))
+        Some(MediaSource::from(self.source.clone()))
     }
 
     fn thumbnail_source(&self) -> Option<MediaSource> {
@@ -189,14 +225,14 @@ mod tests {
     fn test_media_request_url() {
         let mxc_uri = mxc_uri!("mxc://homeserver/media");
 
-        let plain = MediaRequest {
+        let plain = MediaRequestParameters {
             source: MediaSource::Plain(mxc_uri.to_owned()),
             format: MediaFormat::File,
         };
 
         assert_eq!(plain.uri(), mxc_uri);
 
-        let file = MediaRequest {
+        let file = MediaRequestParameters {
             source: MediaSource::Encrypted(Box::new(
                 serde_json::from_value(json!({
                     "url": mxc_uri,

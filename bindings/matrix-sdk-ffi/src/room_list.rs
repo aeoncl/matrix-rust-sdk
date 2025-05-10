@@ -1,37 +1,35 @@
-use std::{fmt::Debug, sync::Arc, time::Duration};
+#![allow(deprecated)]
 
+use std::{fmt::Debug, mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, time::Duration};
+
+use async_compat::get_runtime_handle;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt, TryFutureExt};
-use matrix_sdk::{
-    ruma::{
-        api::client::sync::sync_events::{
-            v4::RoomSubscription as RumaRoomSubscription,
-            UnreadNotificationsCount as RumaUnreadNotificationsCount,
-        },
-        assign, RoomId,
-    },
-    RoomListEntry as MatrixRoomListEntry,
+use matrix_sdk::ruma::{
+    api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
+    RoomId,
 };
 use matrix_sdk_ui::{
-    room_list_service::{
-        filters::{
-            new_filter_all, new_filter_any, new_filter_category, new_filter_favourite,
-            new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none,
-            new_filter_normalized_match_room_name, new_filter_unread, RoomCategory,
-        },
-        BoxedFilterFn,
+    room_list_service::filters::{
+        new_filter_all, new_filter_any, new_filter_category, new_filter_favourite,
+        new_filter_fuzzy_match_room_name, new_filter_invite, new_filter_joined,
+        new_filter_non_left, new_filter_none, new_filter_normalized_match_room_name,
+        new_filter_unread, BoxedFilterFn, RoomCategory,
     },
     timeline::default_event_filter,
+    unable_to_decrypt_hook::UtdHookManager,
 };
+use ruma::{OwnedRoomOrAliasId, OwnedServerName, ServerName};
 use tokio::sync::RwLock;
 
 use crate::{
     error::ClientError,
-    room::Room,
+    room::{Membership, Room},
     room_info::RoomInfo,
-    timeline::{EventTimelineItem, Timeline},
-    timeline_event_filter::TimelineEventTypeFilter,
-    TaskHandle, RUNTIME,
+    room_preview::RoomPreview,
+    timeline::{configuration::TimelineEventTypeFilter, EventTimelineItem, Timeline},
+    utils::AsyncRuntimeDropped,
+    TaskHandle,
 };
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -54,6 +52,8 @@ pub enum RoomListError {
     InitializingTimeline { error: String },
     #[error("Event cache ran into an error: {error}")]
     EventCache { error: String },
+    #[error("The requested room doesn't match the membership requirements {expected:?}, observed {actual:?}")]
+    IncorrectRoomMembership { expected: Vec<Membership>, actual: Membership },
 }
 
 impl From<matrix_sdk_ui::room_list_service::Error> for RoomListError {
@@ -63,7 +63,6 @@ impl From<matrix_sdk_ui::room_list_service::Error> for RoomListError {
         match value {
             SlidingSync(error) => Self::SlidingSync { error: error.to_string() },
             UnknownList(list_name) => Self::UnknownList { list_name },
-            InputCannotBeApplied(_) => Self::InputCannotBeApplied,
             RoomNotFound(room_id) => Self::RoomNotFound { room_name: room_id.to_string() },
             TimelineAlreadyExists(room_id) => {
                 Self::TimelineAlreadyExists { room_name: room_id.to_string() }
@@ -82,38 +81,18 @@ impl From<ruma::IdParseError> for RoomListError {
     }
 }
 
-#[derive(uniffi::Record)]
-pub struct RoomListRange {
-    pub start: u32,
-    pub end_inclusive: u32,
-}
-
-#[derive(uniffi::Enum)]
-pub enum RoomListInput {
-    Viewport { ranges: Vec<RoomListRange> },
-}
-
-impl From<RoomListInput> for matrix_sdk_ui::room_list_service::Input {
-    fn from(value: RoomListInput) -> Self {
-        match value {
-            RoomListInput::Viewport { ranges } => Self::Viewport(
-                ranges.iter().map(|range| range.start..=range.end_inclusive).collect(),
-            ),
-        }
-    }
-}
-
 #[derive(uniffi::Object)]
 pub struct RoomListService {
     pub(crate) inner: Arc<matrix_sdk_ui::RoomListService>,
+    pub(crate) utd_hook: Option<Arc<UtdHookManager>>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListService {
     fn state(&self, listener: Box<dyn RoomListServiceStateListener>) -> Arc<TaskHandle> {
         let state_stream = self.inner.state();
 
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(state_stream);
 
             while let Some(state) = state_stream.next().await {
@@ -126,7 +105,8 @@ impl RoomListService {
         let room_id = <&RoomId>::try_from(room_id.as_str()).map_err(RoomListError::from)?;
 
         Ok(Arc::new(RoomListItem {
-            inner: Arc::new(RUNTIME.block_on(async { self.inner.room(room_id).await })?),
+            inner: Arc::new(self.inner.room(room_id)?),
+            utd_hook: self.utd_hook.clone(),
         }))
     }
 
@@ -135,17 +115,6 @@ impl RoomListService {
             room_list_service: self.clone(),
             inner: Arc::new(self.inner.all_rooms().await.map_err(RoomListError::from)?),
         }))
-    }
-
-    async fn invites(self: Arc<Self>) -> Result<Arc<RoomList>, RoomListError> {
-        Ok(Arc::new(RoomList {
-            room_list_service: self.clone(),
-            inner: Arc::new(self.inner.invites().await.map_err(RoomListError::from)?),
-        }))
-    }
-
-    async fn apply_input(&self, input: RoomListInput) -> Result<(), RoomListError> {
-        self.inner.apply_input(input.into()).await.map(|_| ()).map_err(Into::into)
     }
 
     fn sync_indicator(
@@ -159,13 +128,26 @@ impl RoomListService {
             Duration::from_millis(delay_before_hiding_in_ms.into()),
         );
 
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(sync_indicator_stream);
 
             while let Some(sync_indicator) = sync_indicator_stream.next().await {
                 listener.on_update(sync_indicator.into());
             }
         })))
+    }
+
+    fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
+        let room_ids = room_ids
+            .into_iter()
+            .map(|room_id| {
+                RoomId::parse(&room_id).map_err(|_| RoomListError::InvalidRoomId { error: room_id })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.inner.subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>());
+
+        Ok(())
     }
 }
 
@@ -175,7 +157,7 @@ pub struct RoomList {
     inner: Arc<matrix_sdk_ui::room_list_service::RoomList>,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomList {
     fn loading_state(
         &self,
@@ -185,7 +167,7 @@ impl RoomList {
 
         Ok(RoomListLoadingStateResult {
             state: loading_state.get().into(),
-            state_stream: Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            state_stream: Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
                 pin_mut!(loading_state);
 
                 while let Some(loading_state) = loading_state.next().await {
@@ -195,45 +177,98 @@ impl RoomList {
         })
     }
 
-    fn entries(&self, listener: Box<dyn RoomListEntriesListener>) -> RoomListEntriesResult {
-        let (entries, entries_stream) = self.inner.entries();
-
-        RoomListEntriesResult {
-            entries: entries.into_iter().map(Into::into).collect(),
-            entries_stream: Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
-                pin_mut!(entries_stream);
-
-                while let Some(diff) = entries_stream.next().await {
-                    listener.on_update(diff.into_iter().map(Into::into).collect());
-                }
-            }))),
-        }
-    }
-
     fn entries_with_dynamic_adapters(
-        &self,
+        self: Arc<Self>,
         page_size: u32,
         listener: Box<dyn RoomListEntriesListener>,
-    ) -> RoomListEntriesWithDynamicAdaptersResult {
-        let (entries_stream, dynamic_entries_controller) =
-            self.inner.entries_with_dynamic_adapters(
-                page_size.try_into().unwrap(),
-                self.room_list_service.inner.client().roominfo_update_receiver(),
-            );
+    ) -> Arc<RoomListEntriesWithDynamicAdaptersResult> {
+        let this = self.clone();
+        let utd_hook = self.room_list_service.utd_hook.clone();
 
-        RoomListEntriesWithDynamicAdaptersResult {
-            controller: Arc::new(RoomListDynamicEntriesController::new(
-                dynamic_entries_controller,
-                self.room_list_service.inner.client(),
-            )),
-            entries_stream: Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
-                pin_mut!(entries_stream);
+        // The following code deserves a bit of explanation.
+        // `matrix_sdk_ui::room_list_service::RoomList::entries_with_dynamic_adapters`
+        // returns a `Stream` with a lifetime bounds to its `self` (`RoomList`). This is
+        // problematic here as this `Stream` is returned as part of
+        // `RoomListEntriesWithDynamicAdaptersResult` but it is not possible to store
+        // `RoomList` with it inside the `Future` that is run inside the `TaskHandle`
+        // that consumes this `Stream`. We have a lifetime issue: `RoomList` doesn't
+        // live long enough!
+        //
+        // To solve this issue, the trick is to store the `RoomList` inside the
+        // `RoomListEntriesWithDynamicAdaptersResult`. Alright, but then we have another
+        // lifetime issue! `RoomList` cannot move inside this struct because it is
+        // borrowed by `entries_with_dynamic_adapters`. Indeed, the struct is built
+        // after the `Stream` is obtained.
+        //
+        // To solve this issue, we need to build the struct field by field, starting
+        // with `this`, and use a reference to `this` to call
+        // `entries_with_dynamic_adapters`. This is unsafe because a couple of
+        // invariants must hold, but all this is legal and correct if the invariants are
+        // properly fulfilled.
 
-                while let Some(diff) = entries_stream.next().await {
-                    listener.on_update(diff.into_iter().map(Into::into).collect());
-                }
-            }))),
+        // Create the struct result with uninitialized fields.
+        let mut result = MaybeUninit::<RoomListEntriesWithDynamicAdaptersResult>::uninit();
+        let ptr = result.as_mut_ptr();
+
+        // Initialize the first field `this`.
+        //
+        // SAFETY: `ptr` is correctly aligned, this is guaranteed by `MaybeUninit`.
+        unsafe {
+            addr_of_mut!((*ptr).this).write(this);
         }
+
+        // Get a reference to `this`. It is only borrowed, it's not moved.
+        let this =
+            // SAFETY: `ptr` is correct aligned, the `this` field is correctly aligned,
+            // is dereferenceable and points to a correctly initialized value as done
+            // in the previous line.
+            unsafe { addr_of_mut!((*ptr).this).as_ref() }
+                // SAFETY: `this` contains a non null value.
+                .unwrap();
+
+        // Now we can create `entries_stream` and `dynamic_entries_controller` by
+        // borrowing `this`, which is going to live long enough since it will live as
+        // long as `entries_stream` and `dynamic_entries_controller`.
+        let (entries_stream, dynamic_entries_controller) =
+            this.inner.entries_with_dynamic_adapters(page_size.try_into().unwrap());
+
+        // FFI dance to make those values consumable by foreign language, nothing fancy
+        // here, that's the real code for this method.
+        let dynamic_entries_controller =
+            Arc::new(RoomListDynamicEntriesController::new(dynamic_entries_controller));
+
+        let entries_stream = Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            pin_mut!(entries_stream);
+
+            while let Some(diffs) = entries_stream.next().await {
+                listener.on_update(
+                    diffs
+                        .into_iter()
+                        .map(|diff| RoomListEntriesUpdate::from(diff, utd_hook.clone()))
+                        .collect(),
+                );
+            }
+        })));
+
+        // Initialize the second field `controller`.
+        //
+        // SAFETY: `ptr` is correctly aligned.
+        unsafe {
+            addr_of_mut!((*ptr).controller).write(dynamic_entries_controller);
+        }
+
+        // Initialize the third and last field `entries_stream`.
+        //
+        // SAFETY: `ptr` is correctly aligned.
+        unsafe {
+            addr_of_mut!((*ptr).entries_stream).write(entries_stream);
+        }
+
+        // The result is complete, let's return it!
+        //
+        // SAFETY: `result` is fully initialized, all its fields have received a valid
+        // value.
+        Arc::new(unsafe { result.assume_init() })
     }
 
     fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
@@ -241,16 +276,22 @@ impl RoomList {
     }
 }
 
-#[derive(uniffi::Record)]
-pub struct RoomListEntriesResult {
-    pub entries: Vec<RoomListEntry>,
-    pub entries_stream: Arc<TaskHandle>,
+#[derive(uniffi::Object)]
+pub struct RoomListEntriesWithDynamicAdaptersResult {
+    this: Arc<RoomList>,
+    controller: Arc<RoomListDynamicEntriesController>,
+    entries_stream: Arc<TaskHandle>,
 }
 
-#[derive(uniffi::Record)]
-pub struct RoomListEntriesWithDynamicAdaptersResult {
-    pub controller: Arc<RoomListDynamicEntriesController>,
-    pub entries_stream: Arc<TaskHandle>,
+#[matrix_sdk_ffi_macros::export]
+impl RoomListEntriesWithDynamicAdaptersResult {
+    fn controller(&self) -> Arc<RoomListDynamicEntriesController> {
+        self.controller.clone()
+    }
+
+    fn entries_stream(&self) -> Arc<TaskHandle> {
+        self.entries_stream.clone()
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -320,65 +361,80 @@ impl From<matrix_sdk_ui::room_list_service::RoomListLoadingState> for RoomListLo
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListServiceStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListServiceState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListLoadingStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListLoadingState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListServiceSyncIndicatorListener: Send + Sync + Debug {
     fn on_update(&self, sync_indicator: RoomListServiceSyncIndicator);
 }
 
 #[derive(uniffi::Enum)]
 pub enum RoomListEntriesUpdate {
-    Append { values: Vec<RoomListEntry> },
+    Append { values: Vec<Arc<RoomListItem>> },
     Clear,
-    PushFront { value: RoomListEntry },
-    PushBack { value: RoomListEntry },
+    PushFront { value: Arc<RoomListItem> },
+    PushBack { value: Arc<RoomListItem> },
     PopFront,
     PopBack,
-    Insert { index: u32, value: RoomListEntry },
-    Set { index: u32, value: RoomListEntry },
+    Insert { index: u32, value: Arc<RoomListItem> },
+    Set { index: u32, value: Arc<RoomListItem> },
     Remove { index: u32 },
     Truncate { length: u32 },
-    Reset { values: Vec<RoomListEntry> },
+    Reset { values: Vec<Arc<RoomListItem>> },
 }
 
-impl From<VectorDiff<matrix_sdk::RoomListEntry>> for RoomListEntriesUpdate {
-    fn from(other: VectorDiff<matrix_sdk::RoomListEntry>) -> Self {
-        match other {
-            VectorDiff::Append { values } => {
-                Self::Append { values: values.into_iter().map(Into::into).collect() }
-            }
+impl RoomListEntriesUpdate {
+    fn from(
+        vector_diff: VectorDiff<matrix_sdk_ui::room_list_service::Room>,
+        utd_hook: Option<Arc<UtdHookManager>>,
+    ) -> Self {
+        match vector_diff {
+            VectorDiff::Append { values } => Self::Append {
+                values: values
+                    .into_iter()
+                    .map(|value| Arc::new(RoomListItem::from(value, utd_hook.clone())))
+                    .collect(),
+            },
             VectorDiff::Clear => Self::Clear,
-            VectorDiff::PushFront { value } => Self::PushFront { value: value.into() },
-            VectorDiff::PushBack { value } => Self::PushBack { value: value.into() },
+            VectorDiff::PushFront { value } => {
+                Self::PushFront { value: Arc::new(RoomListItem::from(value, utd_hook)) }
+            }
+            VectorDiff::PushBack { value } => {
+                Self::PushBack { value: Arc::new(RoomListItem::from(value, utd_hook)) }
+            }
             VectorDiff::PopFront => Self::PopFront,
             VectorDiff::PopBack => Self::PopBack,
-            VectorDiff::Insert { index, value } => {
-                Self::Insert { index: u32::try_from(index).unwrap(), value: value.into() }
-            }
-            VectorDiff::Set { index, value } => {
-                Self::Set { index: u32::try_from(index).unwrap(), value: value.into() }
-            }
+            VectorDiff::Insert { index, value } => Self::Insert {
+                index: u32::try_from(index).unwrap(),
+                value: Arc::new(RoomListItem::from(value, utd_hook)),
+            },
+            VectorDiff::Set { index, value } => Self::Set {
+                index: u32::try_from(index).unwrap(),
+                value: Arc::new(RoomListItem::from(value, utd_hook)),
+            },
             VectorDiff::Remove { index } => Self::Remove { index: u32::try_from(index).unwrap() },
             VectorDiff::Truncate { length } => {
                 Self::Truncate { length: u32::try_from(length).unwrap() }
             }
-            VectorDiff::Reset { values } => {
-                Self::Reset { values: values.into_iter().map(Into::into).collect() }
-            }
+            VectorDiff::Reset { values } => Self::Reset {
+                values: values
+                    .into_iter()
+                    .map(|value| Arc::new(RoomListItem::from(value, utd_hook.clone())))
+                    .collect(),
+            },
         }
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListEntriesListener: Send + Sync + Debug {
     fn on_update(&self, room_entries_update: Vec<RoomListEntriesUpdate>);
 }
@@ -386,23 +442,20 @@ pub trait RoomListEntriesListener: Send + Sync + Debug {
 #[derive(uniffi::Object)]
 pub struct RoomListDynamicEntriesController {
     inner: matrix_sdk_ui::room_list_service::RoomListDynamicEntriesController,
-    client: matrix_sdk::Client,
 }
 
 impl RoomListDynamicEntriesController {
     fn new(
         dynamic_entries_controller: matrix_sdk_ui::room_list_service::RoomListDynamicEntriesController,
-        client: &matrix_sdk::Client,
     ) -> Self {
-        Self { inner: dynamic_entries_controller, client: client.clone() }
+        Self { inner: dynamic_entries_controller }
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListDynamicEntriesController {
     fn set_filter(&self, kind: RoomListEntriesDynamicFilterKind) -> bool {
-        let FilterWrapper(filter) = FilterWrapper::from(&self.client, kind);
-        self.inner.set_filter(filter)
+        self.inner.set_filter(kind.into())
     }
 
     fn add_one_page(&self) {
@@ -419,8 +472,10 @@ pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
     NonLeft,
+    Joined,
     Unread,
     Favourite,
+    Invite,
     Category { expect: RoomListFilterCategory },
     None,
     NormalizedMatchRoomName { pattern: String },
@@ -442,31 +497,29 @@ impl From<RoomListFilterCategory> for RoomCategory {
     }
 }
 
-/// Custom internal type to transform a `RoomListEntriesDynamicFilterKind` into
-/// a `BoxedFilterFn`.
-struct FilterWrapper(BoxedFilterFn);
-
-impl FilterWrapper {
-    fn from(client: &matrix_sdk::Client, value: RoomListEntriesDynamicFilterKind) -> Self {
+impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
+    fn from(value: RoomListEntriesDynamicFilterKind) -> Self {
         use RoomListEntriesDynamicFilterKind as Kind;
 
         match value {
-            Kind::All { filters } => Self(Box::new(new_filter_all(
-                filters.into_iter().map(|filter| FilterWrapper::from(client, filter).0).collect(),
-            ))),
-            Kind::Any { filters } => Self(Box::new(new_filter_any(
-                filters.into_iter().map(|filter| FilterWrapper::from(client, filter).0).collect(),
-            ))),
-            Kind::NonLeft => Self(Box::new(new_filter_non_left(client))),
-            Kind::Unread => Self(Box::new(new_filter_unread(client))),
-            Kind::Favourite => Self(Box::new(new_filter_favourite(client))),
-            Kind::Category { expect } => Self(Box::new(new_filter_category(client, expect.into()))),
-            Kind::None => Self(Box::new(new_filter_none())),
+            Kind::All { filters } => Box::new(new_filter_all(
+                filters.into_iter().map(|filter| BoxedFilterFn::from(filter)).collect(),
+            )),
+            Kind::Any { filters } => Box::new(new_filter_any(
+                filters.into_iter().map(|filter| BoxedFilterFn::from(filter)).collect(),
+            )),
+            Kind::NonLeft => Box::new(new_filter_non_left()),
+            Kind::Joined => Box::new(new_filter_joined()),
+            Kind::Unread => Box::new(new_filter_unread()),
+            Kind::Favourite => Box::new(new_filter_favourite()),
+            Kind::Invite => Box::new(new_filter_invite()),
+            Kind::Category { expect } => Box::new(new_filter_category(expect.into())),
+            Kind::None => Box::new(new_filter_none()),
             Kind::NormalizedMatchRoomName { pattern } => {
-                Self(Box::new(new_filter_normalized_match_room_name(client, &pattern)))
+                Box::new(new_filter_normalized_match_room_name(&pattern))
             }
             Kind::FuzzyMatchRoomName { pattern } => {
-                Self(Box::new(new_filter_fuzzy_match_room_name(client, &pattern)))
+                Box::new(new_filter_fuzzy_match_room_name(&pattern))
             }
         }
     }
@@ -475,39 +528,99 @@ impl FilterWrapper {
 #[derive(uniffi::Object)]
 pub struct RoomListItem {
     inner: Arc<matrix_sdk_ui::room_list_service::Room>,
+    utd_hook: Option<Arc<UtdHookManager>>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+impl RoomListItem {
+    fn from(
+        value: matrix_sdk_ui::room_list_service::Room,
+        utd_hook: Option<Arc<UtdHookManager>>,
+    ) -> Self {
+        Self { inner: Arc::new(value), utd_hook }
+    }
+}
+
+#[matrix_sdk_ffi_macros::export]
 impl RoomListItem {
     fn id(&self) -> String {
         self.inner.id().to_string()
     }
 
-    fn name(&self) -> Option<String> {
-        RUNTIME.block_on(async { self.inner.name().await })
+    /// Returns the room's name from the state event if available, otherwise
+    /// compute a room name based on the room's nature (DM or not) and number of
+    /// members.
+    fn display_name(&self) -> Option<String> {
+        self.inner.cached_display_name()
     }
 
     fn avatar_url(&self) -> Option<String> {
         self.inner.avatar_url().map(|uri| uri.to_string())
     }
 
-    fn is_direct(&self) -> bool {
-        RUNTIME.block_on(async { self.inner.inner_room().is_direct().await.unwrap_or(false) })
+    async fn is_direct(&self) -> bool {
+        self.inner.inner_room().is_direct().await.unwrap_or(false)
     }
 
     fn canonical_alias(&self) -> Option<String> {
         self.inner.inner_room().canonical_alias().map(|alias| alias.to_string())
     }
 
-    pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        let avatar_url = self.inner.avatar_url();
-        let latest_event = self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new);
-        Ok(RoomInfo::new(self.inner.inner_room(), avatar_url, latest_event).await?)
+    async fn room_info(&self) -> Result<RoomInfo, ClientError> {
+        RoomInfo::new(self.inner.inner_room()).await
     }
 
-    /// Building a `Room`. If its internal timeline hasn't been initialized
-    /// it'll fail.
-    async fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
+    /// The room's current membership state.
+    fn membership(&self) -> Membership {
+        self.inner.inner_room().state().into()
+    }
+
+    /// Builds a `RoomPreview` from a room list item. This is intended for
+    /// invited, knocked or banned rooms.
+    async fn preview_room(&self, via: Vec<String>) -> Result<Arc<RoomPreview>, ClientError> {
+        // Validate parameters first.
+        let server_names: Vec<OwnedServerName> = via
+            .into_iter()
+            .map(|server| ServerName::parse(server).map_err(ClientError::from))
+            .collect::<Result<_, ClientError>>()?;
+
+        // Do the thing.
+        let client = self.inner.client();
+        let (room_or_alias_id, mut server_names) = if let Some(alias) = self.inner.canonical_alias()
+        {
+            let room_or_alias_id: OwnedRoomOrAliasId = alias.into();
+            (room_or_alias_id, Vec::new())
+        } else {
+            let room_or_alias_id: OwnedRoomOrAliasId = self.inner.id().to_owned().into();
+            (room_or_alias_id, server_names)
+        };
+
+        // If no server names are provided and the room's membership is invited,
+        // add the server name from the sender's user id as a fallback value
+        if server_names.is_empty() {
+            if let Ok(invite_details) = self.inner.invite_details().await {
+                if let Some(inviter) = invite_details.inviter {
+                    server_names.push(inviter.user_id().server_name().to_owned());
+                }
+            }
+        }
+
+        let room_preview = client.get_room_preview(&room_or_alias_id, server_names).await?;
+
+        Ok(Arc::new(RoomPreview::new(AsyncRuntimeDropped::new(client), room_preview)))
+    }
+
+    /// Build a full `Room` FFI object, filling its associated timeline.
+    ///
+    /// An error will be returned if the room is a state different than joined
+    /// or if its internal timeline hasn't been initialized.
+    fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
+        if !matches!(self.membership(), Membership::Joined) {
+            return Err(RoomListError::IncorrectRoomMembership {
+                expected: vec![Membership::Joined],
+                actual: self.membership(),
+            });
+        }
+
         if let Some(timeline) = self.inner.timeline() {
             Ok(Arc::new(Room::with_timeline(
                 self.inner.inner_room().clone(),
@@ -530,9 +643,13 @@ impl RoomListItem {
     /// * `event_type_filter` - An optional [`TimelineEventTypeFilter`] to be
     ///   used to filter timeline events besides the default timeline filter. If
     ///   `None` is passed, only the default timeline filter will be used.
+    /// * `internal_id_prefix` - An optional String that will be prepended to
+    ///   all the timeline item's internal IDs, making it possible to
+    ///   distinguish different timeline instances from each other.
     async fn init_timeline(
         &self,
         event_type_filter: Option<Arc<TimelineEventTypeFilter>>,
+        internal_id_prefix: Option<String>,
     ) -> Result<(), RoomListError> {
         let mut timeline_builder = self
             .inner
@@ -546,67 +663,32 @@ impl RoomListItem {
                 default_event_filter(event, room_version_id) && event_type_filter.filter(event)
             });
         }
+
+        if let Some(internal_id_prefix) = internal_id_prefix {
+            timeline_builder = timeline_builder.with_internal_id_prefix(internal_id_prefix);
+        }
+
+        if let Some(utd_hook) = self.utd_hook.clone() {
+            timeline_builder = timeline_builder.with_unable_to_decrypt_hook(utd_hook);
+        }
+
         self.inner.init_timeline_with_builder(timeline_builder).map_err(RoomListError::from).await
     }
 
-    fn subscribe(&self, settings: Option<RoomSubscription>) {
-        self.inner.subscribe(settings.map(Into::into));
+    /// Checks whether the room is encrypted or not.
+    ///
+    /// **Note**: this info may not be reliable if you don't set up
+    /// `m.room.encryption` as required state.
+    async fn is_encrypted(&self) -> bool {
+        self.inner
+            .latest_encryption_state()
+            .await
+            .map(|state| state.is_encrypted())
+            .unwrap_or(false)
     }
 
-    fn unsubscribe(&self) {
-        self.inner.unsubscribe();
-    }
-
-    async fn latest_event(&self) -> Option<Arc<EventTimelineItem>> {
-        self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new)
-    }
-}
-
-#[derive(Clone, Debug, uniffi::Enum)]
-pub enum RoomListEntry {
-    Empty,
-    Invalidated { room_id: String },
-    Filled { room_id: String },
-}
-
-impl From<MatrixRoomListEntry> for RoomListEntry {
-    fn from(value: MatrixRoomListEntry) -> Self {
-        (&value).into()
-    }
-}
-
-impl From<&MatrixRoomListEntry> for RoomListEntry {
-    fn from(value: &MatrixRoomListEntry) -> Self {
-        match value {
-            MatrixRoomListEntry::Empty => Self::Empty,
-            MatrixRoomListEntry::Filled(room_id) => Self::Filled { room_id: room_id.to_string() },
-            MatrixRoomListEntry::Invalidated(room_id) => {
-                Self::Invalidated { room_id: room_id.to_string() }
-            }
-        }
-    }
-}
-
-#[derive(uniffi::Record)]
-pub struct RequiredState {
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(uniffi::Record)]
-pub struct RoomSubscription {
-    pub required_state: Option<Vec<RequiredState>>,
-    pub timeline_limit: Option<u32>,
-}
-
-impl From<RoomSubscription> for RumaRoomSubscription {
-    fn from(val: RoomSubscription) -> Self {
-        assign!(RumaRoomSubscription::default(), {
-            required_state: val.required_state.map(|r|
-                r.into_iter().map(|s| (s.key.into(), s.value)).collect()
-            ).unwrap_or_default(),
-            timeline_limit: val.timeline_limit.map(|u| u.into())
-        })
+    async fn latest_event(&self) -> Option<EventTimelineItem> {
+        self.inner.latest_event().await.map(Into::into)
     }
 }
 
@@ -616,7 +698,7 @@ pub struct UnreadNotificationsCount {
     notification_count: u32,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl UnreadNotificationsCount {
     fn highlight_count(&self) -> u32 {
         self.highlight_count

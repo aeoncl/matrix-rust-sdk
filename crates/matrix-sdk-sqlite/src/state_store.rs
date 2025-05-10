@@ -1,17 +1,20 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, iter,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
+use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
-    deserialized_responses::{RawAnySyncOrStrippedState, SyncOrStrippedState},
-    media::{MediaRequest, UniqueKey},
-    store::migration_helpers::RoomInfoV1,
+    deserialized_responses::{DisplayName, RawAnySyncOrStrippedState, SyncOrStrippedState},
+    store::{
+        migration_helpers::RoomInfoV1, ChildTransactionId, DependentQueuedRequest,
+        DependentQueuedRequestKind, QueueWedgeError, QueuedRequest, QueuedRequestKind,
+        RoomLoadSettings, SentRequestKey,
+    },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
     StateStoreDataKey, StateStoreDataValue,
 };
@@ -29,7 +32,8 @@ use ruma::{
         GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
+    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -38,9 +42,11 @@ use tracing::{debug, warn};
 
 use crate::{
     error::{Error, Result},
-    get_or_create_store_cipher,
-    utils::{load_db_version, repeat_vars, Key, SqliteObjectExt},
-    OpenStoreError, SqliteObjectStoreExt,
+    utils::{
+        repeat_vars, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        SqliteKeyValueStoreConnExt,
+    },
+    OpenStoreError, SqliteStoreConfig,
 };
 
 mod keys {
@@ -54,50 +60,69 @@ mod keys {
     pub const PROFILE: &str = "profile";
     pub const RECEIPT: &str = "receipt";
     pub const DISPLAY_NAME: &str = "display_name";
-    pub const MEDIA: &str = "media";
+    pub const SEND_QUEUE: &str = "send_queue_events";
+    pub const DEPENDENTS_SEND_QUEUE: &str = "dependent_send_queue_events";
 }
 
-const DATABASE_VERSION: u8 = 3;
+const DATABASE_NAME: &str = "matrix-sdk-state.sqlite3";
 
-/// A sqlite based cryptostore.
+/// Identifier of the latest database version.
+///
+/// This is used to figure whether the SQLite database requires a migration.
+/// Every new SQL migration should imply a bump of this number, and changes in
+/// the [`SqliteStateStore::run_migrations`] function.
+const DATABASE_VERSION: u8 = 12;
+
+/// An SQLite-based state store.
 #[derive(Clone)]
 pub struct SqliteStateStore {
     store_cipher: Option<Arc<StoreCipher>>,
-    path: Option<PathBuf>,
     pool: SqlitePool,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for SqliteStateStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(path) = &self.path {
-            f.debug_struct("SqliteStateStore").field("path", &path).finish()
-        } else {
-            f.debug_struct("SqliteStateStore").field("path", &"memory store").finish()
-        }
+        f.debug_struct("SqliteStateStore").finish_non_exhaustive()
     }
 }
 
 impl SqliteStateStore {
-    /// Open the sqlite-based state store at the given path using the given
+    /// Open the SQLite-based state store at the given path using the given
     /// passphrase to encrypt private data.
     pub async fn open(
         path: impl AsRef<Path>,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
-        let pool = create_pool(path.as_ref()).await?;
-
-        Self::open_with_pool(pool, passphrase).await
+        Self::open_with_config(SqliteStoreConfig::new(path).passphrase(passphrase)).await
     }
 
-    /// Create a sqlite-based state store using the given sqlite database pool.
+    /// Open the SQLite-based state store with the config open config.
+    pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let SqliteStoreConfig { path, passphrase, pool_config, runtime_config } = config;
+
+        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
+
+        let mut config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
+        config.pool = Some(pool_config);
+
+        let pool = config.create_pool(Runtime::Tokio1)?;
+
+        let this = Self::open_with_pool(pool, passphrase.as_deref()).await?;
+        this.pool.get().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
+    }
+
+    /// Create an SQLite-based state store using the given SQLite database pool.
     /// The given passphrase will be used to encrypt private data.
-    pub async fn open_with_pool(
+    async fn open_with_pool(
         pool: SqlitePool,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        let mut version = load_db_version(&conn).await?;
+
+        let mut version = conn.db_version().await?;
 
         if version == 0 {
             init(&conn).await?;
@@ -105,10 +130,10 @@ impl SqliteStateStore {
         }
 
         let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(get_or_create_store_cipher(p, &conn).await?)),
+            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
             None => None,
         };
-        let this = Self { store_cipher, path: None, pool };
+        let this = Self { store_cipher, pool };
         this.run_migrations(&conn, version, None).await?;
 
         Ok(this)
@@ -118,7 +143,7 @@ impl SqliteStateStore {
     /// version
     ///
     /// If `to` is `None`, the current database version will be used.
-    async fn run_migrations(&self, conn: &SqliteConn, from: u8, to: Option<u8>) -> Result<()> {
+    async fn run_migrations(&self, conn: &SqliteAsyncConn, from: u8, to: Option<u8>) -> Result<()> {
         let to = to.unwrap_or(DATABASE_VERSION);
 
         if from < to {
@@ -158,6 +183,7 @@ impl SqliteStateStore {
                     "../migrations/state_store/002_b_replace_room_info.sql"
                 ))?;
 
+                txn.set_db_version(2)?;
                 Result::<_, Error>::Ok(())
             })
             .await?;
@@ -208,12 +234,126 @@ impl SqliteStateStore {
                         .execute((data, room_id))?;
                 }
 
+                txn.set_db_version(3)?;
                 Result::<_, Error>::Ok(())
             })
             .await?;
         }
 
-        conn.set_kv("version", vec![to]).await?;
+        if from < 4 && to >= 4 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!("../migrations/state_store/003_send_queue.sql"))?;
+                txn.set_db_version(4)
+            })
+            .await?;
+        }
+
+        if from < 5 && to >= 5 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/004_send_queue_with_roomid_value.sql"
+                ))?;
+                txn.set_db_version(4)
+            })
+            .await?;
+        }
+
+        if from < 6 && to >= 6 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/005_send_queue_dependent_events.sql"
+                ))?;
+                txn.set_db_version(6)
+            })
+            .await?;
+        }
+
+        if from < 7 && to >= 7 {
+            conn.with_transaction(move |txn| {
+                // Drop media table.
+                txn.execute_batch(include_str!("../migrations/state_store/006_drop_media.sql"))?;
+                txn.set_db_version(7)
+            })
+            .await?;
+        }
+
+        if from < 8 && to >= 8 {
+            // Replace all existing wedged events with a generic error.
+            let error = QueueWedgeError::GenericApiError {
+                msg: "local echo failed to send in a previous session".into(),
+            };
+            let default_err = self.serialize_value(&error)?;
+
+            conn.with_transaction(move |txn| {
+                // Update send queue table to persist the wedge reason if any.
+                txn.execute_batch(include_str!("../migrations/state_store/007_a_send_queue_wedge_reason.sql"))?;
+
+                // Migrate the data, add a generic error for currently wedged events
+
+                for wedged_entries in txn
+                    .prepare("SELECT room_id, transaction_id FROM send_queue_events WHERE wedged = 1")?
+                    .query_map((), |row| {
+                        Ok(
+                            (row.get::<_, Vec<u8>>(0)?,row.get::<_, String>(1)?)
+                        )
+                    })? {
+
+                    let (room_id, transaction_id) = wedged_entries?;
+
+                    txn.prepare_cached("UPDATE send_queue_events SET wedge_reason = ? WHERE room_id = ? AND transaction_id = ?")?
+                        .execute((default_err.clone(), room_id, transaction_id))?;
+                }
+
+
+                // Clean up the table now that data is migrated
+                txn.execute_batch(include_str!("../migrations/state_store/007_b_send_queue_clean.sql"))?;
+
+                txn.set_db_version(8)
+            })
+                .await?;
+        }
+
+        if from < 9 && to >= 9 {
+            conn.with_transaction(move |txn| {
+                // Run the migration.
+                txn.execute_batch(include_str!("../migrations/state_store/008_send_queue.sql"))?;
+                txn.set_db_version(9)
+            })
+            .await?;
+        }
+
+        if from < 10 && to >= 10 {
+            conn.with_transaction(move |txn| {
+                // Run the migration.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/009_send_queue_priority.sql"
+                ))?;
+                txn.set_db_version(10)
+            })
+            .await?;
+        }
+
+        if from < 11 && to >= 11 {
+            conn.with_transaction(move |txn| {
+                // Run the migration.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/010_send_queue_enqueue_time.sql"
+                ))?;
+                txn.set_db_version(11)
+            })
+            .await?;
+        }
+
+        if from < 12 && to >= 12 {
+            // Defragment the DB and optimize its size on the filesystem.
+            // This should have been run in the migration for version 7, to reduce the size
+            // of the DB as we removed the media cache.
+            conn.vacuum().await?;
+            conn.set_kv("version", vec![12]).await?;
+        }
 
         Ok(())
     }
@@ -269,11 +409,26 @@ impl SqliteStateStore {
     fn encode_state_store_data_key(&self, key: StateStoreDataKey<'_>) -> Key {
         let key_s = match key {
             StateStoreDataKey::SyncToken => Cow::Borrowed(StateStoreDataKey::SYNC_TOKEN),
+            StateStoreDataKey::ServerCapabilities => {
+                Cow::Borrowed(StateStoreDataKey::SERVER_CAPABILITIES)
+            }
             StateStoreDataKey::Filter(f) => {
                 Cow::Owned(format!("{}:{f}", StateStoreDataKey::FILTER))
             }
             StateStoreDataKey::UserAvatarUrl(u) => {
                 Cow::Owned(format!("{}:{u}", StateStoreDataKey::USER_AVATAR_URL))
+            }
+            StateStoreDataKey::RecentlyVisitedRooms(b) => {
+                Cow::Owned(format!("{}:{b}", StateStoreDataKey::RECENTLY_VISITED_ROOMS))
+            }
+            StateStoreDataKey::UtdHookManagerData => {
+                Cow::Borrowed(StateStoreDataKey::UTD_HOOK_MANAGER_DATA)
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::COMPOSER_DRAFT))
+            }
+            StateStoreDataKey::SeenKnockRequests(room_id) => {
+                Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::SEEN_KNOCK_REQUESTS))
             }
         };
 
@@ -290,7 +445,7 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, full_key)
     }
 
-    async fn acquire(&self) -> Result<deadpool_sqlite::Object> {
+    async fn acquire(&self) -> Result<SqliteAsyncConn> {
         Ok(self.pool.get().await?)
     }
 
@@ -308,25 +463,18 @@ impl SqliteStateStore {
     }
 }
 
-async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
-    fs::create_dir_all(path).await.map_err(OpenStoreError::CreateDir)?;
-    let cfg = deadpool_sqlite::Config::new(path.join("matrix-sdk-state.sqlite3"));
-    Ok(cfg.create_pool(Runtime::Tokio1)?)
-}
-
 /// Initialize the database.
-async fn init(conn: &SqliteConn) -> Result<()> {
+async fn init(conn: &SqliteAsyncConn) -> Result<()> {
     // First turn on WAL mode, this can't be done in the transaction, it fails with
     // the error message: "cannot change into wal mode from within a transaction".
     conn.execute_batch("PRAGMA journal_mode = wal;").await?;
     conn.with_transaction(|txn| {
-        txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))
+        txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))?;
+        txn.set_db_version(1)?;
+
+        Ok(())
     })
-    .await?;
-
-    conn.set_kv("version", vec![1]).await?;
-
-    Ok(())
+    .await
 }
 
 trait SqliteConnectionStateStoreExt {
@@ -378,6 +526,7 @@ trait SqliteConnectionStateStoreExt {
 
     fn set_profile(&self, room_id: &[u8], user_id: &[u8], data: &[u8]) -> rusqlite::Result<()>;
     fn remove_room_profiles(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+    fn remove_room_profile(&self, room_id: &[u8], user_id: &[u8]) -> rusqlite::Result<()>;
 
     fn set_receipt(
         &self,
@@ -393,6 +542,8 @@ trait SqliteConnectionStateStoreExt {
     fn set_display_name(&self, room_id: &[u8], name: &[u8], data: &[u8]) -> rusqlite::Result<()>;
     fn remove_display_name(&self, room_id: &[u8], name: &[u8]) -> rusqlite::Result<()>;
     fn remove_room_display_names(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+    fn remove_room_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+    fn remove_room_dependent_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionStateStoreExt for rusqlite::Connection {
@@ -550,6 +701,12 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
         Ok(())
     }
 
+    fn remove_room_profile(&self, room_id: &[u8], user_id: &[u8]) -> rusqlite::Result<()> {
+        self.prepare("DELETE FROM profile WHERE room_id = ? AND user_id = ?")?
+            .execute((room_id, user_id))?;
+        Ok(())
+    }
+
     fn set_receipt(
         &self,
         room_id: &[u8],
@@ -593,10 +750,21 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
         self.prepare("DELETE FROM display_name WHERE room_id = ?")?.execute((room_id,))?;
         Ok(())
     }
+
+    fn remove_room_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()> {
+        self.prepare("DELETE FROM send_queue_events WHERE room_id = ?")?.execute((room_id,))?;
+        Ok(())
+    }
+
+    fn remove_room_dependent_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()> {
+        self.prepare("DELETE FROM dependent_send_queue_events WHERE room_id = ?")?
+            .execute((room_id,))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
-trait SqliteObjectStateStoreExt: SqliteObjectExt {
+trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
     async fn get_kv_blob(&self, key: Key) -> Result<Option<Vec<u8>>> {
         Ok(self
             .query_row("SELECT value FROM kv_blob WHERE key = ?", (key,), |row| row.get(0))
@@ -607,15 +775,17 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     async fn get_kv_blobs(&self, keys: Vec<Key>) -> Result<Vec<Vec<u8>>> {
         let keys_length = keys.len();
 
-        self.chunk_large_query_over(keys, Some(keys_length), |keys| {
+        self.chunk_large_query_over(keys, Some(keys_length), |txn, keys| {
             let sql_params = repeat_vars(keys.len());
             let sql = format!("SELECT value FROM kv_blob WHERE key IN ({sql_params})");
 
             let params = rusqlite::params_from_iter(keys);
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| row.get(0)).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| row.get(0))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -627,26 +797,22 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
         Ok(())
     }
 
-    async fn get_room_infos(&self, states: Vec<Key>) -> Result<Vec<Vec<u8>>> {
-        if states.is_empty() {
-            Ok(self
-                .prepare("SELECT data FROM room_info", move |mut stmt| {
+    async fn get_room_infos(&self, room_id: Option<Key>) -> Result<Vec<Vec<u8>>> {
+        Ok(match room_id {
+            None => {
+                self.prepare("SELECT data FROM room_info", move |mut stmt| {
                     stmt.query_map((), |row| row.get(0))?.collect()
                 })
-                .await?)
-        } else {
-            self.chunk_large_query_over(states, None, |states| {
-                let sql_params = repeat_vars(states.len());
-                let sql = format!("SELECT data FROM room_info WHERE state IN ({sql_params})");
+                .await?
+            }
 
-                self.prepare(sql, move |mut stmt| {
-                    stmt.query(rusqlite::params_from_iter(states))?
-                        .mapped(|row| row.get(0))
-                        .collect()
+            Some(room_id) => {
+                self.prepare("SELECT data FROM room_info WHERE room_id = ?", move |mut stmt| {
+                    stmt.query((room_id,))?.mapped(|row| row.get(0)).collect()
                 })
-            })
-            .await
-        }
+                .await?
+            }
+        })
     }
 
     async fn get_maybe_stripped_state_events_for_keys(
@@ -655,7 +821,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
         event_type: Key,
         state_keys: Vec<Key>,
     ) -> Result<Vec<(bool, Vec<u8>)>> {
-        self.chunk_large_query_over(state_keys, None, move |state_keys: Vec<Key>| {
+        self.chunk_large_query_over(state_keys, None, move |txn, state_keys: Vec<Key>| {
             let sql_params = repeat_vars(state_keys.len());
             let sql = format!(
                 "SELECT stripped, data FROM state_event
@@ -666,9 +832,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 [room_id.clone(), event_type.clone()].into_iter().chain(state_keys),
             );
 
-            self.prepare(sql, |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -698,7 +866,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let user_ids_length = user_ids.len();
 
-        self.chunk_large_query_over(user_ids, Some(user_ids_length), move |user_ids| {
+        self.chunk_large_query_over(user_ids, Some(user_ids_length), move |txn, user_ids| {
             let sql_params = repeat_vars(user_ids.len());
             let sql = format!(
                 "SELECT user_id, data FROM profile WHERE room_id = ? AND user_id IN ({sql_params})"
@@ -706,9 +874,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 
             let params = rusqlite::params_from_iter(iter::once(room_id.clone()).chain(user_ids));
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -720,7 +890,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
             })
             .await?
         } else {
-            self.chunk_large_query_over(memberships, None, move |memberships| {
+            self.chunk_large_query_over(memberships, None, move |txn, memberships| {
                 let sql_params = repeat_vars(memberships.len());
                 let sql = format!(
                     "SELECT data FROM member WHERE room_id = ? AND membership IN ({sql_params})"
@@ -729,9 +899,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 let params =
                     rusqlite::params_from_iter(iter::once(room_id.clone()).chain(memberships));
 
-                self.prepare(sql, move |mut stmt| {
-                    stmt.query(params)?.mapped(|row| row.get(0)).collect()
-                })
+                Ok(txn
+                    .prepare(&sql)?
+                    .query(params)?
+                    .mapped(|row| row.get(0))
+                    .collect::<Result<_, _>>()?)
             })
             .await?
         };
@@ -772,7 +944,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let names_length = names.len();
 
-        self.chunk_large_query_over(names, Some(names_length), move |names| {
+        self.chunk_large_query_over(names, Some(names_length), move |txn, names| {
             let sql_params = repeat_vars(names.len());
             let sql = format!(
                 "SELECT name, data FROM display_name WHERE room_id = ? AND name IN ({sql_params})"
@@ -780,9 +952,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 
             let params = rusqlite::params_from_iter(iter::once(room_id.clone()).chain(names));
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -824,40 +998,10 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
             )
             .await?)
     }
-
-    async fn set_media(&self, uri: Key, format: Key, data: Vec<u8>) -> Result<()> {
-        self.execute(
-            "INSERT OR REPLACE INTO media (uri, format, data) VALUES (?, ?, ?)",
-            (uri, format, data),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn get_media(&self, uri: Key, format: Key) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .query_row(
-                "SELECT data FROM media WHERE uri = ? AND format = ?",
-                (uri, format),
-                |row| row.get(0),
-            )
-            .await
-            .optional()?)
-    }
-
-    async fn remove_media(&self, uri: Key, format: Key) -> Result<()> {
-        self.execute("DELETE FROM media WHERE uri = ? AND format = ?", (uri, format)).await?;
-        Ok(())
-    }
-
-    async fn remove_uri_medias(&self, uri: Key) -> Result<()> {
-        self.execute("DELETE FROM media WHERE uri = ?", (uri,)).await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
-impl SqliteObjectStateStoreExt for deadpool_sqlite::Object {
+impl SqliteObjectStateStoreExt for SqliteAsyncConn {
     async fn set_kv_blob(&self, key: Key, value: Vec<u8>) -> Result<()> {
         Ok(self.interact(move |conn| conn.set_kv_blob(&key, &value)).await.unwrap()?)
     }
@@ -873,12 +1017,30 @@ impl StateStore for SqliteStateStore {
             .get_kv_blob(self.encode_state_store_data_key(key))
             .await?
             .map(|data| {
-                let string = self.deserialize_value(&data)?;
                 Ok(match key {
-                    StateStoreDataKey::SyncToken => StateStoreDataValue::SyncToken(string),
-                    StateStoreDataKey::Filter(_) => StateStoreDataValue::Filter(string),
+                    StateStoreDataKey::SyncToken => {
+                        StateStoreDataValue::SyncToken(self.deserialize_value(&data)?)
+                    }
+                    StateStoreDataKey::ServerCapabilities => {
+                        StateStoreDataValue::ServerCapabilities(self.deserialize_value(&data)?)
+                    }
+                    StateStoreDataKey::Filter(_) => {
+                        StateStoreDataValue::Filter(self.deserialize_value(&data)?)
+                    }
                     StateStoreDataKey::UserAvatarUrl(_) => {
-                        StateStoreDataValue::UserAvatarUrl(string)
+                        StateStoreDataValue::UserAvatarUrl(self.deserialize_value(&data)?)
+                    }
+                    StateStoreDataKey::RecentlyVisitedRooms(_) => {
+                        StateStoreDataValue::RecentlyVisitedRooms(self.deserialize_value(&data)?)
+                    }
+                    StateStoreDataKey::UtdHookManagerData => {
+                        StateStoreDataValue::UtdHookManagerData(self.deserialize_value(&data)?)
+                    }
+                    StateStoreDataKey::ComposerDraft(_) => {
+                        StateStoreDataValue::ComposerDraft(self.deserialize_value(&data)?)
+                    }
+                    StateStoreDataKey::SeenKnockRequests(_) => {
+                        StateStoreDataValue::SeenKnockRequests(self.deserialize_value(&data)?)
                     }
                 })
             })
@@ -890,19 +1052,40 @@ impl StateStore for SqliteStateStore {
         key: StateStoreDataKey<'_>,
         value: StateStoreDataValue,
     ) -> Result<()> {
-        let value = match key {
-            StateStoreDataKey::SyncToken => {
-                value.into_sync_token().expect("Session data not a sync token")
+        let serialized_value = match key {
+            StateStoreDataKey::SyncToken => self.serialize_value(
+                &value.into_sync_token().expect("Session data not a sync token"),
+            )?,
+            StateStoreDataKey::ServerCapabilities => self.serialize_value(
+                &value
+                    .into_server_capabilities()
+                    .expect("Session data not containing server capabilities"),
+            )?,
+            StateStoreDataKey::Filter(_) => {
+                self.serialize_value(&value.into_filter().expect("Session data not a filter"))?
             }
-            StateStoreDataKey::Filter(_) => value.into_filter().expect("Session data not a filter"),
-            StateStoreDataKey::UserAvatarUrl(_) => {
-                value.into_user_avatar_url().expect("Session data not an user avatar url")
-            }
+            StateStoreDataKey::UserAvatarUrl(_) => self.serialize_value(
+                &value.into_user_avatar_url().expect("Session data not an user avatar url"),
+            )?,
+            StateStoreDataKey::RecentlyVisitedRooms(_) => self.serialize_value(
+                &value.into_recently_visited_rooms().expect("Session data not breadcrumbs"),
+            )?,
+            StateStoreDataKey::UtdHookManagerData => self.serialize_value(
+                &value.into_utd_hook_manager_data().expect("Session data not UtdHookManagerData"),
+            )?,
+            StateStoreDataKey::ComposerDraft(_) => self.serialize_value(
+                &value.into_composer_draft().expect("Session data not a composer draft"),
+            )?,
+            StateStoreDataKey::SeenKnockRequests(_) => self.serialize_value(
+                &value
+                    .into_seen_knock_requests()
+                    .expect("Session data is not a set of seen knock request ids"),
+            )?,
         };
 
         self.acquire()
             .await?
-            .set_kv_blob(self.encode_state_store_data_key(key), self.serialize_value(&value)?)
+            .set_kv_blob(self.encode_state_store_data_key(key), serialized_value)
             .await
     }
 
@@ -921,6 +1104,7 @@ impl StateStore for SqliteStateStore {
                     account_data,
                     presence,
                     profiles,
+                    profiles_to_delete,
                     state,
                     room_account_data,
                     room_infos,
@@ -969,6 +1153,14 @@ impl StateStore for SqliteStateStore {
                         .encode_key(keys::ROOM_INFO, serde_json::to_string(&room_info.state())?);
                     let data = this.serialize_json(&room_info)?;
                     txn.set_room_info(&room_id, &state, &data)?;
+                }
+
+                for (room_id, user_ids) in profiles_to_delete {
+                    let room_id = this.encode_key(keys::PROFILE, room_id);
+                    for user_id in user_ids {
+                        let user_id = this.encode_key(keys::PROFILE, user_id);
+                        txn.remove_room_profile(&room_id, &user_id)?;
+                    }
                 }
 
                 for (room_id, state_event_types) in state {
@@ -1172,13 +1364,34 @@ impl StateStore for SqliteStateStore {
                     let room_id = this.encode_key(keys::DISPLAY_NAME, room_id);
 
                     for (name, user_ids) in display_names {
-                        let name = this.encode_key(keys::DISPLAY_NAME, name);
+                        let encoded_name = this.encode_key(
+                            keys::DISPLAY_NAME,
+                            name.as_normalized_str().unwrap_or_else(|| name.as_raw_str()),
+                        );
                         let data = this.serialize_json(&user_ids)?;
 
                         if user_ids.is_empty() {
-                            txn.remove_display_name(&room_id, &name)?;
+                            txn.remove_display_name(&room_id, &encoded_name)?;
+
+                            // We can't do a migration to merge the previously distinct buckets of
+                            // user IDs since the display names themselves are hashed before they
+                            // are persisted in the store. So the store will always retain two
+                            // buckets: one for raw display names and one for normalised ones.
+                            //
+                            // We therefore do the next best thing, which is a sort of a soft
+                            // migration: we fetch both the raw and normalised buckets, then merge
+                            // the user IDs contained in them into a separate, temporary merged
+                            // bucket. The SDK then operates on the merged buckets exclusively. See
+                            // the comment in `get_users_with_display_names` for details.
+                            //
+                            // If the merged bucket is empty, that must mean that both the raw and
+                            // normalised buckets were also empty, so we can remove both from the
+                            // store.
+                            let raw_name = this.encode_key(keys::DISPLAY_NAME, name.as_raw_str());
+                            txn.remove_display_name(&room_id, &raw_name)?;
                         } else {
-                            txn.set_display_name(&room_id, &name, &data)?;
+                            // We only create new buckets with the normalized display name.
+                            txn.set_display_name(&room_id, &encoded_name, &data)?;
                         }
                     }
                 }
@@ -1354,30 +1567,13 @@ impl StateStore for SqliteStateStore {
             .collect()
     }
 
-    async fn get_invited_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        self.get_user_ids(room_id, RoomMemberships::INVITE).await
-    }
-
-    async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        self.get_user_ids(room_id, RoomMemberships::JOIN).await
-    }
-
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>> {
+    async fn get_room_infos(&self, room_load_settings: &RoomLoadSettings) -> Result<Vec<RoomInfo>> {
         self.acquire()
             .await?
-            .get_room_infos(Vec::new())
-            .await?
-            .into_iter()
-            .map(|data| self.deserialize_json(&data))
-            .collect()
-    }
-
-    async fn get_stripped_room_infos(&self) -> Result<Vec<RoomInfo>> {
-        let states =
-            vec![self.encode_key(keys::ROOM_INFO, serde_json::to_string(&RoomState::Invited)?)];
-        self.acquire()
-            .await?
-            .get_room_infos(states)
+            .get_room_infos(match room_load_settings {
+                RoomLoadSettings::All => None,
+                RoomLoadSettings::One(room_id) => Some(self.encode_key(keys::ROOM_INFO, room_id)),
+            })
             .await?
             .into_iter()
             .map(|data| self.deserialize_json(&data))
@@ -1387,10 +1583,13 @@ impl StateStore for SqliteStateStore {
     async fn get_users_with_display_name(
         &self,
         room_id: &RoomId,
-        display_name: &str,
+        display_name: &DisplayName,
     ) -> Result<BTreeSet<OwnedUserId>> {
         let room_id = self.encode_key(keys::DISPLAY_NAME, room_id);
-        let names = vec![self.encode_key(keys::DISPLAY_NAME, display_name)];
+        let names = vec![self.encode_key(
+            keys::DISPLAY_NAME,
+            display_name.as_normalized_str().unwrap_or_else(|| display_name.as_raw_str()),
+        )];
 
         Ok(self
             .acquire()
@@ -1407,33 +1606,49 @@ impl StateStore for SqliteStateStore {
     async fn get_users_with_display_names<'a>(
         &self,
         room_id: &RoomId,
-        display_names: &'a [String],
-    ) -> Result<BTreeMap<&'a str, BTreeSet<OwnedUserId>>> {
+        display_names: &'a [DisplayName],
+    ) -> Result<HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>> {
+        let mut result = HashMap::new();
+
         if display_names.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(result);
         }
 
         let room_id = self.encode_key(keys::DISPLAY_NAME, room_id);
         let mut names_map = display_names
             .iter()
-            .map(|n| (self.encode_key(keys::DISPLAY_NAME, n), n.as_ref()))
+            .flat_map(|display_name| {
+                // We encode the display name as the `raw_str()` and the normalized string.
+                //
+                // This is for compatibility reasons since:
+                //  1. Previously "Alice" and "alice" were considered to be distinct display
+                //     names, while we now consider them to be the same so we need to merge the
+                //     previously distinct buckets of user IDs.
+                //  2. We can't do a migration to merge the previously distinct buckets of user
+                //     IDs since the display names itself are hashed before they are persisted
+                //     in the store.
+                let raw =
+                    (self.encode_key(keys::DISPLAY_NAME, display_name.as_raw_str()), display_name);
+                let normalized = display_name.as_normalized_str().map(|normalized| {
+                    (self.encode_key(keys::DISPLAY_NAME, normalized), display_name)
+                });
+
+                iter::once(raw).chain(normalized.into_iter())
+            })
             .collect::<BTreeMap<_, _>>();
         let names = names_map.keys().cloned().collect();
 
-        self.acquire()
-            .await?
-            .get_display_names(room_id, names)
-            .await?
-            .into_iter()
-            .map(|(name, data)| {
-                Ok((
-                    names_map
-                        .remove(name.as_slice())
-                        .expect("returned display names were requested"),
-                    self.deserialize_json(&data)?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()
+        for (name, data) in
+            self.acquire().await?.get_display_names(room_id, names).await?.into_iter()
+        {
+            let display_name =
+                names_map.remove(name.as_slice()).expect("returned display names were requested");
+            let user_ids: BTreeSet<_> = self.deserialize_json(&data)?;
+
+            result.entry(display_name).or_insert_with(BTreeSet::new).extend(user_ids);
+        }
+
+        Ok(result)
     }
 
     async fn get_account_data_event(
@@ -1517,6 +1732,13 @@ impl StateStore for SqliteStateStore {
         self.acquire().await?.get_kv_blob(self.encode_custom_key(key)).await
     }
 
+    async fn set_custom_value_no_read(&self, key: &[u8], value: Vec<u8>) -> Result<()> {
+        let conn = self.acquire().await?;
+        let key = self.encode_custom_key(key);
+        conn.set_kv_blob(key, value).await?;
+        Ok(())
+    }
+
     async fn set_custom_value(&self, key: &[u8], value: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let conn = self.acquire().await?;
         let key = self.encode_custom_key(key);
@@ -1535,62 +1757,360 @@ impl StateStore for SqliteStateStore {
         Ok(previous)
     }
 
-    async fn add_media_content(&self, request: &MediaRequest, content: Vec<u8>) -> Result<()> {
-        let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
-        let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        let data = self.encode_value(content)?;
-        self.acquire().await?.set_media(uri, format, data).await
-    }
-
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
-        let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
-        let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        let data = self.acquire().await?.get_media(uri, format).await?;
-        data.map(|v| self.decode_value(&v).map(Into::into)).transpose()
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
-        let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        self.acquire().await?.remove_media(uri, format).await
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &ruma::MxcUri) -> Result<()> {
-        let uri = self.encode_key(keys::MEDIA, uri);
-        self.acquire().await?.remove_uri_medias(uri).await
-    }
-
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
         let this = self.clone();
         let room_id = room_id.to_owned();
 
+        let conn = self.acquire().await?;
+
+        conn.with_transaction(move |txn| -> Result<()> {
+            let room_info_room_id = this.encode_key(keys::ROOM_INFO, &room_id);
+            txn.remove_room_info(&room_info_room_id)?;
+
+            let state_event_room_id = this.encode_key(keys::STATE_EVENT, &room_id);
+            txn.remove_room_state_events(&state_event_room_id, None)?;
+
+            let member_room_id = this.encode_key(keys::MEMBER, &room_id);
+            txn.remove_room_members(&member_room_id, None)?;
+
+            let profile_room_id = this.encode_key(keys::PROFILE, &room_id);
+            txn.remove_room_profiles(&profile_room_id)?;
+
+            let room_account_data_room_id = this.encode_key(keys::ROOM_ACCOUNT_DATA, &room_id);
+            txn.remove_room_account_data(&room_account_data_room_id)?;
+
+            let receipt_room_id = this.encode_key(keys::RECEIPT, &room_id);
+            txn.remove_room_receipts(&receipt_room_id)?;
+
+            let display_name_room_id = this.encode_key(keys::DISPLAY_NAME, &room_id);
+            txn.remove_room_display_names(&display_name_room_id)?;
+
+            let send_queue_room_id = this.encode_key(keys::SEND_QUEUE, &room_id);
+            txn.remove_room_send_queue(&send_queue_room_id)?;
+
+            let dependent_send_queue_room_id =
+                this.encode_key(keys::DEPENDENTS_SEND_QUEUE, &room_id);
+            txn.remove_room_dependent_send_queue(&dependent_send_queue_room_id)?;
+
+            Ok(())
+        })
+        .await?;
+
+        conn.vacuum().await
+    }
+
+    async fn save_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: QueuedRequestKind,
+        priority: usize,
+    ) -> Result<(), Self::Error> {
+        let room_id_key = self.encode_key(keys::SEND_QUEUE, room_id);
+        let room_id_value = self.serialize_value(&room_id.to_owned())?;
+
+        let content = self.serialize_json(&content)?;
+        // The transaction id is used both as a key (in remove/update) and a value (as
+        // it's useful for the callers), so we keep it as is, and neither hash
+        // it (with encode_key) or encrypt it (through serialize_value). After
+        // all, it carries no personal information, so this is considered fine.
+
+        let created_at_ts: u64 = created_at.0.into();
         self.acquire()
             .await?
             .with_transaction(move |txn| {
-                let room_info_room_id = this.encode_key(keys::ROOM_INFO, &room_id);
-                txn.remove_room_info(&room_info_room_id)?;
-
-                let state_event_room_id = this.encode_key(keys::STATE_EVENT, &room_id);
-                txn.remove_room_state_events(&state_event_room_id, None)?;
-
-                let member_room_id = this.encode_key(keys::MEMBER, &room_id);
-                txn.remove_room_members(&member_room_id, None)?;
-
-                let profile_room_id = this.encode_key(keys::PROFILE, &room_id);
-                txn.remove_room_profiles(&profile_room_id)?;
-
-                let room_account_data_room_id = this.encode_key(keys::ROOM_ACCOUNT_DATA, &room_id);
-                txn.remove_room_account_data(&room_account_data_room_id)?;
-
-                let receipt_room_id = this.encode_key(keys::RECEIPT, &room_id);
-                txn.remove_room_receipts(&receipt_room_id)?;
-
-                let display_name_room_id = this.encode_key(keys::DISPLAY_NAME, &room_id);
-                txn.remove_room_display_names(&display_name_room_id)?;
-
+                txn.prepare_cached("INSERT INTO send_queue_events (room_id, room_id_val, transaction_id, content, priority, created_at) VALUES (?, ?, ?, ?, ?, ?)")?.execute((room_id_key, room_id_value, transaction_id.to_string(), content, priority, created_at_ts))?;
                 Ok(())
             })
             .await
+    }
+
+    async fn update_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: QueuedRequestKind,
+    ) -> Result<bool, Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        let content = self.serialize_json(&content)?;
+        // See comment in [`Self::save_send_queue_event`] to understand why the
+        // transaction id is neither encrypted or hashed.
+        let transaction_id = transaction_id.to_string();
+
+        let num_updated = self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached("UPDATE send_queue_events SET wedge_reason = NULL, content = ? WHERE room_id = ? AND transaction_id = ?")?.execute((content, room_id, transaction_id))
+            })
+            .await?;
+
+        Ok(num_updated > 0)
+    }
+
+    async fn remove_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let transaction_id = transaction_id.to_string();
+
+        let num_deleted = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    "DELETE FROM send_queue_events WHERE room_id = ? AND transaction_id = ?",
+                )?
+                .execute((room_id, &transaction_id))
+            })
+            .await?;
+
+        Ok(num_deleted > 0)
+    }
+
+    async fn load_send_queue_requests(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedRequest>, Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        // Note: ROWID is always present and is an auto-incremented integer counter. We
+        // want to maintain the insertion order, so we can sort using it.
+        // Note 2: transaction_id is not encoded, see why in `save_send_queue_event`.
+        let res: Vec<(String, Vec<u8>, Option<Vec<u8>>, usize, Option<u64>)> = self
+            .acquire()
+            .await?
+            .prepare(
+                "SELECT transaction_id, content, wedge_reason, priority, created_at FROM send_queue_events WHERE room_id = ? ORDER BY priority DESC, ROWID",
+                |mut stmt| {
+                    stmt.query((room_id,))?
+                        .mapped(|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+                        .collect()
+                },
+            )
+            .await?;
+
+        let mut requests = Vec::with_capacity(res.len());
+        for entry in res {
+            let created_at = entry
+                .4
+                .and_then(UInt::new)
+                .map_or_else(MilliSecondsSinceUnixEpoch::now, MilliSecondsSinceUnixEpoch);
+            requests.push(QueuedRequest {
+                transaction_id: entry.0.into(),
+                kind: self.deserialize_json(&entry.1)?,
+                error: entry.2.map(|v| self.deserialize_value(&v)).transpose()?,
+                priority: entry.3,
+                created_at,
+            });
+        }
+
+        Ok(requests)
+    }
+
+    async fn update_send_queue_request_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        error: Option<QueueWedgeError>,
+    ) -> Result<(), Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let transaction_id = transaction_id.to_string();
+
+        // Serialize the error to json bytes (encrypted if option is enabled) if set.
+        let error_value = error.map(|e| self.serialize_value(&e)).transpose()?;
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached("UPDATE send_queue_events SET wedge_reason = ? WHERE room_id = ? AND transaction_id = ?")?.execute((error_value, room_id, transaction_id))?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        // If the values were not encrypted, we could use `SELECT DISTINCT` here, but we
+        // have to manually do the deduplication: indeed, for all X, encrypt(X)
+        // != encrypted(X), since we use a nonce in the encryption process.
+
+        let res: Vec<Vec<u8>> = self
+            .acquire()
+            .await?
+            .prepare("SELECT room_id_val FROM send_queue_events", |mut stmt| {
+                stmt.query(())?.mapped(|row| row.get(0)).collect()
+            })
+            .await?;
+
+        // So we collect the results into a `BTreeSet` to perform the deduplication, and
+        // then rejigger that into a vector.
+        Ok(res
+            .into_iter()
+            .map(|entry| self.deserialize_value(&entry))
+            .collect::<Result<BTreeSet<OwnedRoomId>, _>>()?
+            .into_iter()
+            .collect())
+    }
+
+    async fn save_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: DependentQueuedRequestKind,
+    ) -> Result<()> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let content = self.serialize_json(&content)?;
+
+        // See comment in `save_send_queue_event`.
+        let parent_txn_id = parent_txn_id.to_string();
+        let own_txn_id = own_txn_id.to_string();
+
+        let created_at_ts: u64 = created_at.0.into();
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    r#"INSERT INTO dependent_send_queue_events
+                         (room_id, parent_transaction_id, own_transaction_id, content, created_at)
+                       VALUES (?, ?, ?, ?, ?)"#,
+                )?
+                .execute((
+                    room_id,
+                    parent_txn_id,
+                    own_txn_id,
+                    content,
+                    created_at_ts,
+                ))?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn update_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let content = self.serialize_json(&new_content)?;
+
+        // See comment in `save_send_queue_event`.
+        let own_txn_id = own_transaction_id.to_string();
+
+        let num_updated = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    r#"UPDATE dependent_send_queue_events
+                       SET content = ?
+                       WHERE own_transaction_id = ?
+                       AND room_id = ?"#,
+                )?
+                .execute((content, own_txn_id, room_id))
+            })
+            .await?;
+
+        if num_updated > 1 {
+            return Err(Error::InconsistentUpdate);
+        }
+
+        Ok(num_updated == 1)
+    }
+
+    async fn mark_dependent_queued_requests_as_ready(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        parent_key: SentRequestKey,
+    ) -> Result<usize> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let parent_key = self.serialize_value(&parent_key)?;
+
+        // See comment in `save_send_queue_event`.
+        let parent_txn_id = parent_txn_id.to_string();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                Ok(txn.prepare_cached(
+                    "UPDATE dependent_send_queue_events SET parent_key = ? WHERE parent_transaction_id = ? and room_id = ?",
+                )?
+                .execute((parent_key, parent_txn_id, room_id))?)
+            })
+            .await
+    }
+
+    async fn remove_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        txn_id: &ChildTransactionId,
+    ) -> Result<bool> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let txn_id = txn_id.to_string();
+
+        let num_deleted = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    "DELETE FROM dependent_send_queue_events WHERE own_transaction_id = ? AND room_id = ?",
+                )?
+                .execute((txn_id, room_id))
+            })
+            .await?;
+
+        Ok(num_deleted > 0)
+    }
+
+    async fn load_dependent_queued_requests(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<DependentQueuedRequest>> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+
+        // Note: transaction_id is not encoded, see why in `save_send_queue_event`.
+        let res: Vec<(String, String, Option<Vec<u8>>, Vec<u8>, Option<u64>)> = self
+            .acquire()
+            .await?
+            .prepare(
+                "SELECT own_transaction_id, parent_transaction_id, parent_key, content, created_at FROM dependent_send_queue_events WHERE room_id = ? ORDER BY ROWID",
+                |mut stmt| {
+                    stmt.query((room_id,))?
+                        .mapped(|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+                        .collect()
+                },
+            )
+            .await?;
+
+        let mut dependent_events = Vec::with_capacity(res.len());
+        for entry in res {
+            let created_at = entry
+                .4
+                .and_then(UInt::new)
+                .map_or_else(MilliSecondsSinceUnixEpoch::now, MilliSecondsSinceUnixEpoch);
+            dependent_events.push(DependentQueuedRequest {
+                own_transaction_id: entry.0.into(),
+                parent_transaction_id: entry.1.into(),
+                parent_key: entry.2.map(|bytes| self.deserialize_value(&bytes)).transpose()?,
+                kind: self.deserialize_json(&entry.3)?,
+                created_at,
+            });
+        }
+
+        Ok(dependent_events)
     }
 }
 
@@ -1618,35 +2138,93 @@ mod tests {
         let name = NUM.fetch_add(1, SeqCst).to_string();
         let tmpdir_path = TMP_DIR.path().join(name);
 
+        tracing::info!("using store @ {}", tmpdir_path.to_str().unwrap());
+
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), None).await.unwrap())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    statestore_integration_tests!();
 }
 
 #[cfg(test)]
 mod encrypted_tests {
-    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU32, Ordering::SeqCst},
+    };
 
     use matrix_sdk_base::{statestore_integration_tests, StateStore, StoreError};
+    use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
 
     use super::SqliteStateStore;
+    use crate::{utils::SqliteAsyncConnExt, SqliteStoreConfig};
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
 
-    async fn get_store() -> Result<impl StateStore, StoreError> {
+    fn new_state_store_workspace() -> PathBuf {
         let name = NUM.fetch_add(1, SeqCst).to_string();
-        let tmpdir_path = TMP_DIR.path().join(name);
+        TMP_DIR.path().join(name)
+    }
+
+    async fn get_store() -> Result<impl StateStore, StoreError> {
+        let tmpdir_path = new_state_store_workspace();
+
+        tracing::info!("using store @ {}", tmpdir_path.to_str().unwrap());
 
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), Some("default_test_password"))
             .await
             .unwrap())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    #[async_test]
+    async fn test_pool_size() {
+        let tmpdir_path = new_state_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).pool_max_size(42);
+
+        let store = SqliteStateStore::open_with_config(store_open_config).await.unwrap();
+
+        assert_eq!(store.pool.status().max_size, 42);
+    }
+
+    #[async_test]
+    async fn test_cache_size() {
+        let tmpdir_path = new_state_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).cache_size(1500);
+
+        let store = SqliteStateStore::open_with_config(store_open_config).await.unwrap();
+
+        let conn = store.pool.get().await.unwrap();
+        let cache_size =
+            conn.query_row("PRAGMA cache_size", (), |row| row.get::<_, i32>(0)).await.unwrap();
+
+        // The value passed to `SqliteStoreConfig` is in bytes. Check it is
+        // converted to kibibytes. Also, it must be a negative value because it
+        // _is_ the size in kibibytes, not in page size.
+        assert_eq!(cache_size, -(1500 / 1024));
+    }
+
+    #[async_test]
+    async fn test_journal_size_limit() {
+        let tmpdir_path = new_state_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).journal_size_limit(1500);
+
+        let store = SqliteStateStore::open_with_config(store_open_config).await.unwrap();
+
+        let conn = store.pool.get().await.unwrap();
+        let journal_size_limit = conn
+            .query_row("PRAGMA journal_size_limit", (), |row| row.get::<_, u32>(0))
+            .await
+            .unwrap();
+
+        // The value passed to `SqliteStoreConfig` is in bytes. It stays in
+        // bytes in SQLite.
+        assert_eq!(journal_size_limit, 1500);
+    }
+
+    statestore_integration_tests!();
 }
 
 #[cfg(test)]
@@ -1659,22 +2237,38 @@ mod migration_tests {
         },
     };
 
-    use matrix_sdk_base::{sync::UnreadNotificationsCount, RoomState, StateStore};
+    use as_variant::as_variant;
+    use deadpool_sqlite::Runtime;
+    use matrix_sdk_base::{
+        media::{MediaFormat, MediaRequestParameters},
+        store::{
+            ChildTransactionId, DependentQueuedRequestKind, RoomLoadSettings,
+            SerializableEventContent,
+        },
+        sync::UnreadNotificationsCount,
+        RoomState, StateStore,
+    };
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use ruma::{
-        events::{room::create::RoomCreateEventContent, StateEventType},
-        room_id, server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, RoomId, UserId,
+        events::{
+            room::{create::RoomCreateEventContent, message::RoomMessageEventContent, MediaSource},
+            StateEventType,
+        },
+        room_id, server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedTransactionId,
+        RoomId, TransactionId, UserId,
     };
     use rusqlite::Transaction;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use tempfile::{tempdir, TempDir};
+    use tokio::fs;
 
-    use super::{create_pool, init, keys, SqliteStateStore};
+    use super::{init, keys, SqliteStateStore, DATABASE_NAME};
     use crate::{
         error::{Error, Result},
-        get_or_create_store_cipher,
-        utils::SqliteObjectExt,
+        utils::{SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt},
+        OpenStoreError,
     };
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
@@ -1687,13 +2281,18 @@ mod migration_tests {
     }
 
     async fn create_fake_db(path: &Path, version: u8) -> Result<SqliteStateStore> {
-        let pool = create_pool(path).await.unwrap();
+        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir).unwrap();
+
+        let config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
+        // use default pool config
+
+        let pool = config.create_pool(Runtime::Tokio1).unwrap();
         let conn = pool.get().await?;
 
         init(&conn).await?;
 
-        let store_cipher = Some(Arc::new(get_or_create_store_cipher(SECRET, &conn).await.unwrap()));
-        let this = SqliteStateStore { store_cipher, path: None, pool };
+        let store_cipher = Some(Arc::new(conn.get_or_create_store_cipher(SECRET).await.unwrap()));
+        let this = SqliteStateStore { store_cipher, pool };
         this.run_migrations(&conn, 1, Some(version)).await?;
 
         Ok(this)
@@ -1779,10 +2378,7 @@ mod migration_tests {
         let store = SqliteStateStore::open(path, Some(SECRET)).await.unwrap();
 
         // Check all room infos are there.
-        assert_eq!(store.get_room_infos().await.unwrap().len(), 5);
-        #[allow(deprecated)]
-        let stripped_rooms = store.get_stripped_room_infos().await.unwrap();
-        assert_eq!(stripped_rooms.len(), 2);
+        assert_eq!(store.get_room_infos(&RoomLoadSettings::default()).await.unwrap().len(), 5);
     }
 
     // Add a room in version 2 format of the state store.
@@ -1900,7 +2496,7 @@ mod migration_tests {
         let store = SqliteStateStore::open(path, Some(SECRET)).await.unwrap();
 
         // Check all room infos are there.
-        let room_infos = store.get_room_infos().await.unwrap();
+        let room_infos = store.get_room_infos(&RoomLoadSettings::default()).await.unwrap();
         assert_eq!(room_infos.len(), 3);
 
         let room_a = room_infos.iter().find(|r| r.room_id() == room_a_id).unwrap();
@@ -1914,5 +2510,131 @@ mod migration_tests {
         let room_c = room_infos.iter().find(|r| r.room_id() == room_c_id).unwrap();
         assert_eq!(room_c.name(), None);
         assert_eq!(room_c.creator(), Some(room_c_create_sender));
+    }
+
+    #[async_test]
+    pub async fn test_migrating_v7_to_v9() {
+        let path = new_path();
+
+        let room_id = room_id!("!room_a:dummy.local");
+        let wedged_event_transaction_id = TransactionId::new();
+        let local_event_transaction_id = TransactionId::new();
+
+        // Create and populate db.
+        {
+            let db = create_fake_db(&path, 7).await.unwrap();
+            let conn = db.pool.get().await.unwrap();
+
+            let wedge_tx = wedged_event_transaction_id.clone();
+            let local_tx = local_event_transaction_id.clone();
+
+            conn.with_transaction(move |txn| {
+                add_dependent_send_queue_event_v7(
+                    &db,
+                    txn,
+                    room_id,
+                    &local_tx,
+                    ChildTransactionId::new(),
+                    DependentQueuedRequestKind::RedactEvent,
+                )?;
+                add_send_queue_event_v7(&db, txn, &wedge_tx, room_id, true)?;
+                add_send_queue_event_v7(&db, txn, &local_tx, room_id, false)?;
+                Result::<_, Error>::Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        // This transparently migrates to the latest version, which clears up all
+        // requests and dependent requests.
+        let store = SqliteStateStore::open(path, Some(SECRET)).await.unwrap();
+
+        let requests = store.load_send_queue_requests(room_id).await.unwrap();
+        assert!(requests.is_empty());
+
+        let dependent_requests = store.load_dependent_queued_requests(room_id).await.unwrap();
+        assert!(dependent_requests.is_empty());
+    }
+
+    fn add_send_queue_event_v7(
+        this: &SqliteStateStore,
+        txn: &Transaction<'_>,
+        transaction_id: &TransactionId,
+        room_id: &RoomId,
+        is_wedged: bool,
+    ) -> Result<(), Error> {
+        let content =
+            SerializableEventContent::new(&RoomMessageEventContent::text_plain("Hello").into())?;
+
+        let room_id_key = this.encode_key(keys::SEND_QUEUE, room_id);
+        let room_id_value = this.serialize_value(&room_id.to_owned())?;
+
+        let content = this.serialize_json(&content)?;
+
+        txn.prepare_cached("INSERT INTO send_queue_events (room_id, room_id_val, transaction_id, content, wedged) VALUES (?, ?, ?, ?, ?)")?
+            .execute((room_id_key, room_id_value, transaction_id.to_string(), content, is_wedged))?;
+
+        Ok(())
+    }
+
+    fn add_dependent_send_queue_event_v7(
+        this: &SqliteStateStore,
+        txn: &Transaction<'_>,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        content: DependentQueuedRequestKind,
+    ) -> Result<(), Error> {
+        let room_id_value = this.serialize_value(&room_id.to_owned())?;
+
+        let parent_txn_id = parent_txn_id.to_string();
+        let own_txn_id = own_txn_id.to_string();
+        let content = this.serialize_json(&content)?;
+
+        txn.prepare_cached(
+            "INSERT INTO dependent_send_queue_events
+                         (room_id, parent_transaction_id, own_transaction_id, content)
+                       VALUES (?, ?, ?, ?)",
+        )?
+        .execute((room_id_value, parent_txn_id, own_txn_id, content))?;
+
+        Ok(())
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum LegacyDependentQueuedRequestKind {
+        UploadFileWithThumbnail {
+            content_type: String,
+            cache_key: MediaRequestParameters,
+            related_to: OwnedTransactionId,
+        },
+    }
+
+    #[async_test]
+    pub async fn test_dependent_queued_request_variant_renaming() {
+        let path = new_path();
+        let db = create_fake_db(&path, 7).await.unwrap();
+
+        let cache_key = MediaRequestParameters {
+            format: MediaFormat::File,
+            source: MediaSource::Plain("https://server.local/foobar".into()),
+        };
+        let related_to = TransactionId::new();
+        let request = LegacyDependentQueuedRequestKind::UploadFileWithThumbnail {
+            content_type: "image/png".to_owned(),
+            cache_key,
+            related_to: related_to.clone(),
+        };
+
+        let data = db
+            .serialize_json(&request)
+            .expect("should be able to serialize legacy dependent request");
+        let deserialized: DependentQueuedRequestKind = db.deserialize_json(&data).expect(
+            "should be able to deserialize dependent request from legacy dependent request",
+        );
+
+        as_variant!(deserialized, DependentQueuedRequestKind::UploadFileOrThumbnail { related_to: de_related_to, .. } => {
+            assert_eq!(de_related_to, related_to);
+        });
     }
 }

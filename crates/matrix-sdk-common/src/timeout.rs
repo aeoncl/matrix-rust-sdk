@@ -24,7 +24,7 @@ use tokio::time::timeout as tokio_timeout;
 
 /// Error type notifying that a timeout has elapsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ElapsedError(());
+pub struct ElapsedError();
 
 impl fmt::Display for ElapsedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,19 +41,19 @@ impl Error for ElapsedError {}
 /// an error.
 pub async fn timeout<F, T>(future: F, duration: Duration) -> Result<T, ElapsedError>
 where
-    F: Future<Output = T> + Unpin,
+    F: Future<Output = T>,
 {
     #[cfg(not(target_arch = "wasm32"))]
-    return tokio_timeout(duration, future).await.map_err(|_| ElapsedError(()));
+    return tokio_timeout(duration, future).await.map_err(|_| ElapsedError());
 
     #[cfg(target_arch = "wasm32")]
     {
         let timeout_future =
             TimeoutFuture::new(u32::try_from(duration.as_millis()).expect("Overlong duration"));
 
-        match select(future, timeout_future).await {
+        match select(std::pin::pin!(future), timeout_future).await {
             Either::Left((res, _)) => Ok(res),
-            Either::Right((_, _)) => Err(ElapsedError(())),
+            Either::Right((_, _)) => Err(ElapsedError()),
         }
     }
 }
@@ -62,7 +62,7 @@ where
 pub(crate) mod tests {
     use std::{future, time::Duration};
 
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_test_macros::async_test;
 
     use super::timeout;
 
@@ -70,14 +70,14 @@ pub(crate) mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     #[async_test]
-    async fn without_timeout() {
+    async fn test_without_timeout() {
         timeout(future::ready(()), Duration::from_millis(100))
             .await
             .expect("future should have completed without ElapsedError");
     }
 
     #[async_test]
-    async fn with_timeout() {
+    async fn test_with_timeout() {
         timeout(future::pending::<()>(), Duration::from_millis(100))
             .await
             .expect_err("future should return an ElapsedError");

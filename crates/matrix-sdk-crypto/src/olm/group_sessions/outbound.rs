@@ -16,13 +16,15 @@ use std::{
     cmp::max,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    ops::Bound,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock as StdRwLock,
+        Arc, RwLockReadGuard,
     },
     time::Duration,
 };
 
+use matrix_sdk_common::{deserialized_responses::WithheldCode, locks::RwLock as StdRwLock};
 use ruma::{
     events::{
         room::{encryption::RoomEncryptionEventContent, history_visibility::HistoryVisibility},
@@ -46,27 +48,43 @@ use super::SessionCreationError;
 #[cfg(feature = "experimental-algorithms")]
 use crate::types::events::room::encrypted::MegolmV2AesSha2Content;
 use crate::{
+    olm::account::shared_history_from_history_visibility,
+    session_manager::CollectStrategy,
+    store::caches::SequenceNumber,
     types::{
         events::{
             room::encrypted::{
                 MegolmV1AesSha2Content, RoomEncryptedEventContent, RoomEventEncryptionScheme,
             },
             room_key::{MegolmV1AesSha2Content as MegolmV1AesSha2RoomKeyContent, RoomKeyContent},
-            room_key_withheld::{RoomKeyWithheldContent, WithheldCode},
+            room_key_withheld::RoomKeyWithheldContent,
         },
+        requests::ToDeviceRequest,
         EventEncryptionAlgorithm,
     },
-    ReadOnlyDevice, ToDeviceRequest,
+    DeviceData,
 };
 
-const ROTATION_PERIOD: Duration = Duration::from_millis(604800000);
+const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
+const ONE_WEEK: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+
+const ROTATION_PERIOD: Duration = ONE_WEEK;
 const ROTATION_MESSAGES: u64 = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Information about whether a session was shared with a device.
 pub(crate) enum ShareState {
+    /// The session was not shared with the device.
     NotShared,
+    /// The session was shared with the device with the given device ID, but
+    /// with a different curve25519 key.
     SharedButChangedSenderKey,
-    Shared(u32),
+    /// The session was shared with the device, at the given message index. The
+    /// `olm_wedging_index` is the value of the `olm_wedging_index` from the
+    /// [`DeviceData`] at the time that we last shared the session with the
+    /// device, and indicates whether we need to re-share the session with the
+    /// device.
+    Shared { message_index: u32, olm_wedging_index: SequenceNumber },
 }
 
 /// Settings for an encrypted room.
@@ -82,10 +100,10 @@ pub struct EncryptionSettings {
     pub rotation_period_msgs: u64,
     /// The history visibility of the room when the session was created.
     pub history_visibility: HistoryVisibility,
-    /// Should untrusted devices receive the room key, or should they be
-    /// excluded from the conversation.
+    /// The strategy used to distribute the room keys to participant.
+    /// Default will send to all devices.
     #[serde(default)]
-    pub only_allow_trusted_devices: bool,
+    pub sharing_strategy: CollectStrategy,
 }
 
 impl Default for EncryptionSettings {
@@ -95,19 +113,18 @@ impl Default for EncryptionSettings {
             rotation_period: ROTATION_PERIOD,
             rotation_period_msgs: ROTATION_MESSAGES,
             history_visibility: HistoryVisibility::Shared,
-            only_allow_trusted_devices: false,
+            sharing_strategy: CollectStrategy::default(),
         }
     }
 }
 
 impl EncryptionSettings {
     /// Create new encryption settings using an `RoomEncryptionEventContent`,
-    /// a history visibility, and setting if only trusted devices should receive
-    /// a room key.
+    /// a history visibility, and key sharing strategy.
     pub fn new(
         content: RoomEncryptionEventContent,
         history_visibility: HistoryVisibility,
-        only_allow_trusted_devices: bool,
+        sharing_strategy: CollectStrategy,
     ) -> Self {
         let rotation_period: Duration =
             content.rotation_period_ms.map_or(ROTATION_PERIOD, |r| Duration::from_millis(r.into()));
@@ -119,7 +136,7 @@ impl EncryptionSettings {
             rotation_period,
             rotation_period_msgs,
             history_visibility,
-            only_allow_trusted_devices,
+            sharing_strategy,
         }
     }
 }
@@ -141,11 +158,8 @@ pub struct OutboundGroupSession {
     shared: Arc<AtomicBool>,
     invalidated: Arc<AtomicBool>,
     settings: Arc<EncryptionSettings>,
-    pub(crate) shared_with_set:
-        Arc<StdRwLock<BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>>>,
-    #[allow(clippy::type_complexity)]
-    to_share_with_set:
-        Arc<StdRwLock<BTreeMap<OwnedTransactionId, (Arc<ToDeviceRequest>, ShareInfoSet)>>>,
+    shared_with_set: Arc<StdRwLock<ShareInfoSet>>,
+    to_share_with_set: Arc<StdRwLock<ToShareMap>>,
 }
 
 /// A a map of userid/device it to a `ShareInfo`.
@@ -153,6 +167,8 @@ pub struct OutboundGroupSession {
 /// Holds the `ShareInfo` for all the user/device pairs that will receive the
 /// room key.
 pub type ShareInfoSet = BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, ShareInfo>>;
+
+type ToShareMap = BTreeMap<OwnedTransactionId, (Arc<ToDeviceRequest>, ShareInfoSet)>;
 
 /// Struct holding info about the share state of a outbound group session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,8 +181,12 @@ pub enum ShareInfo {
 
 impl ShareInfo {
     /// Helper to create a SharedWith info
-    pub fn new_shared(sender_key: Curve25519PublicKey, message_index: u32) -> Self {
-        ShareInfo::Shared(SharedWith { sender_key, message_index })
+    pub fn new_shared(
+        sender_key: Curve25519PublicKey,
+        message_index: u32,
+        olm_wedging_index: SequenceNumber,
+    ) -> Self {
+        ShareInfo::Shared(SharedWith { sender_key, message_index, olm_wedging_index })
     }
 
     /// Helper to create a Withheld info
@@ -181,6 +201,93 @@ pub struct SharedWith {
     pub sender_key: Curve25519PublicKey,
     /// The message index that the device received.
     pub message_index: u32,
+    /// The Olm wedging index of the device at the time the session was shared.
+    #[serde(default)]
+    pub olm_wedging_index: SequenceNumber,
+}
+
+/// A read-only view into the device sharing state of an
+/// [`OutboundGroupSession`].
+pub(crate) struct SharingView<'a> {
+    shared_with_set: RwLockReadGuard<'a, ShareInfoSet>,
+    to_share_with_set: RwLockReadGuard<'a, ToShareMap>,
+}
+
+impl SharingView<'_> {
+    /// Has the session been shared with the given user/device pair (or if not,
+    /// is there such a request pending).
+    pub(crate) fn get_share_state(&self, device: &DeviceData) -> ShareState {
+        self.iter_shares(Some(device.user_id()), Some(device.device_id()))
+            .map(|(_, _, info)| match info {
+                ShareInfo::Shared(info) => {
+                    if device.curve25519_key() == Some(info.sender_key) {
+                        ShareState::Shared {
+                            message_index: info.message_index,
+                            olm_wedging_index: info.olm_wedging_index,
+                        }
+                    } else {
+                        ShareState::SharedButChangedSenderKey
+                    }
+                }
+                ShareInfo::Withheld(_) => ShareState::NotShared,
+            })
+            // Return the most "definitive" ShareState found (in case there
+            // are multiple entries for the same device).
+            .max()
+            .unwrap_or(ShareState::NotShared)
+    }
+
+    /// Has the session been withheld for the given user/device pair (or if not,
+    /// is there such a request pending).
+    pub(crate) fn is_withheld_to(&self, device: &DeviceData, code: &WithheldCode) -> bool {
+        self.iter_shares(Some(device.user_id()), Some(device.device_id()))
+            .any(|(_, _, info)| matches!(info, ShareInfo::Withheld(c) if c == code))
+    }
+
+    /// Enumerate all sent or pending sharing requests for the given device (or
+    /// for all devices if not specified).  This can yield the same device
+    /// multiple times.
+    pub(crate) fn iter_shares<'b, 'c>(
+        &self,
+        user_id: Option<&'b UserId>,
+        device_id: Option<&'c DeviceId>,
+    ) -> impl Iterator<Item = (&UserId, &DeviceId, &ShareInfo)> + use<'_, 'b, 'c> {
+        fn iter_share_info_set<'a, 'b, 'c>(
+            set: &'a ShareInfoSet,
+            user_ids: (Bound<&'b UserId>, Bound<&'b UserId>),
+            device_ids: (Bound<&'c DeviceId>, Bound<&'c DeviceId>),
+        ) -> impl Iterator<Item = (&'a UserId, &'a DeviceId, &'a ShareInfo)> + use<'a, 'b, 'c>
+        {
+            set.range::<UserId, _>(user_ids).flat_map(move |(uid, d)| {
+                d.range::<DeviceId, _>(device_ids)
+                    .map(|(id, info)| (uid.as_ref(), id.as_ref(), info))
+            })
+        }
+
+        let user_ids = user_id
+            .map(|u| (Bound::Included(u), Bound::Included(u)))
+            .unwrap_or((Bound::Unbounded, Bound::Unbounded));
+        let device_ids = device_id
+            .map(|d| (Bound::Included(d), Bound::Included(d)))
+            .unwrap_or((Bound::Unbounded, Bound::Unbounded));
+
+        let already_shared = iter_share_info_set(&self.shared_with_set, user_ids, device_ids);
+        let pending = self
+            .to_share_with_set
+            .values()
+            .flat_map(move |(_, set)| iter_share_info_set(set, user_ids, device_ids));
+        already_shared.chain(pending)
+    }
+
+    /// Enumerate all users that have received the session, or have pending
+    /// requests to receive it.  This can yield the same user multiple times,
+    /// so you may want to `collect()` the result into a `BTreeSet`.
+    pub(crate) fn shared_with_users(&self) -> impl Iterator<Item = &UserId> {
+        self.iter_shares(None, None).filter_map(|(u, _, info)| match info {
+            ShareInfo::Shared(_) => Some(u),
+            ShareInfo::Withheld(_) => None,
+        })
+    }
 }
 
 impl OutboundGroupSession {
@@ -204,12 +311,12 @@ impl OutboundGroupSession {
     /// * `device_id` - The id of the device that created this session.
     ///
     /// * `identity_keys` - The identity keys of the account that created this
-    /// session.
+    ///   session.
     ///
     /// * `room_id` - The id of the room that the session is used in.
     ///
     /// * `settings` - Settings determining the algorithm and rotation period of
-    /// the outbound group session.
+    ///   the outbound group session.
     pub fn new(
         device_id: OwnedDeviceId,
         identity_keys: Arc<IdentityKeys>,
@@ -252,7 +359,7 @@ impl OutboundGroupSession {
         request: Arc<ToDeviceRequest>,
         share_infos: ShareInfoSet,
     ) {
-        self.to_share_with_set.write().unwrap().insert(request_id, (request, share_infos));
+        self.to_share_with_set.write().insert(request_id, (request, share_infos));
     }
 
     /// Create a new `m.room_key.withheld` event content with the given code for
@@ -288,7 +395,7 @@ impl OutboundGroupSession {
     ) -> BTreeMap<OwnedUserId, BTreeSet<OwnedDeviceId>> {
         let mut no_olm_devices = BTreeMap::new();
 
-        let removed = self.to_share_with_set.write().unwrap().remove(request_id);
+        let removed = self.to_share_with_set.write().remove(request_id);
         if let Some((to_device, request)) = removed {
             let recipients: BTreeMap<&UserId, BTreeSet<&DeviceId>> = request
                 .iter()
@@ -310,10 +417,10 @@ impl OutboundGroupSession {
                     .collect();
                 no_olm_devices.insert(user_id.to_owned(), no_olms);
 
-                self.shared_with_set.write().unwrap().entry(user_id).or_default().extend(info);
+                self.shared_with_set.write().entry(user_id).or_default().extend(info);
             }
 
-            if self.to_share_with_set.read().unwrap().is_empty() {
+            if self.to_share_with_set.read().is_empty() {
                 debug!(
                     session_id = self.session_id(),
                     room_id = ?self.room_id,
@@ -325,7 +432,7 @@ impl OutboundGroupSession {
             }
         } else {
             let request_ids: Vec<String> =
-                self.to_share_with_set.read().unwrap().keys().map(|k| k.to_string()).collect();
+                self.to_share_with_set.read().keys().map(|k| k.to_string()).collect();
 
             error!(
                 all_request_ids = ?request_ids,
@@ -359,10 +466,10 @@ impl OutboundGroupSession {
     /// # Arguments
     ///
     /// * `event_type` - The plaintext type of the event, the outer type of the
-    /// event will become `m.room.encrypted`.
+    ///   event will become `m.room.encrypted`.
     ///
     /// * `content` - The plaintext content of the message that should be
-    /// encrypted in raw JSON form.
+    ///   encrypted in raw JSON form.
     ///
     /// # Panics
     ///
@@ -415,13 +522,25 @@ impl OutboundGroupSession {
     fn elapsed(&self) -> bool {
         let creation_time = Duration::from_secs(self.creation_time.get().into());
         let now = Duration::from_secs(SecondsSinceUnixEpoch::now().get().into());
-
-        // Since the encryption settings are provided by users and not
-        // checked someone could set a really low rotation period so
-        // clamp it to an hour.
         now.checked_sub(creation_time)
-            .map(|elapsed| elapsed >= max(self.settings.rotation_period, Duration::from_secs(3600)))
+            .map(|elapsed| elapsed >= self.safe_rotation_period())
             .unwrap_or(true)
+    }
+
+    /// Returns the rotation_period_ms that was set for this session, clamped
+    /// to be no less than one hour.
+    ///
+    /// This is to prevent a malicious or careless user causing sessions to be
+    /// rotated very frequently.
+    ///
+    /// The feature flag `_disable-minimum-rotation-period-ms` can
+    /// be used to prevent this behaviour (which can be useful for tests).
+    fn safe_rotation_period(&self) -> Duration {
+        if cfg!(feature = "_disable-minimum-rotation-period-ms") {
+            self.settings.rotation_period
+        } else {
+            max(self.settings.rotation_period, ONE_HOUR)
+        }
     }
 
     /// Check if the session has expired and if it should be rotated.
@@ -492,84 +611,28 @@ impl OutboundGroupSession {
 
     pub(crate) async fn as_content(&self) -> RoomKeyContent {
         let session_key = self.session_key().await;
+        let shared_history =
+            shared_history_from_history_visibility(&self.settings.history_visibility);
 
         RoomKeyContent::MegolmV1AesSha2(
             MegolmV1AesSha2RoomKeyContent::new(
                 self.room_id().to_owned(),
                 self.session_id().to_owned(),
                 session_key,
+                shared_history,
             )
             .into(),
         )
     }
 
-    /// Has or will the session be shared with the given user/device pair.
-    pub(crate) fn is_shared_with(&self, device: &ReadOnlyDevice) -> ShareState {
-        // Check if we shared the session.
-        let shared_state =
-            self.shared_with_set.read().unwrap().get(device.user_id()).and_then(|d| {
-                d.get(device.device_id()).map(|s| match s {
-                    ShareInfo::Shared(s) => {
-                        if device.curve25519_key() == Some(s.sender_key) {
-                            ShareState::Shared(s.message_index)
-                        } else {
-                            ShareState::SharedButChangedSenderKey
-                        }
-                    }
-                    ShareInfo::Withheld(_) => ShareState::NotShared,
-                })
-            });
-
-        if let Some(state) = shared_state {
-            state
-        } else {
-            // If we haven't shared the session, check if we're going to share
-            // the session.
-
-            // Find the first request that contains the given user id and
-            // device ID.
-            let shared =
-                self.to_share_with_set.read().unwrap().values().find_map(|(_, share_info)| {
-                    let d = share_info.get(device.user_id())?;
-                    let info = d.get(device.device_id())?;
-                    Some(match info {
-                        ShareInfo::Shared(info) => {
-                            if device.curve25519_key() == Some(info.sender_key) {
-                                ShareState::Shared(info.message_index)
-                            } else {
-                                ShareState::SharedButChangedSenderKey
-                            }
-                        }
-                        ShareInfo::Withheld(_) => ShareState::NotShared,
-                    })
-                });
-
-            shared.unwrap_or(ShareState::NotShared)
+    /// Create a read-only view into the device sharing state of this session.
+    /// This view includes pending requests, so it is not guaranteed that the
+    /// represented state has been fully propagated yet.
+    pub(crate) fn sharing_view(&self) -> SharingView<'_> {
+        SharingView {
+            shared_with_set: self.shared_with_set.read(),
+            to_share_with_set: self.to_share_with_set.read(),
         }
-    }
-
-    pub(crate) fn is_withheld_to(&self, device: &ReadOnlyDevice, code: &WithheldCode) -> bool {
-        self.shared_with_set
-            .read()
-            .unwrap()
-            .get(device.user_id())
-            .and_then(|d| {
-                let info = d.get(device.device_id())?;
-                Some(matches!(info, ShareInfo::Withheld(c) if c == code))
-            })
-            .unwrap_or_else(|| {
-                // If we haven't yet withheld, check if we're going to withheld
-                // the session.
-
-                // Find the first request that contains the given user id and
-                // device ID.
-                self.to_share_with_set.read().unwrap().values().any(|(_, share_info)| {
-                    share_info
-                        .get(device.user_id())
-                        .and_then(|d| d.get(device.device_id()))
-                        .is_some_and(|info| matches!(info, ShareInfo::Withheld(c) if c == code))
-                })
-            })
     }
 
     /// Mark the session as shared with the given user/device pair, starting
@@ -582,12 +645,10 @@ impl OutboundGroupSession {
         sender_key: Curve25519PublicKey,
         index: u32,
     ) {
-        self.shared_with_set
-            .write()
-            .unwrap()
-            .entry(user_id.to_owned())
-            .or_default()
-            .insert(device_id.to_owned(), ShareInfo::new_shared(sender_key, index));
+        self.shared_with_set.write().entry(user_id.to_owned()).or_default().insert(
+            device_id.to_owned(),
+            ShareInfo::new_shared(sender_key, index, Default::default()),
+        );
     }
 
     /// Mark the session as shared with the given user/device pair, starting
@@ -599,10 +660,10 @@ impl OutboundGroupSession {
         device_id: &DeviceId,
         sender_key: Curve25519PublicKey,
     ) {
-        let share_info = ShareInfo::new_shared(sender_key, self.message_index().await);
+        let share_info =
+            ShareInfo::new_shared(sender_key, self.message_index().await, Default::default());
         self.shared_with_set
             .write()
-            .unwrap()
             .entry(user_id.to_owned())
             .or_default()
             .insert(device_id.to_owned(), share_info);
@@ -611,12 +672,12 @@ impl OutboundGroupSession {
     /// Get the list of requests that need to be sent out for this session to be
     /// marked as shared.
     pub(crate) fn pending_requests(&self) -> Vec<Arc<ToDeviceRequest>> {
-        self.to_share_with_set.read().unwrap().values().map(|(req, _)| req.clone()).collect()
+        self.to_share_with_set.read().values().map(|(req, _)| req.clone()).collect()
     }
 
     /// Get the list of request ids this session is waiting for to be sent out.
     pub(crate) fn pending_request_ids(&self) -> Vec<OwnedTransactionId> {
-        self.to_share_with_set.read().unwrap().keys().cloned().collect()
+        self.to_share_with_set.read().keys().cloned().collect()
     }
 
     /// Restore a Session from a previously pickled string.
@@ -635,7 +696,7 @@ impl OutboundGroupSession {
     /// * `pickle` - The pickled version of the `OutboundGroupSession`.
     ///
     /// * `pickle_mode` - The mode that was used to pickle the session, either
-    /// an unencrypted mode or an encrypted using passphrase.
+    ///   an unencrypted mode or an encrypted using passphrase.
     pub fn from_pickle(
         device_id: OwnedDeviceId,
         identity_keys: Arc<IdentityKeys>,
@@ -666,8 +727,7 @@ impl OutboundGroupSession {
     /// # Arguments
     ///
     /// * `pickle_mode` - The mode that should be used to pickle the group
-    ///   session,
-    /// either an unencrypted mode or an encrypted using passphrase.
+    ///   session, either an unencrypted mode or an encrypted using passphrase.
     pub async fn pickle(&self) -> PickledOutboundGroupSession {
         let pickle = self.inner.read().await.pickle();
 
@@ -679,8 +739,8 @@ impl OutboundGroupSession {
             message_count: self.message_count.load(Ordering::SeqCst),
             shared: self.shared(),
             invalidated: self.invalidated(),
-            shared_with_set: self.shared_with_set.read().unwrap().clone(),
-            requests: self.to_share_with_set.read().unwrap().clone(),
+            shared_with_set: self.shared_with_set.read().clone(),
+            requests: self.to_share_with_set.read().clone(),
         }
     }
 }
@@ -695,7 +755,7 @@ impl From<String> for OutboundGroupSessionPickle {
 }
 
 #[cfg(not(tarpaulin_include))]
-impl std::fmt::Debug for OutboundGroupSession {
+impl fmt::Debug for OutboundGroupSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutboundGroupSession")
             .field("session_id", &self.session_id)
@@ -735,26 +795,27 @@ pub struct PickledOutboundGroupSession {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::atomic::Ordering, time::Duration};
+    use std::time::Duration;
 
-    use matrix_sdk_test::async_test;
     use ruma::{
-        device_id,
         events::room::{
             encryption::RoomEncryptionEventContent, history_visibility::HistoryVisibility,
-            message::RoomMessageEventContent,
         },
-        room_id, uint, user_id, EventEncryptionAlgorithm,
+        uint, EventEncryptionAlgorithm,
     };
 
-    use super::{EncryptionSettings, ROTATION_MESSAGES, ROTATION_PERIOD};
-    use crate::{Account, MegolmError};
+    use super::{EncryptionSettings, ShareState, ROTATION_MESSAGES, ROTATION_PERIOD};
+    use crate::CollectStrategy;
 
     #[test]
     fn test_encryption_settings_conversion() {
         let mut content =
             RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-        let settings = EncryptionSettings::new(content.clone(), HistoryVisibility::Joined, false);
+        let settings = EncryptionSettings::new(
+            content.clone(),
+            HistoryVisibility::Joined,
+            CollectStrategy::AllDevices,
+        );
 
         assert_eq!(settings.rotation_period, ROTATION_PERIOD);
         assert_eq!(settings.rotation_period_msgs, ROTATION_MESSAGES);
@@ -762,84 +823,243 @@ mod tests {
         content.rotation_period_ms = Some(uint!(3600));
         content.rotation_period_msgs = Some(uint!(500));
 
-        let settings = EncryptionSettings::new(content, HistoryVisibility::Shared, false);
+        let settings = EncryptionSettings::new(
+            content,
+            HistoryVisibility::Shared,
+            CollectStrategy::AllDevices,
+        );
 
         assert_eq!(settings.rotation_period, Duration::from_millis(3600));
         assert_eq!(settings.rotation_period_msgs, 500);
     }
 
-    #[async_test]
+    /// Ensure that the `ShareState` PartialOrd instance orders according to
+    /// specificity of the value.
+    #[test]
+    fn test_share_state_ordering() {
+        let values = [
+            ShareState::NotShared,
+            ShareState::SharedButChangedSenderKey,
+            ShareState::Shared { message_index: 1, olm_wedging_index: Default::default() },
+        ];
+        // Make sure our test case of possible variants is exhaustive
+        match values[0] {
+            ShareState::NotShared
+            | ShareState::SharedButChangedSenderKey
+            | ShareState::Shared { .. } => {}
+        }
+        assert!(values.is_sorted());
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos", target_arch = "wasm32"))]
-    async fn test_expiration() -> Result<(), MegolmError> {
-        use ruma::{serde::Raw, SecondsSinceUnixEpoch};
+    mod expiration {
+        use std::{sync::atomic::Ordering, time::Duration};
 
-        let settings = EncryptionSettings { rotation_period_msgs: 1, ..Default::default() };
-
-        let account =
-            Account::with_device_id(user_id!("@alice:example.org"), device_id!("DEVICEID"))
-                .static_data;
-        let (session, _) = account
-            .create_group_session_pair(room_id!("!test_room:example.org"), settings)
-            .await
-            .unwrap();
-
-        assert!(!session.expired());
-        let _ = session
-            .encrypt(
-                "m.room.message",
-                &Raw::new(&RoomMessageEventContent::text_plain("Test message"))?.cast(),
-            )
-            .await;
-        assert!(session.expired());
-
-        let settings = EncryptionSettings {
-            rotation_period: Duration::from_millis(100),
-            ..Default::default()
+        use matrix_sdk_test::async_test;
+        use ruma::{
+            device_id, events::room::message::RoomMessageEventContent, room_id, serde::Raw, uint,
+            user_id, SecondsSinceUnixEpoch,
         };
 
-        let (mut session, _) = account
-            .create_group_session_pair(room_id!("!test_room:example.org"), settings)
-            .await
-            .unwrap();
+        use crate::{
+            olm::{OutboundGroupSession, SenderData},
+            Account, EncryptionSettings, MegolmError,
+        };
 
-        assert!(!session.expired());
+        const TWO_HOURS: Duration = Duration::from_secs(60 * 60 * 2);
 
-        let now = SecondsSinceUnixEpoch::now();
-        session.creation_time = SecondsSinceUnixEpoch(now.get() - uint!(3600));
-        assert!(session.expired());
-
-        let settings = EncryptionSettings { rotation_period_msgs: 0, ..Default::default() };
-
-        let (session, _) = account
-            .create_group_session_pair(room_id!("!test_room:example.org"), settings)
-            .await
-            .unwrap();
-
-        assert!(!session.expired());
-
-        let _ = session
-            .encrypt(
-                "m.room.message",
-                &Raw::new(&RoomMessageEventContent::text_plain("Test message"))?.cast(),
-            )
+        #[async_test]
+        async fn test_session_is_not_expired_if_no_messages_sent_and_no_time_passed() {
+            // Given a session that expires after one message
+            let session = create_session(EncryptionSettings {
+                rotation_period_msgs: 1,
+                ..Default::default()
+            })
             .await;
-        assert!(session.expired());
 
-        let settings = EncryptionSettings { rotation_period_msgs: 100_000, ..Default::default() };
+            // When we send no messages at all
 
-        let (session, _) = account
-            .create_group_session_pair(room_id!("!test_room:example.org"), settings)
-            .await
-            .unwrap();
+            // Then it is not expired
+            assert!(!session.expired());
+        }
 
-        assert!(!session.expired());
-        session.message_count.store(1000, Ordering::SeqCst);
-        assert!(!session.expired());
-        session.message_count.store(9999, Ordering::SeqCst);
-        assert!(!session.expired());
-        session.message_count.store(10_000, Ordering::SeqCst);
-        assert!(session.expired());
+        #[async_test]
+        async fn test_session_is_expired_if_we_rotate_every_message_and_one_was_sent(
+        ) -> Result<(), MegolmError> {
+            // Given a session that expires after one message
+            let session = create_session(EncryptionSettings {
+                rotation_period_msgs: 1,
+                ..Default::default()
+            })
+            .await;
 
-        Ok(())
+            // When we send a message
+            let _ = session
+                .encrypt(
+                    "m.room.message",
+                    &Raw::new(&RoomMessageEventContent::text_plain("Test message"))?.cast(),
+                )
+                .await;
+
+            // Then the session is expired
+            assert!(session.expired());
+
+            Ok(())
+        }
+
+        #[async_test]
+        async fn test_session_with_rotation_period_is_not_expired_after_no_time() {
+            // Given a session with a 2h expiration
+            let session = create_session(EncryptionSettings {
+                rotation_period: TWO_HOURS,
+                ..Default::default()
+            })
+            .await;
+
+            // When we don't allow any time to pass
+
+            // Then it is not expired
+            assert!(!session.expired());
+        }
+
+        #[async_test]
+        async fn test_session_is_expired_after_rotation_period() {
+            // Given a session with a 2h expiration
+            let mut session = create_session(EncryptionSettings {
+                rotation_period: TWO_HOURS,
+                ..Default::default()
+            })
+            .await;
+
+            // When 3 hours have passed
+            let now = SecondsSinceUnixEpoch::now();
+            session.creation_time = SecondsSinceUnixEpoch(now.get() - uint!(10800));
+
+            // Then the session is expired
+            assert!(session.expired());
+        }
+
+        #[async_test]
+        #[cfg(not(feature = "_disable-minimum-rotation-period-ms"))]
+        async fn test_session_does_not_expire_under_one_hour_even_if_we_ask_for_shorter() {
+            // Given a session with a 100ms expiration
+            let mut session = create_session(EncryptionSettings {
+                rotation_period: Duration::from_millis(100),
+                ..Default::default()
+            })
+            .await;
+
+            // When less than an hour has passed
+            let now = SecondsSinceUnixEpoch::now();
+            session.creation_time = SecondsSinceUnixEpoch(now.get() - uint!(1800));
+
+            // Then the session is not expired: we enforce a minimum of 1 hour
+            assert!(!session.expired());
+
+            // But when more than an hour has passed
+            session.creation_time = SecondsSinceUnixEpoch(now.get() - uint!(3601));
+
+            // Then the session is expired
+            assert!(session.expired());
+        }
+
+        #[async_test]
+        #[cfg(feature = "_disable-minimum-rotation-period-ms")]
+        async fn test_with_disable_minrotperiod_feature_sessions_can_expire_quickly() {
+            // Given a session with a 100ms expiration
+            let mut session = create_session(EncryptionSettings {
+                rotation_period: Duration::from_millis(100),
+                ..Default::default()
+            })
+            .await;
+
+            // When less than an hour has passed
+            let now = SecondsSinceUnixEpoch::now();
+            session.creation_time = SecondsSinceUnixEpoch(now.get() - uint!(1800));
+
+            // Then the session is expired: the feature flag has prevented us enforcing a
+            // minimum
+            assert!(session.expired());
+        }
+
+        #[async_test]
+        async fn test_session_with_zero_msgs_rotation_is_not_expired_initially() {
+            // Given a session that is supposed to expire after zero messages
+            let session = create_session(EncryptionSettings {
+                rotation_period_msgs: 0,
+                ..Default::default()
+            })
+            .await;
+
+            // When we send no messages
+
+            // Then the session is not expired: we are protected against this nonsensical
+            // setup
+            assert!(!session.expired());
+        }
+
+        #[async_test]
+        async fn test_session_with_zero_msgs_rotation_expires_after_one_message(
+        ) -> Result<(), MegolmError> {
+            // Given a session that is supposed to expire after zero messages
+            let session = create_session(EncryptionSettings {
+                rotation_period_msgs: 0,
+                ..Default::default()
+            })
+            .await;
+
+            // When we send a message
+            let _ = session
+                .encrypt(
+                    "m.room.message",
+                    &Raw::new(&RoomMessageEventContent::text_plain("Test message"))?.cast(),
+                )
+                .await;
+
+            // Then the session is expired: we treated rotation_period_msgs=0 as if it were
+            // =1
+            assert!(session.expired());
+
+            Ok(())
+        }
+
+        #[async_test]
+        async fn test_session_expires_after_10k_messages_even_if_we_ask_for_more() {
+            // Given we asked to expire after 100K messages
+            let session = create_session(EncryptionSettings {
+                rotation_period_msgs: 100_000,
+                ..Default::default()
+            })
+            .await;
+
+            // Sanity: it does not expire after <10K messages
+            assert!(!session.expired());
+            session.message_count.store(1000, Ordering::SeqCst);
+            assert!(!session.expired());
+            session.message_count.store(9999, Ordering::SeqCst);
+            assert!(!session.expired());
+
+            // When we have sent >= 10K messages
+            session.message_count.store(10_000, Ordering::SeqCst);
+
+            // Then it is considered expired: we enforce a maximum of 10K messages before
+            // rotation.
+            assert!(session.expired());
+        }
+
+        async fn create_session(settings: EncryptionSettings) -> OutboundGroupSession {
+            let account =
+                Account::with_device_id(user_id!("@alice:example.org"), device_id!("DEVICEID"))
+                    .static_data;
+            let (session, _) = account
+                .create_group_session_pair(
+                    room_id!("!test_room:example.org"),
+                    settings,
+                    SenderData::unknown(),
+                )
+                .await
+                .unwrap();
+            session
+        }
     }
 }

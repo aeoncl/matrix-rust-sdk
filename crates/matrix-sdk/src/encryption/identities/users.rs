@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 
 use matrix_sdk_base::{
-    crypto::{types::MasterPubkey, UserIdentities as CryptoUserIdentities},
+    crypto::{types::MasterPubkey, CryptoStoreError, UserIdentity as CryptoUserIdentity},
     RoomMemberships,
 };
 use ruma::{
@@ -86,9 +86,9 @@ impl IdentityUpdates {
 ///
 /// Each key has a separate role:
 /// * Master key, signs only the sub-keys, can be used as a fingerprint of the
-/// identity.
+///   identity.
 /// * Self-signing key, signs devices belonging to the user that owns this
-/// identity.
+///   identity.
 /// * User-signing key, signs Master keys belonging to other users.
 ///
 /// The User-signing key and its signatures of other user's Master keys are
@@ -99,13 +99,18 @@ impl IdentityUpdates {
 /// [`Encryption::bootstrap_cross_signing()`]: crate::encryption::Encryption::bootstrap_cross_signing
 #[derive(Debug, Clone)]
 pub struct UserIdentity {
-    inner: UserIdentities,
+    client: Client,
+    inner: CryptoUserIdentity,
 }
 
 impl UserIdentity {
-    pub(crate) fn new(client: Client, identity: CryptoUserIdentities) -> Self {
-        let inner = UserIdentities { client, identity };
-        Self { inner }
+    pub(crate) fn new(client: Client, identity: CryptoUserIdentity) -> Self {
+        Self { inner: identity, client }
+    }
+
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    pub(crate) fn underlying_identity(&self) -> CryptoUserIdentity {
+        self.inner.clone()
     }
 
     /// The ID of the user this identity belongs to.
@@ -128,9 +133,9 @@ impl UserIdentity {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn user_id(&self) -> &UserId {
-        match &self.inner.identity {
-            CryptoUserIdentities::Own(identity) => identity.user_id(),
-            CryptoUserIdentities::Other(identity) => identity.user_id(),
+        match &self.inner {
+            CryptoUserIdentity::Own(identity) => identity.user_id(),
+            CryptoUserIdentity::Other(identity) => identity.user_id(),
         }
     }
 
@@ -144,10 +149,10 @@ impl UserIdentity {
     /// someone else's:
     ///
     /// * Our own identity - All our E2EE capable devices will receive the event
-    /// over to-device messaging.
+    ///   over to-device messaging.
     /// * Someone else's identity - The event will be sent to a DM room we share
-    /// with the user, if we don't share a DM with the user, one will be
-    /// created.
+    ///   with the user, if we don't share a DM with the user, one will be
+    ///   created.
     ///
     /// The default methods that are supported are:
     ///
@@ -185,7 +190,7 @@ impl UserIdentity {
     pub async fn request_verification(
         &self,
     ) -> Result<VerificationRequest, RequestVerificationError> {
-        self.inner.request_verification(None).await
+        self.request_verification_impl(None).await
     }
 
     /// Request an interactive verification with this `UserIdentity` using the
@@ -203,7 +208,7 @@ impl UserIdentity {
     /// # Arguments
     ///
     /// * `methods` - The verification methods that we want to support. Must be
-    /// non-empty.
+    ///   non-empty.
     ///
     /// # Panics
     ///
@@ -244,8 +249,56 @@ impl UserIdentity {
         methods: Vec<VerificationMethod>,
     ) -> Result<VerificationRequest, RequestVerificationError> {
         assert!(!methods.is_empty(), "The list of verification methods can't be non-empty");
+        self.request_verification_impl(Some(methods)).await
+    }
 
-        self.inner.request_verification(Some(methods)).await
+    async fn request_verification_impl(
+        &self,
+        methods: Option<Vec<VerificationMethod>>,
+    ) -> Result<VerificationRequest, RequestVerificationError> {
+        match &self.inner {
+            CryptoUserIdentity::Own(identity) => {
+                let (verification, request) = if let Some(methods) = methods {
+                    identity
+                        .request_verification_with_methods(methods)
+                        .await
+                        .map_err(crate::Error::from)?
+                } else {
+                    identity.request_verification().await.map_err(crate::Error::from)?
+                };
+
+                self.client.send_verification_request(request).await?;
+
+                Ok(VerificationRequest { inner: verification, client: self.client.clone() })
+            }
+            CryptoUserIdentity::Other(i) => {
+                let content = i.verification_request_content(methods.clone());
+
+                let room = if let Some(room) = self.client.get_dm_room(i.user_id()) {
+                    // Make sure that the user, to be verified, is still in the room
+                    if !room
+                        .members(RoomMemberships::ACTIVE)
+                        .await?
+                        .iter()
+                        .any(|member| member.user_id() == i.user_id())
+                    {
+                        room.invite_user_by_id(i.user_id()).await?;
+                    }
+                    room.clone()
+                } else {
+                    self.client.create_dm(i.user_id()).await?
+                };
+
+                let response = room
+                    .send(RoomMessageEventContent::new(MessageType::VerificationRequest(content)))
+                    .await?;
+
+                let verification =
+                    i.request_verification(room.room_id(), &response.event_id, methods);
+
+                Ok(VerificationRequest { inner: verification, client: self.client.clone() })
+            }
+        }
     }
 
     /// Manually verify this [`UserIdentity`].
@@ -308,17 +361,24 @@ impl UserIdentity {
     /// ```
     /// [`Encryption::cross_signing_status()`]: crate::encryption::Encryption::cross_signing_status
     pub async fn verify(&self) -> Result<(), ManualVerifyError> {
-        self.inner.verify().await
+        let request = match &self.inner {
+            CryptoUserIdentity::Own(identity) => identity.verify().await?,
+            CryptoUserIdentity::Other(identity) => identity.verify().await?,
+        };
+
+        self.client.send(request).await?;
+
+        Ok(())
     }
 
     /// Is the user identity considered to be verified.
     ///
     /// A user identity is considered to be verified if:
     ///
-    /// * It has been signed by our User-signing key, if the identity belongs
-    /// to another user
+    /// * It has been signed by our User-signing key, if the identity belongs to
+    ///   another user
     /// * If it has been locally marked as verified, if the user identity
-    /// belongs to us.
+    ///   belongs to us.
     ///
     /// If the identity belongs to another user, our own user identity needs to
     /// be verified as well for the identity to be considered to be verified.
@@ -350,10 +410,47 @@ impl UserIdentity {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn is_verified(&self) -> bool {
-        match &self.inner.identity {
-            CryptoUserIdentities::Own(identity) => identity.is_verified(),
-            CryptoUserIdentities::Other(identity) => identity.is_verified(),
-        }
+        self.inner.is_verified()
+    }
+
+    /// True if we verified this identity at some point in the past.
+    ///
+    /// To reset this latch back to `false`, one must call
+    /// [`UserIdentity::withdraw_verification()`].
+    pub fn was_previously_verified(&self) -> bool {
+        self.inner.was_previously_verified()
+    }
+
+    /// Remove the requirement for this identity to be verified.
+    ///
+    /// If an identity was previously verified and is not anymore it will be
+    /// reported to the user. In order to remove this notice users have to
+    /// verify again or to withdraw the verification requirement.
+    pub async fn withdraw_verification(&self) -> Result<(), CryptoStoreError> {
+        self.inner.withdraw_verification().await
+    }
+
+    /// Was this identity previously verified, and is no longer?
+    pub fn has_verification_violation(&self) -> bool {
+        self.inner.has_verification_violation()
+    }
+
+    /// Remember this identity, ensuring it does not result in a pin violation.
+    ///
+    /// When we first see a user, we assume their cryptographic identity has not
+    /// been tampered with by the homeserver or another entity with
+    /// man-in-the-middle capabilities. We remember this identity and call this
+    /// action "pinning".
+    ///
+    /// If the identity presented for the user changes later on, the newly
+    /// presented identity is considered to be in "pin violation". This
+    /// method explicitly accepts the new identity, allowing it to replace
+    /// the previously pinned one and bringing it out of pin violation.
+    ///
+    /// UIs should display a warning to the user when encountering an identity
+    /// which is not verified and is in pin violation.
+    pub async fn pin(&self) -> Result<(), CryptoStoreError> {
+        self.inner.pin().await
     }
 
     /// Get the public part of the Master key of this user identity.
@@ -398,75 +495,9 @@ impl UserIdentity {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn master_key(&self) -> &MasterPubkey {
-        match &self.inner.identity {
-            CryptoUserIdentities::Own(identity) => identity.master_key(),
-            CryptoUserIdentities::Other(identity) => identity.master_key(),
+        match &self.inner {
+            CryptoUserIdentity::Own(identity) => identity.master_key(),
+            CryptoUserIdentity::Other(identity) => identity.master_key(),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct UserIdentities {
-    client: Client,
-    identity: CryptoUserIdentities,
-}
-
-impl UserIdentities {
-    async fn request_verification(
-        &self,
-        methods: Option<Vec<VerificationMethod>>,
-    ) -> Result<VerificationRequest, RequestVerificationError> {
-        match &self.identity {
-            CryptoUserIdentities::Own(identity) => {
-                let (verification, request) = if let Some(methods) = methods {
-                    identity
-                        .request_verification_with_methods(methods)
-                        .await
-                        .map_err(crate::Error::from)?
-                } else {
-                    identity.request_verification().await.map_err(crate::Error::from)?
-                };
-
-                self.client.send_verification_request(request).await?;
-
-                Ok(VerificationRequest { inner: verification, client: self.client.clone() })
-            }
-            CryptoUserIdentities::Other(i) => {
-                let content = i.verification_request_content(methods.clone()).await;
-
-                let room = if let Some(room) = self.client.get_dm_room(i.user_id()) {
-                    // Make sure that the user, to be verified, is still in the room
-                    if !room
-                        .members(RoomMemberships::ACTIVE)
-                        .await?
-                        .iter()
-                        .any(|member| member.user_id() == i.user_id())
-                    {
-                        room.invite_user_by_id(i.user_id()).await?;
-                    }
-                    room.clone()
-                } else {
-                    self.client.create_dm(i.user_id()).await?
-                };
-
-                let response = room
-                    .send(RoomMessageEventContent::new(MessageType::VerificationRequest(content)))
-                    .await?;
-
-                let verification =
-                    i.request_verification(room.room_id(), &response.event_id, methods).await;
-
-                Ok(VerificationRequest { inner: verification, client: self.client.clone() })
-            }
-        }
-    }
-
-    async fn verify(&self) -> Result<(), ManualVerifyError> {
-        let request = match &self.identity {
-            CryptoUserIdentities::Own(identity) => identity.verify().await?,
-            CryptoUserIdentities::Other(identity) => identity.verify().await?,
-        };
-        self.client.send(request, None).await?;
-        Ok(())
     }
 }

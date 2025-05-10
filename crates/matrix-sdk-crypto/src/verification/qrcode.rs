@@ -30,7 +30,7 @@ use ruma::{
             cancel::CancelCode,
             done::{KeyVerificationDoneEventContent, ToDeviceKeyVerificationDoneEventContent},
             start::{
-                self, KeyVerificationStartEventContent, ReciprocateV1Content, StartMethod,
+                KeyVerificationStartEventContent, ReciprocateV1Content, StartMethod,
                 ToDeviceKeyVerificationStartEventContent,
             },
         },
@@ -41,7 +41,7 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use thiserror::Error;
-use tracing::trace;
+use tracing::{debug, trace};
 use vodozemac::Ed25519PublicKey;
 
 use super::{
@@ -51,8 +51,8 @@ use super::{
     VerificationStore,
 };
 use crate::{
-    CryptoStoreError, OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyUserIdentities,
-    RoomMessageRequest, ToDeviceRequest,
+    types::requests::{OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest},
+    CryptoStoreError, DeviceData, UserIdentityData,
 };
 
 const SECRET_SIZE: usize = 16;
@@ -120,9 +120,9 @@ pub enum QrVerificationState {
     /// The verification process has been successfully concluded.
     Done {
         /// The list of devices that has been verified.
-        verified_devices: Vec<ReadOnlyDevice>,
+        verified_devices: Vec<DeviceData>,
         /// The list of user identities that has been verified.
-        verified_identities: Vec<ReadOnlyUserIdentities>,
+        verified_identities: Vec<UserIdentityData>,
     },
     /// The verification process has been cancelled.
     Cancelled(CancelInfo),
@@ -197,7 +197,7 @@ impl QrVerification {
     }
 
     /// Get the device of the other user.
-    pub fn other_device(&self) -> &ReadOnlyDevice {
+    pub fn other_device(&self) -> &DeviceData {
         self.identities.other_device()
     }
 
@@ -328,6 +328,7 @@ impl QrVerification {
 
     /// Confirm that the other side has scanned our QR code.
     pub fn confirm_scanning(&self) -> Option<OutgoingVerificationRequest> {
+        debug!("User confirmed other side scanned our QR code");
         let mut state = self.state.write();
 
         match &*state {
@@ -596,7 +597,7 @@ impl QrVerification {
             .as_ref()
             .ok_or_else(|| ScanError::MissingCrossSigningIdentity(other_user_id.clone()))?;
 
-        let check_master_key = |key, identity: &ReadOnlyUserIdentities| {
+        let check_master_key = |key, identity: &UserIdentityData| {
             let master_key = identity.master_key().get_first_key().ok_or_else(|| {
                 ScanError::MissingCrossSigningIdentity(identity.user_id().to_owned())
             })?;
@@ -804,7 +805,7 @@ impl QrState<Created> {
         content: &StartContent<'_>,
     ) -> Result<QrState<Scanned>, QrState<Cancelled>> {
         match content.method() {
-            start::StartMethod::ReciprocateV1(m) => {
+            StartMethod::ReciprocateV1(m) => {
                 // TODO use constant time eq here.
                 if self.state.secret == m.secret {
                     Ok(QrState { state: Scanned {} })
@@ -822,7 +823,7 @@ impl QrState<Done> {
         self.state.as_content(flow_id)
     }
 
-    fn verified_identities(&self) -> (Arc<[ReadOnlyDevice]>, Arc<[ReadOnlyUserIdentities]>) {
+    fn verified_identities(&self) -> (Arc<[DeviceData]>, Arc<[UserIdentityData]>) {
         (self.state.verified_devices.clone(), self.state.verified_master_keys.clone())
     }
 }
@@ -831,8 +832,8 @@ impl QrState<Confirmed> {
     fn into_done(
         self,
         _: &DoneContent<'_>,
-        verified_device: Option<&ReadOnlyDevice>,
-        verified_identity: Option<&ReadOnlyUserIdentities>,
+        verified_device: Option<&DeviceData>,
+        verified_identity: Option<&UserIdentityData>,
     ) -> QrState<Done> {
         let devices: Vec<_> = verified_device.into_iter().cloned().collect();
         let identities: Vec<_> = verified_identity.into_iter().cloned().collect();
@@ -870,8 +871,8 @@ impl QrState<Reciprocated> {
     fn into_done(
         self,
         _: &DoneContent<'_>,
-        verified_device: Option<&ReadOnlyDevice>,
-        verified_identity: Option<&ReadOnlyUserIdentities>,
+        verified_device: Option<&DeviceData>,
+        verified_identity: Option<&UserIdentityData>,
     ) -> QrState<Done> {
         let devices: Vec<_> = verified_device.into_iter().cloned().collect();
         let identities: Vec<_> = verified_identity.into_iter().cloned().collect();
@@ -902,15 +903,15 @@ mod tests {
             event_enums::{DoneContent, OutgoingContent, StartContent},
             FlowId, VerificationStore,
         },
-        QrVerification, QrVerificationState, ReadOnlyDevice,
+        DeviceData, QrVerification, QrVerificationState,
     };
 
     fn user_id() -> &'static UserId {
         user_id!("@example:localhost")
     }
 
-    fn memory_store(user_id: &UserId) -> Arc<CryptoStoreWrapper> {
-        Arc::new(CryptoStoreWrapper::new(user_id, MemoryStore::new()))
+    fn memory_store(user_id: &UserId, device_id: &DeviceId) -> Arc<CryptoStoreWrapper> {
+        Arc::new(CryptoStoreWrapper::new(user_id, device_id, MemoryStore::new()))
     }
 
     fn device_id() -> &'static DeviceId {
@@ -920,7 +921,7 @@ mod tests {
     #[async_test]
     async fn test_verification_creation() {
         let account = Account::with_device_id(user_id(), device_id());
-        let store = memory_store(account.user_id());
+        let store = memory_store(account.user_id(), account.device_id());
 
         let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
         let master_key = private_identity.master_public_key().await.unwrap();
@@ -935,7 +936,7 @@ mod tests {
         let flow_id = FlowId::ToDevice("test_transaction".into());
 
         let device_key = account.static_data.identity_keys.ed25519;
-        let alice_device = ReadOnlyDevice::from_account(&account);
+        let alice_device = DeviceData::from_account(&account);
 
         let identities = store.get_identities(alice_device).await.unwrap();
 
@@ -984,7 +985,7 @@ mod tests {
     async fn test_reciprocate_receival() {
         let test = |flow_id: FlowId| async move {
             let alice_account = Account::with_device_id(user_id(), device_id());
-            let store = memory_store(alice_account.user_id());
+            let store = memory_store(alice_account.user_id(), alice_account.device_id());
 
             let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
 
@@ -1003,8 +1004,8 @@ mod tests {
             let master_key = private_identity.master_public_key().await.unwrap();
             let master_key = master_key.get_first_key().unwrap().to_owned();
 
-            let alice_device = ReadOnlyDevice::from_account(&alice_account);
-            let bob_device = ReadOnlyDevice::from_account(&bob_account);
+            let alice_device = DeviceData::from_account(&alice_account);
+            let bob_device = DeviceData::from_account(&bob_account);
 
             let mut changes = Changes::default();
             changes.identities.new.push(identity.clone().into());
@@ -1023,7 +1024,7 @@ mod tests {
             );
             assert_matches!(alice_verification.state(), QrVerificationState::Started);
 
-            let bob_store = memory_store(bob_account.user_id());
+            let bob_store = memory_store(bob_account.user_id(), bob_account.device_id());
 
             let private_identity = PrivateCrossSigningIdentity::new(user_id().to_owned());
             let bob_store = VerificationStore {

@@ -5,10 +5,10 @@ use std::{
 
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand};
-use uniffi_bindgen::{bindings::TargetLanguage, library_mode::generate_bindings};
-use xshell::{cmd, pushd};
+use uniffi_bindgen::{bindings::SwiftBindingGenerator, library_mode::generate_bindings};
+use xshell::cmd;
 
-use crate::{workspace, Result};
+use crate::{sh, workspace, Result};
 
 /// Builds the SDK for Swift as a Static Library or XCFramework.
 #[derive(Args)]
@@ -32,9 +32,11 @@ enum SwiftCommand {
         #[clap(long)]
         profile: Option<String>,
 
-        /// Build the given target only
+        /// Build the given target. This option can be specified multiple times
+        /// to build more than one. Omitting this option will build all
+        /// supported targets.
         #[clap(long)]
-        only_target: Option<String>,
+        target: Option<Vec<String>>,
 
         /// Move the generated xcframework and swift sources into the given
         /// components-folder
@@ -51,7 +53,8 @@ enum SwiftCommand {
 
 impl SwiftArgs {
     pub fn run(self) -> Result<()> {
-        let _p = pushd(workspace::root_path()?)?;
+        let sh = sh();
+        let _p = sh.push_dir(workspace::root_path()?);
 
         match self.cmd {
             SwiftCommand::BuildLibrary => build_library(),
@@ -59,11 +62,14 @@ impl SwiftArgs {
                 release,
                 profile,
                 components_path,
-                only_target,
+                target: targets,
                 sequentially,
             } => {
-                let profile = profile.as_deref().unwrap_or(if release { "release" } else { "dev" });
-                build_xcframework(profile, only_target, components_path, sequentially)
+                // The dev profile seems to cause crashes on some platforms so we default to
+                // reldbg (https://github.com/matrix-org/matrix-rust-sdk/issues/4009)
+                let profile =
+                    profile.as_deref().unwrap_or(if release { "release" } else { "reldbg" });
+                build_xcframework(profile, targets, components_path, sequentially)
             }
         }
     }
@@ -94,13 +100,13 @@ impl Platform {
         }
     }
 
-    /// The name of the library for the platform once all architectures are
-    /// lipo'd together.
-    fn lib_name(&self) -> &str {
+    /// The name of the subfolder in which to place the library for the platform
+    /// once all architectures are lipo'd together.
+    fn lib_folder_name(&self) -> &str {
         match self {
-            Platform::Macos => "libmatrix_sdk_ffi_macos.a",
-            Platform::Ios => "libmatrix_sdk_ffi_ios.a",
-            Platform::IosSimulator => "libmatrix_sdk_ffi_iossimulator.a",
+            Platform::Macos => "macos",
+            Platform::Ios => "ios",
+            Platform::IosSimulator => "ios-simulator",
         }
     }
 }
@@ -142,7 +148,8 @@ fn build_library() -> Result<()> {
 
     create_dir_all(ffi_directory.as_path())?;
 
-    cmd!("rustup run stable cargo build -p matrix-sdk-ffi").run()?;
+    let sh = sh();
+    cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi").run()?;
 
     rename(lib_output_dir.join(FFI_LIBRARY_NAME), ffi_directory.join(FFI_LIBRARY_NAME))?;
     let swift_directory = root_directory.join("bindings/apple/generated/swift");
@@ -161,13 +168,13 @@ fn build_library() -> Result<()> {
 }
 
 fn generate_uniffi(library_path: &Utf8Path, ffi_directory: &Utf8Path) -> Result<()> {
-    generate_bindings(library_path, None, &[TargetLanguage::Swift], None, ffi_directory, false)?;
+    generate_bindings(library_path, None, &SwiftBindingGenerator, None, ffi_directory, false)?;
     Ok(())
 }
 
 fn build_xcframework(
     profile: &str,
-    only_target: Option<String>,
+    targets: Option<Vec<String>>,
     components_path: Option<Utf8PathBuf>,
     sequentially: bool,
 ) -> Result<()> {
@@ -179,14 +186,20 @@ fn build_xcframework(
     let _ = remove_dir_all(&generated_dir);
     create_dir_all(&generated_dir)?;
 
-    let headers_dir = generated_dir.join("ls");
+    let headers_dir = generated_dir.join("headers");
+    // Use a subdirectory to fix conflicts with other UniFFI libraries.
+    let headers_module_dir = headers_dir.join("MatrixSDKFFI");
     let swift_dir = generated_dir.join("swift");
-    create_dir_all(headers_dir.clone())?;
+    create_dir_all(headers_module_dir.clone())?;
     create_dir_all(swift_dir.clone())?;
 
-    let targets = if let Some(triple) = only_target {
-        let target = TARGETS.iter().find(|t| t.triple == triple).expect("Invalid target specified");
-        vec![target]
+    let targets = if let Some(triples) = targets {
+        triples
+            .iter()
+            .map(|t| {
+                TARGETS.iter().find(|target| target.triple == *t).expect("Invalid target specified")
+            })
+            .collect()
     } else {
         TARGETS.iter().collect()
     };
@@ -198,8 +211,8 @@ fn build_xcframework(
     let uniffi_lib_path = platform_build_paths.values().next().unwrap().first().unwrap().clone();
     generate_uniffi(&uniffi_lib_path, &generated_dir)?;
 
-    move_files("h", &generated_dir, &headers_dir)?;
-    consolidate_modulemap_files(&generated_dir, &headers_dir)?;
+    move_files("h", &generated_dir, &headers_module_dir)?;
+    consolidate_modulemap_files(&generated_dir, &headers_module_dir)?;
 
     move_files("swift", &generated_dir, &swift_dir)?;
 
@@ -208,7 +221,8 @@ fn build_xcframework(
     if xcframework_path.exists() {
         remove_dir_all(&xcframework_path)?;
     }
-    let mut cmd = cmd!("xcodebuild -create-xcframework");
+    let sh = sh();
+    let mut cmd = cmd!(sh, "xcodebuild -create-xcframework");
     for p in libs {
         cmd = cmd.arg("-library").arg(p).arg("-headers").arg(&headers_dir)
     }
@@ -259,17 +273,19 @@ fn build_targets(
     profile: &str,
     sequentially: bool,
 ) -> Result<HashMap<Platform, Vec<Utf8PathBuf>>> {
+    let sh = sh();
+
     if sequentially {
         for target in &targets {
             let triple = target.triple;
 
             println!("-- Building for {}", target.description);
-            cmd!("rustup run stable cargo build -p matrix-sdk-ffi --target {triple} --profile {profile}")
+            cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi --target {triple} --profile {profile}")
                 .run()?;
         }
     } else {
         let triples = &targets.iter().map(|target| target.triple).collect::<Vec<_>>();
-        let mut cmd = cmd!("rustup run stable cargo build -p matrix-sdk-ffi");
+        let mut cmd = cmd!(sh, "rustup run stable cargo build -p matrix-sdk-ffi");
         for triple in triples {
             cmd = cmd.arg("--target").arg(triple);
         }
@@ -302,9 +318,10 @@ fn build_path_for_target(target: &Target, profile: &str) -> Result<Utf8PathBuf> 
 /// Lipo's together the libraries for each platform into a single library.
 fn lipo_platform_libraries(
     platform_build_paths: &HashMap<Platform, Vec<Utf8PathBuf>>,
-    generated_dir: &Utf8PathBuf,
+    generated_dir: &Utf8Path,
 ) -> Result<Vec<Utf8PathBuf>> {
     let mut libs = Vec::new();
+    let sh = sh();
     for platform in platform_build_paths.keys() {
         let paths = platform_build_paths.get(platform).unwrap();
 
@@ -313,8 +330,11 @@ fn lipo_platform_libraries(
             continue;
         }
 
-        let output_path = generated_dir.join(platform.lib_name());
-        let mut cmd = cmd!("lipo -create");
+        let output_folder = generated_dir.join("lipo").join(platform.lib_folder_name());
+        create_dir_all(&output_folder)?;
+
+        let output_path = output_folder.join(FFI_LIBRARY_NAME);
+        let mut cmd = cmd!(sh, "lipo -create");
         for path in paths {
             cmd = cmd.arg(path);
         }
@@ -330,7 +350,7 @@ fn lipo_platform_libraries(
 
 /// Moves all files of the specified file extension from one directory into
 /// another.
-fn move_files(extension: &str, source: &Utf8PathBuf, destination: &Utf8PathBuf) -> Result<()> {
+fn move_files(extension: &str, source: &Utf8Path, destination: &Utf8Path) -> Result<()> {
     for entry in source.read_dir_utf8()? {
         let entry = entry?;
 
@@ -348,7 +368,7 @@ fn move_files(extension: &str, source: &Utf8PathBuf, destination: &Utf8PathBuf) 
 /// Consolidates the contents of each modulemap file found in the source
 /// directory into a single `module.modulemap` file in the destination
 /// directory.
-fn consolidate_modulemap_files(source: &Utf8PathBuf, destination: &Utf8PathBuf) -> Result<()> {
+fn consolidate_modulemap_files(source: &Utf8Path, destination: &Utf8Path) -> Result<()> {
     let mut modulemap = String::new();
     for entry in source.read_dir_utf8()? {
         let entry = entry?;

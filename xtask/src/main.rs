@@ -1,17 +1,23 @@
+#![allow(unexpected_cfgs)]
+
 mod ci;
 mod fixup;
 mod kotlin;
+mod release;
 mod swift;
 mod workspace;
+
+use std::rc::Rc;
 
 use ci::CiArgs;
 use clap::{Parser, Subcommand};
 use fixup::FixupArgs;
 use kotlin::KotlinArgs;
+use release::ReleaseArgs;
 use swift::SwiftArgs;
-use xshell::cmd;
+use xshell::{cmd, Shell};
 
-const NIGHTLY: &str = "nightly-2024-02-06";
+const NIGHTLY: &str = "nightly-2025-02-20";
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
@@ -33,6 +39,8 @@ enum Command {
         #[clap(long)]
         open: bool,
     },
+    /// Prepare and publish a release of the matrix-sdk crates
+    Release(ReleaseArgs),
     Swift(SwiftArgs),
     Kotlin(KotlinArgs),
 }
@@ -44,6 +52,7 @@ fn main() -> Result<()> {
         Command::Doc { open } => build_docs(open.then_some("--open"), DenyWarnings::No),
         Command::Swift(cfg) => cfg.run(),
         Command::Kotlin(cfg) => cfg.run(),
+        Command::Release(cfg) => cfg.run(),
     }
 }
 
@@ -61,13 +70,22 @@ fn build_docs(
         rustdocflags += " -Dwarnings";
     }
 
+    let sh = sh();
     // Keep in sync with .github/workflows/docs.yml
-    cmd!("rustup run {NIGHTLY} cargo doc --no-deps --workspace --features docsrs")
-        // Work around https://github.com/rust-lang/cargo/issues/10744
-        .env("CARGO_TARGET_APPLIES_TO_HOST", "true")
+    cmd!(sh, "rustup run {NIGHTLY} cargo doc --no-deps --workspace --features docsrs")
         .env("RUSTDOCFLAGS", rustdocflags)
         .args(extra_args)
         .run()?;
 
     Ok(())
+}
+
+thread_local! {
+    /// The shared shell API.
+    static SH: Rc<Shell> = Rc::new(Shell::new().unwrap())
+}
+
+/// Get a reference to the shared shell API.
+fn sh() -> Rc<Shell> {
+    SH.with(|sh| sh.clone())
 }

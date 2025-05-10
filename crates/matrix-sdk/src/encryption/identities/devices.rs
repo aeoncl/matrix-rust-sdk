@@ -15,7 +15,7 @@
 use std::{collections::BTreeMap, ops::Deref};
 
 use matrix_sdk_base::crypto::{
-    store::CryptoStoreError, Device as BaseDevice, LocalTrust, ReadOnlyDevice,
+    store::CryptoStoreError, Device as BaseDevice, DeviceData, LocalTrust,
     UserDevices as BaseUserDevices,
 };
 use ruma::{events::key::verification::VerificationMethod, DeviceId, OwnedDeviceId, OwnedUserId};
@@ -100,7 +100,7 @@ pub struct Device {
 }
 
 impl Deref for Device {
-    type Target = ReadOnlyDevice;
+    type Target = DeviceData;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -140,7 +140,7 @@ impl Device {
     /// [`request_verification_with_methods()`]:
     /// #method.request_verification_with_methods
     pub async fn request_verification(&self) -> Result<VerificationRequest> {
-        let (verification, request) = self.inner.request_verification().await;
+        let (verification, request) = self.inner.request_verification();
         self.client.send_verification_request(request).await?;
 
         Ok(VerificationRequest { inner: verification, client: self.client.clone() })
@@ -154,7 +154,7 @@ impl Device {
     /// # Arguments
     ///
     /// * `methods` - The verification methods that we want to support. Must be
-    /// non-empty.
+    ///   non-empty.
     ///
     /// # Panics
     ///
@@ -194,7 +194,7 @@ impl Device {
     ) -> Result<VerificationRequest> {
         assert!(!methods.is_empty(), "The list of verification methods can't be non-empty");
 
-        let (verification, request) = self.inner.request_verification_with_methods(methods).await;
+        let (verification, request) = self.inner.request_verification_with_methods(methods);
         self.client.send_verification_request(request).await?;
 
         Ok(VerificationRequest { inner: verification, client: self.client.clone() })
@@ -290,7 +290,7 @@ impl Device {
     /// ```
     pub async fn verify(&self) -> Result<(), ManualVerifyError> {
         let request = self.inner.verify().await?;
-        self.client.send(request, None).await?;
+        self.client.send(request).await?;
 
         Ok(())
     }
@@ -359,7 +359,7 @@ impl Device {
     ///
     /// * The device has been signed by the user's self-signing key
     /// * The user's master-signing key has been signed by our own user-signing
-    /// key, i.e. our own identity trusts the other users identity.
+    ///   key, i.e. our own identity trusts the other users identity.
     /// * Our own user identity is considered to be [verified]
     ///
     /// ```text
@@ -474,7 +474,7 @@ impl Device {
     ///
     /// * The device has been signed by the user's self-signing key
     /// * The user's master-signing key has been signed by our own user-signing
-    /// key, i.e. our own identity trusts the other users identity.
+    ///   key, i.e. our own identity trusts the other users identity.
     /// * Our own user identity is considered to be [verified]
     ///
     /// ```text

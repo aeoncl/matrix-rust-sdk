@@ -14,12 +14,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    num::NonZeroUsize,
-    sync::RwLock as StdRwLock,
+    sync::RwLock,
 };
 
 use async_trait::async_trait;
-use matrix_sdk_common::{instant::Instant, ring_buffer::RingBuffer};
+use growable_bloom_filter::GrowableBloom;
 use ruma::{
     canonical_json::{redact, RedactedBecause},
     events::{
@@ -30,84 +29,68 @@ use ruma::{
         AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId,
-    RoomId, RoomVersionId, UserId,
+    time::Instant,
+    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
-use super::{Result, RoomInfo, StateChanges, StateStore, StoreError};
+use super::{
+    send_queue::{ChildTransactionId, QueuedRequest, SentRequestKey},
+    traits::{ComposerDraft, ServerCapabilities},
+    DependentQueuedRequest, DependentQueuedRequestKind, QueuedRequestKind, Result, RoomInfo,
+    RoomLoadSettings, StateChanges, StateStore, StoreError,
+};
 use crate::{
-    deserialized_responses::RawAnySyncOrStrippedState,
-    media::{MediaRequest, UniqueKey as _},
-    MinimalRoomMemberEvent, RoomMemberships, RoomState, StateStoreDataKey, StateStoreDataValue,
+    deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
+    store::QueueWedgeError,
+    MinimalRoomMemberEvent, RoomMemberships, StateStoreDataKey, StateStoreDataValue,
 };
 
-/// In-Memory, non-persistent implementation of the `StateStore`
-///
-/// Default if no other is configured at startup.
+#[derive(Debug, Default)]
 #[allow(clippy::type_complexity)]
-#[derive(Debug)]
-pub struct MemoryStore {
-    user_avatar_url: StdRwLock<HashMap<String, String>>,
-    sync_token: StdRwLock<Option<String>>,
-    filters: StdRwLock<HashMap<String, String>>,
-    account_data: StdRwLock<HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>>,
-    profiles: StdRwLock<HashMap<OwnedRoomId, HashMap<OwnedUserId, MinimalRoomMemberEvent>>>,
-    display_names: StdRwLock<HashMap<OwnedRoomId, HashMap<String, BTreeSet<OwnedUserId>>>>,
-    members: StdRwLock<HashMap<OwnedRoomId, HashMap<OwnedUserId, MembershipState>>>,
-    room_info: StdRwLock<HashMap<OwnedRoomId, RoomInfo>>,
-    room_state: StdRwLock<
+struct MemoryStoreInner {
+    recently_visited_rooms: HashMap<OwnedUserId, Vec<OwnedRoomId>>,
+    composer_drafts: HashMap<OwnedRoomId, ComposerDraft>,
+    user_avatar_url: HashMap<OwnedUserId, OwnedMxcUri>,
+    sync_token: Option<String>,
+    server_capabilities: Option<ServerCapabilities>,
+    filters: HashMap<String, String>,
+    utd_hook_manager_data: Option<GrowableBloom>,
+    account_data: HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>,
+    profiles: HashMap<OwnedRoomId, HashMap<OwnedUserId, MinimalRoomMemberEvent>>,
+    display_names: HashMap<OwnedRoomId, HashMap<DisplayName, BTreeSet<OwnedUserId>>>,
+    members: HashMap<OwnedRoomId, HashMap<OwnedUserId, MembershipState>>,
+    room_info: HashMap<OwnedRoomId, RoomInfo>,
+    room_state:
         HashMap<OwnedRoomId, HashMap<StateEventType, HashMap<String, Raw<AnySyncStateEvent>>>>,
-    >,
-    room_account_data: StdRwLock<
+    room_account_data:
         HashMap<OwnedRoomId, HashMap<RoomAccountDataEventType, Raw<AnyRoomAccountDataEvent>>>,
-    >,
-    stripped_room_state: StdRwLock<
+    stripped_room_state:
         HashMap<OwnedRoomId, HashMap<StateEventType, HashMap<String, Raw<AnyStrippedStateEvent>>>>,
+    stripped_members: HashMap<OwnedRoomId, HashMap<OwnedUserId, MembershipState>>,
+    presence: HashMap<OwnedUserId, Raw<PresenceEvent>>,
+    room_user_receipts: HashMap<
+        OwnedRoomId,
+        HashMap<(String, Option<String>), HashMap<OwnedUserId, (OwnedEventId, Receipt)>>,
     >,
-    stripped_members: StdRwLock<HashMap<OwnedRoomId, HashMap<OwnedUserId, MembershipState>>>,
-    presence: StdRwLock<HashMap<OwnedUserId, Raw<PresenceEvent>>>,
-    room_user_receipts: StdRwLock<
-        HashMap<
-            OwnedRoomId,
-            HashMap<(String, Option<String>), HashMap<OwnedUserId, (OwnedEventId, Receipt)>>,
-        >,
+
+    room_event_receipts: HashMap<
+        OwnedRoomId,
+        HashMap<(String, Option<String>), HashMap<OwnedEventId, HashMap<OwnedUserId, Receipt>>>,
     >,
-    room_event_receipts: StdRwLock<
-        HashMap<
-            OwnedRoomId,
-            HashMap<(String, Option<String>), HashMap<OwnedEventId, HashMap<OwnedUserId, Receipt>>>,
-        >,
-    >,
-    media: StdRwLock<RingBuffer<(OwnedMxcUri, String /* unique key */, Vec<u8>)>>,
-    custom: StdRwLock<HashMap<Vec<u8>, Vec<u8>>>,
+    custom: HashMap<Vec<u8>, Vec<u8>>,
+    send_queue_events: BTreeMap<OwnedRoomId, Vec<QueuedRequest>>,
+    dependent_send_queue_events: BTreeMap<OwnedRoomId, Vec<DependentQueuedRequest>>,
+    seen_knock_requests: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, OwnedUserId>>,
 }
 
-// SAFETY: `new_unchecked` is safe because 20 is not zero.
-const NUMBER_OF_MEDIAS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) };
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self {
-            user_avatar_url: Default::default(),
-            sync_token: Default::default(),
-            filters: Default::default(),
-            account_data: Default::default(),
-            profiles: Default::default(),
-            display_names: Default::default(),
-            members: Default::default(),
-            room_info: Default::default(),
-            room_state: Default::default(),
-            room_account_data: Default::default(),
-            stripped_room_state: Default::default(),
-            stripped_members: Default::default(),
-            presence: Default::default(),
-            room_user_receipts: Default::default(),
-            room_event_receipts: Default::default(),
-            media: StdRwLock::new(RingBuffer::new(NUMBER_OF_MEDIAS)),
-            custom: Default::default(),
-        }
-    }
+/// In-memory, non-persistent implementation of the `StateStore`.
+///
+/// Default if no other is configured at startup.
+#[derive(Debug, Default)]
+pub struct MemoryStore {
+    inner: RwLock<MemoryStoreInner>,
 }
 
 impl MemoryStore {
@@ -123,9 +106,10 @@ impl MemoryStore {
         thread: ReceiptThread,
         user_id: &UserId,
     ) -> Option<(OwnedEventId, Receipt)> {
-        self.room_user_receipts
+        self.inner
             .read()
             .unwrap()
+            .room_user_receipts
             .get(room_id)?
             .get(&(receipt_type.to_string(), thread.as_str().map(ToOwned::to_owned)))?
             .get(user_id)
@@ -140,9 +124,10 @@ impl MemoryStore {
         event_id: &EventId,
     ) -> Option<Vec<(OwnedUserId, Receipt)>> {
         Some(
-            self.room_event_receipts
+            self.inner
                 .read()
                 .unwrap()
+                .room_event_receipts
                 .get(room_id)?
                 .get(&(receipt_type.to_string(), thread.as_str().map(ToOwned::to_owned)))?
                 .get(event_id)?
@@ -159,24 +144,36 @@ impl StateStore for MemoryStore {
     type Error = StoreError;
 
     async fn get_kv_data(&self, key: StateStoreDataKey<'_>) -> Result<Option<StateStoreDataValue>> {
+        let inner = self.inner.read().unwrap();
         Ok(match key {
             StateStoreDataKey::SyncToken => {
-                self.sync_token.read().unwrap().clone().map(StateStoreDataValue::SyncToken)
+                inner.sync_token.clone().map(StateStoreDataValue::SyncToken)
             }
-            StateStoreDataKey::Filter(filter_name) => self
-                .filters
-                .read()
-                .unwrap()
-                .get(filter_name)
+            StateStoreDataKey::ServerCapabilities => {
+                inner.server_capabilities.clone().map(StateStoreDataValue::ServerCapabilities)
+            }
+            StateStoreDataKey::Filter(filter_name) => {
+                inner.filters.get(filter_name).cloned().map(StateStoreDataValue::Filter)
+            }
+            StateStoreDataKey::UserAvatarUrl(user_id) => {
+                inner.user_avatar_url.get(user_id).cloned().map(StateStoreDataValue::UserAvatarUrl)
+            }
+            StateStoreDataKey::RecentlyVisitedRooms(user_id) => inner
+                .recently_visited_rooms
+                .get(user_id)
                 .cloned()
-                .map(StateStoreDataValue::Filter),
-            StateStoreDataKey::UserAvatarUrl(user_id) => self
-                .user_avatar_url
-                .read()
-                .unwrap()
-                .get(user_id.as_str())
+                .map(StateStoreDataValue::RecentlyVisitedRooms),
+            StateStoreDataKey::UtdHookManagerData => {
+                inner.utd_hook_manager_data.clone().map(StateStoreDataValue::UtdHookManagerData)
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                inner.composer_drafts.get(room_id).cloned().map(StateStoreDataValue::ComposerDraft)
+            }
+            StateStoreDataKey::SeenKnockRequests(room_id) => inner
+                .seen_knock_requests
+                .get(room_id)
                 .cloned()
-                .map(StateStoreDataValue::UserAvatarUrl),
+                .map(StateStoreDataValue::SeenKnockRequests),
         })
     }
 
@@ -185,21 +182,58 @@ impl StateStore for MemoryStore {
         key: StateStoreDataKey<'_>,
         value: StateStoreDataValue,
     ) -> Result<()> {
+        let mut inner = self.inner.write().unwrap();
         match key {
             StateStoreDataKey::SyncToken => {
-                *self.sync_token.write().unwrap() =
+                inner.sync_token =
                     Some(value.into_sync_token().expect("Session data not a sync token"))
             }
             StateStoreDataKey::Filter(filter_name) => {
-                self.filters.write().unwrap().insert(
+                inner.filters.insert(
                     filter_name.to_owned(),
                     value.into_filter().expect("Session data not a filter"),
                 );
             }
             StateStoreDataKey::UserAvatarUrl(user_id) => {
-                self.filters.write().unwrap().insert(
-                    user_id.to_string(),
+                inner.user_avatar_url.insert(
+                    user_id.to_owned(),
                     value.into_user_avatar_url().expect("Session data not a user avatar url"),
+                );
+            }
+            StateStoreDataKey::RecentlyVisitedRooms(user_id) => {
+                inner.recently_visited_rooms.insert(
+                    user_id.to_owned(),
+                    value
+                        .into_recently_visited_rooms()
+                        .expect("Session data not a list of recently visited rooms"),
+                );
+            }
+            StateStoreDataKey::UtdHookManagerData => {
+                inner.utd_hook_manager_data = Some(
+                    value
+                        .into_utd_hook_manager_data()
+                        .expect("Session data not the hook manager data"),
+                );
+            }
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                inner.composer_drafts.insert(
+                    room_id.to_owned(),
+                    value.into_composer_draft().expect("Session data not a composer draft"),
+                );
+            }
+            StateStoreDataKey::ServerCapabilities => {
+                inner.server_capabilities = Some(
+                    value
+                        .into_server_capabilities()
+                        .expect("Session data not containing server capabilities"),
+                );
+            }
+            StateStoreDataKey::SeenKnockRequests(room_id) => {
+                inner.seen_knock_requests.insert(
+                    room_id.to_owned(),
+                    value
+                        .into_seen_knock_requests()
+                        .expect("Session data is not a set of seen join request ids"),
                 );
             }
         }
@@ -208,30 +242,53 @@ impl StateStore for MemoryStore {
     }
 
     async fn remove_kv_data(&self, key: StateStoreDataKey<'_>) -> Result<()> {
+        let mut inner = self.inner.write().unwrap();
         match key {
-            StateStoreDataKey::SyncToken => *self.sync_token.write().unwrap() = None,
+            StateStoreDataKey::SyncToken => inner.sync_token = None,
+            StateStoreDataKey::ServerCapabilities => inner.server_capabilities = None,
             StateStoreDataKey::Filter(filter_name) => {
-                self.filters.write().unwrap().remove(filter_name);
+                inner.filters.remove(filter_name);
             }
             StateStoreDataKey::UserAvatarUrl(user_id) => {
-                self.filters.write().unwrap().remove(user_id.as_str());
+                inner.user_avatar_url.remove(user_id);
+            }
+            StateStoreDataKey::RecentlyVisitedRooms(user_id) => {
+                inner.recently_visited_rooms.remove(user_id);
+            }
+            StateStoreDataKey::UtdHookManagerData => inner.utd_hook_manager_data = None,
+            StateStoreDataKey::ComposerDraft(room_id) => {
+                inner.composer_drafts.remove(room_id);
+            }
+            StateStoreDataKey::SeenKnockRequests(room_id) => {
+                inner.seen_knock_requests.remove(room_id);
             }
         }
         Ok(())
     }
 
+    #[instrument(skip(self, changes))]
     async fn save_changes(&self, changes: &StateChanges) -> Result<()> {
         let now = Instant::now();
 
+        let mut inner = self.inner.write().unwrap();
+
         if let Some(s) = &changes.sync_token {
-            *self.sync_token.write().unwrap() = Some(s.to_owned());
+            inner.sync_token = Some(s.to_owned());
+        }
+
+        for (room, users) in &changes.profiles_to_delete {
+            let Some(room_profiles) = inner.profiles.get_mut(room) else {
+                continue;
+            };
+            for user in users {
+                room_profiles.remove(user);
+            }
         }
 
         for (room, users) in &changes.profiles {
             for (user_id, profile) in users {
-                self.profiles
-                    .write()
-                    .unwrap()
+                inner
+                    .profiles
                     .entry(room.clone())
                     .or_default()
                     .insert(user_id.clone(), profile.clone());
@@ -240,202 +297,174 @@ impl StateStore for MemoryStore {
 
         for (room, map) in &changes.ambiguity_maps {
             for (display_name, display_names) in map {
-                self.display_names
-                    .write()
-                    .unwrap()
+                inner
+                    .display_names
                     .entry(room.clone())
                     .or_default()
                     .insert(display_name.clone(), display_names.clone());
             }
         }
 
-        {
-            let mut account_data = self.account_data.write().unwrap();
-            for (event_type, event) in &changes.account_data {
-                account_data.insert(event_type.clone(), event.clone());
+        for (event_type, event) in &changes.account_data {
+            inner.account_data.insert(event_type.clone(), event.clone());
+        }
+
+        for (room, events) in &changes.room_account_data {
+            for (event_type, event) in events {
+                inner
+                    .room_account_data
+                    .entry(room.clone())
+                    .or_default()
+                    .insert(event_type.clone(), event.clone());
             }
         }
 
-        {
-            let mut room_account_data = self.room_account_data.write().unwrap();
-            for (room, events) in &changes.room_account_data {
-                for (event_type, event) in events {
-                    room_account_data
+        for (room, event_types) in &changes.state {
+            for (event_type, events) in event_types {
+                for (state_key, raw_event) in events {
+                    inner
+                        .room_state
                         .entry(room.clone())
                         .or_default()
-                        .insert(event_type.clone(), event.clone());
-                }
-            }
-        }
+                        .entry(event_type.clone())
+                        .or_default()
+                        .insert(state_key.to_owned(), raw_event.clone());
+                    inner.stripped_room_state.remove(room);
 
-        {
-            let mut room_state = self.room_state.write().unwrap();
-            let mut stripped_room_state = self.stripped_room_state.write().unwrap();
-            let mut members = self.members.write().unwrap();
-            let mut stripped_members = self.stripped_members.write().unwrap();
+                    if *event_type == StateEventType::RoomMember {
+                        let event = match raw_event.deserialize_as::<SyncRoomMemberEvent>() {
+                            Ok(ev) => ev,
+                            Err(e) => {
+                                let event_id: Option<String> =
+                                    raw_event.get_field("event_id").ok().flatten();
+                                debug!(event_id, "Failed to deserialize member event: {e}");
+                                continue;
+                            }
+                        };
 
-            for (room, event_types) in &changes.state {
-                for (event_type, events) in event_types {
-                    for (state_key, raw_event) in events {
-                        room_state
+                        inner.stripped_members.remove(room);
+
+                        inner
+                            .members
                             .entry(room.clone())
                             .or_default()
-                            .entry(event_type.clone())
-                            .or_default()
-                            .insert(state_key.to_owned(), raw_event.clone());
-                        stripped_room_state.remove(room);
-
-                        if *event_type == StateEventType::RoomMember {
-                            let event = match raw_event.deserialize_as::<SyncRoomMemberEvent>() {
-                                Ok(ev) => ev,
-                                Err(e) => {
-                                    let event_id: Option<String> =
-                                        raw_event.get_field("event_id").ok().flatten();
-                                    debug!(event_id, "Failed to deserialize member event: {e}");
-                                    continue;
-                                }
-                            };
-
-                            stripped_members.remove(room);
-
-                            members
-                                .entry(room.clone())
-                                .or_default()
-                                .insert(event.state_key().to_owned(), event.membership().clone());
-                        }
+                            .insert(event.state_key().to_owned(), event.membership().clone());
                     }
                 }
             }
         }
 
-        {
-            let mut room_info = self.room_info.write().unwrap();
-            for (room_id, info) in &changes.room_infos {
-                room_info.insert(room_id.clone(), info.clone());
-            }
+        for (room_id, info) in &changes.room_infos {
+            inner.room_info.insert(room_id.clone(), info.clone());
         }
 
-        {
-            let mut presence = self.presence.write().unwrap();
-            for (sender, event) in &changes.presence {
-                presence.insert(sender.clone(), event.clone());
-            }
+        for (sender, event) in &changes.presence {
+            inner.presence.insert(sender.clone(), event.clone());
         }
 
-        {
-            let mut stripped_room_state = self.stripped_room_state.write().unwrap();
-            let mut stripped_members = self.stripped_members.write().unwrap();
+        for (room, event_types) in &changes.stripped_state {
+            for (event_type, events) in event_types {
+                for (state_key, raw_event) in events {
+                    inner
+                        .stripped_room_state
+                        .entry(room.clone())
+                        .or_default()
+                        .entry(event_type.clone())
+                        .or_default()
+                        .insert(state_key.to_owned(), raw_event.clone());
 
-            for (room, event_types) in &changes.stripped_state {
-                for (event_type, events) in event_types {
-                    for (state_key, raw_event) in events {
-                        stripped_room_state
+                    if *event_type == StateEventType::RoomMember {
+                        let event = match raw_event.deserialize_as::<StrippedRoomMemberEvent>() {
+                            Ok(ev) => ev,
+                            Err(e) => {
+                                let event_id: Option<String> =
+                                    raw_event.get_field("event_id").ok().flatten();
+                                debug!(
+                                    event_id,
+                                    "Failed to deserialize stripped member event: {e}"
+                                );
+                                continue;
+                            }
+                        };
+
+                        inner
+                            .stripped_members
                             .entry(room.clone())
                             .or_default()
-                            .entry(event_type.clone())
-                            .or_default()
-                            .insert(state_key.to_owned(), raw_event.clone());
-
-                        if *event_type == StateEventType::RoomMember {
-                            let event = match raw_event.deserialize_as::<StrippedRoomMemberEvent>()
-                            {
-                                Ok(ev) => ev,
-                                Err(e) => {
-                                    let event_id: Option<String> =
-                                        raw_event.get_field("event_id").ok().flatten();
-                                    debug!(
-                                        event_id,
-                                        "Failed to deserialize stripped member event: {e}"
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            stripped_members
-                                .entry(room.clone())
-                                .or_default()
-                                .insert(event.state_key, event.content.membership.clone());
-                        }
+                            .insert(event.state_key, event.content.membership.clone());
                     }
                 }
             }
         }
 
-        {
-            let mut room_user_receipts = self.room_user_receipts.write().unwrap();
-            let mut room_event_receipts = self.room_event_receipts.write().unwrap();
-
-            for (room, content) in &changes.receipts {
-                for (event_id, receipts) in &content.0 {
-                    for (receipt_type, receipts) in receipts {
-                        for (user_id, receipt) in receipts {
-                            let thread = receipt.thread.as_str().map(ToOwned::to_owned);
-                            // Add the receipt to the room user receipts
-                            if let Some((old_event, _)) = room_user_receipts
-                                .entry(room.clone())
-                                .or_default()
-                                .entry((receipt_type.to_string(), thread.clone()))
-                                .or_default()
-                                .insert(user_id.clone(), (event_id.clone(), receipt.clone()))
-                            {
-                                // Remove the old receipt from the room event receipts
-                                if let Some(receipt_map) = room_event_receipts.get_mut(room) {
-                                    if let Some(event_map) = receipt_map
-                                        .get_mut(&(receipt_type.to_string(), thread.clone()))
-                                    {
-                                        if let Some(user_map) = event_map.get_mut(&old_event) {
-                                            user_map.remove(user_id);
-                                        }
+        for (room, content) in &changes.receipts {
+            for (event_id, receipts) in &content.0 {
+                for (receipt_type, receipts) in receipts {
+                    for (user_id, receipt) in receipts {
+                        let thread = receipt.thread.as_str().map(ToOwned::to_owned);
+                        // Add the receipt to the room user receipts
+                        if let Some((old_event, _)) = inner
+                            .room_user_receipts
+                            .entry(room.clone())
+                            .or_default()
+                            .entry((receipt_type.to_string(), thread.clone()))
+                            .or_default()
+                            .insert(user_id.clone(), (event_id.clone(), receipt.clone()))
+                        {
+                            // Remove the old receipt from the room event receipts
+                            if let Some(receipt_map) = inner.room_event_receipts.get_mut(room) {
+                                if let Some(event_map) =
+                                    receipt_map.get_mut(&(receipt_type.to_string(), thread.clone()))
+                                {
+                                    if let Some(user_map) = event_map.get_mut(&old_event) {
+                                        user_map.remove(user_id);
                                     }
                                 }
                             }
-
-                            // Add the receipt to the room event receipts
-                            room_event_receipts
-                                .entry(room.clone())
-                                .or_default()
-                                .entry((receipt_type.to_string(), thread))
-                                .or_default()
-                                .entry(event_id.clone())
-                                .or_default()
-                                .insert(user_id.clone(), receipt.clone());
                         }
+
+                        // Add the receipt to the room event receipts
+                        inner
+                            .room_event_receipts
+                            .entry(room.clone())
+                            .or_default()
+                            .entry((receipt_type.to_string(), thread))
+                            .or_default()
+                            .entry(event_id.clone())
+                            .or_default()
+                            .insert(user_id.clone(), receipt.clone());
                     }
                 }
             }
         }
 
-        {
-            let room_info = self.room_info.read().unwrap();
-            let mut room_state = self.room_state.write().unwrap();
+        let make_room_version = |room_info: &HashMap<OwnedRoomId, RoomInfo>, room_id| {
+            room_info.get(room_id).and_then(|info| info.room_version().cloned()).unwrap_or_else(
+                || {
+                    warn!(?room_id, "Unable to find the room version, assuming version 9");
+                    RoomVersionId::V9
+                },
+            )
+        };
 
-            let make_room_version = |room_id| {
-                room_info.get(room_id).and_then(|info| info.room_version().cloned()).unwrap_or_else(
-                    || {
-                        warn!(?room_id, "Unable to find the room version, assuming version 9");
-                        RoomVersionId::V9
-                    },
-                )
-            };
+        let inner = &mut *inner;
+        for (room_id, redactions) in &changes.redactions {
+            let mut room_version = None;
 
-            for (room_id, redactions) in &changes.redactions {
-                let mut room_version = None;
-                if let Some(room) = room_state.get_mut(room_id) {
-                    for ref_room_mu in room.values_mut() {
-                        for raw_evt in ref_room_mu.values_mut() {
-                            if let Ok(Some(event_id)) =
-                                raw_evt.get_field::<OwnedEventId>("event_id")
-                            {
-                                if let Some(redaction) = redactions.get(&event_id) {
-                                    let redacted = redact(
-                                        raw_evt.deserialize_as::<CanonicalJsonObject>()?,
-                                        room_version
-                                            .get_or_insert_with(|| make_room_version(room_id)),
-                                        Some(RedactedBecause::from_raw_event(redaction)?),
-                                    )
-                                    .map_err(StoreError::Redaction)?;
-                                    *raw_evt = Raw::new(&redacted)?.cast();
-                                }
+            if let Some(room) = inner.room_state.get_mut(room_id) {
+                for ref_room_mu in room.values_mut() {
+                    for raw_evt in ref_room_mu.values_mut() {
+                        if let Ok(Some(event_id)) = raw_evt.get_field::<OwnedEventId>("event_id") {
+                            if let Some(redaction) = redactions.get(&event_id) {
+                                let redacted = redact(
+                                    raw_evt.deserialize_as::<CanonicalJsonObject>()?,
+                                    room_version.get_or_insert_with(|| {
+                                        make_room_version(&inner.room_info, room_id)
+                                    }),
+                                    Some(RedactedBecause::from_raw_event(redaction)?),
+                                )
+                                .map_err(StoreError::Redaction)?;
+                                *raw_evt = Raw::new(&redacted)?.cast();
                             }
                         }
                     }
@@ -449,14 +478,14 @@ impl StateStore for MemoryStore {
     }
 
     async fn get_presence_event(&self, user_id: &UserId) -> Result<Option<Raw<PresenceEvent>>> {
-        Ok(self.presence.read().unwrap().get(user_id).cloned())
+        Ok(self.inner.read().unwrap().presence.get(user_id).cloned())
     }
 
     async fn get_presence_events(
         &self,
         user_ids: &[OwnedUserId],
     ) -> Result<Vec<Raw<PresenceEvent>>> {
-        let presence = self.presence.read().unwrap();
+        let presence = &self.inner.read().unwrap().presence;
         Ok(user_ids.iter().filter_map(|user_id| presence.get(user_id).cloned()).collect())
     }
 
@@ -488,19 +517,15 @@ impl StateStore for MemoryStore {
             Some(state_events.values().cloned().map(to_enum).collect())
         }
 
+        let inner = self.inner.read().unwrap();
         Ok(get_events(
-            &self.stripped_room_state.read().unwrap(),
+            &inner.stripped_room_state,
             room_id,
             &event_type,
             RawAnySyncOrStrippedState::Stripped,
         )
         .or_else(|| {
-            get_events(
-                &self.room_state.read().unwrap(),
-                room_id,
-                &event_type,
-                RawAnySyncOrStrippedState::Sync,
-            )
+            get_events(&inner.room_state, room_id, &event_type, RawAnySyncOrStrippedState::Sync)
         })
         .unwrap_or_default())
     }
@@ -511,41 +536,31 @@ impl StateStore for MemoryStore {
         event_type: StateEventType,
         state_keys: &[&str],
     ) -> Result<Vec<RawAnySyncOrStrippedState>, Self::Error> {
-        Ok(
-            if let Some(stripped_state_events) = self
-                .stripped_room_state
-                .read()
-                .unwrap()
-                .get(room_id)
-                .and_then(|events| events.get(&event_type))
-            {
-                state_keys
-                    .iter()
-                    .filter_map(|k| {
-                        stripped_state_events
-                            .get(*k)
-                            .map(|e| RawAnySyncOrStrippedState::Stripped(e.clone()))
-                    })
-                    .collect()
-            } else if let Some(sync_state_events) = self
-                .room_state
-                .read()
-                .unwrap()
-                .get(room_id)
-                .and_then(|events| events.get(&event_type))
-            {
-                state_keys
-                    .iter()
-                    .filter_map(|k| {
-                        sync_state_events
-                            .get(*k)
-                            .map(|e| RawAnySyncOrStrippedState::Sync(e.clone()))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-        )
+        let inner = self.inner.read().unwrap();
+
+        if let Some(stripped_state_events) =
+            inner.stripped_room_state.get(room_id).and_then(|events| events.get(&event_type))
+        {
+            Ok(state_keys
+                .iter()
+                .filter_map(|k| {
+                    stripped_state_events
+                        .get(*k)
+                        .map(|e| RawAnySyncOrStrippedState::Stripped(e.clone()))
+                })
+                .collect())
+        } else if let Some(sync_state_events) =
+            inner.room_state.get(room_id).and_then(|events| events.get(&event_type))
+        {
+            Ok(state_keys
+                .iter()
+                .filter_map(|k| {
+                    sync_state_events.get(*k).map(|e| RawAnySyncOrStrippedState::Sync(e.clone()))
+                })
+                .collect())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn get_profile(
@@ -554,9 +569,10 @@ impl StateStore for MemoryStore {
         user_id: &UserId,
     ) -> Result<Option<MinimalRoomMemberEvent>> {
         Ok(self
-            .profiles
+            .inner
             .read()
             .unwrap()
+            .profiles
             .get(room_id)
             .and_then(|room_profiles| room_profiles.get(user_id))
             .cloned())
@@ -571,7 +587,7 @@ impl StateStore for MemoryStore {
             return Ok(BTreeMap::new());
         }
 
-        let profiles = self.profiles.read().unwrap();
+        let profiles = &self.inner.read().unwrap().profiles;
         let Some(room_profiles) = profiles.get(room_id) else {
             return Ok(BTreeMap::new());
         };
@@ -582,6 +598,7 @@ impl StateStore for MemoryStore {
             .collect())
     }
 
+    #[instrument(skip(self, memberships))]
     async fn get_user_ids(
         &self,
         room_id: &RoomId,
@@ -610,46 +627,38 @@ impl StateStore for MemoryStore {
                 })
                 .unwrap_or_default()
         }
-
-        let v = get_user_ids_inner(&self.stripped_members.read().unwrap(), room_id, memberships);
+        let inner = self.inner.read().unwrap();
+        let v = get_user_ids_inner(&inner.stripped_members, room_id, memberships);
         if !v.is_empty() {
             return Ok(v);
         }
-        Ok(get_user_ids_inner(&self.members.read().unwrap(), room_id, memberships))
+        Ok(get_user_ids_inner(&inner.members, room_id, memberships))
     }
 
-    async fn get_invited_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        StateStore::get_user_ids(self, room_id, RoomMemberships::INVITE).await
-    }
+    async fn get_room_infos(&self, room_load_settings: &RoomLoadSettings) -> Result<Vec<RoomInfo>> {
+        let memory_store_inner = self.inner.read().unwrap();
+        let room_infos = &memory_store_inner.room_info;
 
-    async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        StateStore::get_user_ids(self, room_id, RoomMemberships::JOIN).await
-    }
+        Ok(match room_load_settings {
+            RoomLoadSettings::All => room_infos.values().cloned().collect(),
 
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>> {
-        Ok(self.room_info.read().unwrap().values().cloned().collect())
-    }
-
-    async fn get_stripped_room_infos(&self) -> Result<Vec<RoomInfo>> {
-        Ok(self
-            .room_info
-            .read()
-            .unwrap()
-            .values()
-            .filter(|r| matches!(r.state(), RoomState::Invited))
-            .cloned()
-            .collect())
+            RoomLoadSettings::One(room_id) => match room_infos.get(room_id) {
+                Some(room_info) => vec![room_info.clone()],
+                None => vec![],
+            },
+        })
     }
 
     async fn get_users_with_display_name(
         &self,
         room_id: &RoomId,
-        display_name: &str,
+        display_name: &DisplayName,
     ) -> Result<BTreeSet<OwnedUserId>> {
         Ok(self
-            .display_names
+            .inner
             .read()
             .unwrap()
+            .display_names
             .get(room_id)
             .and_then(|room_names| room_names.get(display_name).cloned())
             .unwrap_or_default())
@@ -658,28 +667,25 @@ impl StateStore for MemoryStore {
     async fn get_users_with_display_names<'a>(
         &self,
         room_id: &RoomId,
-        display_names: &'a [String],
-    ) -> Result<BTreeMap<&'a str, BTreeSet<OwnedUserId>>> {
+        display_names: &'a [DisplayName],
+    ) -> Result<HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>> {
         if display_names.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(HashMap::new());
         }
 
-        let read_guard = &self.display_names.read().unwrap();
-        let Some(room_names) = read_guard.get(room_id) else {
-            return Ok(BTreeMap::new());
+        let inner = self.inner.read().unwrap();
+        let Some(room_names) = inner.display_names.get(room_id) else {
+            return Ok(HashMap::new());
         };
 
-        Ok(display_names
-            .iter()
-            .filter_map(|n| room_names.get(n).map(|d| (n.as_str(), d.clone())))
-            .collect())
+        Ok(display_names.iter().filter_map(|n| room_names.get(n).map(|d| (n, d.clone()))).collect())
     }
 
     async fn get_account_data_event(
         &self,
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEvent>>> {
-        Ok(self.account_data.read().unwrap().get(&event_type).cloned())
+        Ok(self.inner.read().unwrap().account_data.get(&event_type).cloned())
     }
 
     async fn get_room_account_data_event(
@@ -688,9 +694,10 @@ impl StateStore for MemoryStore {
         event_type: RoomAccountDataEventType,
     ) -> Result<Option<Raw<AnyRoomAccountDataEvent>>> {
         Ok(self
-            .room_account_data
+            .inner
             .read()
             .unwrap()
+            .room_account_data
             .get(room_id)
             .and_then(|m| m.get(&event_type))
             .cloned())
@@ -719,82 +726,232 @@ impl StateStore for MemoryStore {
     }
 
     async fn get_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.custom.read().unwrap().get(key).cloned())
+        Ok(self.inner.read().unwrap().custom.get(key).cloned())
     }
 
     async fn set_custom_value(&self, key: &[u8], value: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        Ok(self.custom.write().unwrap().insert(key.to_vec(), value))
+        Ok(self.inner.write().unwrap().custom.insert(key.to_vec(), value))
     }
 
     async fn remove_custom_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.custom.write().unwrap().remove(key))
-    }
-
-    async fn add_media_content(&self, request: &MediaRequest, data: Vec<u8>) -> Result<()> {
-        // Avoid duplication. Let's try to remove it first.
-        self.remove_media_content(request).await?;
-        // Now, let's add it.
-        self.media.write().unwrap().push((request.uri().to_owned(), request.unique_key(), data));
-
-        Ok(())
-    }
-
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
-        let media = self.media.read().unwrap();
-        let expected_key = request.unique_key();
-
-        Ok(media.iter().find_map(|(_media_uri, media_key, media_content)| {
-            (media_key == &expected_key).then(|| media_content.to_owned())
-        }))
-    }
-
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        let mut media = self.media.write().unwrap();
-        let expected_key = request.unique_key();
-        let Some(index) = media
-            .iter()
-            .position(|(_media_uri, media_key, _media_content)| media_key == &expected_key)
-        else {
-            return Ok(());
-        };
-
-        media.remove(index);
-
-        Ok(())
-    }
-
-    async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<()> {
-        let mut media = self.media.write().unwrap();
-        let expected_key = uri.to_owned();
-        let positions = media
-            .iter()
-            .enumerate()
-            .filter_map(|(position, (media_uri, _media_key, _media_content))| {
-                (media_uri == &expected_key).then_some(position)
-            })
-            .collect::<Vec<_>>();
-
-        // Iterate in reverse-order so that positions stay valid after first removals.
-        for position in positions.into_iter().rev() {
-            media.remove(position);
-        }
-
-        Ok(())
+        Ok(self.inner.write().unwrap().custom.remove(key))
     }
 
     async fn remove_room(&self, room_id: &RoomId) -> Result<()> {
-        self.profiles.write().unwrap().remove(room_id);
-        self.display_names.write().unwrap().remove(room_id);
-        self.members.write().unwrap().remove(room_id);
-        self.room_info.write().unwrap().remove(room_id);
-        self.room_state.write().unwrap().remove(room_id);
-        self.room_account_data.write().unwrap().remove(room_id);
-        self.stripped_room_state.write().unwrap().remove(room_id);
-        self.stripped_members.write().unwrap().remove(room_id);
-        self.room_user_receipts.write().unwrap().remove(room_id);
-        self.room_event_receipts.write().unwrap().remove(room_id);
+        let mut inner = self.inner.write().unwrap();
+
+        inner.profiles.remove(room_id);
+        inner.display_names.remove(room_id);
+        inner.members.remove(room_id);
+        inner.room_info.remove(room_id);
+        inner.room_state.remove(room_id);
+        inner.room_account_data.remove(room_id);
+        inner.stripped_room_state.remove(room_id);
+        inner.stripped_members.remove(room_id);
+        inner.room_user_receipts.remove(room_id);
+        inner.room_event_receipts.remove(room_id);
+        inner.send_queue_events.remove(room_id);
+        inner.dependent_send_queue_events.remove(room_id);
 
         Ok(())
+    }
+
+    async fn save_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        kind: QueuedRequestKind,
+        priority: usize,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write()
+            .unwrap()
+            .send_queue_events
+            .entry(room_id.to_owned())
+            .or_default()
+            .push(QueuedRequest { kind, transaction_id, error: None, priority, created_at });
+        Ok(())
+    }
+
+    async fn update_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        kind: QueuedRequestKind,
+    ) -> Result<bool, Self::Error> {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .unwrap()
+            .send_queue_events
+            .entry(room_id.to_owned())
+            .or_default()
+            .iter_mut()
+            .find(|item| item.transaction_id == transaction_id)
+        {
+            entry.kind = kind;
+            entry.error = None;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn remove_send_queue_request(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+        let q = &mut inner.send_queue_events;
+
+        let entry = q.get_mut(room_id);
+        if let Some(entry) = entry {
+            // Find the event by id in its room queue, and remove it if present.
+            if let Some(pos) = entry.iter().position(|item| item.transaction_id == transaction_id) {
+                entry.remove(pos);
+                // And if this was the last event before removal, remove the entire room entry.
+                if entry.is_empty() {
+                    q.remove(room_id);
+                }
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn load_send_queue_requests(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedRequest>, Self::Error> {
+        let mut ret = self
+            .inner
+            .write()
+            .unwrap()
+            .send_queue_events
+            .entry(room_id.to_owned())
+            .or_default()
+            .clone();
+        // Inverted order of priority, use stable sort to keep insertion order.
+        ret.sort_by(|lhs, rhs| rhs.priority.cmp(&lhs.priority));
+        Ok(ret)
+    }
+
+    async fn update_send_queue_request_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        error: Option<QueueWedgeError>,
+    ) -> Result<(), Self::Error> {
+        if let Some(entry) = self
+            .inner
+            .write()
+            .unwrap()
+            .send_queue_events
+            .entry(room_id.to_owned())
+            .or_default()
+            .iter_mut()
+            .find(|item| item.transaction_id == transaction_id)
+        {
+            entry.error = error;
+        }
+        Ok(())
+    }
+
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        Ok(self.inner.read().unwrap().send_queue_events.keys().cloned().collect())
+    }
+
+    async fn save_dependent_queued_request(
+        &self,
+        room: &RoomId,
+        parent_transaction_id: &TransactionId,
+        own_transaction_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: DependentQueuedRequestKind,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .write()
+            .unwrap()
+            .dependent_send_queue_events
+            .entry(room.to_owned())
+            .or_default()
+            .push(DependentQueuedRequest {
+                kind: content,
+                parent_transaction_id: parent_transaction_id.to_owned(),
+                own_transaction_id,
+                parent_key: None,
+                created_at,
+            });
+        Ok(())
+    }
+
+    async fn mark_dependent_queued_requests_as_ready(
+        &self,
+        room: &RoomId,
+        parent_txn_id: &TransactionId,
+        sent_parent_key: SentRequestKey,
+    ) -> Result<usize, Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+        let dependents = inner.dependent_send_queue_events.entry(room.to_owned()).or_default();
+        let mut num_updated = 0;
+        for d in dependents.iter_mut().filter(|item| item.parent_transaction_id == parent_txn_id) {
+            d.parent_key = Some(sent_parent_key.clone());
+            num_updated += 1;
+        }
+        Ok(num_updated)
+    }
+
+    async fn update_dependent_queued_request(
+        &self,
+        room: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+        let dependents = inner.dependent_send_queue_events.entry(room.to_owned()).or_default();
+        for d in dependents.iter_mut() {
+            if d.own_transaction_id == *own_transaction_id {
+                d.kind = new_content;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn remove_dependent_queued_request(
+        &self,
+        room: &RoomId,
+        txn_id: &ChildTransactionId,
+    ) -> Result<bool, Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+        let dependents = inner.dependent_send_queue_events.entry(room.to_owned()).or_default();
+        if let Some(pos) = dependents.iter().position(|item| item.own_transaction_id == *txn_id) {
+            dependents.remove(pos);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all the dependent send queue events.
+    ///
+    /// This returns absolutely all the dependent send queue events, whether
+    /// they have an event id or not.
+    async fn load_dependent_queued_requests(
+        &self,
+        room: &RoomId,
+    ) -> Result<Vec<DependentQueuedRequest>, Self::Error> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .dependent_send_queue_events
+            .get(room)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -806,5 +963,5 @@ mod tests {
         Ok(MemoryStore::new())
     }
 
-    statestore_integration_tests!(with_media_tests);
+    statestore_integration_tests!();
 }

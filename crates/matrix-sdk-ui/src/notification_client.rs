@@ -18,21 +18,23 @@ use std::{
 };
 
 use futures_util::{pin_mut, StreamExt as _};
-use matrix_sdk::{room::Room, Client, ClientBuildError, SlidingSyncList, SlidingSyncMode};
-use matrix_sdk_base::{
-    crypto::{vodozemac, MegolmError},
-    deserialized_responses::TimelineEvent,
-    RoomState, StoreError,
+use matrix_sdk::{
+    room::Room, sleep::sleep, Client, ClientBuildError, SlidingSyncList, SlidingSyncMode,
 };
+use matrix_sdk_base::{deserialized_responses::TimelineEvent, RoomState, StoreError};
 use ruma::{
-    api::client::sync::sync_events::v4::{
-        AccountDataConfig, RoomSubscription, SyncRequestListFilters,
-    },
+    api::client::sync::sync_events::v5 as http,
     assign,
+    directory::RoomTypeFilter,
     events::{
-        room::{member::StrippedRoomMemberEvent, message::SyncRoomMessageEvent},
-        AnyFullStateEventContent, AnyStateEvent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-        FullStateEventContent, StateEventType, TimelineEventType,
+        room::{
+            join_rules::JoinRule,
+            member::{MembershipState, StrippedRoomMemberEvent},
+            message::{Relation, SyncRoomMessageEvent},
+        },
+        AnyFullStateEventContent, AnyMessageLikeEventContent, AnyStateEvent,
+        AnySyncMessageLikeEvent, AnySyncTimelineEvent, FullStateEventContent, StateEventType,
+        TimelineEventType,
     },
     html::RemoveReplyFallback,
     push::Action,
@@ -87,10 +89,6 @@ pub struct NotificationClient {
     /// Is the notification client running on its own process or not?
     process_setup: NotificationProcessSetup,
 
-    /// Should we try to filter out the notification event according to the push
-    /// rules?
-    filter_by_push_rules: bool,
-
     /// A mutex to serialize requests to the notifications sliding sync.
     ///
     /// If several notifications come in at the same time (e.g. network was
@@ -111,12 +109,27 @@ impl NotificationClient {
     const CONNECTION_ID: &'static str = "notifications";
     const LOCK_ID: &'static str = "notifications";
 
-    /// Create a new builder for a notification client.
-    pub async fn builder(
-        client: Client,
+    /// Create a new notification client.
+    pub async fn new(
+        parent_client: Client,
         process_setup: NotificationProcessSetup,
-    ) -> Result<NotificationClientBuilder, Error> {
-        NotificationClientBuilder::new(client, process_setup).await
+    ) -> Result<Self, Error> {
+        let client = parent_client.notification_client(Self::LOCK_ID.to_owned()).await?;
+
+        Ok(NotificationClient {
+            client,
+            parent_client,
+            notification_sync_mutex: AsyncMutex::new(()),
+            encryption_sync_mutex: AsyncMutex::new(()),
+            process_setup,
+        })
+    }
+
+    /// Fetches a room by its ID using the in-memory state store backed client.
+    /// Useful to retrieve room information after running the limited
+    /// notification client sliding sync loop.
+    pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
+        self.client.get_room(room_id)
     }
 
     /// Fetches the content of a notification.
@@ -172,8 +185,8 @@ impl NotificationClient {
         //
         // Spawn an `EncryptionSync` that runs two iterations of the sliding sync loop:
         // - the first iteration allows to get SS events as well as send e2ee requests.
-        // - the second one let the SS proxy forward events triggered by the sending of
-        // e2ee requests.
+        // - the second one let the SS homeserver forward events triggered by the
+        //   sending of e2ee requests.
         //
         // Keep timeouts small for both, since we might be short on time.
 
@@ -182,6 +195,7 @@ impl NotificationClient {
             NotificationProcessSetup::MultipleProcesses
         ));
 
+        let push_ctx = room.push_context().await?;
         let sync_permit_guard = match &self.process_setup {
             NotificationProcessSetup::MultipleProcesses => {
                 // We're running on our own process, dedicated for notifications. In that case,
@@ -209,25 +223,26 @@ impl NotificationClient {
                     for _ in 0..3 {
                         trace!("waiting for decryption…");
 
-                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        sleep(Duration::from_millis(wait)).await;
 
-                        match room.decrypt_event(raw_event.cast_ref()).await {
-                            Ok(new_event) => {
+                        let new_event =
+                            room.decrypt_event(raw_event.cast_ref(), push_ctx.as_ref()).await?;
+
+                        match new_event.kind {
+                            matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                                utd_info, ..} => {
+                                if utd_info.reason.is_missing_room_key() {
+                                    // Decryption error that could be caused by a missing room
+                                    // key; retry in a few.
+                                    wait *= 2;
+                                } else {
+                                    debug!("Event could not be decrypted, but waiting longer is unlikely to help: {:?}", utd_info.reason);
+                                    return Ok(None);
+                                }
+                            }
+                            _ => {
                                 trace!("Waiting succeeded and event could be decrypted!");
                                 return Ok(Some(new_event));
-                            }
-                            Err(matrix_sdk::Error::MegolmError(
-                                MegolmError::MissingRoomKey(_)
-                                | MegolmError::Decryption(
-                                    vodozemac::megolm::DecryptionError::UnknownMessageIndex(_, _),
-                                ),
-                            )) => {
-                                // Decryption error that could be caused by a missing room key;
-                                // retry in a few.
-                                wait *= 2;
-                            }
-                            Err(err) => {
-                                return Err(err.into());
                             }
                         }
                     }
@@ -240,7 +255,6 @@ impl NotificationClient {
         };
 
         let encryption_sync = EncryptionSyncService::new(
-            Self::LOCK_ID.to_owned(),
             self.client.clone(),
             Some((Duration::from_secs(3), Duration::from_secs(4))),
             with_locking,
@@ -253,11 +267,22 @@ impl NotificationClient {
 
         match encryption_sync {
             Ok(sync) => match sync.run_fixed_iterations(2, sync_permit_guard).await {
-                Ok(()) => match room.decrypt_event(raw_event.cast_ref()).await {
-                    Ok(new_event) => {
-                        trace!("Encryption sync managed to decrypt the event.");
-                        Ok(Some(new_event))
-                    }
+                Ok(()) => match room.decrypt_event(raw_event.cast_ref(), push_ctx.as_ref()).await {
+                    Ok(new_event) => match new_event.kind {
+                        matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                            utd_info, ..
+                        } => {
+                            trace!(
+                                "Encryption sync failed to decrypt the event: {:?}",
+                                utd_info.reason
+                            );
+                            Ok(None)
+                        }
+                        _ => {
+                            trace!("Encryption sync managed to decrypt the event.");
+                            Ok(Some(new_event))
+                        }
+                    },
                     Err(err) => {
                         trace!("Encryption sync failed to decrypt the event: {err}");
                         Ok(None)
@@ -278,9 +303,21 @@ impl NotificationClient {
     /// Try to run a sliding sync (without encryption) to retrieve the event
     /// from the notification.
     ///
-    /// This works by requesting explicit state that'll be useful for building
-    /// the `NotificationItem`, and subscribing to the room which the
-    /// notification relates to.
+    /// The event can either be:
+    /// - an invite event,
+    /// - or a non-invite event.
+    ///
+    /// In case it's a non-invite event, it's rather easy: we'll request
+    /// explicit state that'll be useful for building the
+    /// `NotificationItem`, and subscribe to the room which the notification
+    /// relates to.
+    ///
+    /// In case it's an invite-event, it's trickier because the stripped event
+    /// may not contain the event id, so we can't just match on it. Rather,
+    /// we look at stripped room member events that may be fitting (i.e.
+    /// match the current user and are invites), and if the SDK concludes the
+    /// room was in the invited state, and we didn't find the event by id,
+    /// *then* we'll use that stripped room member event.
     #[instrument(skip_all)]
     async fn try_sliding_sync(
         &self,
@@ -295,9 +332,9 @@ impl NotificationClient {
         // notification, so we can figure out the full event and associated
         // information.
 
-        let notification = Arc::new(Mutex::new(None));
+        let raw_notification = Arc::new(Mutex::new(None));
 
-        let cloned_notif = notification.clone();
+        let handler_raw_notification = raw_notification.clone();
         let target_event_id = event_id.to_owned();
 
         let timeline_event_handler =
@@ -307,7 +344,7 @@ impl NotificationClient {
                         if event_id == target_event_id {
                             // found it! There shouldn't be a previous event before, but if there
                             // is, that should be ok to just replace it.
-                            *cloned_notif.lock().unwrap() =
+                            *handler_raw_notification.lock().unwrap() =
                                 Some(RawNotificationEvent::Timeline(raw));
                         }
                     }
@@ -320,48 +357,78 @@ impl NotificationClient {
                 }
             });
 
-        let cloned_notif = notification.clone();
+        // We'll only use this event if the room is in the invited state.
+        let raw_invite = Arc::new(Mutex::new(None));
+
         let target_event_id = event_id.to_owned();
+        let user_id = self.client.user_id().unwrap().to_owned();
+        let handler_raw_invite = raw_invite.clone();
+        let handler_raw_notification = raw_notification.clone();
         let stripped_member_handler =
             self.client.add_event_handler(move |raw: Raw<StrippedRoomMemberEvent>| async move {
+                let deserialized = match raw.deserialize() {
+                    Ok(d) => d,
+                    Err(err) => {
+                        warn!("failed to deserialize raw stripped room member event: {err}");
+                        return;
+                    }
+                };
+
+                trace!("received a stripped room member event");
+
+                // Try to match the event by event_id, as it's the most precise. In theory, we
+                // shouldn't receive it, so that's a first attempt.
                 match raw.get_field::<OwnedEventId>("event_id") {
                     Ok(Some(event_id)) => {
                         if event_id == target_event_id {
                             // found it! There shouldn't be a previous event before, but if there
                             // is, that should be ok to just replace it.
-                            *cloned_notif.lock().unwrap() = Some(RawNotificationEvent::Invite(raw));
+                            *handler_raw_notification.lock().unwrap() =
+                                Some(RawNotificationEvent::Invite(raw));
+                            return;
                         }
                     }
                     Ok(None) => {
-                        warn!("a room member event had no id");
+                        debug!("a room member event had no id");
                     }
                     Err(err) => {
-                        warn!("a room member event id couldn't be decoded: {err}");
+                        debug!("a room member event id couldn't be decoded: {err}");
                     }
+                }
+
+                // Try to match the event by membership and state_key for the current user.
+                if deserialized.content.membership == MembershipState::Invite
+                    && deserialized.state_key == user_id
+                {
+                    debug!("found an invite event for the current user");
+                    // This could be it! There might be several of these following each other, so
+                    // assume it's the latest one (in sync ordering), and override a previous one if
+                    // present.
+                    *handler_raw_invite.lock().unwrap() = Some(RawNotificationEvent::Invite(raw));
+                } else {
+                    debug!("not an invite event, or not for the current user");
                 }
             });
 
         // Room power levels are necessary to build the push context.
         let required_state = vec![
-            (StateEventType::RoomAvatar, "".to_owned()),
             (StateEventType::RoomEncryption, "".to_owned()),
             (StateEventType::RoomMember, "$LAZY".to_owned()),
             (StateEventType::RoomMember, "$ME".to_owned()),
             (StateEventType::RoomCanonicalAlias, "".to_owned()),
             (StateEventType::RoomName, "".to_owned()),
             (StateEventType::RoomPowerLevels, "".to_owned()),
+            (StateEventType::CallMember, "*".to_owned()),
         ];
 
         let invites = SlidingSyncList::builder("invites")
             .sync_mode(SlidingSyncMode::new_selective().add_range(0..=16))
             .timeline_limit(8)
             .required_state(required_state.clone())
-            .filters(Some(assign!(SyncRequestListFilters::default(), {
+            .filters(Some(assign!(http::request::ListFilters::default(), {
                 is_invite: Some(true),
-                is_tombstoned: Some(false),
-                not_room_types: vec!["m.space".to_owned()],
-            })))
-            .sort(vec!["by_recency".to_owned(), "by_name".to_owned()]);
+                not_room_types: vec![RoomTypeFilter::Space],
+            })));
 
         let sync = self
             .client
@@ -369,18 +436,19 @@ impl NotificationClient {
             .poll_timeout(Duration::from_secs(1))
             .network_timeout(Duration::from_secs(3))
             .with_account_data_extension(
-                assign!(AccountDataConfig::default(), { enabled: Some(true) }),
+                assign!(http::request::AccountData::default(), { enabled: Some(true) }),
             )
             .add_list(invites)
             .build()
             .await?;
 
-        sync.subscribe_to_room(
-            room_id.to_owned(),
-            Some(assign!(RoomSubscription::default(), {
+        sync.subscribe_to_rooms(
+            &[room_id],
+            Some(assign!(http::request::RoomSubscription::default(), {
                 required_state,
-                timeline_limit: Some(uint!(16))
+                timeline_limit: uint!(16)
             })),
+            true,
         );
 
         let mut remaining_attempts = 3;
@@ -394,7 +462,7 @@ impl NotificationClient {
                 break;
             }
 
-            if notification.lock().unwrap().is_some() {
+            if raw_notification.lock().unwrap().is_some() || raw_invite.lock().unwrap().is_some() {
                 // We got the event.
                 break;
             }
@@ -409,7 +477,24 @@ impl NotificationClient {
         self.client.remove_event_handler(stripped_member_handler);
         self.client.remove_event_handler(timeline_event_handler);
 
-        let maybe_event = notification.lock().unwrap().take();
+        let mut maybe_event = raw_notification.lock().unwrap().take();
+
+        if maybe_event.is_none() {
+            trace!("we didn't have a non-invite event, looking for invited room now");
+            if let Some(room) = self.client.get_room(room_id) {
+                if room.state() == RoomState::Invited {
+                    maybe_event = raw_invite.lock().unwrap().take();
+                } else {
+                    debug!("the room isn't in the invited state");
+                }
+            } else {
+                debug!("the room isn't an invite");
+            }
+        }
+
+        let found = if maybe_event.is_some() { "" } else { "not " };
+        trace!("the notification event has been {found}found");
+
         Ok(maybe_event)
     }
 
@@ -432,9 +517,12 @@ impl NotificationClient {
         let push_actions = match &raw_event {
             RawNotificationEvent::Timeline(timeline_event) => {
                 // Timeline events may be encrypted, so make sure they get decrypted first.
-                if let Some(timeline_event) = self.retry_decryption(&room, timeline_event).await? {
-                    raw_event = RawNotificationEvent::Timeline(timeline_event.event.cast());
-                    timeline_event.push_actions
+                if let Some(mut timeline_event) =
+                    self.retry_decryption(&room, timeline_event).await?
+                {
+                    let push_actions = timeline_event.push_actions.take();
+                    raw_event = RawNotificationEvent::Timeline(timeline_event.into_raw());
+                    push_actions
                 } else {
                     room.event_push_actions(timeline_event).await?
                 }
@@ -446,7 +534,7 @@ impl NotificationClient {
         };
 
         if let Some(push_actions) = &push_actions {
-            if self.filter_by_push_rules && !push_actions.iter().any(|a| a.should_notify()) {
+            if !push_actions.iter().any(|a| a.should_notify()) {
                 return Ok(NotificationStatus::EventFilteredOut);
             }
         }
@@ -480,29 +568,27 @@ impl NotificationClient {
             return Err(Error::UnknownRoom);
         };
 
-        let (mut timeline_event, state_events) =
-            room.event_with_context(event_id, true).await?.ok_or(Error::ContextMissingEvent)?;
+        let response = room.event_with_context(event_id, true, uint!(0), None).await?;
 
-        if let Some(decrypted_event) =
-            self.retry_decryption(&room, timeline_event.event.cast_ref()).await?
-        {
+        let mut timeline_event = response.event.ok_or(Error::ContextMissingEvent)?;
+        let state_events = response.state;
+
+        if let Some(decrypted_event) = self.retry_decryption(&room, timeline_event.raw()).await? {
             timeline_event = decrypted_event;
         }
 
-        if self.filter_by_push_rules
-            && !timeline_event
-                .push_actions
-                .as_ref()
-                .is_some_and(|actions| actions.iter().any(|a| a.should_notify()))
-        {
-            return Ok(None);
+        if let Some(actions) = timeline_event.push_actions.as_ref() {
+            if !actions.iter().any(|a| a.should_notify()) {
+                return Ok(None);
+            }
         }
 
+        let push_actions = timeline_event.push_actions.take();
         Ok(Some(
             NotificationItem::new(
                 &room,
-                RawNotificationEvent::Timeline(timeline_event.event.cast()),
-                timeline_event.push_actions.as_deref(),
+                RawNotificationEvent::Timeline(timeline_event.into_raw()),
+                push_actions.as_deref(),
                 state_events,
             )
             .await?,
@@ -511,7 +597,7 @@ impl NotificationClient {
 }
 
 fn is_event_encrypted(event_type: TimelineEventType) -> bool {
-    let is_still_encrypted = matches!(event_type, ruma::events::TimelineEventType::RoomEncrypted);
+    let is_still_encrypted = matches!(event_type, TimelineEventType::RoomEncrypted);
 
     #[cfg(feature = "unstable-msc3956")]
     let is_still_encrypted =
@@ -525,52 +611,6 @@ pub enum NotificationStatus {
     Event(NotificationItem),
     EventNotFound,
     EventFilteredOut,
-}
-
-/// Builder for a `NotificationClient`.
-///
-/// Fields have the same meaning as in `NotificationClient`.
-#[derive(Clone)]
-pub struct NotificationClientBuilder {
-    /// SDK client that uses an in-memory state store, to be used with the
-    /// sliding sync method.
-    client: Client,
-    /// SDK client that uses the same state store as the caller's context.
-    parent_client: Client,
-    filter_by_push_rules: bool,
-
-    /// Is the notification client running on its own process or not?
-    process_setup: NotificationProcessSetup,
-}
-
-impl NotificationClientBuilder {
-    async fn new(
-        parent_client: Client,
-        process_setup: NotificationProcessSetup,
-    ) -> Result<Self, Error> {
-        let client = parent_client.notification_client().await?;
-
-        Ok(Self { client, parent_client, filter_by_push_rules: false, process_setup })
-    }
-
-    /// Filter out the notification event according to the push rules present in
-    /// the event.
-    pub fn filter_by_push_rules(mut self) -> Self {
-        self.filter_by_push_rules = true;
-        self
-    }
-
-    /// Finishes configuring the `NotificationClient`.
-    pub fn build(self) -> NotificationClient {
-        NotificationClient {
-            client: self.client,
-            parent_client: self.parent_client,
-            filter_by_push_rules: self.filter_by_push_rules,
-            notification_sync_mutex: AsyncMutex::new(()),
-            encryption_sync_mutex: AsyncMutex::new(()),
-            process_setup: self.process_setup,
-        }
-    }
 }
 
 /// The Notification event as it was fetched from remote for the
@@ -603,6 +643,22 @@ impl NotificationEvent {
             NotificationEvent::Invite(ev) => &ev.sender,
         }
     }
+
+    /// Returns the root event id of the thread the notification event is in, if
+    /// any.
+    fn thread_id(&self) -> Option<OwnedEventId> {
+        let NotificationEvent::Timeline(AnySyncTimelineEvent::MessageLike(event)) = &self else {
+            return None;
+        };
+        let content = event.original_content()?;
+        match content {
+            AnyMessageLikeEventContent::RoomMessage(content) => match content.relates_to? {
+                Relation::Thread(thread) => Some(thread.event_id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 /// A notification with its full content.
@@ -621,14 +677,18 @@ pub struct NotificationItem {
     /// Is the sender's name ambiguous?
     pub is_sender_name_ambiguous: bool,
 
-    /// Room display name.
-    pub room_display_name: String,
+    /// Room computed display name.
+    pub room_computed_display_name: String,
     /// Room avatar URL.
     pub room_avatar_url: Option<String>,
     /// Room canonical alias.
     pub room_canonical_alias: Option<String>,
+    /// Room join rule.
+    pub room_join_rule: JoinRule,
     /// Is this room encrypted?
     pub is_room_encrypted: Option<bool>,
+    /// Is this a public room?
+    pub is_room_public: bool,
     /// Is this room considered a direct message?
     pub is_direct_message_room: bool,
     /// Numbers of members who joined the room.
@@ -640,6 +700,7 @@ pub struct NotificationItem {
     /// It is set if and only if the push actions could be determined.
     pub is_noisy: Option<bool>,
     pub has_mention: Option<bool>,
+    pub thread_id: Option<OwnedEventId>,
 }
 
 impl NotificationItem {
@@ -706,6 +767,7 @@ impl NotificationItem {
 
         let is_noisy = push_actions.map(|actions| actions.iter().any(|a| a.sound().is_some()));
         let has_mention = push_actions.map(|actions| actions.iter().any(|a| a.is_highlight()));
+        let thread_id = event.thread_id().clone();
 
         let item = NotificationItem {
             event,
@@ -713,14 +775,21 @@ impl NotificationItem {
             sender_display_name,
             sender_avatar_url,
             is_sender_name_ambiguous,
-            room_display_name: room.display_name().await?.to_string(),
+            room_computed_display_name: room.display_name().await?.to_string(),
             room_avatar_url: room.avatar_url().map(|s| s.to_string()),
             room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
+            room_join_rule: room.join_rule(),
             is_direct_message_room: room.is_direct().await?,
-            is_room_encrypted: room.is_encrypted().await.ok(),
+            is_room_public: room.is_public(),
+            is_room_encrypted: room
+                .latest_encryption_state()
+                .await
+                .map(|state| state.is_encrypted())
+                .ok(),
             joined_members_count: room.joined_members_count(),
             is_noisy,
             has_mention,
+            thread_id,
         };
 
         Ok(item)
@@ -756,4 +825,39 @@ pub enum Error {
     /// An error forwarded from the underlying state store.
     #[error(transparent)]
     StoreError(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches2::assert_let;
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+    use ruma::{event_id, room_id, user_id};
+
+    use crate::notification_client::{NotificationItem, RawNotificationEvent};
+
+    #[async_test]
+    async fn test_notification_item_returns_thread_id() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let thread_root_event_id = event_id!("$root:b.c");
+        let message = EventFactory::new()
+            .room(room_id)
+            .sender(user_id!("@sender:b.c"))
+            .text_msg("Threaded")
+            .in_thread(thread_root_event_id, event_id!("$prev:b.c"))
+            .into_raw_sync();
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        let raw_notification_event = RawNotificationEvent::Timeline(message);
+        let notification_item =
+            NotificationItem::new(&room, raw_notification_event, None, Vec::new())
+                .await
+                .expect("Could not create notification item");
+
+        assert_let!(Some(thread_id) = notification_item.thread_id);
+        assert_eq!(thread_id, thread_root_event_id);
+    }
 }

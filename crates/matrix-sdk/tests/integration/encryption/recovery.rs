@@ -14,21 +14,25 @@
 
 use std::sync::{Arc, Mutex};
 
+use assert_matches2::assert_let;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    authentication::matrix::MatrixSession,
     config::RequestConfig,
     encryption::{
         backups::BackupState,
         recovery::{EnableProgress, RecoveryState},
-        BackupDownloadStrategy,
+        BackupDownloadStrategy, CrossSigningResetAuthType,
     },
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
-    test_utils::{no_retry_test_client_with_server, test_client_builder_with_server},
+    test_utils::{
+        client::mock_session_tokens, no_retry_test_client_with_server,
+        test_client_builder_with_server,
+    },
     Client,
 };
 use matrix_sdk_base::SessionMeta;
 use matrix_sdk_test::async_test;
-use ruma::{device_id, user_id, UserId};
+use ruma::{api::client::uiaa, device_id, user_id, UserId};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::spawn;
@@ -42,7 +46,7 @@ use crate::{encryption::mock_secret_store_with_backup_key, logged_in_client_with
 async fn test_client(user_id: &UserId) -> (Client, wiremock::MockServer) {
     let session = MatrixSession {
         meta: SessionMeta { user_id: user_id.into(), device_id: device_id!("DEVICEID").to_owned() },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        tokens: mock_session_tokens(),
     };
 
     let (builder, server) = test_client_builder_with_server().await;
@@ -66,7 +70,7 @@ async fn test_client(user_id: &UserId) -> (Client, wiremock::MockServer) {
             "errcode": "M_NOT_FOUND",
             "error": "Account data not found"
         })))
-        .expect(1)
+        .expect(2)
         .named("m.secret_storage.default_key account data GET")
         .mount_as_scoped(&server)
         .await;
@@ -154,20 +158,20 @@ async fn mock_put_new_default_secret_storage_key(user_id: &UserId, server: &wire
 }
 
 #[async_test]
-async fn recovery_status_server_unavailable() {
+async fn test_recovery_status_server_unavailable() {
     let (client, _) = logged_in_client_with_server().await;
     client.encryption().wait_for_e2ee_initialization_tasks().await;
     assert_eq!(client.encryption().recovery().state(), RecoveryState::Unknown);
 }
 
 #[async_test]
-async fn recovery_status_secret_storage_set_up() {
+async fn test_recovery_status_secret_storage_set_up() {
     const KEY_ID: &str = "yJWwBm2Ts8jHygTBslKpABFyykavhhfA";
     let user_id = user_id!("@example:morpheus.localhost");
 
     let session = MatrixSession {
         meta: SessionMeta { user_id: user_id.into(), device_id: device_id!("DEVICEID").to_owned() },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        tokens: mock_session_tokens(),
     };
 
     let (client, server) = no_retry_test_client_with_server().await;
@@ -183,12 +187,12 @@ async fn recovery_status_secret_storage_set_up() {
 }
 
 #[async_test]
-async fn recovery_status_secret_storage_not_set_up() {
+async fn test_recovery_status_secret_storage_not_set_up() {
     let user_id = user_id!("@example:morpheus.localhost");
 
     let session = MatrixSession {
         meta: SessionMeta { user_id: user_id.into(), device_id: device_id!("DEVICEID").to_owned() },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        tokens: mock_session_tokens(),
     };
 
     let (client, server) = no_retry_test_client_with_server().await;
@@ -319,10 +323,13 @@ async fn enable(
         )))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(move |_: &wiremock::Request| {
-            let content = default_key_content.lock().unwrap().take().unwrap();
-            ResponseTemplate::new(200).set_body_json(content)
+            if let Some(content) = default_key_content.lock().unwrap().as_ref() {
+                ResponseTemplate::new(200).set_body_json(content)
+            } else {
+                ResponseTemplate::new(404)
+            }
         })
-        .expect(1)
+        .expect(2)
         .mount_as_scoped(server)
         .await;
 
@@ -440,7 +447,7 @@ async fn enable(
 }
 
 #[async_test]
-async fn recovery_setup() {
+async fn test_recovery_setup() {
     let user_id = user_id!("@example:morpheus.localhost");
     let (client, server) = test_client(user_id).await;
 
@@ -453,7 +460,7 @@ async fn recovery_setup() {
 }
 
 #[async_test]
-async fn recovery_setup_without_wait() {
+async fn test_recovery_setup_without_wait() {
     let user_id = user_id!("@example:morpheus.localhost");
     let (client, server) = test_client(user_id).await;
 
@@ -466,7 +473,7 @@ async fn recovery_setup_without_wait() {
 }
 
 #[async_test]
-async fn backups_enabling() {
+async fn test_backups_enabling() {
     let user_id = user_id!("@example:morpheus.localhost");
     let (client, server) = test_client(user_id).await;
 
@@ -525,7 +532,7 @@ async fn backups_enabling() {
 }
 
 #[async_test]
-async fn backups_enabling_already_enabled() {
+async fn test_backups_enabling_already_enabled() {
     let user_id = user_id!("@example:morpheus.localhost");
     let (client, server) = test_client(user_id).await;
 
@@ -560,7 +567,7 @@ async fn backups_enabling_already_enabled() {
 }
 
 #[async_test]
-async fn recovery_disabling() {
+async fn test_recovery_disabling() {
     let user_id = user_id!("@example:morpheus.localhost");
     let (client, server) = test_client(user_id).await;
 
@@ -633,11 +640,22 @@ async fn recovery_disabling() {
         )))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(move |_: &wiremock::Request| {
-            let content = default_key_content.lock().unwrap().take().unwrap();
-            ResponseTemplate::new(200).set_body_json(content)
+            if let Some(content) = default_key_content.lock().unwrap().as_ref() {
+                ResponseTemplate::new(200).set_body_json(content)
+            } else {
+                ResponseTemplate::new(404)
+            }
         })
-        .expect(1)
+        .expect(3)
         .named("m.secret_storage.default_key account data GET")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(format!("_matrix/client/r0/user/{user_id}/account_data/m.megolm_backup.v1",)))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1..)
         .mount(&server)
         .await;
 
@@ -649,7 +667,7 @@ async fn recovery_disabling() {
 }
 
 #[async_test]
-async fn reset_recovery_key() {
+async fn test_reset_recovery_key() {
     let user_id = user_id!("@example:morpheus.localhost");
     let (client, server) = test_client(user_id).await;
 
@@ -695,14 +713,14 @@ async fn reset_recovery_key() {
 }
 
 #[async_test]
-async fn recover_and_reset() {
+async fn test_recover_and_reset() {
     let user_id = user_id!("@example:morpheus.localhost");
     const SECRET_STORE_KEY: &str = "mypassphrase";
     const KEY_ID: &str = "yJWwBm2Ts8jHygTBslKpABFyykavhhfA";
 
     let session = MatrixSession {
         meta: SessionMeta { user_id: user_id.into(), device_id: device_id!("DEVICEID").to_owned() },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        tokens: mock_session_tokens(),
     };
 
     let (client, server) = no_retry_test_client_with_server().await;
@@ -759,4 +777,189 @@ async fn recover_and_reset() {
         .expect("We should be able to recover our secrets and reset the secret storage key");
 
     server.verify().await
+}
+
+#[async_test]
+async fn test_reset_identity() {
+    let user_id = user_id!("@example:morpheus.localhost");
+    let (client, server) = test_client(user_id).await;
+
+    enable(user_id, &client, &server, true).await;
+
+    // At this point both backups and recovery should be enabled
+    assert_eq!(client.encryption().backups().state(), BackupState::Enabled);
+    assert_eq!(client.encryption().recovery().state(), RecoveryState::Enabled);
+
+    let did_delete_backup = Arc::new(Mutex::new(false));
+
+    // Disabling backups
+    Mock::given(method("GET"))
+        .and(path("_matrix/client/r0/room_keys/version"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with({
+            let did_delete_backup = did_delete_backup.clone();
+            move |_: &wiremock::Request| {
+                if *did_delete_backup.lock().unwrap() {
+                    ResponseTemplate::new(404).set_body_json(json!({
+                        "errcode": "M_NOT_FOUND",
+                        "error": "No current backup version"
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+                        "auth_data": {
+                            "public_key": "hdx5rSn94rBuvJI5cwnhKAVmFyZgfJjk7vwEBD6mIHc",
+                            "signatures": {}
+                        },
+                        "count": 1,
+                        "etag": "1",
+                        "version": "1"
+                    }))
+                }
+            }
+        })
+        .expect(3)
+        .named("room_keys/version GET")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("_matrix/client/r0/room_keys/version/1"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with({
+            let did_delete_backup = did_delete_backup.clone();
+            move |_: &wiremock::Request| {
+                *did_delete_backup.lock().unwrap() = true;
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            }
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Disabling recovery
+    Mock::given(method("PUT"))
+        .and(path(format!(
+            "_matrix/client/r0/user/{user_id}/account_data/m.secret_storage.default_key"
+        )))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("m.secret_storage.default_key PUT")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "_matrix/client/r0/user/{user_id}/account_data/m.secret_storage.default_key"
+        )))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .named("m.secret_storage.default_key account data GET")
+        .mount(&server)
+        .await;
+
+    // Resetting cross-signing keys
+    let reset_handle = {
+        let _guard = Mock::given(method("POST"))
+            .and(path("/_matrix/client/unstable/keys/device_signing/upload"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "flows": [
+                    {
+                        "stages": [
+                            "m.login.password"
+                        ]
+                    }
+                ],
+                "params": {},
+                "session": "oFIJVvtEOCKmRUTYKTYIIPHL"
+            })))
+            .expect(1)
+            .named("Initial cross-signing upload attempt")
+            .mount_as_scoped(&server)
+            .await;
+
+        client
+            .encryption()
+            .recovery()
+            .reset_identity()
+            .await
+            .unwrap()
+            .expect("We should have received a reset handle")
+    };
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/unstable/keys/device_signing/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .named("Retrying to upload the cross-signing keys")
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/unstable/keys/signatures/upload"))
+        .respond_with(move |_: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        })
+        .named("Final signatures upload")
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Re-enable backups
+    Mock::given(method("PUT"))
+        .and(path(format!(
+            "_matrix/client/r0/user/{user_id}/account_data/m.org.matrix.custom.backup_disabled"
+        )))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .named("m.org.matrix.custom.backup_disabled PUT")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "_matrix/client/r0/user/{user_id}/account_data/m.org.matrix.custom.backup_disabled"
+        )))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"type": "m.org.matrix.custom.backup_disabled",
+            "content": {
+              "disabled": false
+            }}),
+        ))
+        .expect(1)
+        .named("m.org.matrix.custom.backup_disabled GET")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("_matrix/client/unstable/room_keys/version"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1" })))
+        .expect(1)
+        .named("room_keys/version POST")
+        .mount(&server)
+        .await;
+
+    assert_let!(CrossSigningResetAuthType::Uiaa(uiaa_info) = reset_handle.auth_type());
+
+    let mut password = uiaa::Password::new(user_id.to_owned().into(), "1234".to_owned());
+    password.session = uiaa_info.session.clone();
+    reset_handle
+        .reset(Some(uiaa::AuthData::Password(password)))
+        .await
+        .expect("Failed retrieving identity reset handle");
+
+    assert!(
+        client.encryption().cross_signing_status().await.unwrap().is_complete(),
+        "After the reset we have the cross-signing available.",
+    );
+
+    // After reset backups should get renabled but recovery needs setting up again
+    assert_eq!(client.encryption().backups().state(), BackupState::Enabled);
+    assert_eq!(client.encryption().recovery().state(), RecoveryState::Disabled);
+
+    server.verify().await;
 }

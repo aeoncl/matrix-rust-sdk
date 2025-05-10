@@ -14,10 +14,12 @@
 
 use std::{
     fmt::{self, Debug},
+    num::NonZeroUsize,
     time::Duration,
 };
 
 use matrix_sdk_common::debug::DebugStructExt;
+use ruma::api::MatrixVersion;
 
 use crate::http_client::DEFAULT_REQUEST_TIMEOUT;
 
@@ -42,20 +44,31 @@ use crate::http_client::DEFAULT_REQUEST_TIMEOUT;
 #[derive(Copy, Clone)]
 pub struct RequestConfig {
     pub(crate) timeout: Duration,
-    pub(crate) retry_limit: Option<u64>,
-    pub(crate) retry_timeout: Option<Duration>,
+    pub(crate) retry_limit: Option<usize>,
+    pub(crate) max_retry_time: Option<Duration>,
+    pub(crate) max_concurrent_requests: Option<NonZeroUsize>,
     pub(crate) force_auth: bool,
+    pub(crate) force_matrix_version: Option<MatrixVersion>,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl Debug for RequestConfig {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { timeout, retry_limit, retry_timeout, force_auth } = self;
+        let Self {
+            timeout,
+            retry_limit,
+            max_retry_time: retry_timeout,
+            force_auth,
+            max_concurrent_requests,
+            force_matrix_version,
+        } = self;
 
         let mut res = fmt.debug_struct("RequestConfig");
         res.field("timeout", timeout)
             .maybe_field("retry_limit", retry_limit)
-            .maybe_field("retry_timeout", retry_timeout);
+            .maybe_field("max_retry_time", retry_timeout)
+            .maybe_field("max_concurrent_requests", max_concurrent_requests)
+            .maybe_field("force_matrix_version", force_matrix_version);
 
         if *force_auth {
             res.field("force_auth", &true);
@@ -70,8 +83,10 @@ impl Default for RequestConfig {
         Self {
             timeout: DEFAULT_REQUEST_TIMEOUT,
             retry_limit: Default::default(),
-            retry_timeout: Default::default(),
+            max_retry_time: Default::default(),
+            max_concurrent_requests: Default::default(),
             force_auth: false,
+            force_matrix_version: Default::default(),
         }
     }
 }
@@ -98,10 +113,20 @@ impl RequestConfig {
         self
     }
 
-    /// The number of times a request should be retried. The default is no limit
+    /// The number of times a request should be retried. The default is no
+    /// limit.
     #[must_use]
-    pub fn retry_limit(mut self, retry_limit: u64) -> Self {
+    pub fn retry_limit(mut self, retry_limit: usize) -> Self {
         self.retry_limit = Some(retry_limit);
+        self
+    }
+
+    /// The total limit of request that are pending or run concurrently.
+    /// Any additional request beyond that number will be waiting until another
+    /// concurrent requests finished. Requests are queued fairly.
+    #[must_use]
+    pub fn max_concurrent_requests(mut self, limit: Option<NonZeroUsize>) -> Self {
+        self.max_concurrent_requests = limit;
         self
     }
 
@@ -112,11 +137,14 @@ impl RequestConfig {
         self
     }
 
-    /// Set a timeout for how long a request should be retried. The default is
-    /// no timeout, meaning requests are retried forever.
+    /// Set a time limit for how long a request should be retried. The default
+    /// is that there isn't a limit, meaning requests are retried forever.
+    ///
+    /// This is a time-based variant of the [`RequestConfig::retry_limit`]
+    /// method.
     #[must_use]
-    pub fn retry_timeout(mut self, retry_timeout: Duration) -> Self {
-        self.retry_timeout = Some(retry_timeout);
+    pub fn max_retry_time(mut self, retry_timeout: Duration) -> Self {
+        self.max_retry_time = Some(retry_timeout);
         self
     }
 
@@ -125,6 +153,17 @@ impl RequestConfig {
     #[must_use]
     pub fn force_auth(mut self) -> Self {
         self.force_auth = true;
+        self
+    }
+
+    /// Force the Matrix version used to select which version of the endpoint to
+    /// use.
+    ///
+    /// Can be used to force the use of a stable endpoint when the versions
+    /// advertised by the homeserver do not support it.
+    #[must_use]
+    pub(crate) fn force_matrix_version(mut self, version: MatrixVersion) -> Self {
+        self.force_matrix_version = Some(version);
         self
     }
 }
@@ -139,13 +178,13 @@ mod tests {
     fn smoketest() {
         let cfg = RequestConfig::new()
             .force_auth()
-            .retry_timeout(Duration::from_secs(32))
+            .max_retry_time(Duration::from_secs(32))
             .retry_limit(4)
             .timeout(Duration::from_secs(600));
 
         assert!(cfg.force_auth);
         assert_eq!(cfg.retry_limit, Some(4));
-        assert_eq!(cfg.retry_timeout, Some(Duration::from_secs(32)));
+        assert_eq!(cfg.max_retry_time, Some(Duration::from_secs(32)));
         assert_eq!(cfg.timeout, Duration::from_secs(600));
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "matrix-sdk-store-encryption"
-version = "0.7.0"
+version = "0.11.0"
 edition = "2021"
 description = "Helpers for encrypted storage keys for the Matrix SDK"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
@@ -8,21 +8,20 @@ license = "Apache-2.0"
 rust-version = { workspace = true }
 
 [package.metadata.docs.rs]
-rustdoc-args = ["--cfg", "docsrs"]
+rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
 
 [features]
 js = ["dep:getrandom", "getrandom?/js"]
 
 [dependencies]
 base64 = { workspace = true }
-blake3 = "1.5.0"
+blake3 = "1.8.1"
 chacha20poly1305 = { version = "0.10.1", features = ["std"] }
-displaydoc = "0.2.4"
-getrandom = { version = "0.2.10", optional = true }
-hmac = "0.12.1"
-pbkdf2 = "0.12.2"
+getrandom = { workspace = true, optional = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
 rand = { workspace = true }
-rmp-serde = "1.1.2"
+rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -31,3 +30,9 @@ zeroize = { workspace = true, features = ["zeroize_derive"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["getrandom"] # We do manually enable a feature for it.

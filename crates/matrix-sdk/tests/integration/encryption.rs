@@ -1,7 +1,12 @@
 mod backups;
+mod cross_signing;
 mod recovery;
 mod secret_storage;
 mod verification;
+
+/// The backup key, which is also returned (encrypted) as part of the secret
+/// storage data by [`mock_secret_store_with_backup_key`].
+const BACKUP_DECRYPTION_KEY_BASE64: &str = "IeJv45zHC4AamrFtCi3MedkLMBZYXjPbKUnv53Iqzho";
 
 async fn mock_secret_store_with_backup_key(
     user_id: &ruma::UserId,

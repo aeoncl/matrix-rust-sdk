@@ -43,7 +43,6 @@
 
 use std::sync::Arc;
 
-use hkdf::Hkdf;
 use ruma::{
     api::client::dehydrated_device::{put_dehydrated_device, DehydratedDeviceData},
     assign,
@@ -51,13 +50,12 @@ use ruma::{
     serde::Raw,
     DeviceId,
 };
-use sha2::Sha256;
 use thiserror::Error;
 use tracing::{instrument, trace};
-use vodozemac::LibolmPickleError;
+use vodozemac::{DehydratedDeviceError, LibolmPickleError};
 
 use crate::{
-    store::{CryptoStoreWrapper, MemoryStore, RoomKeyInfo, Store},
+    store::{Changes, CryptoStoreWrapper, DehydratedDeviceKey, MemoryStore, RoomKeyInfo, Store},
     verification::VerificationMachine,
     Account, CryptoStoreError, EncryptionSyncChanges, OlmError, OlmMachine, SignatureError,
 };
@@ -65,9 +63,17 @@ use crate::{
 /// Error type for device dehydration issues.
 #[derive(Debug, Error)]
 pub enum DehydrationError {
+    /// The legacy dehydrated device could not be unpickled.
+    #[error(transparent)]
+    LegacyPickle(#[from] LibolmPickleError),
+
     /// The dehydrated device could not be unpickled.
     #[error(transparent)]
-    Pickle(#[from] LibolmPickleError),
+    Pickle(#[from] DehydratedDeviceError),
+
+    /// The pickle key has an invalid length
+    #[error("The pickle key has an invalid length, expected 32 bytes, got {0}")]
+    PickleKeyLength(usize),
 
     /// The dehydrated device could not be signed by our user identity,
     /// we're missing the self-signing key.
@@ -95,8 +101,9 @@ impl DehydratedDevices {
         let user_id = self.inner.user_id();
         let user_identity = self.inner.store().private_identity();
 
-        let account = Account::new(user_id);
-        let store = Arc::new(CryptoStoreWrapper::new(user_id, MemoryStore::new()));
+        let account = Account::new_dehydrated(user_id);
+        let store =
+            Arc::new(CryptoStoreWrapper::new(user_id, account.device_id(), MemoryStore::new()));
 
         let verification_machine = VerificationMachine::new(
             account.static_data().clone(),
@@ -131,14 +138,48 @@ impl DehydratedDevices {
     ///   private keys of the device.
     pub async fn rehydrate(
         &self,
-        pickle_key: &[u8; 32],
+        pickle_key: &DehydratedDeviceKey,
         device_id: &DeviceId,
         device_data: Raw<DehydratedDeviceData>,
     ) -> Result<RehydratedDevice, DehydrationError> {
-        let pickle_key = expand_pickle_key(pickle_key, device_id);
-        let rehydrated = self.inner.rehydrate(&pickle_key, device_id, device_data).await?;
+        let rehydrated =
+            self.inner.rehydrate(pickle_key.inner.as_ref(), device_id, device_data).await?;
 
         Ok(RehydratedDevice { rehydrated, original: self.inner.to_owned() })
+    }
+
+    /// Get the cached dehydrated device pickle key if any.
+    ///
+    /// None if the key was not previously cached (via
+    /// [`DehydratedDevices::save_dehydrated_device_pickle_key`]).
+    ///
+    /// Should be used to periodically rotate the dehydrated device to avoid
+    /// one-time keys exhaustion and accumulation of to_device messages.
+    pub async fn get_dehydrated_device_pickle_key(
+        &self,
+    ) -> Result<Option<DehydratedDeviceKey>, DehydrationError> {
+        Ok(self.inner.store().load_dehydrated_device_pickle_key().await?)
+    }
+
+    /// Store the dehydrated device pickle key in the crypto store.
+    ///
+    /// This is useful if the client wants to periodically rotate dehydrated
+    /// devices to avoid one-time keys exhaustion and accumulated to_device
+    /// problems.
+    pub async fn save_dehydrated_device_pickle_key(
+        &self,
+        dehydrated_device_pickle_key: &DehydratedDeviceKey,
+    ) -> Result<(), DehydrationError> {
+        let changes = Changes {
+            dehydrated_device_pickle_key: Some(dehydrated_device_pickle_key.clone()),
+            ..Default::default()
+        };
+        Ok(self.inner.store().save_changes(changes).await?)
+    }
+
+    /// Deletes the previously stored dehydrated device pickle key.
+    pub async fn delete_dehydrated_device_pickle_key(&self) -> Result<(), DehydrationError> {
+        Ok(self.inner.store().delete_dehydrated_device_pickle_key().await?)
     }
 }
 
@@ -169,7 +210,7 @@ impl RehydratedDevice {
     ///
     /// ```no_run
     /// # use anyhow::Result;
-    /// # use matrix_sdk_crypto::OlmMachine;
+    /// # use matrix_sdk_crypto::{ OlmMachine, store::DehydratedDeviceKey };
     /// # use ruma::{api::client::dehydrated_device, DeviceId};
     /// # async fn example() -> Result<()> {
     /// # let machine: OlmMachine = unimplemented!();
@@ -183,9 +224,9 @@ impl RehydratedDevice {
     /// ) -> Result<dehydrated_device::get_events::unstable::Response> {
     ///     todo!("Download the to-device events of the dehydrated device");
     /// }
-    ///
-    /// // Don't use a zero key for real.
-    /// let pickle_key = [0u8; 32];
+    /// // Get the cached dehydrated key (got it after verification/recovery)
+    /// let pickle_key = machine
+    ///     .dehydrated_devices().get_dehydrated_device_pickle_key().await?.unwrap();
     ///
     /// // Fetch the dehydrated device from the server.
     /// let response = get_dehydrated_device().await?;
@@ -284,11 +325,13 @@ impl DehydratedDevice {
     /// # Examples
     ///
     /// ```no_run
-    /// # use matrix_sdk_crypto::OlmMachine;
-    /// # async fn example() -> anyhow::Result<()> {
+    /// # use matrix_sdk_crypto::OlmMachine;    /// #
+    /// use matrix_sdk_crypto::store::DehydratedDeviceKey;
+    ///
+    /// async fn example() -> anyhow::Result<()> {
     /// # let machine: OlmMachine = unimplemented!();
-    /// // Don't use a zero key for real.
-    /// let pickle_key = [0u8; 32];
+    /// // Create a new random key
+    /// let pickle_key = DehydratedDeviceKey::new()?;
     ///
     /// // Create the dehydrated device.
     /// let device = machine.dehydrated_devices().create().await?;
@@ -297,6 +340,9 @@ impl DehydratedDevice {
     /// let request = device
     ///     .keys_for_upload("Dehydrated device".to_owned(), &pickle_key)
     ///     .await?;
+    ///
+    /// // Save the key if you want to later one rotate the dehydrated device
+    /// machine.dehydrated_devices().save_dehydrated_device_pickle_key(&pickle_key).await.unwrap();
     ///
     /// // Send the request out using your HTTP client.
     /// // client.send(request).await?;
@@ -313,12 +359,12 @@ impl DehydratedDevice {
     pub async fn keys_for_upload(
         &self,
         initial_device_display_name: String,
-        pickle_key: &[u8; 32],
+        pickle_key: &DehydratedDeviceKey,
     ) -> Result<put_dehydrated_device::unstable::Request, DehydrationError> {
         let mut transaction = self.store.transaction().await;
 
         let account = transaction.account().await?;
-        account.generate_fallback_key_helper();
+        account.generate_fallback_key_if_needed();
 
         let (device_keys, one_time_keys, fallback_keys) = account.keys_for_upload();
 
@@ -329,9 +375,8 @@ impl DehydratedDevice {
 
         trace!("Creating an upload request for a dehydrated device");
 
-        let pickle_key = expand_pickle_key(pickle_key, &self.store.static_account().device_id);
         let device_id = self.store.static_account().device_id.clone();
-        let device_data = account.dehydrate(&pickle_key);
+        let device_data = account.dehydrate(pickle_key.inner.as_ref());
         let initial_device_display_name = Some(initial_device_display_name);
 
         transaction.commit().await?;
@@ -344,58 +389,41 @@ impl DehydratedDevice {
     }
 }
 
-/// We're using the libolm-compatible pickle format and its encryption scheme.
-///
-/// The libolm pickle encryption scheme uses HKDF to deterministically expand an
-/// input key material, usually 32 bytes, into a AES key, MAC key, and the
-/// initialization vector (IV).
-///
-/// This means that the same input key material will always end up producing the
-/// same AES key, and IV.
-///
-/// This encryption scheme is used in the Olm double ratchet and was designed to
-/// minimize the size of the ciphertext. As a tradeof, it requires a unique
-/// input key material for each plaintext that gets encrypted, otherwise IV
-/// reuse happens.
-///
-/// To combat the IV reuse, we're going to create a per-dehydrated-device unique
-/// pickle key by expanding the key itself with the device ID used as the salt.
-fn expand_pickle_key(key: &[u8; 32], device_id: &DeviceId) -> Box<[u8; 32]> {
-    // TODO: Perhaps we should put this into vodozemac with a new pickle
-    // minimalistic pickle format using the [`matrix_pickle`] crate.
-    //
-    // [`matrix_pickle`]: https://docs.rs/matrix-pickle/latest/matrix_pickle/
-    let kdf: Hkdf<Sha256> = Hkdf::new(Some(device_id.as_bytes()), key);
-    let mut key = Box::new([0u8; 32]);
-
-    kdf.expand(b"dehydrated-device-pickle-key", key.as_mut_slice())
-        .expect("We should be able to expand the 32 byte pickle key");
-
-    key
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, iter};
 
+    use js_option::JsOption;
     use matrix_sdk_test::async_test;
     use ruma::{
-        api::client::keys::get_keys::v3::Response as KeysQueryResponse, assign,
-        encryption::DeviceKeys, events::AnyToDeviceEvent, room_id, serde::Raw, user_id, DeviceId,
-        RoomId, TransactionId, UserId,
+        api::client::{
+            dehydrated_device::put_dehydrated_device,
+            keys::get_keys::v3::Response as KeysQueryResponse,
+        },
+        assign,
+        encryption::DeviceKeys,
+        events::AnyToDeviceEvent,
+        room_id,
+        serde::Raw,
+        user_id, DeviceId, RoomId, TransactionId, UserId,
     };
 
     use crate::{
-        machine::tests::{
-            create_session, get_prepared_machine_test_helper, to_device_requests_to_content,
+        dehydrated_devices::DehydratedDevice,
+        machine::{
+            test_helpers::{create_session, get_prepared_machine_test_helper},
+            tests::to_device_requests_to_content,
         },
         olm::OutboundGroupSession,
-        types::events::ToDeviceEvent,
+        store::DehydratedDeviceKey,
+        types::{events::ToDeviceEvent, DeviceKeys as DeviceKeysType},
         utilities::json_convert,
         EncryptionSettings, OlmMachine,
     };
 
-    const PICKLE_KEY: &[u8; 32] = &[0u8; 32];
+    fn pickle_key() -> DehydratedDeviceKey {
+        DehydratedDeviceKey::from_bytes(&[0u8; 32])
+    }
 
     fn user_id() -> &'static UserId {
         user_id!("@alice:localhost")
@@ -464,7 +492,7 @@ mod tests {
         let dehydrated_device = olm_machine.dehydrated_devices().create().await.unwrap();
 
         let request = dehydrated_device
-            .keys_for_upload("Foo".to_owned(), PICKLE_KEY)
+            .keys_for_upload("Foo".to_owned(), &pickle_key())
             .await
             .expect("We should be able to create a request to upload a dehydrated device");
 
@@ -477,6 +505,13 @@ mod tests {
             !request.fallback_keys.is_empty(),
             "The dehydrated device creation request should contain some fallback keys"
         );
+
+        let device_keys: DeviceKeysType = request.device_keys.deserialize_as().unwrap();
+        assert_eq!(
+            device_keys.dehydrated,
+            JsOption::Some(true),
+            "The device keys of the dehydrated device should be marked as dehydrated."
+        );
     }
 
     #[async_test]
@@ -487,7 +522,7 @@ mod tests {
         let dehydrated_device = alice.dehydrated_devices().create().await.unwrap();
 
         let mut request = dehydrated_device
-            .keys_for_upload("Foo".to_owned(), PICKLE_KEY)
+            .keys_for_upload("Foo".to_owned(), &pickle_key())
             .await
             .expect("We should be able to create a request to upload a dehydrated device");
 
@@ -521,7 +556,7 @@ mod tests {
         // Rehydrate the device.
         let rehydrated = bob
             .dehydrated_devices()
-            .rehydrate(PICKLE_KEY, &request.device_id, request.device_data)
+            .rehydrate(&pickle_key(), &request.device_id, request.device_data)
             .await
             .expect("We should be able to rehydrate the device");
 
@@ -550,5 +585,148 @@ mod tests {
             group_session.session_id(),
             "The session ids of the imported room key and the outbound group session should match"
         );
+    }
+
+    #[async_test]
+    async fn test_dehydrated_device_pickle_key_cache() {
+        let alice = get_olm_machine().await;
+
+        let dehydrated_manager = alice.dehydrated_devices();
+
+        let stored_key = dehydrated_manager.get_dehydrated_device_pickle_key().await.unwrap();
+        assert!(stored_key.is_none());
+
+        let pickle_key = DehydratedDeviceKey::new().unwrap();
+
+        dehydrated_manager.save_dehydrated_device_pickle_key(&pickle_key).await.unwrap();
+
+        let stored_key =
+            dehydrated_manager.get_dehydrated_device_pickle_key().await.unwrap().unwrap();
+        assert_eq!(stored_key.to_base64(), pickle_key.to_base64());
+
+        let dehydrated_device = dehydrated_manager.create().await.unwrap();
+
+        let request = dehydrated_device
+            .keys_for_upload("Foo".to_owned(), &stored_key)
+            .await
+            .expect("We should be able to create a request to upload a dehydrated device");
+
+        // Rehydrate the device.
+        dehydrated_manager
+            .rehydrate(&stored_key, &request.device_id, request.device_data)
+            .await
+            .expect("We should be able to rehydrate the device");
+
+        dehydrated_manager
+            .delete_dehydrated_device_pickle_key()
+            .await
+            .expect("Should be able to delete the dehydrated device key");
+
+        let stored_key = dehydrated_manager.get_dehydrated_device_pickle_key().await.unwrap();
+        assert!(stored_key.is_none());
+    }
+
+    /// Test that we can rehydrate an older version of dehydrated device
+    #[async_test]
+    async fn test_legacy_dehydrated_device_rehydration() {
+        let room_id = room_id!("!test:example.org");
+        let alice = get_olm_machine().await;
+
+        let dehydrated_device = alice.dehydrated_devices().create().await.unwrap();
+        let mut request =
+            legacy_dehydrated_device_keys_for_upload(&dehydrated_device, &pickle_key()).await;
+
+        let (key_id, one_time_key) = request
+            .one_time_keys
+            .pop_first()
+            .expect("The dehydrated device creation request should contain a one-time key");
+
+        let device_id = request.device_id;
+
+        // Ensure that we know about the public keys of the dehydrated device.
+        receive_device_keys(&alice, user_id(), &device_id, request.device_keys).await;
+        // Create a 1-to-1 Olm session with the dehydrated device.
+        create_session(&alice, user_id(), &device_id, key_id, one_time_key).await;
+
+        // Send a room key to the dehydrated device.
+        let (event, group_session) = send_room_key(&alice, room_id, user_id()).await;
+
+        // Let's now create a new `OlmMachine` which doesn't know about the room key.
+        let bob = get_olm_machine().await;
+
+        let room_key = bob
+            .store()
+            .get_inbound_group_session(room_id, group_session.session_id())
+            .await
+            .unwrap();
+
+        assert!(
+            room_key.is_none(),
+            "We should not have access to the room key that was only sent to the dehydrated device"
+        );
+
+        // Rehydrate the device.
+        let rehydrated = bob
+            .dehydrated_devices()
+            .rehydrate(&pickle_key(), &device_id, request.device_data)
+            .await
+            .expect("We should be able to rehydrate the device");
+
+        assert_eq!(rehydrated.rehydrated.device_id(), &device_id);
+        assert_eq!(rehydrated.original.device_id(), alice.device_id());
+
+        // Push the to-device event containing the room key into the rehydrated device.
+        let ret = rehydrated
+            .receive_events(vec![event])
+            .await
+            .expect("We should be able to push to-device events into the rehydrated device");
+
+        assert_eq!(ret.len(), 1, "The rehydrated device should have imported a room key");
+
+        // The `OlmMachine` now does know about the room key since the rehydrated device
+        // shared it with us.
+        let room_key = bob
+            .store()
+            .get_inbound_group_session(room_id, group_session.session_id())
+            .await
+            .unwrap()
+            .expect("We should now have access to the room key, since the rehydrated device imported it for us");
+
+        assert_eq!(
+            room_key.session_id(),
+            group_session.session_id(),
+            "The session ids of the imported room key and the outbound group session should match"
+        );
+    }
+
+    /// Duplicates the behaviour of [`DehydratedDevice::keys_for_upload`],
+    /// except that it calls [`Account::legacy_dehydrate`] instead of
+    /// [`Account::dehydrate`].
+    async fn legacy_dehydrated_device_keys_for_upload(
+        dehydrated_device: &DehydratedDevice,
+        pickle_key: &DehydratedDeviceKey,
+    ) -> put_dehydrated_device::unstable::Request {
+        let mut transaction = dehydrated_device.store.transaction().await;
+        let account = transaction.account().await.unwrap();
+        account.generate_fallback_key_if_needed();
+
+        let (device_keys, one_time_keys, fallback_keys) = account.keys_for_upload();
+        let mut device_keys = device_keys.unwrap();
+        dehydrated_device
+            .store
+            .private_identity()
+            .lock()
+            .await
+            .sign_device_keys(&mut device_keys)
+            .await
+            .expect("Should be able to cross-sign a device");
+
+        let device_id = account.device_id().to_owned();
+        let device_data = account.legacy_dehydrate(pickle_key.inner.as_ref());
+        transaction.commit().await.unwrap();
+
+        assign!(put_dehydrated_device::unstable::Request::new(device_id, device_data, device_keys.to_raw()), {
+            one_time_keys, fallback_keys
+        })
     }
 }

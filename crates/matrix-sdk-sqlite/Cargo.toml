@@ -1,30 +1,36 @@
 [package]
 name = "matrix-sdk-sqlite"
-version = "0.7.0"
+version = "0.11.0"
 edition = "2021"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 description = "Sqlite storage backend for matrix-sdk"
 license = "Apache-2.0"
 rust-version = { workspace = true }
 
+[package.metadata.docs.rs]
+rustdoc-args = ["--generate-link-to-definition"]
+
 [features]
-default = ["state-store"]
+default = ["state-store", "event-cache"]
 testing = ["matrix-sdk-crypto?/testing"]
 
 bundled = ["rusqlite/bundled"]
 crypto-store = ["dep:matrix-sdk-crypto"]
+event-cache = ["dep:matrix-sdk-base"]
 state-store = ["dep:matrix-sdk-base"]
 
 [dependencies]
+as_variant = { workspace = true }
 async-trait = { workspace = true }
-deadpool-sqlite = "0.7.0"
+deadpool-sqlite = "0.10.0"
 itertools = { workspace = true }
 matrix-sdk-base = { workspace = true, optional = true }
 matrix-sdk-crypto = { workspace = true, optional = true }
 matrix-sdk-store-encryption = { workspace = true }
-rmp-serde = "1.1.1"
+num_cpus = "1.16.0"
+rmp-serde = { workspace = true }
 ruma = { workspace = true }
-rusqlite = { version = "0.30.0", features = ["limits"] }
+rusqlite = { version = "0.33.0", features = ["limits"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -34,10 +40,15 @@ vodozemac = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
-glob = "0.3.0"
+glob = "0.3.2"
 matrix-sdk-base = { workspace = true, features = ["testing"] }
+matrix-sdk-common = { workspace = true }
 matrix-sdk-crypto = { workspace = true, features = ["testing"] }
 matrix-sdk-test = { workspace = true }
 once_cell = { workspace = true }
-tempfile = "3.3.0"
+similar-asserts = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

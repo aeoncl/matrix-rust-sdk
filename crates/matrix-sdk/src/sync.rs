@@ -22,14 +22,18 @@ use std::{
 
 pub use matrix_sdk_base::sync::*;
 use matrix_sdk_base::{
-    debug::{DebugInvitedRoom, DebugListOfRawEventsNoId},
-    instant::Instant,
+    debug::{DebugInvitedRoom, DebugKnockedRoom, DebugListOfRawEventsNoId},
+    sleep::sleep,
     sync::SyncResponse as BaseSyncResponse,
 };
 use ruma::{
-    api::client::sync::sync_events::{self, v3::InvitedRoom},
+    api::client::sync::sync_events::{
+        self,
+        v3::{InvitedRoom, KnockedRoom},
+    },
     events::{presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyToDeviceEvent},
     serde::Raw,
+    time::Instant,
     OwnedRoomId, RoomId,
 };
 use tracing::{debug, error, warn};
@@ -100,6 +104,13 @@ pub enum RoomUpdate {
         /// Updates to the room.
         updates: InvitedRoom,
     },
+    /// Updates to a room the user knocked on.
+    Knocked {
+        /// Room object with general information on the room.
+        room: Room,
+        /// Updates to the room.
+        updates: KnockedRoom,
+    },
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -116,6 +127,11 @@ impl fmt::Debug for RoomUpdate {
                 .debug_struct("Invited")
                 .field("room", room)
                 .field("updates", &DebugInvitedRoom(updates))
+                .finish(),
+            Self::Knocked { room, updates } => f
+                .debug_struct("Knocked")
+                .field("room", room)
+                .field("updates", &DebugKnockedRoom(updates))
                 .finish(),
         }
     }
@@ -162,7 +178,7 @@ impl Client {
         // Ignore errors when there are no receivers.
         let _ = self.inner.room_updates_sender.send(rooms.clone());
 
-        for (room_id, room_info) in &rooms.join {
+        for (room_id, room_info) in &rooms.joined {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -191,7 +207,7 @@ impl Client {
             self.handle_sync_events(HandlerKind::EphemeralRoomData, room, ephemeral).await?;
         }
 
-        for (room_id, room_info) in &rooms.leave {
+        for (room_id, room_info) in &rooms.left {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -210,7 +226,7 @@ impl Client {
             self.handle_sync_timeline_events(room, &timeline.events).await?;
         }
 
-        for (room_id, room_info) in &rooms.invite {
+        for (room_id, room_info) in &rooms.invited {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -223,6 +239,21 @@ impl Client {
 
             let invite_state = &room_info.invite_state.events;
             self.handle_sync_events(HandlerKind::StrippedState, Some(&room), invite_state).await?;
+        }
+
+        for (room_id, room_info) in &rooms.knocked {
+            let Some(room) = self.get_room(room_id) else {
+                error!(?room_id, "Can't call event handler, room not found");
+                continue;
+            };
+
+            self.send_room_update(room_id, || RoomUpdate::Knocked {
+                room: room.clone(),
+                updates: room_info.clone(),
+            });
+
+            let knock_state = &room_info.knock_state.events;
+            self.handle_sync_events(HandlerKind::StrippedState, Some(&room), knock_state).await?;
         }
 
         debug!("Ran event handlers in {:?}", now.elapsed());
@@ -269,11 +300,7 @@ impl Client {
     }
 
     async fn sleep() {
-        #[cfg(target_arch = "wasm32")]
-        gloo_timers::future::TimeoutFuture::new(1_000).await;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1)).await;
     }
 
     pub(crate) async fn sync_loop_helper(

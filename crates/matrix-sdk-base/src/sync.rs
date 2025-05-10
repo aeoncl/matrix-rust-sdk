@@ -16,12 +16,12 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::SyncTimelineEvent};
+use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::TimelineEvent};
+pub use ruma::api::client::sync::sync_events::v3::{
+    InvitedRoom as InvitedRoomUpdate, KnockedRoom as KnockedRoomUpdate,
+};
 use ruma::{
-    api::client::sync::sync_events::{
-        v3::InvitedRoom as InvitedRoomUpdate,
-        UnreadNotificationsCount as RumaUnreadNotificationsCount,
-    },
+    api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
     events::{
         presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent,
         AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnyToDeviceEvent,
@@ -33,7 +33,7 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    debug::{DebugInvitedRoom, DebugListOfRawEvents, DebugListOfRawEventsNoId},
+    debug::{DebugInvitedRoom, DebugKnockedRoom, DebugListOfRawEvents, DebugListOfRawEventsNoId},
     deserialized_responses::{AmbiguityChange, RawAnySyncOrStrippedTimelineEvent},
 };
 
@@ -71,20 +71,23 @@ impl fmt::Debug for SyncResponse {
 #[derive(Clone, Default)]
 pub struct RoomUpdates {
     /// The rooms that the user has left or been banned from.
-    pub leave: BTreeMap<OwnedRoomId, LeftRoomUpdate>,
+    pub left: BTreeMap<OwnedRoomId, LeftRoomUpdate>,
     /// The rooms that the user has joined.
-    pub join: BTreeMap<OwnedRoomId, JoinedRoomUpdate>,
+    pub joined: BTreeMap<OwnedRoomId, JoinedRoomUpdate>,
     /// The rooms that the user has been invited to.
-    pub invite: BTreeMap<OwnedRoomId, InvitedRoomUpdate>,
+    pub invited: BTreeMap<OwnedRoomId, InvitedRoomUpdate>,
+    /// The rooms that the user has knocked on.
+    pub knocked: BTreeMap<OwnedRoomId, KnockedRoomUpdate>,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for RoomUpdates {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rooms")
-            .field("leave", &self.leave)
-            .field("join", &self.join)
-            .field("invite", &DebugInvitedRoomUpdates(&self.invite))
+        f.debug_struct("RoomUpdates")
+            .field("leave", &self.left)
+            .field("join", &self.joined)
+            .field("invite", &DebugInvitedRoomUpdates(&self.invited))
+            .field("knocked", &DebugKnockedRoomUpdates(&self.knocked))
             .finish()
     }
 }
@@ -116,7 +119,7 @@ pub struct JoinedRoomUpdate {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for JoinedRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinedRoom")
+        f.debug_struct("JoinedRoomUpdate")
             .field("unread_notifications", &self.unread_notifications)
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
@@ -193,7 +196,7 @@ impl LeftRoomUpdate {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for LeftRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinedRoom")
+        f.debug_struct("LeftRoomUpdate")
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
@@ -214,7 +217,7 @@ pub struct Timeline {
     pub prev_batch: Option<String>,
 
     /// A list of events.
-    pub events: Vec<SyncTimelineEvent>,
+    pub events: Vec<TimelineEvent>,
 }
 
 impl Timeline {
@@ -226,9 +229,18 @@ impl Timeline {
 struct DebugInvitedRoomUpdates<'a>(&'a BTreeMap<OwnedRoomId, InvitedRoomUpdate>);
 
 #[cfg(not(tarpaulin_include))]
-impl<'a> fmt::Debug for DebugInvitedRoomUpdates<'a> {
+impl fmt::Debug for DebugInvitedRoomUpdates<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.0.iter().map(|(k, v)| (k, DebugInvitedRoom(v)))).finish()
+    }
+}
+
+struct DebugKnockedRoomUpdates<'a>(&'a BTreeMap<OwnedRoomId, KnockedRoomUpdate>);
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for DebugKnockedRoomUpdates<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.0.iter().map(|(k, v)| (k, DebugKnockedRoom(v)))).finish()
     }
 }
 

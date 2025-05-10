@@ -17,12 +17,15 @@ use serde::{Deserialize, Serialize};
 
 mod inbound;
 mod outbound;
+mod sender_data;
+pub(crate) mod sender_data_finder;
 
 pub use inbound::{InboundGroupSession, PickledInboundGroupSession};
 pub(crate) use outbound::ShareState;
 pub use outbound::{
     EncryptionSettings, OutboundGroupSession, PickledOutboundGroupSession, ShareInfo,
 };
+pub use sender_data::{KnownSenderData, SenderData, SenderDataType};
 use thiserror::Error;
 pub use vodozemac::megolm::{ExportedSessionKey, SessionKey};
 use vodozemac::{megolm::SessionKeyDecodeError, Curve25519PublicKey};
@@ -61,9 +64,11 @@ pub enum SessionExportError {
     MissingEd25519Key,
 }
 
-/// An exported version of an `InboundGroupSession`
+/// An exported version of an [`InboundGroupSession`].
 ///
 /// This can be used to share the `InboundGroupSession` in an exported file.
+///
+/// See <https://spec.matrix.org/v1.13/client-server-api/#key-export-format>.
 #[derive(Deserialize, Serialize)]
 #[allow(missing_debug_implementations)]
 pub struct ExportedRoomKey {
@@ -95,29 +100,55 @@ pub struct ExportedRoomKey {
         serialize_with = "serialize_curve_key_vec"
     )]
     pub forwarding_curve25519_key_chain: Vec<Curve25519PublicKey>,
+
+    /// Whether this [`ExportedRoomKey`] can be shared with users who are
+    /// invited to the room in the future, allowing access to history, as
+    /// defined in [MSC3061].
+    ///
+    /// [MSC3061]: https://github.com/matrix-org/matrix-spec-proposals/pull/3061
+    #[serde(default, rename = "org.matrix.msc3061.shared_history")]
+    pub shared_history: bool,
 }
 
 impl ExportedRoomKey {
-    pub(crate) fn from_backed_up_room_key(
+    /// Create an `ExportedRoomKey` from a `BackedUpRoomKey`.
+    ///
+    /// This can be used when importing the keys from a backup into the store.
+    pub fn from_backed_up_room_key(
         room_id: OwnedRoomId,
         session_id: String,
         room_key: BackedUpRoomKey,
     ) -> Self {
+        let BackedUpRoomKey {
+            algorithm,
+            sender_key,
+            session_key,
+            sender_claimed_keys,
+            forwarding_curve25519_key_chain,
+            shared_history,
+        } = room_key;
+
         Self {
-            algorithm: room_key.algorithm,
+            algorithm,
             room_id,
-            sender_key: room_key.sender_key,
+            sender_key,
             session_id,
-            session_key: room_key.session_key,
-            sender_claimed_keys: room_key.sender_claimed_keys,
-            forwarding_curve25519_key_chain: room_key.forwarding_curve25519_key_chain,
+            session_key,
+            sender_claimed_keys,
+            forwarding_curve25519_key_chain,
+            shared_history,
         }
     }
 }
 
-/// A backed up version of an `InboundGroupSession`
+/// A backed up version of an [`InboundGroupSession`].
 ///
-/// This can be used to backup the `InboundGroupSession` to the server.
+/// This can be used to back up the [`InboundGroupSession`] to the server using
+/// [server-side key backups].
+///
+/// See <https://spec.matrix.org/v1.13/client-server-api/#definition-backedupsessiondata>.
+///
+/// [server-side key backups]: https://spec.matrix.org/v1.13/client-server-api/#server-side-key-backups
 #[derive(Deserialize, Serialize)]
 #[allow(missing_debug_implementations)]
 pub struct BackedUpRoomKey {
@@ -135,8 +166,21 @@ pub struct BackedUpRoomKey {
     pub sender_claimed_keys: SigningKeys<DeviceKeyAlgorithm>,
 
     /// Chain of Curve25519 keys through which this session was forwarded, via
-    /// m.forwarded_room_key events.
+    /// `m.forwarded_room_key` events.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_curve_key_vec",
+        serialize_with = "serialize_curve_key_vec"
+    )]
     pub forwarding_curve25519_key_chain: Vec<Curve25519PublicKey>,
+
+    /// Whether this [`BackedUpRoomKey`] can be shared with users who are
+    /// invited to the room in the future, allowing access to history, as
+    /// defined in [MSC3061].
+    ///
+    /// [MSC3061]: https://github.com/matrix-org/matrix-spec-proposals/pull/3061
+    #[serde(default, rename = "org.matrix.msc3061.shared_history")]
+    pub shared_history: bool,
 }
 
 impl TryFrom<ExportedRoomKey> for ForwardedRoomKeyContent {
@@ -197,13 +241,25 @@ impl TryFrom<ExportedRoomKey> for ForwardedRoomKeyContent {
 }
 
 impl From<ExportedRoomKey> for BackedUpRoomKey {
-    fn from(k: ExportedRoomKey) -> Self {
+    fn from(value: ExportedRoomKey) -> Self {
+        let ExportedRoomKey {
+            algorithm,
+            room_id: _,
+            sender_key,
+            session_id: _,
+            session_key,
+            sender_claimed_keys,
+            forwarding_curve25519_key_chain,
+            shared_history,
+        } = value;
+
         Self {
-            algorithm: k.algorithm,
-            sender_key: k.sender_key,
-            session_key: k.session_key,
-            sender_claimed_keys: k.sender_claimed_keys,
-            forwarding_curve25519_key_chain: k.forwarding_curve25519_key_chain,
+            algorithm,
+            sender_key,
+            session_key,
+            sender_claimed_keys,
+            forwarding_curve25519_key_chain,
+            shared_history,
         }
     }
 }
@@ -229,6 +285,7 @@ impl TryFrom<ForwardedRoomKeyContent> for ExportedRoomKey {
                     sender_claimed_keys,
                     sender_key: content.claimed_sender_key,
                     session_key: content.session_key,
+                    shared_history: false,
                 })
             }
             #[cfg(feature = "experimental-algorithms")]
@@ -240,8 +297,39 @@ impl TryFrom<ForwardedRoomKeyContent> for ExportedRoomKey {
                 sender_claimed_keys: content.claimed_signing_keys,
                 sender_key: content.claimed_sender_key,
                 session_key: content.session_key,
+                shared_history: false,
             }),
             ForwardedRoomKeyContent::Unknown(c) => Err(SessionExportError::Algorithm(c.algorithm)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::BackedUpRoomKey;
+
+    #[test]
+    fn test_deserialize_backed_up_key() {
+        let data = json!({
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "room_id": "!room:id",
+                "sender_key": "FOvlmz18LLI3k/llCpqRoKT90+gFF8YhuL+v1YBXHlw",
+                "session_id": "/2K+V777vipCxPZ0gpY9qcpz1DYaXwuMRIu0UEP0Wa0",
+                "session_key": "AQAAAAAclzWVMeWBKH+B/WMowa3rb4ma3jEl6n5W4GCs9ue65CruzD3ihX+85pZ9hsV9Bf6fvhjp76WNRajoJYX0UIt7aosjmu0i+H+07hEQ0zqTKpVoSH0ykJ6stAMhdr6Q4uW5crBmdTTBIsqmoWsNJZKKoE2+ldYrZ1lrFeaJbjBIY/9ivle++74qQsT2dIKWPanKc9Q2Gl8LjESLtFBD9Fmt",
+                "sender_claimed_keys": {
+                    "ed25519": "F4P7f1Z0RjbiZMgHk1xBCG3KC4/Ng9PmxLJ4hQ13sHA"
+                },
+                "forwarding_curve25519_key_chain": ["DBPC2zr6c9qimo9YRFK3RVr0Two/I6ODb9mbsToZN3Q", "bBc/qzZFOOKshMMT+i4gjS/gWPDoKfGmETs9yfw9430"]
+        });
+
+        let backed_up_room_key: BackedUpRoomKey = serde_json::from_value(data)
+            .expect("We should be able to deserialize the backed up room key.");
+        assert_eq!(
+            backed_up_room_key.forwarding_curve25519_key_chain.len(),
+            2,
+            "The number of forwarding Curve25519 chains should be two."
+        );
     }
 }

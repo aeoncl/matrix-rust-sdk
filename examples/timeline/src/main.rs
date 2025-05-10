@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use futures_util::StreamExt;
-use matrix_sdk::{self, config::SyncSettings, ruma::OwnedRoomId, Client};
+use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client};
 use matrix_sdk_ui::timeline::RoomExt;
 use url::Url;
 
@@ -75,8 +75,8 @@ async fn main() -> Result<()> {
 
     println!("Initial timeline items: {timeline_items:#?}");
     tokio::spawn(async move {
-        while let Some(diff) = timeline_stream.next().await {
-            println!("Received a timeline diff: {diff:#?}");
+        while let Some(diffs) = timeline_stream.next().await {
+            println!("Received timeline diffs: {diffs:#?}");
         }
     });
 

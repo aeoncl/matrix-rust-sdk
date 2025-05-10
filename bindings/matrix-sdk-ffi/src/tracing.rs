@@ -19,7 +19,7 @@ use tracing_core::{identify_callsite, metadata::Kind as MetadataKind};
 /// level + target) it is called with. Please make sure that the number of
 /// different combinations of those parameters this can be called with is
 /// constant in the final executable.
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 fn log_event(file: String, line: Option<u32>, level: LogLevel, target: String, message: String) {
     static CALLSITES: Mutex<BTreeMap<MetadataId, &'static DefaultCallsite>> =
         Mutex::new(BTreeMap::new());
@@ -96,7 +96,7 @@ fn span_or_event_enabled(callsite: &'static DefaultCallsite) -> bool {
 #[derive(uniffi::Object)]
 pub struct Span(tracing::Span);
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl Span {
     /// Create a span originating at the given callsite (file, line and column).
     ///
@@ -107,10 +107,10 @@ impl Span {
     /// target passed for second and following creation of a span with the same
     /// callsite will be ignored.
     ///
-    /// This function leaks a little bit of memory for each unique (file + line
-    /// + level + target + name) it is called with. Please make sure that the
-    /// number of different combinations of those parameters this can be called
-    /// with is constant in the final executable.
+    /// This function leaks a little bit of memory for each unique (file +
+    /// line + level + target + name) it is called with. Please make sure that
+    /// the number of different combinations of those parameters this can be
+    /// called with is constant in the final executable.
     ///
     /// For a span to have an effect, you must `.enter()` it at the start of a
     /// logical unit of work and `.exit()` it at the end of the same (including
@@ -166,7 +166,7 @@ impl Span {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, uniffi::Enum)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, uniffi::Enum)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -176,13 +176,23 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    fn to_tracing_level(&self) -> tracing::Level {
+    fn to_tracing_level(self) -> tracing::Level {
         match self {
             LogLevel::Error => tracing::Level::ERROR,
             LogLevel::Warn => tracing::Level::WARN,
             LogLevel::Info => tracing::Level::INFO,
             LogLevel::Debug => tracing::Level::DEBUG,
             LogLevel::Trace => tracing::Level::TRACE,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
         }
     }
 }

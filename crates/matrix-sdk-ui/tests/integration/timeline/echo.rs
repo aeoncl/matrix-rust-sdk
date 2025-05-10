@@ -19,55 +19,42 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    config::SyncSettings, executor::spawn, ruma::MilliSecondsSinceUnixEpoch,
-    test_utils::logged_in_client_with_server,
+    executor::spawn, ruma::MilliSecondsSinceUnixEpoch, test_utils::mocks::MatrixMockServer,
 };
-use matrix_sdk_test::{async_test, sync_timeline_event, JoinedRoomBuilder, SyncResponseBuilder};
-use matrix_sdk_ui::timeline::{
-    EventSendState, RoomExt, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
-};
+use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder};
+use matrix_sdk_ui::timeline::{EventSendState, RoomExt};
 use ruma::{
     event_id,
     events::room::message::{MessageType, RoomMessageEventContent},
-    room_id, uint,
+    room_id, uint, user_id,
 };
 use serde_json::json;
-use stream_assert::assert_next_matches;
-use wiremock::{
-    matchers::{header, method, path_regex},
-    Mock, ResponseTemplate,
-};
-
-use crate::{mock_encryption_state, mock_sync};
+use stream_assert::{assert_next_matches, assert_pending};
+use tokio::task::yield_now;
+use wiremock::ResponseTemplate;
 
 #[async_test]
 async fn test_echo() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    let room = client.get_room(room_id).unwrap();
-    let timeline = Arc::new(room.timeline().await.unwrap());
+    let timeline = Arc::new(
+        room.timeline_builder()
+            .with_internal_id_prefix("le_prefix".to_owned())
+            .build()
+            .await
+            .unwrap(),
+    );
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    mock_encryption_state(&server, false).await;
+    let event_id = event_id!("$ev");
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
-        )
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id).mock_once().mount().await;
 
     // Don't move the original timeline, it must live until the end of the test
     let timeline = timeline.clone();
@@ -76,209 +63,227 @@ async fn test_echo() {
         timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await
     });
 
-    assert_let!(Some(VectorDiff::PushBack { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
-    assert_let!(Some(VectorDiff::PushBack { value: local_echo }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::PushBack { value: local_echo } = &timeline_updates[0]);
     let item = local_echo.as_event().unwrap();
     assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
-    let txn_id = item.transaction_id().unwrap();
-
-    assert_let!(TimelineItemContent::Message(msg) = item.content());
+    assert_let!(Some(msg) = item.content().as_message());
     assert_let!(MessageType::Text(text) = msg.msgtype());
     assert_eq!(text.body, "Hello, World!");
+    assert!(item.event_id().is_none());
+    let txn_id = item.transaction_id().unwrap();
+
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
 
     // Wait for the sending to finish and assert everything was successful
-    send_hdl.await.unwrap();
+    send_hdl.await.unwrap().unwrap();
 
-    assert_let!(
-        Some(VectorDiff::Set { index: 1, value: sent_confirmation }) = timeline_stream.next().await
-    );
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
+    assert_let!(VectorDiff::Set { index: 1, value: sent_confirmation } = &timeline_updates[0]);
     let item = sent_confirmation.as_event().unwrap();
     assert_matches!(item.send_state(), Some(EventSendState::Sent { .. }));
+    assert_eq!(item.event_id(), Some(event_id));
 
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
-        sync_timeline_event!({
-            "content": {
-                "body": "Hello, World!",
-                "msgtype": "m.text",
-            },
-            "event_id": "$7at8sd:localhost",
-            "origin_server_ts": 152038280,
-            "sender": "@example:localhost",
-            "type": "m.room.message",
-            "unsigned": { "transaction_id": txn_id, },
-        }),
-    ));
+    let f = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("Hello, World!")
+                    .sender(user_id!("@example:localhost"))
+                    .event_id(event_id)
+                    .server_ts(152038280)
+                    .unsigned_transaction_id(txn_id),
+            ),
+        )
+        .await;
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 4);
 
-    // Local echo is removed
-    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 1 }));
-    // Local echo day divider is removed
-    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 0 }));
+    // Local echo is replaced with the remote echo.
+    assert_let!(VectorDiff::Remove { index: 1 } = &timeline_updates[0]);
 
-    // New day divider is added
-    assert_let!(Some(VectorDiff::PushBack { value: new_item }) = timeline_stream.next().await);
-    assert_matches!(**new_item, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)));
-
-    // Remote echo is added
-    assert_let!(Some(VectorDiff::PushBack { value: remote_echo }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushFront { value: remote_echo } = &timeline_updates[1]);
     let item = remote_echo.as_event().unwrap();
     assert!(item.is_own());
     assert_eq!(item.timestamp(), MilliSecondsSinceUnixEpoch(uint!(152038280)));
+
+    // The date divider is also replaced.
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[2]);
+    assert!(date_divider.is_date_divider());
+
+    assert_let!(VectorDiff::Remove { index: 2 } = &timeline_updates[3]);
+
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
 async fn test_retry_failed() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    client.send_queue().set_enabled(true).await;
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await;
+    // When trying to send an event, return with a 500 error, which is interpreted
+    // as a transient error.
+    let scoped_faulty_send = server.mock_room_send().error500().expect(3).mount_as_scoped().await;
 
-    // First, local echo is added
+    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
+
+    // First, local echo is added.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
         assert_matches!(value.send_state(), Some(EventSendState::NotSentYet));
     });
 
-    // Sending fails, the mock server has no matching route yet
+    // Sending fails, because the error is a transient one that's recoverable,
+    // indicating something's wrong on the client side.
     assert_let!(Some(VectorDiff::Set { index: 0, value: item }) = timeline_stream.next().await);
-    assert_matches!(item.send_state(), Some(EventSendState::SendingFailed { .. }));
-    let txn_id = item.transaction_id().unwrap().to_owned();
+    assert_matches!(
+        item.send_state(),
+        Some(EventSendState::SendingFailed { is_recoverable: true, .. })
+    );
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(&json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
-        )
-        .mount(&server)
-        .await;
+    // This doesn't disable the send queue at the global level…
+    assert!(client.send_queue().is_enabled());
+    // …but does so at the local level.
+    assert!(!room.send_queue().is_enabled());
 
-    timeline.retry_send(&txn_id).await.unwrap();
+    // Have the endpoint return a success result, and re-enable the queue.
+    drop(scoped_faulty_send);
+    server.mock_room_send().ok(event_id!("$wWgymRfo7ri1uQx0NXO40vLJ")).mount().await;
 
-    // After mocking the endpoint and retrying, it first transitions back out of
-    // the error state
-    assert_next_matches!(timeline_stream, VectorDiff::Remove { index: 0 });
-    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
-        assert_matches!(value.send_state(), Some(EventSendState::NotSentYet));
-    });
+    room.send_queue().set_enabled(true);
 
-    // … before succeeding.
+    // Let the send queue handle the event.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // After mocking the endpoint and retrying, it succeeds.
     assert_let!(Some(VectorDiff::Set { index: 0, value }) = timeline_stream.next().await);
     assert_matches!(value.send_state(), Some(EventSendState::Sent { .. }));
 }
 
 #[async_test]
 async fn test_dedup_by_event_id_late() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     let event_id = event_id!("$wWgymRfo7ri1uQx0NXO40vLJ");
 
-    mock_encryption_state(&server, false).await;
-
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    server
+        .mock_room_send()
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&json!({ "event_id": event_id }))
+                .set_body_json(json!({ "event_id": event_id }))
                 // Not great to use a timer for this, but it's what wiremock gives us right now.
-                // Ideally we'd wait on a channel to produce a value or sth. like that.
-                .set_delay(Duration::from_millis(100)),
+                // Ideally we'd wait on a channel to produce a value or sth. like that, but
+                // wiremock doesn't allow to handle multiple queries at the same time.
+                .set_delay(Duration::from_millis(500)),
         )
-        .mount(&server)
+        .mount()
         .await;
 
-    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
 
-    assert_matches!(timeline_stream.next().await, Some(VectorDiff::PushBack { .. })); // day divider
-    assert_let!(Some(VectorDiff::PushBack { value: local_echo }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    // Timeline: [local echo]
+    assert_let!(VectorDiff::PushBack { value: local_echo } = &timeline_updates[0]);
     let item = local_echo.as_event().unwrap();
     assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
 
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
-        sync_timeline_event!({
-            "content": {
-                "body": "Hello, World!",
-                "msgtype": "m.text",
-            },
-            "event_id": event_id,
-            "origin_server_ts": 123456,
-            "sender": "@example:localhost",
-            "type": "m.room.message",
-            // no transaction ID
-        }),
-    ));
+    // Timeline: [date-divider, local echo]
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    let f = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                // Note: no transaction id.
+                f.text_msg("Hello, World!")
+                    .sender(user_id!("@example:localhost"))
+                    .event_id(event_id)
+                    .server_ts(123456),
+            ),
+        )
+        .await;
 
-    assert_next_matches!(timeline_stream, VectorDiff::Insert { index: 0, .. }); // day divider
-    let remote_echo =
-        assert_next_matches!(timeline_stream, VectorDiff::Insert { index: 1, value } => value);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    // Timeline: [remote-echo, date-divider, local echo]
+    assert_let!(VectorDiff::PushFront { value: remote_echo } = &timeline_updates[0]);
     let item = remote_echo.as_event().unwrap();
     assert_eq!(item.event_id(), Some(event_id));
 
-    // Local echo and its day divider are removed.
-    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 3 }));
-    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 2 }));
+    // Timeline: [date-divider, remote-echo, date-divider, local echo]
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    // Local echo and its date divider are removed.
+    // Timeline: [date-divider, remote-echo, date-divider]
+    assert_let!(VectorDiff::Remove { index: 3 } = &timeline_updates[0]);
+
+    // Timeline: [date-divider, remote-echo]
+    assert_let!(VectorDiff::Remove { index: 2 } = &timeline_updates[1]);
+
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
 async fn test_cancel_failed() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await;
+    let handle =
+        timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
 
     // Local echo is added (immediately)
-    let txn_id = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
+    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
         assert_matches!(value.send_state(), Some(EventSendState::NotSentYet));
-        value.transaction_id().unwrap().to_owned()
     });
 
     // Sending fails, the mock server has no matching route
@@ -286,7 +291,7 @@ async fn test_cancel_failed() {
     assert_matches!(value.send_state(), Some(EventSendState::SendingFailed { .. }));
 
     // Discard, assert the local echo is found
-    assert!(timeline.cancel_send(&txn_id).await);
+    assert!(handle.abort().await.unwrap());
 
     // Observable local echo being removed
     assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 0 }));
