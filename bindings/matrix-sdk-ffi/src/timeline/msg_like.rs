@@ -15,7 +15,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use matrix_sdk::crypto::types::events::UtdCause;
-use ruma::events::{room::MediaSource as RumaMediaSource, EventContent};
+use ruma::events::{room::MediaSource as RumaMediaSource, MessageLikeEventContent};
 
 use super::{
     content::Reaction,
@@ -23,6 +23,7 @@ use super::{
 };
 use crate::{
     error::ClientError,
+    event::MessageLikeEventType,
     ruma::{ImageInfo, MediaSource, MediaSourceExt, Mentions, MessageType, PollKind},
     timeline::content::ReactionSenderData,
     utils::Timestamp,
@@ -50,6 +51,9 @@ pub enum MsgLikeKind {
 
     /// An `m.room.encrypted` event that could not be decrypted.
     UnableToDecrypt { msg: EncryptedMessage },
+
+    /// A custom message like event.
+    Other { event_type: MessageLikeEventType },
 }
 
 /// A special kind of [`super::TimelineItemContent`] that groups together
@@ -182,6 +186,15 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                 thread_root,
                 thread_summary,
             },
+            Kind::Other(other) => Self {
+                kind: MsgLikeKind::Other {
+                    event_type: MessageLikeEventType::Other(other.event_type().to_string()),
+                },
+                reactions,
+                in_reply_to,
+                thread_root,
+                thread_summary,
+            },
         })
     }
 }
@@ -241,13 +254,17 @@ pub struct PollAnswer {
 #[derive(Clone, uniffi::Object)]
 pub struct ThreadSummary {
     pub latest_event: EmbeddedEventDetails,
-    pub num_replies: usize,
+    pub num_replies: u32,
 }
 
 #[matrix_sdk_ffi_macros::export]
 impl ThreadSummary {
     pub fn latest_event(&self) -> EmbeddedEventDetails {
         self.latest_event.clone()
+    }
+
+    pub fn num_replies(&self) -> u64 {
+        self.num_replies as u64
     }
 }
 

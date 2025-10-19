@@ -17,14 +17,15 @@ use std::{
     time::Duration,
 };
 
+use assert_matches::assert_matches;
 use matrix_sdk::{
-    assert_next_eq_with_timeout,
+    assert_next_matches_with_timeout,
     test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
 };
 use matrix_sdk_test::async_test;
 use matrix_sdk_ui::sync_service::{State, SyncService};
 use serde_json::json;
-use stream_assert::{assert_next_eq, assert_next_matches, assert_pending};
+use stream_assert::{assert_next_matches, assert_pending};
 use wiremock::{Match as _, Mock, MockGuard, MockServer, Request, ResponseTemplate};
 
 use crate::sliding_sync::{PartialSlidingSyncRequest, SlidingSyncMatcher};
@@ -74,7 +75,7 @@ async fn test_sync_service_state() -> anyhow::Result<()> {
     let mut state_stream = sync_service.state();
 
     // At first, the sync service is sleeping.
-    assert_eq!(state_stream.get(), State::Idle);
+    assert_matches!(state_stream.get(), State::Idle);
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(!sync_service.is_supervisor_running().await);
     assert!(sync_service.try_get_encryption_sync_permit().is_some());
@@ -110,22 +111,22 @@ async fn test_sync_service_state() -> anyhow::Result<()> {
 
         let mut json_value = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
 
-        if let Some(root) = json_value.as_object_mut() {
-            if let Some(conn_id) = root.get("conn_id").and_then(|obj| obj.as_str()) {
-                if conn_id == "encryption" {
-                    num_encryption_sync_requests += 1;
-                } else if conn_id == "room-list" {
-                    num_room_list_requests += 1;
+        if let Some(root) = json_value.as_object_mut()
+            && let Some(conn_id) = root.get("conn_id").and_then(|obj| obj.as_str())
+        {
+            if conn_id == "encryption" {
+                num_encryption_sync_requests += 1;
+            } else if conn_id == "room-list" {
+                num_room_list_requests += 1;
 
-                    // Retrieve the position used in the query.
-                    for (key, val) in request.url.query_pairs() {
-                        if key == "pos" {
-                            latest_room_list_pos = Some(val.to_string());
-                        }
+                // Retrieve the position used in the query.
+                for (key, val) in request.url.query_pairs() {
+                    if key == "pos" {
+                        latest_room_list_pos = Some(val.to_string());
                     }
-                } else {
-                    panic!("unexpected conn id seen server side: {conn_id}");
                 }
+            } else {
+                panic!("unexpected conn id seen server side: {conn_id}");
             }
         }
     }
@@ -167,29 +168,29 @@ async fn test_sync_service_state() -> anyhow::Result<()> {
 
         let mut json_value = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
 
-        if let Some(root) = json_value.as_object_mut() {
-            if let Some(conn_id) = root.get("conn_id").and_then(|obj| obj.as_str()) {
-                if conn_id == "encryption" {
-                    num_encryption_sync_requests += 1;
-                } else if conn_id == "room-list" {
-                    if num_room_list_requests == 0 {
-                        // Either it's the same pos, or it's the next one if the request could be
-                        // processed by the client.
-                        let mut current_pos = None;
-                        for (key, val) in request.url.query_pairs() {
-                            if key == "pos" {
-                                current_pos = Some(val);
-                            }
+        if let Some(root) = json_value.as_object_mut()
+            && let Some(conn_id) = root.get("conn_id").and_then(|obj| obj.as_str())
+        {
+            if conn_id == "encryption" {
+                num_encryption_sync_requests += 1;
+            } else if conn_id == "room-list" {
+                if num_room_list_requests == 0 {
+                    // Either it's the same pos, or it's the next one if the request could be
+                    // processed by the client.
+                    let mut current_pos = None;
+                    for (key, val) in request.url.query_pairs() {
+                        if key == "pos" {
+                            current_pos = Some(val);
                         }
-                        let current_pos: i32 = current_pos.unwrap().parse()?;
-                        let prev_pos: i32 = latest_room_list_pos.take().unwrap().parse()?;
-                        assert!((current_pos - prev_pos).abs() <= 1);
                     }
-
-                    num_room_list_requests += 1;
-                } else {
-                    panic!("unexpected conn id seen server side: {conn_id}");
+                    let current_pos: i32 = current_pos.unwrap().parse()?;
+                    let prev_pos: i32 = latest_room_list_pos.take().unwrap().parse()?;
+                    assert!((current_pos - prev_pos).abs() <= 1);
                 }
+
+                num_room_list_requests += 1;
+            } else {
+                panic!("unexpected conn id seen server side: {conn_id}");
             }
         }
     }
@@ -224,13 +225,13 @@ async fn test_sync_service_offline_mode() {
         let _versions_guard = mock_server.mock_versions().error500().mount_as_scoped().await;
 
         sync_service.start().await;
-        assert_next_eq!(states, State::Running);
-        assert_next_eq_with_timeout!(states, State::Offline, 500 ms, "We should have entered the offline mode");
+        assert_next_matches!(states, State::Running);
+        assert_next_matches_with_timeout!(states, 2000, State::Offline);
     }
 
     mock_server.mock_versions().ok().expect(1..).mount().await;
 
-    assert_next_eq_with_timeout!(states, State::Running, 1000 ms,  "We should have continued to sync");
+    assert_next_matches_with_timeout!(states, 1000, State::Running);
 }
 
 #[async_test]
@@ -249,11 +250,11 @@ async fn test_sync_service_offline_mode_stopping() {
     mock_server.mock_versions().error500().mount().await;
 
     sync_service.start().await;
-    assert_next_eq!(states, State::Running);
+    assert_next_matches!(states, State::Running);
 
-    assert_next_eq_with_timeout!(states, State::Offline, 500 ms, "We should have entered the offline mode");
+    assert_next_matches_with_timeout!(states, 2000, State::Offline);
     sync_service.stop().await;
-    assert_next_eq_with_timeout!(states, State::Idle, 500 ms, "We should have entered the idle mode");
+    assert_next_matches_with_timeout!(states, 2000, State::Idle);
 }
 
 #[async_test]
@@ -271,11 +272,11 @@ async fn test_sync_service_offline_mode_restarting() {
     mock_server.mock_versions().error500().mount().await;
 
     sync_service.start().await;
-    assert_next_eq!(states, State::Running);
-    assert_next_eq_with_timeout!(states, State::Offline, 500 ms, "We should have entered the offline mode");
+    assert_next_matches!(states, State::Running);
+    assert_next_matches_with_timeout!(states, 2000, State::Offline);
 
     sync_service.start().await;
 
-    assert_next_eq_with_timeout!(states, State::Running, 500 ms, "We should have entered the running mode");
-    assert_next_eq_with_timeout!(states, State::Offline, 500 ms, "We should have entered the offline mode again");
+    assert_next_matches_with_timeout!(states, 2000, State::Running);
+    assert_next_matches_with_timeout!(states, 2000, State::Offline);
 }

@@ -21,16 +21,18 @@
 //! store.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    borrow::Borrow,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     ops::Deref,
     result::Result as StdResult,
-    str::Utf8Error,
+    str::{FromStr, Utf8Error},
     sync::{Arc, RwLock as StdRwLock},
 };
 
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::Stream;
+use matrix_sdk_common::ROOM_VERSION_RULES_FALLBACK;
 use once_cell::sync::OnceCell;
 
 #[cfg(any(test, feature = "testing"))]
@@ -39,29 +41,40 @@ pub mod integration_tests;
 mod observable_map;
 mod traits;
 
+use matrix_sdk_common::locks::Mutex as SyncMutex;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::store::{DynCryptoStore, IntoCryptoStore};
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 use observable_map::ObservableMap;
 use ruma::{
+    EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
     events::{
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
+        AnySyncStateEvent, EmptyStateKey, GlobalAccountDataEventType, RedactContent,
+        RedactedStateEventContent, RoomAccountDataEventType, StateEventType, StaticEventContent,
+        StaticStateEventContent, StrippedStateEvent, SyncStateEvent,
         presence::PresenceEvent,
         receipt::ReceiptEventContent,
-        room::{member::StrippedRoomMemberEvent, redaction::SyncRoomRedactionEvent},
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
-        AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
+        room::{
+            create::RoomCreateEventContent,
+            member::{RoomMemberEventContent, StrippedRoomMemberEvent},
+            power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
+            redaction::SyncRoomRedactionEvent,
+        },
     },
     serde::Raw,
-    EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
-use tokio::sync::{broadcast, Mutex, RwLock};
+use serde::de::DeserializeOwned;
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tracing::warn;
+pub use traits::compare_thread_subscription_bump_stamps;
 
 use crate::{
+    MinimalRoomMemberEvent, Room, RoomCreateWithCreatorEventContent, RoomStateFilter, SessionMeta,
     deserialized_responses::DisplayName,
     event_cache::store as event_cache_store,
+    media::store as media_store,
     room::{RoomInfo, RoomInfoNotableUpdate, RoomState},
-    MinimalRoomMemberEvent, Room, RoomStateFilter, SendOutsideWasm, SessionMeta, SyncOutsideWasm,
 };
 
 pub(crate) mod ambiguity_map;
@@ -81,8 +94,9 @@ pub use self::{
         SentMediaInfo, SentRequestKey, SerializableEventContent,
     },
     traits::{
-        ComposerDraft, ComposerDraftType, DynStateStore, IntoStateStore, ServerCapabilities,
-        StateStore, StateStoreDataKey, StateStoreDataValue, StateStoreExt,
+        ComposerDraft, ComposerDraftType, DynStateStore, IntoStateStore, ServerInfo, StateStore,
+        StateStoreDataKey, StateStoreDataValue, StateStoreExt, ThreadSubscriptionCatchupToken,
+        WellKnownResponse,
     },
 };
 
@@ -90,28 +104,27 @@ pub use self::{
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// An error happened in the underlying database backend.
-    #[cfg(not(target_family = "wasm"))]
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync>),
 
-    /// An error happened in the underlying database backend.
-    #[cfg(target_family = "wasm")]
-    #[error(transparent)]
-    Backend(Box<dyn std::error::Error>),
     /// An error happened while serializing or deserializing some data.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
     /// An error happened while deserializing a Matrix identifier, e.g. an user
     /// id.
     #[error(transparent)]
     Identifier(#[from] ruma::IdParseError),
+
     /// The store is locked with a passphrase and an incorrect passphrase was
     /// given.
     #[error("The store failed to be unlocked")]
     StoreLocked,
+
     /// An unencrypted store was tried to be unlocked with a passphrase.
     #[error("The store is not encrypted but was tried to be opened with a passphrase")]
     UnencryptedStore,
+
     /// The store failed to encrypt or decrypt some data.
     #[error("Error encrypting or decrypting data from the store: {0}")]
     Encryption(#[from] StoreEncryptionError),
@@ -126,11 +139,19 @@ pub enum StoreError {
         version: {0}, latest version: {1}"
     )]
     UnsupportedDatabaseVersion(usize, usize),
+
     /// Redacting an event in the store has failed.
     ///
     /// This should never happen.
     #[error("Redaction failed: {0}")]
     Redaction(#[source] ruma::canonical_json::RedactionError),
+
+    /// The store contains invalid data.
+    #[error("The store contains invalid data: {details}")]
+    InvalidData {
+        /// Details about which data is invalid, and how.
+        details: String,
+    },
 }
 
 impl StoreError {
@@ -140,7 +161,7 @@ impl StoreError {
     #[inline]
     pub fn backend<E>(error: E) -> Self
     where
-        E: std::error::Error + SendOutsideWasm + SyncOutsideWasm + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         Self::Backend(Box::new(error))
     }
@@ -164,7 +185,11 @@ pub(crate) struct BaseStateStore {
     rooms: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
     /// A lock to synchronize access to the store, such that data by the sync is
     /// never overwritten.
-    sync_lock: Arc<Mutex<()>>,
+    lock: Arc<Mutex<()>>,
+
+    /// Which rooms have already logged a log line about missing room info, in
+    /// the context of response processors?
+    pub(crate) already_logged_missing_room: Arc<SyncMutex<HashSet<OwnedRoomId>>>,
 }
 
 impl BaseStateStore {
@@ -176,13 +201,14 @@ impl BaseStateStore {
             room_load_settings: Default::default(),
             sync_token: Default::default(),
             rooms: Arc::new(StdRwLock::new(ObservableMap::new())),
-            sync_lock: Default::default(),
+            lock: Default::default(),
+            already_logged_missing_room: Default::default(),
         }
     }
 
     /// Get access to the syncing lock.
-    pub fn sync_lock(&self) -> &Mutex<()> {
-        &self.sync_lock
+    pub fn lock(&self) -> &Mutex<()> {
+        &self.lock
     }
 
     /// Set the [`SessionMeta`] into [`BaseStateStore::session_meta`].
@@ -310,7 +336,9 @@ impl BaseStateStore {
 
     /// Get a stream of all the rooms changes, in addition to the existing
     /// rooms.
-    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
+    pub fn rooms_stream(
+        &self,
+    ) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + use<>) {
         self.rooms.read().unwrap().stream()
     }
 
@@ -433,6 +461,74 @@ pub enum RoomLoadSettings {
     One(OwnedRoomId),
 }
 
+/// The subscription status of a thread.
+///
+/// We keep unsubscriptions in the database, because we need the bumpstamp
+/// information (in `ThreadSubscription`) to be around to order subscriptions
+/// and unsubscriptions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadSubscriptionStatus {
+    /// The user is subscribed to the related thread.
+    Subscribed {
+        /// Whether the subscription was made automatically by a client, not by
+        /// manual user choice.
+        automatic: bool,
+    },
+
+    /// The user has been unsubscribed to the related thread.
+    Unsubscribed,
+}
+
+impl FromStr for ThreadSubscriptionStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "automatic" => Ok(ThreadSubscriptionStatus::Subscribed { automatic: true }),
+            "manual" => Ok(ThreadSubscriptionStatus::Subscribed { automatic: false }),
+            "unsubscribed" => Ok(ThreadSubscriptionStatus::Unsubscribed),
+            _ => Err(()),
+        }
+    }
+}
+
+impl ThreadSubscriptionStatus {
+    /// Represent the status as a static string ref, for it to be stored into a
+    /// persistent format.
+    ///
+    /// Note: this is serialized in some databases implementations, so make sure
+    /// to not change it lightly, and keep it in sync with
+    /// [`Self::from_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThreadSubscriptionStatus::Subscribed { automatic } => {
+                if *automatic {
+                    "automatic"
+                } else {
+                    "manual"
+                }
+            }
+            ThreadSubscriptionStatus::Unsubscribed => "unsubscribed",
+        }
+    }
+}
+
+/// A thread subscription, as saved in the state store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredThreadSubscription {
+    /// Current status of the subscription.
+    pub status: ThreadSubscriptionStatus,
+
+    /// An optional bump stamp, as defined in the MSC; the higher the value, the
+    /// most recent the thread subscription information is, and should be
+    /// remembered.
+    ///
+    /// If not set, this means it's a user-provided thread subscription, for
+    /// which we're waiting validation from a server (e.g. through a remote
+    /// echo via sync).
+    pub bump_stamp: Option<u64>,
+}
+
 /// Store state changes and pass them to the StateStore.
 #[derive(Clone, Debug, Default)]
 pub struct StateChanges {
@@ -471,7 +567,7 @@ pub struct StateChanges {
     pub redactions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, Raw<SyncRoomRedactionEvent>>>,
 
     /// A mapping of `RoomId` to a map of event type to a map of state key to
-    /// `AnyStrippedStateEvent`.
+    /// `StrippedState`.
     pub stripped_state: BTreeMap<
         OwnedRoomId,
         BTreeMap<StateEventType, BTreeMap<String, Raw<AnyStrippedStateEvent>>>,
@@ -562,6 +658,108 @@ impl StateChanges {
     pub fn add_receipts(&mut self, room_id: &RoomId, event: ReceiptEventContent) {
         self.receipts.insert(room_id.to_owned(), event);
     }
+
+    /// Get a specific state event of statically-known type with the given state
+    /// key in the given room, if it is present in the `state` map of these
+    /// `StateChanges`.
+    pub(crate) fn state_static_for_key<C, K>(
+        &self,
+        room_id: &RoomId,
+        state_key: &K,
+    ) -> Option<&Raw<SyncStateEvent<C>>>
+    where
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
+        C::Redacted: RedactedStateEventContent,
+        C::StateKey: Borrow<K>,
+        K: AsRef<str> + ?Sized,
+    {
+        self.state
+            .get(room_id)?
+            .get(&C::TYPE.into())?
+            .get(state_key.as_ref())
+            .map(Raw::cast_ref_unchecked)
+    }
+
+    /// Get a specific stripped state event of statically-known type with the
+    /// given state key in the given room, if it is present in the
+    /// `stripped_state` map of these `StateChanges`.
+    pub(crate) fn stripped_state_static_for_key<C, K>(
+        &self,
+        room_id: &RoomId,
+        state_key: &K,
+    ) -> Option<&Raw<StrippedStateEvent<C::PossiblyRedacted>>>
+    where
+        C: StaticEventContent<IsPrefix = ruma::events::False> + StaticStateEventContent,
+        C::StateKey: Borrow<K>,
+        K: AsRef<str> + ?Sized,
+    {
+        self.stripped_state
+            .get(room_id)?
+            .get(&C::TYPE.into())?
+            .get(state_key.as_ref())
+            .map(Raw::cast_ref_unchecked)
+    }
+
+    /// Get a specific state event of statically-known type with the given state
+    /// key in the given room, if it is present in the `state` or
+    /// `stripped_state` map of these `StateChanges` and it deserializes
+    /// successfully.
+    pub(crate) fn any_state_static_for_key<C, K>(
+        &self,
+        room_id: &RoomId,
+        state_key: &K,
+    ) -> Option<StrippedStateEvent<C::PossiblyRedacted>>
+    where
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
+        C::Redacted: RedactedStateEventContent,
+        C::PossiblyRedacted: StaticEventContent + DeserializeOwned,
+        C::StateKey: Borrow<K>,
+        K: AsRef<str> + ?Sized,
+    {
+        self.state_static_for_key::<C, K>(room_id, state_key)
+            .map(Raw::cast_ref)
+            .or_else(|| self.stripped_state_static_for_key::<C, K>(room_id, state_key))?
+            .deserialize()
+            .ok()
+    }
+
+    /// Get the member for the given user in the given room from an event
+    /// contained in these `StateChanges`, if any.
+    pub(crate) fn member(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Option<StrippedRoomMemberEvent> {
+        self.any_state_static_for_key::<RoomMemberEventContent, _>(room_id, user_id)
+    }
+
+    /// Get the create event for the given room from an event contained in these
+    /// `StateChanges`, if any.
+    pub(crate) fn create(&self, room_id: &RoomId) -> Option<RoomCreateWithCreatorEventContent> {
+        self.any_state_static_for_key::<RoomCreateEventContent, _>(room_id, &EmptyStateKey)
+            .map(|event| {
+                RoomCreateWithCreatorEventContent::from_event_content(event.content, event.sender)
+            })
+            // Fallback to the content in the room info.
+            .or_else(|| self.room_infos.get(room_id)?.create().cloned())
+    }
+
+    /// Get the power levels for the given room from an event contained in these
+    /// `StateChanges`, if any.
+    pub(crate) fn power_levels(&self, room_id: &RoomId) -> Option<RoomPowerLevels> {
+        let power_levels_content = self
+            .any_state_static_for_key::<RoomPowerLevelsEventContent, _>(room_id, &EmptyStateKey)?;
+
+        let create_content = self.create(room_id)?;
+        let rules = create_content.room_version.rules().unwrap_or(ROOM_VERSION_RULES_FALLBACK);
+        let creators = create_content.creators();
+
+        Some(power_levels_content.power_levels(&rules.authorization, creators))
+    }
 }
 
 /// Configuration for the various stores.
@@ -584,6 +782,7 @@ pub struct StoreConfig {
     pub(crate) crypto_store: Arc<DynCryptoStore>,
     pub(crate) state_store: Arc<DynStateStore>,
     pub(crate) event_cache_store: event_cache_store::EventCacheStoreLock,
+    pub(crate) media_store: media_store::MediaStoreLock,
     cross_process_store_locks_holder_name: String,
 }
 
@@ -598,7 +797,7 @@ impl StoreConfig {
     /// Create a new default `StoreConfig`.
     ///
     /// To learn more about `cross_process_store_locks_holder_name`, please read
-    /// [`CrossProcessStoreLock::new`](matrix_sdk_common::store_locks::CrossProcessStoreLock::new).
+    /// [`CrossProcessLock::new`](matrix_sdk_common::cross_process_lock::CrossProcessLock::new).
     #[must_use]
     pub fn new(cross_process_store_locks_holder_name: String) -> Self {
         Self {
@@ -607,6 +806,10 @@ impl StoreConfig {
             state_store: Arc::new(MemoryStore::new()),
             event_cache_store: event_cache_store::EventCacheStoreLock::new(
                 event_cache_store::MemoryStore::new(),
+                cross_process_store_locks_holder_name.clone(),
+            ),
+            media_store: media_store::MediaStoreLock::new(
+                media_store::MemoryMediaStore::new(),
                 cross_process_store_locks_holder_name.clone(),
             ),
             cross_process_store_locks_holder_name,
@@ -635,6 +838,18 @@ impl StoreConfig {
     {
         self.event_cache_store = event_cache_store::EventCacheStoreLock::new(
             event_cache_store,
+            self.cross_process_store_locks_holder_name.clone(),
+        );
+        self
+    }
+
+    /// Set a custom implementation of an `MediaStore`.
+    pub fn media_store<S>(mut self, media_store: S) -> Self
+    where
+        S: media_store::IntoMediaStore,
+    {
+        self.media_store = media_store::MediaStoreLock::new(
+            media_store,
             self.cross_process_store_locks_holder_name.clone(),
         );
         self

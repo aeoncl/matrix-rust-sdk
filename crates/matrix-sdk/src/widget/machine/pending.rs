@@ -15,7 +15,7 @@
 //! A wrapper around a hash map that tracks pending requests and makes sure
 //! that expired requests are removed.
 
-use indexmap::{map::Entry, IndexMap};
+use indexmap::{IndexMap, map::Entry};
 use ruma::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ pub(crate) struct RequestLimits {
     pub(crate) max_pending_requests: usize,
     /// For how long can the unanswered (pending) request stored in a map before
     /// it is dropped. This ensures that requests that are not answered within
-    /// a ceratin amount of time, are dropped/cleaned up (considered as failed).
+    /// a certain amount of time, are dropped/cleaned up (considered as failed).
     pub(crate) response_timeout: Duration,
 }
 

@@ -16,26 +16,31 @@ default-members = ["benchmarks", "crates/*", "labs/*"]
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
-anyhow = "1.0.95"
+anyhow = "1.0.99"
 aquamarine = "0.6.0"
 as_variant = "1.3.0"
 assert-json-diff = "2.0.2"
 assert_matches = "1.5.0"
 assert_matches2 = "0.1.2"
-async-compat = "0.2.4"
+async-compat = "0.2.5"
 async-rx = "0.1.3"
+# Bumping this to 0.3.6 produces a test failure because the semantic between the
+# versions changed subtly.
 async-stream = "0.3.5"
-async-trait = "0.1.85"
+async-trait = "0.1.89"
 base64 = "0.22.1"
-bitflags = "2.8.0"
+bitflags = "2.9.3"
 byteorder = "1.5.0"
-chrono = "0.4.39"
+cfg-if = "1.0.3"
+clap = "4.5.46"
+chrono = "0.4.41"
+dirs = "6.0.0"
 eyeball = { version = "0.8.8", features = ["tracing"] }
-eyeball-im = { version = "0.7.0", features = ["tracing"] }
-eyeball-im-util = "0.9.0"
+eyeball-im = { version = "0.8.0", features = ["tracing"] }
+eyeball-im-util = "0.10.0"
 futures-core = "0.3.31"
 futures-executor = "0.3.31"
 futures-util = "0.3.31"
@@ -44,78 +49,86 @@ gloo-timers = "0.3.0"
 growable-bloom-filter = "2.1.1"
 hkdf = "0.12.4"
 hmac = "0.12.1"
-http = "1.2.0"
-imbl = "5.0.0"
-indexmap = "2.7.1"
-insta = { version = "1.42.1", features = ["json", "redactions"] }
+http = "1.3.1"
+imbl = "6.1.0"
+indexed_db_futures = "0.6.4"
+indexmap = "2.11.0"
+insta = { version = "1.43.1", features = ["json", "redactions"] }
 itertools = "0.14.0"
-js-sys = "0.3.69"
+js-sys = "0.3.77"
 mime = "0.3.17"
-once_cell = "1.20.2"
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "timing-resistant-secret-traits"] }
+once_cell = "1.21.3"
 pbkdf2 = { version = "0.12.2" }
 pin-project-lite = "0.2.16"
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rand = "0.8.5"
-reqwest = { version = "0.12.12", default-features = false }
+regex = "1.11.2"
+reqwest = { version = "0.12.23", default-features = false }
 rmp-serde = "1.3.0"
-# Be careful to use commits from the https://github.com/ruma/ruma/tree/ruma-0.12
-# branch until a proper release with breaking changes happens.
-ruma = { version = "0.12.3", features = [
+ruma = { git = "https://github.com/ruma/ruma", rev = "670349f66f7e3f403c6730967768472dcf1bcf60", features = [
     "client-api-c",
     "compat-upload-signatures",
-    "compat-user-id",
     "compat-arbitrary-length-ids",
     "compat-tag-info",
     "compat-encrypted-stickers",
+    "compat-lax-room-create-deser",
+    "compat-lax-room-topic-deser",
     "unstable-msc3401",
-    "unstable-msc3266",
     "unstable-msc3488",
     "unstable-msc3489",
     "unstable-msc4075",
     "unstable-msc4140",
+    "unstable-msc4143",
     "unstable-msc4171",
     "unstable-msc4278",
     "unstable-msc4286",
-    ] }
-ruma-common = "0.15.2"
-sentry = "0.36.0"
-sentry-tracing = "0.36.0"
-serde = { version = "1.0.217", features = ["rc"] }
+    "unstable-msc4306",
+    "unstable-msc4308",
+    "unstable-msc4310"
+] }
+sentry = { version = "0.42.0", default-features = false }
+sentry-tracing = "0.42.0"
+serde = { version = "1.0.219", features = ["rc"] }
 serde_html_form = "0.2.7"
-serde_json = "1.0.138"
-sha2 = "0.10.8"
-similar-asserts = "1.6.1"
+serde_json = "1.0.143"
+sha2 = "0.10.9"
+similar-asserts = "1.7.0"
 stream_assert = "0.1.1"
-tempfile = "3.16.0"
-thiserror = "2.0.11"
-tokio = { version = "1.43.1", default-features = false, features = ["sync"] }
+tempfile = "3.21.0"
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", default-features = false, features = ["sync"] }
 tokio-stream = "0.1.17"
-tracing = { version = "0.1.40", default-features = false, features = ["std"] }
-tracing-core = "0.1.32"
-tracing-subscriber = "0.3.18"
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
+tracing-appender = "0.2.3"
+tracing-core = "0.1.34"
+tracing-subscriber = "0.3.20"
 unicode-normalization = "0.1.24"
 uniffi = { version = "0.28.0" }
 uniffi_bindgen = { version = "0.28.0" }
-url = "2.5.4"
-uuid = "1.12.1"
+url = "2.5.7"
+uuid = "1.18.0"
+vergen-gitcl = "1.0.8"
 vodozemac = { version = "0.9.0", features = ["insecure-pk-encryption"] }
 wasm-bindgen = "0.2.84"
 wasm-bindgen-test = "0.3.50"
 web-sys = "0.3.69"
-wiremock = "0.6.2"
+wiremock = "0.6.5"
 zeroize = "1.8.1"
 
-matrix-sdk = { path = "crates/matrix-sdk", version = "0.11.0", default-features = false }
-matrix-sdk-base = { path = "crates/matrix-sdk-base", version = "0.11.0" }
-matrix-sdk-common = { path = "crates/matrix-sdk-common", version = "0.11.0" }
-matrix-sdk-crypto = { path = "crates/matrix-sdk-crypto", version = "0.11.0" }
+matrix-sdk = { path = "crates/matrix-sdk", version = "0.14.0", default-features = false }
+matrix-sdk-base = { path = "crates/matrix-sdk-base", version = "0.14.1" }
+matrix-sdk-common = { path = "crates/matrix-sdk-common", version = "0.14.0" }
+matrix-sdk-crypto = { path = "crates/matrix-sdk-crypto", version = "0.14.0" }
 matrix-sdk-ffi-macros = { path = "bindings/matrix-sdk-ffi-macros", version = "0.7.0" }
-matrix-sdk-indexeddb = { path = "crates/matrix-sdk-indexeddb", version = "0.11.0", default-features = false }
-matrix-sdk-qrcode = { path = "crates/matrix-sdk-qrcode", version = "0.11.0" }
-matrix-sdk-sqlite = { path = "crates/matrix-sdk-sqlite", version = "0.11.0", default-features = false }
-matrix-sdk-store-encryption = { path = "crates/matrix-sdk-store-encryption", version = "0.11.0" }
-matrix-sdk-test = { path = "testing/matrix-sdk-test", version = "0.11.0" }
-matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.11.0", default-features = false }
+matrix-sdk-indexeddb = { path = "crates/matrix-sdk-indexeddb", version = "0.14.0", default-features = false }
+matrix-sdk-qrcode = { path = "crates/matrix-sdk-qrcode", version = "0.14.0" }
+matrix-sdk-sqlite = { path = "crates/matrix-sdk-sqlite", version = "0.14.0", default-features = false }
+matrix-sdk-store-encryption = { path = "crates/matrix-sdk-store-encryption", version = "0.14.0" }
+matrix-sdk-test = { path = "testing/matrix-sdk-test", version = "0.14.0" }
+matrix-sdk-test-utils = { path = "testing/matrix-sdk-test-utils", version = "0.14.0" }
+matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.14.0", default-features = false }
+matrix-sdk-search = { path = "crates/matrix-sdk-search", version = "0.14.0" }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
@@ -137,13 +150,15 @@ cloned_instead_of_copied = "warn"
 dbg_macro = "warn"
 inefficient_to_string = "warn"
 macro_use_imports = "warn"
+manual_let_else = "warn"
 mut_mut = "warn"
 needless_borrow = "warn"
 nonstandard_macro_braces = "warn"
+redundant_clone = "warn"
 str_to_string = "warn"
 todo = "warn"
+unnecessary_semicolon = "warn"
 unused_async = "warn"
-redundant_clone = "warn"
 
 # Default development profile; default for most Cargo commands, otherwise
 # selected with `--debug`
@@ -178,12 +193,16 @@ lto = false
 # Get symbol names for profiling purposes.
 debug = true
 
+[profile.bench]
+inherits = "release"
+lto = false
+
 [patch.crates-io]
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 const_panic = { git = "https://github.com/jplatte/const_panic", rev = "9024a4cb3eac45c1d2d980f17aaee287b17be498" }
+indexed_db_futures = { git = "https://github.com/matrix-org/rust-indexed-db", rev = "201caac274e38756c6e523ba7cf84ffb625b7c48" }
 # Needed to fix rotation log issue on Android (https://github.com/tokio-rs/tracing/issues/2937)
-tracing = { git = "https://github.com/element-hq/tracing.git", rev = "ca9431f74d37c9d3b5e6a9f35b2c706711dab7dd" }
-tracing-core = { git = "https://github.com/element-hq/tracing.git", rev = "ca9431f74d37c9d3b5e6a9f35b2c706711dab7dd" }
-tracing-subscriber = { git = "https://github.com/element-hq/tracing.git", rev = "ca9431f74d37c9d3b5e6a9f35b2c706711dab7dd" }
-tracing-appender = { git = "https://github.com/element-hq/tracing.git", rev = "ca9431f74d37c9d3b5e6a9f35b2c706711dab7dd" }
-paranoid-android = { git = "https://github.com/element-hq/paranoid-android.git", rev = "69388ac5b4afeed7be4401c70ce17f6d9a2cf19b" }
+tracing = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+tracing-core = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+tracing-subscriber = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }
+tracing-appender = { git = "https://github.com/tokio-rs/tracing.git", rev = "20f5b3d8ba057ca9c4ae00ad30dda3dce8a71c05" }

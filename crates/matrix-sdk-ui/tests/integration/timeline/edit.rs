@@ -20,21 +20,22 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::{FutureExt, StreamExt};
 use matrix_sdk::{
+    Client,
     room::edit::EditedContent,
     test_utils::mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
-    Client,
 };
-use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE, BOB};
+use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::{
+    Timeline,
     timeline::{
         EditError, Error, EventSendState, MsgLikeContent, MsgLikeKind, RoomExt, TimelineDetails,
         TimelineEventItemId, TimelineItemContent,
     },
-    Timeline,
 };
 use ruma::{
-    event_id,
+    OwnedRoomId, event_id,
     events::{
+        AnyMessageLikeEventContent, AnyTimelineEvent,
         poll::unstable_start::{
             NewUnstablePollStartEventContent, ReplacementUnstablePollStartEventContent,
             UnstablePollAnswer, UnstablePollAnswers, UnstablePollStartContentBlock,
@@ -44,11 +45,9 @@ use ruma::{
             MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             TextMessageEventContent,
         },
-        AnyMessageLikeEventContent, AnyTimelineEvent,
     },
     owned_event_id, room_id,
     serde::Raw,
-    OwnedRoomId,
 };
 use stream_assert::{assert_next_matches, assert_pending};
 use tokio::{task::yield_now, time::sleep};
@@ -199,7 +198,7 @@ async fn test_edit_local_echo() {
     let internal_id = item.unique_id();
 
     let item = item.as_event().unwrap();
-    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
     assert!(date_divider.is_date_divider());
@@ -249,7 +248,7 @@ async fn test_edit_local_echo() {
     assert!(item.is_local_echo());
 
     // The send state has been reset.
-    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     let edit_message = item.content().as_message().unwrap();
     assert_eq!(edit_message.body(), "hello, world");
@@ -635,7 +634,7 @@ async fn test_edit_local_echo_with_unsupported_content() {
     assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
-    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
     assert!(date_divider.is_date_divider());
@@ -689,7 +688,7 @@ async fn test_edit_local_echo_with_unsupported_content() {
     assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
-    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     // Let's edit the local echo (poll start) with an unsupported type (message).
     let edit_err = timeline
@@ -877,13 +876,14 @@ async fn test_pending_edit_from_backpagination() {
     let original_event_id = event_id!("$original");
     let edit_event_id = event_id!("$edit");
     h.handle_backpagination(
-        vec![f
-            .text_msg("* hello")
-            .sender(&ALICE)
-            .event_id(edit_event_id)
-            .room(&h.room_id)
-            .edit(original_event_id, RoomMessageEventContent::text_plain("hello").into())
-            .into()],
+        vec![
+            f.text_msg("* hello")
+                .sender(&ALICE)
+                .event_id(edit_event_id)
+                .room(&h.room_id)
+                .edit(original_event_id, RoomMessageEventContent::text_plain("hello").into())
+                .into(),
+        ],
         10,
     )
     .await;
@@ -941,13 +941,14 @@ async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from
     // And then I receive an edit from a back-pagination for the same event…
     let edit_event_id2 = event_id!("$edit2");
     h.handle_backpagination(
-        vec![f
-            .text_msg("* aloha")
-            .sender(&ALICE)
-            .event_id(edit_event_id2)
-            .room(&h.room_id)
-            .edit(original_event_id, RoomMessageEventContent::text_plain("aloha").into())
-            .into()],
+        vec![
+            f.text_msg("* aloha")
+                .sender(&ALICE)
+                .event_id(edit_event_id2)
+                .room(&h.room_id)
+                .edit(original_event_id, RoomMessageEventContent::text_plain("aloha").into())
+                .into(),
+        ],
         10,
     )
     .await;

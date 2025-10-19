@@ -1,8 +1,11 @@
 use std::{env, process::exit};
 
 use matrix_sdk::{
-    ruma::{api::client::profile, OwnedMxcUri, UserId},
     Client, Result as MatrixResult,
+    ruma::{
+        OwnedMxcUri, UserId,
+        api::client::profile::{self, AvatarUrl, DisplayName},
+    },
 };
 use url::Url;
 
@@ -27,7 +30,10 @@ async fn get_profile(client: Client, mxid: &UserId) -> MatrixResult<UserProfile>
     // Use the response and construct a UserProfile struct.
     // See https://docs.rs/ruma-client-api/0.9.0/ruma_client_api/r0/profile/get_profile/struct.Response.html
     // for details on the Response for this Request
-    let user_profile = UserProfile { avatar_url: resp.avatar_url, displayname: resp.displayname };
+    let user_profile = UserProfile {
+        avatar_url: resp.get_static::<AvatarUrl>()?,
+        displayname: resp.get_static::<DisplayName>()?,
+    };
     Ok(user_profile)
 }
 
@@ -52,17 +58,13 @@ async fn login(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let (homeserver_url, username, password) =
-        match (env::args().nth(1), env::args().nth(2), env::args().nth(3)) {
-            (Some(a), Some(b), Some(c)) => (a, b, c),
-            _ => {
-                eprintln!(
-                    "Usage: {} <homeserver_url> <mxid> <password>",
-                    env::args().next().unwrap()
-                );
-                exit(1)
-            }
-        };
+    // parse the command line for homeserver, username and password
+    let (Some(homeserver_url), Some(username), Some(password)) =
+        (env::args().nth(1), env::args().nth(2), env::args().nth(3))
+    else {
+        eprintln!("Usage: {} <homeserver_url> <mxid> <password>", env::args().next().unwrap());
+        exit(1)
+    };
 
     let client = login(homeserver_url, &username, &password).await?;
 

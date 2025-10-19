@@ -22,24 +22,24 @@ use std::{
 use anyhow::bail;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    Client, ClientBuildError, Result, RoomState,
     authentication::oauth::{
-        error::OAuthClientRegistrationError,
-        registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthError, OAuthSession,
         UrlOrQuery, UserSession,
+        error::OAuthClientRegistrationError,
+        registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
     },
     config::SyncSettings,
-    encryption::{recovery::RecoveryState, CrossSigningResetAuthType},
+    encryption::{CrossSigningResetAuthType, recovery::RecoveryState},
     room::Room,
     ruma::{
         events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
         serde::Raw,
     },
     utils::local_server::{LocalServerBuilder, LocalServerRedirectHandle, QueryString},
-    Client, ClientBuildError, Result, RoomState,
 };
 use matrix_sdk_ui::sync_service::SyncService;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncBufReadExt as _};
 use url::Url;
@@ -140,12 +140,10 @@ impl OAuthCli {
         let cli = Self { client, restored: false, session_file };
 
         if let Err(error) = cli.register_and_login().await {
-            if error.downcast_ref::<OAuthError>().is_some_and(|error| {
-                matches!(
-                    error,
-                    OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported)
-                )
-            }) {
+            if let Some(error) = error.downcast_ref::<OAuthError>()
+                && let OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported) =
+                    error
+            {
                 // This would require to register with the authorization server manually, which
                 // we don't support here.
                 bail!(
@@ -189,8 +187,10 @@ impl OAuthCli {
             // the redirect when the custom URI scheme is opened.
             let (redirect_uri, server_handle) = LocalServerBuilder::new().spawn().await?;
 
-            let OAuthAuthorizationData { url, .. } =
-                oauth.login(redirect_uri, None, Some(client_metadata().into())).build().await?;
+            let OAuthAuthorizationData { url, .. } = oauth
+                .login(redirect_uri, None, Some(client_metadata().into()), None)
+                .build()
+                .await?;
 
             let query_string =
                 use_auth_url(&url, server_handle).await.map(|query| query.0).unwrap_or_default();
@@ -307,7 +307,7 @@ impl OAuthCli {
                     println!("Error: no command\n");
                     help()
                 }
-            };
+            }
         }
 
         Ok(())
@@ -376,12 +376,10 @@ impl OAuthCli {
 
     /// Get the account management URL.
     async fn account(&self, action: Option<AccountManagementActionFull>) {
-        let mut url_builder = match self.client.oauth().fetch_account_management_url().await {
-            Ok(Some(url_builder)) => url_builder,
-            _ => {
-                println!("\nThis homeserver does not provide the URL to manage your account");
-                return;
-            }
+        let Ok(Some(mut url_builder)) = self.client.oauth().fetch_account_management_url().await
+        else {
+            println!("\nThis homeserver does not provide the URL to manage your account");
+            return;
         };
 
         if let Some(action) = action {
@@ -465,7 +463,7 @@ impl OAuthCli {
                                     }
                                 }
 
-                                matrix_sdk_ui::sync_service::State::Error | matrix_sdk_ui::sync_service::State::Offline => {
+                                matrix_sdk_ui::sync_service::State::Error(_) | matrix_sdk_ui::sync_service::State::Offline => {
                                     num_errors += 1;
                                     num_running = 0;
 

@@ -25,11 +25,12 @@ use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
 use matrix_sdk_base::{
-    event_cache::store::EventCacheStoreError, Error as SdkBaseError, QueueWedgeError, RoomState,
-    StoreError,
+    Error as SdkBaseError, QueueWedgeError, RoomState, StoreError,
+    event_cache::store::EventCacheStoreError, media::store::MediaStoreError,
 };
 use reqwest::Error as ReqwestError;
 use ruma::{
+    IdParseError,
     api::{
         client::{
             error::{ErrorBody, ErrorKind, RetryAfter},
@@ -37,17 +38,17 @@ use ruma::{
         },
         error::{FromHttpResponseError, IntoHttpError},
     },
-    events::tag::InvalidUserTagName,
+    events::{room::power_levels::PowerLevelsError, tag::InvalidUserTagName},
     push::{InsertPushRuleError, RemovePushRuleError},
-    IdParseError,
 };
 use serde_json::Error as JsonError;
 use thiserror::Error;
 use url::ParseError as UrlParseError;
 
 use crate::{
-    authentication::oauth::OAuthError, event_cache::EventCacheError, media::MediaError,
-    room::reply::ReplyError, sliding_sync::Error as SlidingSyncError, store_locks::LockStoreError,
+    authentication::oauth::OAuthError, cross_process_lock::CrossProcessLockError,
+    event_cache::EventCacheError, media::MediaError, room::reply::ReplyError,
+    sliding_sync::Error as SlidingSyncError,
 };
 
 /// Result type of the matrix-sdk.
@@ -94,10 +95,6 @@ pub enum HttpError {
     /// Error at the HTTP layer.
     #[error(transparent)]
     Reqwest(#[from] ReqwestError),
-
-    /// Queried endpoint is not meant for clients.
-    #[error("the queried endpoint is not meant for clients")]
-    NotClientRequest,
 
     /// API response error (deserialization, or a Matrix-specific error).
     // `Box` its inner value to reduce the enum size.
@@ -315,7 +312,7 @@ pub enum Error {
 
     /// An error occurred with a cross-process store lock.
     #[error(transparent)]
-    CrossProcessLockError(Box<LockStoreError>),
+    CrossProcessLockError(Box<CrossProcessLockError>),
 
     /// An error occurred during a E2EE operation.
     #[cfg(feature = "e2e-encryption")]
@@ -339,6 +336,10 @@ pub enum Error {
     /// An error occurred in the event cache store.
     #[error(transparent)]
     EventCacheStore(Box<EventCacheStoreError>),
+
+    /// An error occurred in the media store.
+    #[error(transparent)]
+    MediaStore(Box<MediaStoreError>),
 
     /// An error encountered when trying to parse an identifier.
     #[error(transparent)]
@@ -404,6 +405,10 @@ pub enum Error {
     #[error("backups are not enabled")]
     BackupNotEnabled,
 
+    /// It's forbidden to ignore your own user.
+    #[error("can't ignore the logged-in user")]
+    CantIgnoreLoggedInUser,
+
     /// An error happened during handling of a media subrequest.
     #[error(transparent)]
     Media(#[from] MediaError),
@@ -411,6 +416,10 @@ pub enum Error {
     /// An error happened while attempting to reply to an event.
     #[error(transparent)]
     ReplyError(#[from] ReplyError),
+
+    /// An error happened while attempting to change power levels.
+    #[error("power levels error: {0}")]
+    PowerLevels(#[from] PowerLevelsError),
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -467,8 +476,8 @@ impl From<CryptoStoreError> for Error {
     }
 }
 
-impl From<LockStoreError> for Error {
-    fn from(error: LockStoreError) -> Self {
+impl From<CrossProcessLockError> for Error {
+    fn from(error: CrossProcessLockError) -> Self {
         Error::CrossProcessLockError(Box::new(error))
     }
 }
@@ -496,6 +505,12 @@ impl From<StoreError> for Error {
 impl From<EventCacheStoreError> for Error {
     fn from(error: EventCacheStoreError) -> Self {
         Error::EventCacheStore(Box::new(error))
+    }
+}
+
+impl From<MediaStoreError> for Error {
+    fn from(error: MediaStoreError) -> Self {
+        Error::MediaStore(Box::new(error))
     }
 }
 
@@ -700,6 +715,13 @@ pub enum NotificationSettingsError {
     /// Unable to save the push rules
     #[error("Unable to save push rules")]
     UnableToSavePushRules,
+}
+
+impl NotificationSettingsError {
+    /// Whether this error is the [`RuleNotFound`](Self::RuleNotFound) variant.
+    pub fn is_rule_not_found(&self) -> bool {
+        matches!(self, Self::RuleNotFound(_))
+    }
 }
 
 impl From<InsertPushRuleError> for NotificationSettingsError {

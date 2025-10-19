@@ -1,7 +1,7 @@
 [package]
 name = "example-qr-login"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 license = "Apache-2.0"
 
@@ -14,11 +14,11 @@ test = false
 
 [dependencies]
 anyhow.workspace = true
-clap = { version = "4.0.15", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
-url = "2.3.1"
+url.workspace = true
 
 [dependencies.matrix-sdk]
 # when copy-pasting this, please use a git dependency or make sure that you

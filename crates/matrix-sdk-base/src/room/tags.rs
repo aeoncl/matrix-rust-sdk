@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bitflags::bitflags;
-use ruma::events::{tag::Tags, AnyRoomAccountDataEvent, RoomAccountDataEventType};
+use ruma::events::{AnyRoomAccountDataEvent, RoomAccountDataEventType, tag::Tags};
 use serde::{Deserialize, Serialize};
 
 use super::Room;
@@ -38,7 +38,7 @@ impl Room {
     ///
     /// A room is considered favourite if it has received the `m.favourite` tag.
     pub fn is_favourite(&self) -> bool {
-        self.inner.read().base_info.notable_tags.contains(RoomNotableTags::FAVOURITE)
+        self.info.read().base_info.notable_tags.contains(RoomNotableTags::FAVOURITE)
     }
 
     /// Check whether the room is marked as low priority.
@@ -46,7 +46,7 @@ impl Room {
     /// A room is considered low priority if it has received the `m.lowpriority`
     /// tag.
     pub fn is_low_priority(&self) -> bool {
-        self.inner.read().base_info.notable_tags.contains(RoomNotableTags::LOW_PRIORITY)
+        self.info.read().base_info.notable_tags.contains(RoomNotableTags::LOW_PRIORITY)
     }
 }
 
@@ -82,16 +82,19 @@ mod tests {
 
     use super::{super::BaseRoomInfo, RoomNotableTags};
     use crate::{
+        BaseClient, RoomState, SessionMeta,
+        client::ThreadingSupport,
         response_processors as processors,
         store::{RoomLoadSettings, StoreConfig},
-        BaseClient, RoomState, SessionMeta,
     };
 
     #[async_test]
     async fn test_is_favourite() {
         // Given a room,
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(
@@ -129,13 +132,12 @@ mod tests {
             "type": "m.tag",
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         // When the new tag is handled and applied.
         let mut context = processors::Context::default();
 
-        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store)
-            .await;
+        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store);
 
         processors::changes::save_and_apply(
             context.clone(),
@@ -161,10 +163,9 @@ mod tests {
             "type": "m.tag"
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
-        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store)
-            .await;
+        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store);
 
         processors::changes::save_and_apply(
             context,
@@ -186,8 +187,10 @@ mod tests {
     #[async_test]
     async fn test_is_low_priority() {
         // Given a room,
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(
@@ -225,13 +228,12 @@ mod tests {
             "type": "m.tag"
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         // When the new tag is handled and applied.
         let mut context = processors::Context::default();
 
-        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store)
-            .await;
+        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store);
 
         processors::changes::save_and_apply(
             context.clone(),
@@ -257,10 +259,9 @@ mod tests {
             "type": "m.tag"
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
-        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store)
-            .await;
+        processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store);
 
         processors::changes::save_and_apply(
             context,

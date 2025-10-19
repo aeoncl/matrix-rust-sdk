@@ -11,19 +11,21 @@ use matrix_sdk::{
     },
     Room as SdkRoom,
 };
-use matrix_sdk_common::{runtime::get_runtime_handle, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     room_list_service::filters::{
         new_filter_all, new_filter_any, new_filter_category, new_filter_deduplicate_versions,
         new_filter_favourite, new_filter_fuzzy_match_room_name, new_filter_invite,
-        new_filter_joined, new_filter_non_left, new_filter_none,
-        new_filter_normalized_match_room_name, new_filter_unread, BoxedFilterFn, RoomCategory,
+        new_filter_joined, new_filter_low_priority, new_filter_non_left, new_filter_none,
+        new_filter_normalized_match_room_name, new_filter_not, new_filter_space, new_filter_unread,
+        BoxedFilterFn, RoomCategory,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
 
 use crate::{
     room::{Membership, Room},
+    runtime::get_runtime_handle,
     TaskHandle,
 };
 
@@ -41,7 +43,10 @@ pub enum RoomListError {
     InvalidRoomId { error: String },
     #[error("Event cache ran into an error: {error}")]
     EventCache { error: String },
-    #[error("The requested room doesn't match the membership requirements {expected:?}, observed {actual:?}")]
+    #[error(
+        "The requested room doesn't match the membership requirements {expected:?}, \
+         observed {actual:?}"
+    )]
     IncorrectRoomMembership { expected: Vec<Membership>, actual: Membership },
 }
 
@@ -117,7 +122,7 @@ impl RoomListService {
         })))
     }
 
-    fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
+    async fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
         let room_ids = room_ids
             .into_iter()
             .map(|room_id| {
@@ -125,7 +130,9 @@ impl RoomListService {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        self.inner.subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>());
+        self.inner
+            .subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+            .await;
 
         Ok(())
     }
@@ -160,6 +167,15 @@ impl RoomList {
     fn entries_with_dynamic_adapters(
         self: Arc<Self>,
         page_size: u32,
+        listener: Box<dyn RoomListEntriesListener>,
+    ) -> Arc<RoomListEntriesWithDynamicAdaptersResult> {
+        self.entries_with_dynamic_adapters_with(page_size, false, listener)
+    }
+
+    fn entries_with_dynamic_adapters_with(
+        self: Arc<Self>,
+        page_size: u32,
+        enable_latest_event_sorter: bool,
         listener: Box<dyn RoomListEntriesListener>,
     ) -> Arc<RoomListEntriesWithDynamicAdaptersResult> {
         let this = self;
@@ -209,7 +225,10 @@ impl RoomList {
         // borrowing `this`, which is going to live long enough since it will live as
         // long as `entries_stream` and `dynamic_entries_controller`.
         let (entries_stream, dynamic_entries_controller) =
-            this.inner.entries_with_dynamic_adapters(page_size.try_into().unwrap());
+            this.inner.entries_with_dynamic_adapters_with(
+                page_size.try_into().unwrap(),
+                enable_latest_event_sorter,
+            );
 
         // FFI dance to make those values consumable by foreign language, nothing fancy
         // here, that's the real code for this method.
@@ -224,7 +243,12 @@ impl RoomList {
                 listener.on_update(
                     diffs
                         .into_iter()
-                        .map(|room| RoomListEntriesUpdate::from(utd_hook.clone(), room))
+                        .map(|diff| {
+                            RoomListEntriesUpdate::from(
+                                utd_hook.clone(),
+                                diff.map(|room| room.into_inner()),
+                            )
+                        })
                         .collect(),
                 );
             }
@@ -448,10 +472,16 @@ impl RoomListDynamicEntriesController {
 pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
+    NonSpace,
+    Space,
     NonLeft,
+    // Not { filter: RoomListEntriesDynamicFilterKind } - requires recursive enum
+    // support in uniffi https://github.com/mozilla/uniffi-rs/issues/396
     Joined,
     Unread,
     Favourite,
+    LowPriority,
+    NonLowPriority,
     Invite,
     Category { expect: RoomListFilterCategory },
     None,
@@ -486,10 +516,14 @@ impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
             Kind::Any { filters } => Box::new(new_filter_any(
                 filters.into_iter().map(|filter| BoxedFilterFn::from(filter)).collect(),
             )),
+            Kind::NonSpace => Box::new(new_filter_not(Box::new(new_filter_space()))),
+            Kind::Space => Box::new(new_filter_space()),
             Kind::NonLeft => Box::new(new_filter_non_left()),
             Kind::Joined => Box::new(new_filter_joined()),
             Kind::Unread => Box::new(new_filter_unread()),
             Kind::Favourite => Box::new(new_filter_favourite()),
+            Kind::LowPriority => Box::new(new_filter_low_priority()),
+            Kind::NonLowPriority => Box::new(new_filter_not(Box::new(new_filter_low_priority()))),
             Kind::Invite => Box::new(new_filter_invite()),
             Kind::Category { expect } => Box::new(new_filter_category(expect.into())),
             Kind::None => Box::new(new_filter_none()),

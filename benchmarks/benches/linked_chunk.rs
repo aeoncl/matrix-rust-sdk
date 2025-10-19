@@ -1,16 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use matrix_sdk::{
-    linked_chunk::{lazy_loader, LinkedChunk, Update},
     SqliteEventCacheStore,
+    linked_chunk::{LinkedChunk, LinkedChunkId, Update, lazy_loader},
 };
 use matrix_sdk_base::event_cache::{
-    store::{DynEventCacheStore, IntoEventCacheStore, MemoryStore, DEFAULT_CHUNK_CAPACITY},
     Event, Gap,
+    store::{DEFAULT_CHUNK_CAPACITY, DynEventCacheStore, IntoEventCacheStore, MemoryStore},
 };
-use matrix_sdk_test::{event_factory::EventFactory, ALICE};
-use ruma::{room_id, EventId};
+use matrix_sdk_test::{ALICE, event_factory::EventFactory};
+use ruma::{EventId, room_id};
 use tempfile::tempdir;
 use tokio::runtime::Builder;
 
@@ -19,6 +19,11 @@ enum Operation {
     PushItemsBack(Vec<Event>),
     PushGapBack(Gap),
 }
+
+#[cfg(not(feature = "codspeed"))]
+const NUMBER_OF_EVENTS: &[u64] = &[10, 100, 1000, 10_000, 100_000];
+#[cfg(feature = "codspeed")]
+const NUMBER_OF_EVENTS: &[u64] = &[10, 100, 1000];
 
 fn writing(c: &mut Criterion) {
     // Create a new asynchronous runtime.
@@ -29,12 +34,13 @@ fn writing(c: &mut Criterion) {
         .expect("Failed to create an asynchronous runtime");
 
     let room_id = room_id!("!foo:bar.baz");
+    let linked_chunk_id = LinkedChunkId::Room(room_id);
     let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
 
-    let mut group = c.benchmark_group("writing");
+    let mut group = c.benchmark_group("Linked chunk writing");
     group.sample_size(10).measurement_time(Duration::from_secs(30));
 
-    for number_of_events in [10, 100, 1000, 10_000, 100_000] {
+    for &number_of_events in NUMBER_OF_EVENTS {
         let sqlite_temp_dir = tempdir().unwrap();
 
         // Declare new stores for this set of events.
@@ -95,7 +101,7 @@ fn writing(c: &mut Criterion) {
 
             // Get a bencher.
             group.bench_with_input(
-                BenchmarkId::new(store_name, number_of_events),
+                BenchmarkId::new(format!("Linked chunk writing [{store_name}]"), number_of_events),
                 &operations,
                 |bencher, operations| {
                     // Bench the routine.
@@ -115,9 +121,9 @@ fn writing(c: &mut Criterion) {
 
                             if let Some(store) = &store {
                                 let updates = linked_chunk.updates().unwrap().take();
-                                store.handle_linked_chunk_updates(room_id, updates).await.unwrap();
+                                store.handle_linked_chunk_updates(linked_chunk_id, updates).await.unwrap();
                                 // Empty the store.
-                                store.handle_linked_chunk_updates(room_id, vec![Update::Clear]).await.unwrap();
+                                store.handle_linked_chunk_updates(linked_chunk_id, vec![Update::Clear]).await.unwrap();
                             }
 
                         },
@@ -145,12 +151,13 @@ fn reading(c: &mut Criterion) {
         .expect("Failed to create an asynchronous runtime");
 
     let room_id = room_id!("!foo:bar.baz");
+    let linked_chunk_id = LinkedChunkId::Room(room_id);
     let event_factory = EventFactory::new().room(room_id).sender(&ALICE);
 
-    let mut group = c.benchmark_group("reading");
+    let mut group = c.benchmark_group("Linked chunk reading");
     group.sample_size(10);
 
-    for num_events in [10, 100, 1000, 10_000, 100_000] {
+    for &num_events in NUMBER_OF_EVENTS {
         let sqlite_temp_dir = tempdir().unwrap();
 
         // Declare new stores for this set of events.
@@ -185,45 +192,68 @@ fn reading(c: &mut Criterion) {
 
                 while events.peek().is_some() {
                     let events_chunk = events.by_ref().take(80).collect::<Vec<_>>();
+
                     if events_chunk.is_empty() {
                         break;
                     }
+
                     lc.push_items_back(events_chunk);
                     lc.push_gap_back(Gap { prev_token: format!("gap{num_gaps}") });
+
                     num_gaps += 1;
                 }
 
                 // Now persist the updates to recreate this full linked chunk.
                 let updates = lc.updates().unwrap().take();
-                runtime.block_on(store.handle_linked_chunk_updates(room_id, updates)).unwrap();
+                runtime
+                    .block_on(store.handle_linked_chunk_updates(linked_chunk_id, updates))
+                    .unwrap();
             }
 
             // Define the throughput.
             group.throughput(Throughput::Elements(num_events));
 
-            // Get a bencher.
-            group.bench_function(BenchmarkId::new(store_name, num_events), |bencher| {
-                // Bench the routine.
-                bencher.to_async(&runtime).iter(|| async {
-                    // Load the last chunk first,
-                    let (last_chunk, chunk_id_gen) = store.load_last_chunk(room_id).await.unwrap();
+            // Bench the lazy loader.
+            group.bench_function(
+                BenchmarkId::new(format!("Linked chunk lazy loader[{store_name}]"), num_events),
+                |bencher| {
+                    // Bench the routine.
+                    bencher.to_async(&runtime).iter(|| async {
+                        // Load the last chunk first,
+                        let (last_chunk, chunk_id_gen) =
+                            store.load_last_chunk(linked_chunk_id).await.unwrap();
 
-                    let mut lc =
-                        lazy_loader::from_last_chunk::<128, _, _>(last_chunk, chunk_id_gen)
-                            .expect("no error when reconstructing the linked chunk")
-                            .expect("there is a linked chunk in the store");
+                        let mut lc =
+                            lazy_loader::from_last_chunk::<128, _, _>(last_chunk, chunk_id_gen)
+                                .expect("no error when reconstructing the linked chunk")
+                                .expect("there is a linked chunk in the store");
 
-                    // Then load until the start of the linked chunk.
-                    let mut cur_chunk_id = lc.chunks().next().unwrap().identifier();
-                    while let Some(prev) =
-                        store.load_previous_chunk(room_id, cur_chunk_id).await.unwrap()
-                    {
-                        cur_chunk_id = prev.identifier;
-                        lazy_loader::insert_new_first_chunk(&mut lc, prev)
-                            .expect("no error when linking the previous lazy-loaded chunk");
-                    }
-                })
-            });
+                        // Then load until the start of the linked chunk.
+                        let mut cur_chunk_id = lc.chunks().next().unwrap().identifier();
+                        while let Some(prev) =
+                            store.load_previous_chunk(linked_chunk_id, cur_chunk_id).await.unwrap()
+                        {
+                            cur_chunk_id = prev.identifier;
+                            lazy_loader::insert_new_first_chunk(&mut lc, prev)
+                                .expect("no error when linking the previous lazy-loaded chunk");
+                        }
+                    })
+                },
+            );
+
+            // Bench the metadata loader.
+            group.bench_function(
+                BenchmarkId::new(format!("Linked chunk metadata loader[{store_name}]"), num_events),
+                |bencher| {
+                    // Bench the routine.
+                    bencher.to_async(&runtime).iter(|| async {
+                        let _metadata = store
+                            .load_all_chunks_metadata(linked_chunk_id)
+                            .await
+                            .expect("metadata must load");
+                    })
+                },
+            );
 
             {
                 let _guard = runtime.enter();
@@ -235,21 +265,9 @@ fn reading(c: &mut Criterion) {
     group.finish()
 }
 
-fn criterion() -> Criterion {
-    #[cfg(target_os = "linux")]
-    let criterion = Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
-        100,
-        pprof::criterion::Output::Flamegraph(None),
-    ));
-    #[cfg(not(target_os = "linux"))]
-    let criterion = Criterion::default();
-
-    criterion
-}
-
 criterion_group! {
     name = event_cache;
-    config = criterion();
+    config = Criterion::default();
     targets = writing, reading,
 }
 

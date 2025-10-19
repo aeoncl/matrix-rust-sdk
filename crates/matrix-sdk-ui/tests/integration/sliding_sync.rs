@@ -1,6 +1,6 @@
 //! Helpers for integration tests involving sliding sync.
 
-use wiremock::{http::Method, Match, MockServer, Request};
+use wiremock::{Match, MockServer, Request, http::Method};
 
 pub(crate) async fn check_requests(server: MockServer, expected_requests: &[serde_json::Value]) {
     let mut num_requests = 0;
@@ -102,9 +102,9 @@ macro_rules! sliding_sync_then_assert_request_and_fake_response {
                             $( $response_json )*
                         })
                     )
-                    $( .set_delay($response_delay) )?
+                    $( .set_delay( $response_delay ) )?
                 })
-                .mount_as_scoped(&$server)
+                .mount_as_scoped(& $server )
                 .await;
 
             let next = $stream.next().await;

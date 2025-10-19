@@ -15,19 +15,19 @@
 use std::collections::BTreeMap;
 
 use ruma::{
-    api::client::sync::sync_events::v5 as http,
-    events::{receipt::ReceiptEventContent, AnySyncEphemeralRoomEvent, SyncEphemeralRoomEvent},
-    serde::Raw,
     OwnedRoomId, RoomId,
+    api::client::sync::sync_events::v5 as http,
+    events::{AnySyncEphemeralRoomEvent, SyncEphemeralRoomEvent, receipt::ReceiptEventContent},
+    serde::Raw,
 };
 
 use super::super::super::{
-    account_data::for_room as account_data_for_room, ephemeral_events::dispatch_receipt, Context,
+    Context, account_data::for_room as account_data_for_room, ephemeral_events::dispatch_receipt,
 };
 use crate::{
+    RoomState,
     store::BaseStateStore,
     sync::{JoinedRoomUpdate, RoomUpdates},
-    RoomState,
 };
 
 /// Dispatch the ephemeral events in the `extensions.typing` part of the
@@ -51,22 +51,20 @@ pub fn dispatch_receipt_ephemeral_event_for_room(
     context: &mut Context,
     room_id: &RoomId,
     receipt: &Raw<SyncEphemeralRoomEvent<ReceiptEventContent>>,
-    joined_room_update: &mut JoinedRoomUpdate,
 ) {
     let receipt: Raw<AnySyncEphemeralRoomEvent> = receipt.cast_ref().clone();
 
     dispatch_receipt(context, &receipt, room_id);
-    joined_room_update.ephemeral.push(receipt);
 }
 
-pub async fn room_account_data(
+pub fn room_account_data(
     context: &mut Context,
     account_data: &http::response::AccountData,
     room_updates: &mut RoomUpdates,
     state_store: &BaseStateStore,
 ) {
     for (room_id, raw) in &account_data.rooms {
-        account_data_for_room(context, room_id, raw, state_store).await;
+        account_data_for_room(context, room_id, raw, state_store);
 
         if let Some(room) = state_store.room(room_id) {
             match room.state() {

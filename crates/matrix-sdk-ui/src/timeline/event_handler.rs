@@ -15,7 +15,6 @@
 use std::{borrow::Cow, sync::Arc};
 
 use as_variant::as_variant;
-use imbl::Vector;
 use indexmap::IndexMap;
 use matrix_sdk::{
     crypto::types::events::UtdCause,
@@ -23,44 +22,45 @@ use matrix_sdk::{
     send_queue::SendHandle,
 };
 use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    TransactionId,
     events::{
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
+        AnySyncTimelineEvent, FullStateEventContent, MessageLikeEventContent, MessageLikeEventType,
+        StateEventType, SyncStateEvent,
         poll::unstable_start::{
             NewUnstablePollStartEventContentWithoutRelation, UnstablePollStartEventContent,
         },
         receipt::Receipt,
         relation::Replacement,
         room::message::{
-            Relation, RelationWithoutReplacement, RoomMessageEventContent,
-            RoomMessageEventContentWithoutRelation,
+            Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
         },
-        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
-        AnySyncTimelineEvent, BundledMessageLikeRelations, EventContent, FullStateEventContent,
-        MessageLikeEventType, StateEventType, SyncStateEvent,
     },
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    TransactionId,
 };
 use tracing::{debug, error, field::debug, instrument, trace, warn};
 
 use super::{
+    EmbeddedEvent, EncryptedMessage, EventTimelineItem, InReplyToDetails, MsgLikeContent,
+    MsgLikeKind, OtherState, ReactionStatus, Sticker, ThreadSummary, TimelineDetails, TimelineItem,
+    TimelineItemContent,
     controller::{
-        find_item_and_apply_aggregation, Aggregation, AggregationKind, ObservableItemsTransaction,
-        PendingEditKind, TimelineMetadata, TimelineStateTransaction,
+        Aggregation, AggregationKind, ObservableItemsTransaction, PendingEditKind,
+        TimelineMetadata, TimelineStateTransaction, find_item_and_apply_aggregation,
     },
     date_dividers::DateDividerAdjuster,
     event_item::{
-        extract_bundled_edit_event_json, extract_poll_edit_content, extract_room_msg_edit_content,
         AnyOtherFullStateEventContent, EventSendState, EventTimelineItemKind,
         LocalEventTimelineItem, PollState, Profile, RemoteEventOrigin, RemoteEventTimelineItem,
         TimelineEventItemId,
     },
     traits::RoomDataProvider,
-    EmbeddedEvent, EncryptedMessage, EventTimelineItem, InReplyToDetails, MsgLikeContent,
-    MsgLikeKind, OtherState, ReactionStatus, Sticker, ThreadSummary, TimelineDetails, TimelineItem,
-    TimelineItemContent,
 };
-use crate::timeline::controller::aggregations::PendingEdit;
+use crate::{
+    timeline::{controller::aggregations::PendingEdit, event_item::OtherMessageLike},
+    unable_to_decrypt_hook::UtdHookManager,
+};
 
 /// When adding an event, useful information related to the source of the event.
 pub(super) enum Flow {
@@ -145,14 +145,18 @@ pub(super) enum HandleAggregationKind {
     PollEnd,
 }
 
-/// All parameters to [`TimelineAction::from_content`] that only apply if an
-/// event is a remote echo.
-pub(super) struct RemoteEventContext<'a> {
-    event_id: &'a EventId,
-    raw_event: &'a Raw<AnySyncTimelineEvent>,
-    relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
-    bundled_edit_encryption_info: Option<Arc<EncryptionInfo>>,
-    thread_summary: Option<ThreadSummary>,
+impl HandleAggregationKind {
+    /// Returns a small string describing this aggregation, for debug purposes.
+    pub fn debug_string(&self) -> &'static str {
+        match self {
+            HandleAggregationKind::Reaction { .. } => "a reaction",
+            HandleAggregationKind::Redaction => "a redaction",
+            HandleAggregationKind::Edit { .. } => "an edit",
+            HandleAggregationKind::PollResponse { .. } => "a poll response",
+            HandleAggregationKind::PollEdit { .. } => "a poll edit",
+            HandleAggregationKind::PollEnd => "a poll end",
+        }
+    }
 }
 
 /// An action that we want to cause on the timeline.
@@ -190,20 +194,18 @@ impl TimelineAction {
 
     /// Create a new [`TimelineAction`] from a given remote event.
     ///
-    /// The return value may be `None` if handling the event (be it a new item
-    /// or an aggregation) is not supported for this event type.
+    /// The return value may be `None` if the event was a redacted reaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_event<P: RoomDataProvider>(
         event: AnySyncTimelineEvent,
         raw_event: &Raw<AnySyncTimelineEvent>,
         room_data_provider: &P,
+        unable_to_decrypt: Option<(UnableToDecryptInfo, Option<&Arc<UtdHookManager>>)>,
+        in_reply_to: Option<InReplyToDetails>,
+        thread_root: Option<OwnedEventId>,
         thread_summary: Option<ThreadSummary>,
-        unable_to_decrypt_info: Option<UnableToDecryptInfo>,
-        bundled_edit_encryption_info: Option<Arc<EncryptionInfo>>,
-        timeline_items: &Vector<Arc<TimelineItem>>,
-        meta: &mut TimelineMetadata,
     ) -> Option<Self> {
-        let room_version = room_data_provider.room_version();
+        let redaction_rules = room_data_provider.room_version_rules().redaction;
 
         let redacted_message_or_none = |event_type: MessageLikeEventType| {
             (event_type != MessageLikeEventType::Reaction)
@@ -212,7 +214,7 @@ impl TimelineAction {
 
         Some(match event {
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(ev)) => {
-                if let Some(redacts) = ev.redacts(&room_version).map(ToOwned::to_owned) {
+                if let Some(redacts) = ev.redacts(&redaction_rules).map(ToOwned::to_owned) {
                     Self::HandleAggregation {
                         related_event: redacts,
                         kind: HandleAggregationKind::Redaction,
@@ -225,7 +227,9 @@ impl TimelineAction {
             AnySyncTimelineEvent::MessageLike(ev) => match ev.original_content() {
                 Some(AnyMessageLikeEventContent::RoomEncrypted(content)) => {
                     // An event which is still encrypted.
-                    if let Some(unable_to_decrypt_info) = unable_to_decrypt_info {
+                    if let Some((unable_to_decrypt_info, unable_to_decrypt_hook_manager)) =
+                        unable_to_decrypt
+                    {
                         let utd_cause = UtdCause::determine(
                             raw_event,
                             room_data_provider.crypto_context_info().await,
@@ -234,7 +238,7 @@ impl TimelineAction {
 
                         // Let the hook know that we ran into an unable-to-decrypt that is added to
                         // the timeline.
-                        if let Some(hook) = meta.unable_to_decrypt_hook.as_ref() {
+                        if let Some(hook) = unable_to_decrypt_hook_manager {
                             hook.on_utd(
                                 ev.event_id(),
                                 utd_cause,
@@ -254,34 +258,17 @@ impl TimelineAction {
                         // `TimelineEvent` containing an `m.room.encrypted` event without
                         // decrypting it. Possibly this means that encryption has not been
                         // configured. We treat it the same as any other message-like event.
-                        return Self::from_content(
+                        Self::from_content(
                             AnyMessageLikeEventContent::RoomEncrypted(content),
-                            Some(RemoteEventContext {
-                                event_id: ev.event_id(),
-                                raw_event,
-                                relations: ev.relations(),
-                                bundled_edit_encryption_info,
-                                thread_summary,
-                            }),
-                            timeline_items,
-                            meta,
-                        );
+                            in_reply_to,
+                            thread_root,
+                            thread_summary,
+                        )
                     }
                 }
 
                 Some(content) => {
-                    return Self::from_content(
-                        content,
-                        Some(RemoteEventContext {
-                            event_id: ev.event_id(),
-                            raw_event,
-                            relations: ev.relations(),
-                            bundled_edit_encryption_info,
-                            thread_summary,
-                        }),
-                        timeline_items,
-                        meta,
-                    );
+                    Self::from_content(content, in_reply_to, thread_root, thread_summary)
                 }
 
                 None => Self::add_item(redacted_message_or_none(ev.event_type())?),
@@ -325,11 +312,11 @@ impl TimelineAction {
     /// or an aggregation) is not supported for this event type.
     pub(super) fn from_content(
         content: AnyMessageLikeEventContent,
-        remote_ctx: Option<RemoteEventContext<'_>>,
-        timeline_items: &Vector<Arc<TimelineItem>>,
-        meta: &mut TimelineMetadata,
-    ) -> Option<Self> {
-        Some(match content {
+        in_reply_to: Option<InReplyToDetails>,
+        thread_root: Option<OwnedEventId>,
+        thread_summary: Option<ThreadSummary>,
+    ) -> Self {
+        match content {
             AnyMessageLikeEventContent::Reaction(c) => {
                 // This is a reaction to a message.
                 Self::HandleAggregation {
@@ -367,69 +354,24 @@ impl TimelineAction {
                 Self::add_item(TimelineItemContent::CallInvite)
             }
 
-            AnyMessageLikeEventContent::CallNotify(_) => {
-                Self::add_item(TimelineItemContent::CallNotify)
+            AnyMessageLikeEventContent::RtcNotification(_) => {
+                Self::add_item(TimelineItemContent::RtcNotification)
             }
 
             AnyMessageLikeEventContent::Sticker(content) => {
-                let (in_reply_to, thread_root) = Self::extract_reply_and_thread_root(
-                    content.relates_to.clone().and_then(|rel| rel.try_into().ok()),
-                    timeline_items,
-                );
-
-                if let Some(event_id) = remote_ctx.as_ref().map(|ctx| ctx.event_id) {
-                    Self::mark_response(meta, event_id, in_reply_to.as_ref());
-                }
-
                 Self::add_item(TimelineItemContent::MsgLike(MsgLikeContent {
                     kind: MsgLikeKind::Sticker(Sticker { content }),
                     reactions: Default::default(),
                     thread_root,
                     in_reply_to,
-                    thread_summary: remote_ctx.and_then(|ctx| ctx.thread_summary),
+                    thread_summary,
                 }))
             }
 
             AnyMessageLikeEventContent::UnstablePollStart(UnstablePollStartEventContent::New(
                 c,
             )) => {
-                let (in_reply_to, thread_root) =
-                    Self::extract_reply_and_thread_root(c.relates_to.clone(), timeline_items);
-
-                // Record the bundled edit in the aggregations set, if any.
-                let thread_summary = if let Some(ctx) = remote_ctx {
-                    if let Some(new_content) = extract_poll_edit_content(ctx.relations) {
-                        // It is replacing the current event.
-                        if let Some(edit_event_id) =
-                            ctx.raw_event.get_field::<OwnedEventId>("event_id").ok().flatten()
-                        {
-                            let edit_json = extract_bundled_edit_event_json(ctx.raw_event);
-                            let aggregation = Aggregation::new(
-                                TimelineEventItemId::EventId(edit_event_id),
-                                AggregationKind::Edit(PendingEdit {
-                                    kind: PendingEditKind::Poll(Replacement::new(
-                                        ctx.event_id.to_owned(),
-                                        new_content,
-                                    )),
-                                    edit_json,
-                                    encryption_info: ctx.bundled_edit_encryption_info,
-                                }),
-                            );
-                            meta.aggregations.add(
-                                TimelineEventItemId::EventId(ctx.event_id.to_owned()),
-                                aggregation,
-                            );
-                        }
-                    }
-
-                    Self::mark_response(meta, ctx.event_id, in_reply_to.as_ref());
-
-                    ctx.thread_summary
-                } else {
-                    None
-                };
-
-                let poll_state = PollState::new(c);
+                let poll_state = PollState::new(c.poll_start, c.text);
 
                 Self::AddItem {
                     content: TimelineItemContent::MsgLike(MsgLikeContent {
@@ -442,102 +384,30 @@ impl TimelineAction {
                 }
             }
 
-            AnyMessageLikeEventContent::RoomMessage(msg) => {
-                let (in_reply_to, thread_root) = Self::extract_reply_and_thread_root(
-                    msg.relates_to.and_then(|rel| rel.try_into().ok()),
-                    timeline_items,
-                );
+            AnyMessageLikeEventContent::RoomMessage(msg) => Self::AddItem {
+                content: TimelineItemContent::message(
+                    msg.msgtype,
+                    msg.mentions,
+                    Default::default(),
+                    thread_root,
+                    in_reply_to,
+                    thread_summary,
+                ),
+            },
 
-                // Record the bundled edit in the aggregations set, if any.
-                let thread_summary = if let Some(ctx) = remote_ctx {
-                    if let Some(new_content) = extract_room_msg_edit_content(ctx.relations) {
-                        // It is replacing the current event.
-                        if let Some(edit_event_id) =
-                            ctx.raw_event.get_field::<OwnedEventId>("event_id").ok().flatten()
-                        {
-                            let edit_json = extract_bundled_edit_event_json(ctx.raw_event);
-                            let aggregation = Aggregation::new(
-                                TimelineEventItemId::EventId(edit_event_id),
-                                AggregationKind::Edit(PendingEdit {
-                                    kind: PendingEditKind::RoomMessage(Replacement::new(
-                                        ctx.event_id.to_owned(),
-                                        new_content,
-                                    )),
-                                    edit_json,
-                                    encryption_info: ctx.bundled_edit_encryption_info,
-                                }),
-                            );
-                            meta.aggregations.add(
-                                TimelineEventItemId::EventId(ctx.event_id.to_owned()),
-                                aggregation,
-                            );
-                        }
-                    }
-
-                    Self::mark_response(meta, ctx.event_id, in_reply_to.as_ref());
-
-                    ctx.thread_summary
-                } else {
-                    None
-                };
+            event => {
+                let other = OtherMessageLike { event_type: event.event_type() };
 
                 Self::AddItem {
-                    content: TimelineItemContent::message(
-                        msg.msgtype,
-                        msg.mentions,
-                        Default::default(),
+                    content: TimelineItemContent::MsgLike(MsgLikeContent {
+                        kind: MsgLikeKind::Other(other),
+                        reactions: Default::default(),
                         thread_root,
                         in_reply_to,
                         thread_summary,
-                    ),
+                    }),
                 }
             }
-
-            _ => {
-                debug!(
-                    "Ignoring message-like event of type `{}`, not supported (yet)",
-                    content.event_type()
-                );
-                return None;
-            }
-        })
-    }
-
-    fn extract_reply_and_thread_root(
-        relates_to: Option<RelationWithoutReplacement>,
-        timeline_items: &Vector<Arc<TimelineItem>>,
-    ) -> (Option<InReplyToDetails>, Option<OwnedEventId>) {
-        let mut thread_root = None;
-
-        let in_reply_to = relates_to.and_then(|relation| match relation {
-            RelationWithoutReplacement::Reply { in_reply_to } => {
-                Some(InReplyToDetails::new(in_reply_to.event_id, timeline_items))
-            }
-            RelationWithoutReplacement::Thread(thread) => {
-                thread_root = Some(thread.event_id);
-                thread
-                    .in_reply_to
-                    .map(|in_reply_to| InReplyToDetails::new(in_reply_to.event_id, timeline_items))
-            }
-            _ => None,
-        });
-
-        (in_reply_to, thread_root)
-    }
-
-    fn mark_response(
-        meta: &mut TimelineMetadata,
-        event_id: &EventId,
-        in_reply_to: Option<&InReplyToDetails>,
-    ) {
-        // If this message is a reply to another message, add an entry in the
-        // inverted mapping.
-        if let Some(replied_to_event_id) = in_reply_to.as_ref().map(|details| &details.event_id) {
-            // This is a reply! Add an entry.
-            meta.replies
-                .entry(replied_to_event_id.to_owned())
-                .or_default()
-                .insert(event_id.to_owned());
         }
     }
 
@@ -616,8 +486,8 @@ pub(super) struct TimelineEventHandler<'a, 'o> {
 }
 
 impl<'a, 'o> TimelineEventHandler<'a, 'o> {
-    pub(super) fn new(
-        state: &'a mut TimelineStateTransaction<'o>,
+    pub(super) fn new<P: RoomDataProvider>(
+        state: &'a mut TimelineStateTransaction<'o, P>,
         ctx: TimelineEventContext,
     ) -> Self {
         let TimelineStateTransaction { items, meta, .. } = state;
@@ -626,7 +496,14 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
     /// Handle an event.
     ///
-    /// Returns the number of timeline updates that were made.
+    /// Returns if an item was added to the timeline due to the new timeline
+    /// action. Items might not be added to the timeline for various reasons,
+    /// some common ones are if the item:
+    ///     - Contains an unsupported event type.
+    ///     - Is an edit or a redaction.
+    ///     - Contains a local echo turning into a remote echo.
+    ///     - Contains a message that is already in the timeline but was now
+    ///       decrypted.
     ///
     /// `raw_event` is only needed to determine the cause of any UTDs,
     /// so if we know this is not a UTD it can be None.
@@ -635,7 +512,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         mut self,
         date_divider_adjuster: &mut DateDividerAdjuster,
         timeline_action: TimelineAction,
-    ) -> RemovedItem {
+    ) -> bool {
         let span = tracing::Span::current();
 
         date_divider_adjuster.mark_used();
@@ -654,7 +531,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 }
                 trace!("Handling remote event");
             }
-        };
+        }
 
         let mut added_item = false;
 
@@ -694,25 +571,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             },
         }
 
-        let mut removed_item = false;
-
-        if !added_item {
-            trace!("No new item added");
-
-            if let Flow::Remote {
-                position: TimelineItemPosition::UpdateAt { timeline_item_index },
-                ..
-            } = self.ctx.flow
-            {
-                // If add was not called, that means the UTD event is one that
-                // wouldn't normally be visible. Remove it.
-                trace!("Removing UTD that was successfully retried");
-                self.items.remove(timeline_item_index);
-                removed_item = true;
-            }
-        }
-
-        removed_item
+        added_item
     }
 
     #[instrument(skip(self, edit_kind))]
@@ -727,6 +586,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 kind: edit_kind,
                 edit_json: self.ctx.flow.raw_event().cloned(),
                 encryption_info,
+                bundled_item_owner: None,
             }),
         );
 
@@ -737,10 +597,15 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         ) {
             // Update all events that replied to this message with the edited content.
-            Self::maybe_update_responses(self.meta, self.items, &edited_event_id, &new_item);
+            Self::maybe_update_responses(
+                self.meta,
+                self.items,
+                &edited_event_id,
+                EmbeddedEvent::from_timeline_item(&new_item),
+            );
         }
     }
 
@@ -780,7 +645,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         );
     }
 
@@ -800,7 +665,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         );
     }
 
@@ -816,7 +681,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         );
     }
 
@@ -842,17 +707,25 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             Aggregation::new(self.ctx.flow.timeline_item_id(), AggregationKind::Redaction);
         self.meta.aggregations.add(target.clone(), aggregation.clone());
 
-        if let Some(new_item) = find_item_and_apply_aggregation(
+        find_item_and_apply_aggregation(
             &self.meta.aggregations,
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
-        ) {
-            // Look for any timeline event that's a reply to the redacted event, and redact
-            // the replied-to event there as well.
-            Self::maybe_update_responses(self.meta, self.items, &redacted, &new_item);
-        }
+            &self.meta.room_version_rules,
+        );
+
+        // Even if the redacted event wasn't in the timeline, we can always update
+        // responses with a placeholder "redacted" embedded item.
+        let embedded_event = EmbeddedEvent {
+            content: TimelineItemContent::MsgLike(MsgLikeContent::redacted()),
+            sender: self.ctx.sender.clone(),
+            sender_profile: TimelineDetails::from_initial_value(self.ctx.sender_profile.clone()),
+            timestamp: self.ctx.timestamp,
+            identifier: TimelineEventItemId::EventId(redacted.clone()),
+        };
+
+        Self::maybe_update_responses(self.meta, self.items, &redacted, embedded_event);
     }
 
     /// Attempts to redact an aggregation (e.g. a reaction, a poll response,
@@ -893,7 +766,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
         let kind: EventTimelineItemKind = match &self.ctx.flow {
             Flow::Local { txn_id, send_handle } => LocalEventTimelineItem {
-                send_state: EventSendState::NotSentYet,
+                send_state: EventSendState::NotSentYet { progress: None },
                 transaction_id: txn_id.to_owned(),
                 send_handle: send_handle.clone(),
             }
@@ -947,7 +820,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             &self.ctx.flow.timeline_item_id(),
             &mut cowed,
             self.items,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         ) {
             warn!("discarding aggregations: {err}");
         }
@@ -1105,7 +978,12 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 trace!("Updating timeline item at position {idx}");
 
                 // Update all events that replied to this previously encrypted message.
-                Self::maybe_update_responses(self.meta, self.items, decrypted_event_id, &item);
+                Self::maybe_update_responses(
+                    self.meta,
+                    self.items,
+                    decrypted_event_id,
+                    EmbeddedEvent::from_timeline_item(&item),
+                );
 
                 let internal_id = self.items[*idx].internal_id.clone();
                 self.items.replace(*idx, TimelineItem::new(item, internal_id));
@@ -1176,7 +1054,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         meta: &mut TimelineMetadata,
         items: &mut ObservableItemsTransaction<'_>,
         target_event_id: &EventId,
-        new_item: &EventTimelineItem,
+        new_embedded_event: EmbeddedEvent,
     ) {
         let Some(replies) = meta.replies.get(target_event_id) else {
             trace!("item has no replies");
@@ -1205,9 +1083,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             trace!(reply_event_id = ?event_item.identifier(), "Updating response to updated event");
             let in_reply_to = InReplyToDetails {
                 event_id: in_reply_to.event_id.clone(),
-                event: TimelineDetails::Ready(Box::new(EmbeddedEvent::from_timeline_item(
-                    new_item,
-                ))),
+                event: TimelineDetails::Ready(Box::new(new_embedded_event.clone())),
             };
 
             let new_reply_content = TimelineItemContent::MsgLike(

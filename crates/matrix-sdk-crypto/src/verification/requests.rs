@@ -881,7 +881,7 @@ impl VerificationRequest {
     ///
     /// The changes are presented as a stream of [`VerificationRequestState`]
     /// values.
-    pub fn changes(&self) -> impl Stream<Item = VerificationRequestState> {
+    pub fn changes(&self) -> impl Stream<Item = VerificationRequestState> + use<> {
         self.inner.subscribe().map(|s| (&s).into())
     }
 
@@ -949,7 +949,7 @@ impl InnerRequest {
     fn cancel(&self, cancelled_by_us: bool, cancel_code: &CancelCode) -> Option<InnerRequest> {
         let print_info = || {
             trace!(
-                cancelled_by_us = cancelled_by_us,
+                cancelled_by_us,
                 code = cancel_code.as_str(),
                 "Verification request going into the cancelled state"
             );
@@ -973,7 +973,7 @@ impl InnerRequest {
                 s.clone().into_canceled(cancelled_by_us, cancel_code)
             }
             InnerRequest::Passive(_) | InnerRequest::Done(_) | InnerRequest::Cancelled(_) => {
-                return None
+                return None;
             }
         });
 
@@ -1390,11 +1390,15 @@ async fn receive_start<T: Clone>(
                                 ),
                                 (Ordering::Greater, _) | (Ordering::Equal, Ordering::Greater)
                             ) {
-                                info!("Started a new SAS verification, replacing an already started one.");
+                                info!(
+                                    "Started a new SAS verification, replacing an already started one."
+                                );
                                 request_state.verification_cache.replace_sas(new.to_owned());
                                 Ok(Some(state.to_transitioned(request_state, new.into())))
                             } else {
-                                info!("Ignored incoming SAS verification from lexicographically larger user/device ID.");
+                                info!(
+                                    "Ignored incoming SAS verification from lexicographically larger user/device ID."
+                                );
                                 Ok(None)
                             }
                         }

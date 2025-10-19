@@ -34,11 +34,10 @@ use std::{
 };
 
 use as_variant::as_variant;
-use matrix_sdk_common::deserialized_responses::{EncryptionInfo, PrivOwnedStr};
+use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
 use ruma::{
-    events::AnyToDeviceEvent,
-    serde::{Raw, StringEnum},
-    DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, RoomId, UserId,
+    serde::StringEnum, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, RoomId,
+    UserId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature, KeyError};
@@ -54,7 +53,7 @@ pub mod requests;
 pub mod room_history;
 
 pub use self::{backup::*, cross_signing::*, device_keys::*, one_time_keys::*};
-use crate::store::BackupDecryptionKey;
+use crate::store::types::BackupDecryptionKey;
 
 macro_rules! from_base64 {
     ($foo:ident, $name:ident) => {
@@ -430,7 +429,7 @@ impl Algorithm for DeviceKeyAlgorithm {
 }
 
 /// An encryption algorithm to be used to encrypt messages sent to a room.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, StringEnum)]
+#[derive(Clone, StringEnum)]
 #[non_exhaustive]
 pub enum EventEncryptionAlgorithm {
     /// Olm version 1 using Curve25519, AES-256, and SHA-256.
@@ -518,6 +517,40 @@ where
 {
     let keys: Vec<String> = keys.iter().map(|k| k.to_base64()).collect();
     keys.serialize(s)
+}
+
+mod serde_curve_key_option {
+    use super::{Curve25519PublicKey, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn deserialize<'de, D>(de: D) -> Result<Option<Curve25519PublicKey>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let key: Option<String> = Deserialize::deserialize(de)?;
+        key.map(|k| Curve25519PublicKey::from_base64(&k))
+            .transpose()
+            .map_err(serde::de::Error::custom)
+    }
+
+    pub(crate) fn serialize<S>(key: &Option<Curve25519PublicKey>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let key = key.as_ref().map(|k| k.to_base64());
+        key.serialize(s)
+    }
+}
+
+/// Trait to express the various room key export formats we have in a unified
+/// manner.
+pub trait RoomKeyExport {
+    /// The ID of the room where the exported room key was used.
+    fn room_id(&self) -> &RoomId;
+    /// The unique ID of the exported room key.
+    fn session_id(&self) -> &str;
+    /// The [Curve25519PublicKey] long-term identity key of the sender of this
+    /// room key.
+    fn sender_key(&self) -> Curve25519PublicKey;
 }
 
 #[cfg(test)]
@@ -627,52 +660,4 @@ mod test {
 
         assert_json_snapshot!(secret_bundle);
     }
-}
-
-/// Represents a to-device event after it has been processed by the olm machine.
-#[derive(Clone, Debug)]
-pub enum ProcessedToDeviceEvent {
-    /// A successfully-decrypted encrypted event.
-    /// Contains the raw decrypted event and encryption info
-    Decrypted {
-        /// The raw decrypted event
-        raw: Raw<AnyToDeviceEvent>,
-        /// The olm encryption info
-        encryption_info: EncryptionInfo,
-    },
-
-    /// An encrypted event which could not be decrypted.
-    UnableToDecrypt(Raw<AnyToDeviceEvent>),
-
-    /// An unencrypted event.
-    PlainText(Raw<AnyToDeviceEvent>),
-
-    /// An invalid to device event that was ignored because it is missing some
-    /// required information to be processed (like no event `type` for
-    /// example)
-    Invalid(Raw<AnyToDeviceEvent>),
-}
-impl ProcessedToDeviceEvent {
-    /// Converts a ProcessedToDeviceEvent to the `Raw<AnyToDeviceEvent>` it
-    /// encapsulates
-    pub fn to_raw(&self) -> Raw<AnyToDeviceEvent> {
-        match self {
-            ProcessedToDeviceEvent::Decrypted { raw, .. } => raw.clone(),
-            ProcessedToDeviceEvent::UnableToDecrypt(event) => event.clone(),
-            ProcessedToDeviceEvent::PlainText(event) => event.clone(),
-            ProcessedToDeviceEvent::Invalid(event) => event.clone(),
-        }
-    }
-}
-
-/// Trait to express the various room key export formats we have in a unified
-/// manner.
-pub trait RoomKeyExport {
-    /// The ID of the room where the exported room key was used.
-    fn room_id(&self) -> &RoomId;
-    /// The unique ID of the exported room key.
-    fn session_id(&self) -> &str;
-    /// The [Curve25519PublicKey] long-term identity key of the sender of this
-    /// room key.
-    fn sender_key(&self) -> Curve25519PublicKey;
 }

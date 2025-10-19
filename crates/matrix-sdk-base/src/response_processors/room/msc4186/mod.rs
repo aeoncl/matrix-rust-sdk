@@ -20,36 +20,35 @@ use std::collections::BTreeSet;
 
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
-#[cfg(feature = "e2e-encryption")]
-use ruma::events::StateEventType;
+use matrix_sdk_common::timer;
 use ruma::{
+    JsOption, OwnedRoomId, RoomId, UserId,
     api::client::sync::sync_events::{
         v3::{InviteState, InvitedRoom, KnockState, KnockedRoom},
         v5 as http,
     },
     assign,
     events::{
-        room::member::{MembershipState, RoomMemberEventContent},
         AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent,
+        room::member::{MembershipState, RoomMemberEventContent},
     },
     serde::Raw,
-    JsOption, OwnedRoomId, RoomId, UserId,
 };
 use tokio::sync::broadcast::Sender;
 
 #[cfg(feature = "e2e-encryption")]
 use super::super::e2ee;
 use super::{
-    super::{notification, state_events, timeline, Context},
+    super::{Context, notification, state_events, timeline},
     RoomCreationData,
 };
 #[cfg(feature = "e2e-encryption")]
 use crate::StateChanges;
 use crate::{
-    store::BaseStateStore,
-    sync::{InvitedRoomUpdate, JoinedRoomUpdate, KnockedRoomUpdate, LeftRoomUpdate},
     Result, Room, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
     RoomState,
+    store::BaseStateStore,
+    sync::{InvitedRoomUpdate, JoinedRoomUpdate, KnockedRoomUpdate, LeftRoomUpdate, State},
 };
 
 /// Represent any kind of room updates.
@@ -69,6 +68,8 @@ pub async fn update_any_room(
     #[cfg(feature = "e2e-encryption")] e2ee: e2ee::E2EE<'_>,
     notification: notification::Notification<'_>,
 ) -> Result<Option<(RoomInfo, RoomUpdateKind)>> {
+    let _timer = timer!(tracing::Level::TRACE, "update_any_room");
+
     let RoomCreationData {
         room_id,
         room_info_notable_update_sender,
@@ -81,8 +82,8 @@ pub async fn update_any_room(
     // Don't read state events from the `timeline` field, because they might be
     // incomplete or staled already. We must only read state events from
     // `required_state`.
-    let (raw_state_events, state_events) =
-        state_events::sync::collect(&room_response.required_state);
+    let state = State::from_msc4186(room_response.required_state.clone());
+    let (raw_state_events, state_events) = state.collect(&[]);
 
     let state_store = notification.state_store;
 
@@ -118,6 +119,9 @@ pub async fn update_any_room(
         &mut room_info,
         ambiguity_cache,
         &mut new_user_ids,
+        state_store,
+        #[cfg(feature = "experimental-encrypted-state-events")]
+        e2ee.clone(),
     )
     .await?;
 
@@ -190,7 +194,7 @@ pub async fn update_any_room(
                 room_info,
                 RoomUpdateKind::Joined(JoinedRoomUpdate::new(
                     timeline,
-                    raw_state_events,
+                    state,
                     room_account_data.cloned().unwrap_or_default(),
                     ephemeral,
                     notification_count,
@@ -203,7 +207,7 @@ pub async fn update_any_room(
             room_info,
             RoomUpdateKind::Left(LeftRoomUpdate::new(
                 timeline,
-                raw_state_events,
+                state,
                 room_account_data.cloned().unwrap_or_default(),
                 ambiguity_changes,
             )),
@@ -242,10 +246,10 @@ fn membership(
         // We need to find the membership event since it could be for either an invited
         // or knocked room.
         let membership_event = state_events.1.iter().find_map(|event| {
-            if let AnyStrippedStateEvent::RoomMember(membership_event) = event {
-                if membership_event.state_key == user_id {
-                    return Some(membership_event.content.clone());
-                }
+            if let AnyStrippedStateEvent::RoomMember(membership_event) = event
+                && membership_event.state_key == user_id
+            {
+                return Some(membership_event.content.clone());
             }
             None
         });
@@ -395,7 +399,7 @@ fn properties(
     }
 
     if let Some(recency_stamp) = &room_response.bump_stamp {
-        let recency_stamp: u64 = (*recency_stamp).into();
+        let recency_stamp = u64::from(*recency_stamp).into();
 
         if room_info.recency_stamp.as_ref() != Some(&recency_stamp) {
             room_info.update_recency_stamp(recency_stamp);
@@ -433,26 +437,18 @@ pub(crate) async fn cache_latest_events(
 
     use crate::{
         deserialized_responses::DisplayName,
-        latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent},
+        latest_event::{LatestEvent, PossibleLatestEvent, is_suitable_for_latest_event},
         store::ambiguity_map::is_display_name_ambiguous,
     };
+
+    let _timer = timer!(tracing::Level::TRACE, "cache_latest_events");
 
     let mut encrypted_events =
         Vec::with_capacity(room.latest_encrypted_events.read().unwrap().capacity());
 
-    // Try to get room power levels from the current changes
-    let power_levels_from_changes = || {
-        let state_changes = changes?.state.get(room_info.room_id())?;
-        let room_power_levels_state =
-            state_changes.get(&StateEventType::RoomPowerLevels)?.values().next()?;
-        match room_power_levels_state.deserialize().ok()? {
-            AnySyncStateEvent::RoomPowerLevels(ev) => Some(ev.power_levels()),
-            _ => None,
-        }
-    };
-
-    // If we didn't get any info, try getting it from local data
-    let power_levels = match power_levels_from_changes() {
+    // Try to get room power levels from the current changes. If we didn't get any
+    // info, try getting it from local data.
+    let power_levels = match changes.and_then(|changes| changes.power_levels(room_info.room_id())) {
         Some(power_levels) => Some(power_levels),
         None => room.power_levels().await.ok(),
     };
@@ -465,7 +461,7 @@ pub(crate) async fn cache_latest_events(
                 PossibleLatestEvent::YesRoomMessage(_)
                 | PossibleLatestEvent::YesPoll(_)
                 | PossibleLatestEvent::YesCallInvite(_)
-                | PossibleLatestEvent::YesCallNotify(_)
+                | PossibleLatestEvent::YesRtcNotification(_)
                 | PossibleLatestEvent::YesSticker(_)
                 | PossibleLatestEvent::YesKnockedStateEvent(_) => {
                     // We found a suitable latest event. Store it.
@@ -508,17 +504,17 @@ pub(crate) async fn cache_latest_events(
                     }
 
                     // Otherwise, look up the sender's profile from the `Store`.
-                    if sender_profile.is_none() {
-                        if let Some(store) = store {
-                            sender_profile = store
-                                .get_profile(room.room_id(), timeline_event.sender())
-                                .await
-                                .ok()
-                                .flatten();
+                    if sender_profile.is_none()
+                        && let Some(store) = store
+                    {
+                        sender_profile = store
+                            .get_profile(room.room_id(), timeline_event.sender())
+                            .await
+                            .ok()
+                            .flatten();
 
-                            // TODO: need to update `sender_name_is_ambiguous`,
-                            // but how?
-                        }
+                        // TODO: need to update `sender_name_is_ambiguous`,
+                        // but how?
                     }
 
                     let latest_event = Box::new(LatestEvent::new_with_sender_details(
@@ -561,4 +557,12 @@ pub(crate) async fn cache_latest_events(
     // Push the encrypted events we found into the Room, in reverse order, so
     // the latest is last
     room.latest_encrypted_events.write().unwrap().extend(encrypted_events.into_iter().rev());
+}
+
+impl State {
+    /// Construct a [`State`] from the state changes for a joined or left room
+    /// from a response of the Simplified Sliding Sync endpoint.
+    fn from_msc4186(events: Vec<Raw<AnySyncStateEvent>>) -> Self {
+        Self::After(events)
+    }
 }

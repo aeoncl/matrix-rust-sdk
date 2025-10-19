@@ -17,8 +17,12 @@ env:
   RUST_LOG: info,matrix_sdk=trace
 
 jobs:
+  xtask:
+    uses: ./.github/workflows/xtask.yml
+
   code_coverage:
     name: Code Coverage
+    needs: xtask
     runs-on: "ubuntu-latest"
 
     # run several docker containers with the same networking stack so the hostname 'synapse'
@@ -35,8 +39,65 @@ jobs:
             - 8008:8008
 
     steps:
+      # This CI workflow can run into space issue, so we're cleaning up some
+      # space here.
+      - name: Create some more space
+        run: |
+          echo "Disk space before cleanup"
+          df -h
+
+          cd /opt
+          find . -maxdepth 1 -mindepth 1 '!' -path ./containerd '!' -path ./actionarchivecache '!' -path ./runner '!' -path ./runner-cache -exec rm -rf '{}' ';'
+          rm -rf /opt/hostedtoolcache
+
+          # Get rid of binaries and libs we're not interested in.
+          sudo rm -rf \
+            /usr/local/julia* \
+            /usr/local/aws*
+
+          sudo rm -rf \
+            /usr/local/bin/minikube \
+            /usr/local/bin/node \
+            /usr/local/bin/stack \
+            /usr/local/bin/bicep \
+            /usr/local/bin/pulumi* \
+            /usr/local/bin/helm \
+            /usr/local/bin/azcopy \
+            /usr/local/bin/packer \
+            /usr/local/bin/cmake-gui \
+            /usr/local/bin/cpack
+
+          sudo rm -rf \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium
+
+          sudo rm -rf /usr/local/lib/android
+
+          echo "::group::/usr/local/bin/*"
+          du -hsc /usr/local/bin/* | sort -h
+          echo "::endgroup::"
+
+          echo "::group::/usr/local/share/*"
+          du -hsc /usr/local/share/* | sort -h
+          echo "::endgroup::"
+
+          echo "::group::/usr/local/*"
+          du -hsc /usr/local/* | sort -h
+          echo "::endgroup::"
+
+          echo "::group::/usr/local/lib/*"
+          du -hsc /usr/local/lib/* | sort -h
+          echo "::endgroup::"
+
+          echo "::group::/opt/*"
+          du -hsc /opt/* | sort -h
+          echo "::endgroup::"
+
+          echo "Disk space after cleanup"
+          df -h
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -44,6 +105,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libsqlite3-dev
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -56,29 +119,34 @@ jobs:
       - name: Load cache
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: "coverage"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
-      # set up backend for integration tests
-      - uses: actions/setup-python@v5
-        with:
-          python-version: 3.8
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
 
-      - name: Run tarpaulin
+      - name: Get xtask
+        uses: actions/cache/restore@v4
+        with:
+          path: target/debug/xtask
+          key: "${{ needs.xtask.outputs.cachekey-linux }}"
+          fail-on-cache-miss: true
+
+      - name: Check total disk space before running
         run: |
-          rustup run stable cargo tarpaulin \
-            --skip-clean --profile cov --out xml \
-            --features experimental-widgets,testing
+          df -h
+
+      - name: Create the coverage report
+        run: |
+          target/debug/xtask ci coverage -o codecov 
         env:
           CARGO_PROFILE_COV_INHERITS: 'dev'
           CARGO_PROFILE_COV_DEBUG: 1
           HOMESERVER_URL: "http://localhost:8008"
           HOMESERVER_DOMAIN: "synapse"
-          SLIDING_SYNC_PROXY_URL: "http://localhost:8118"
 
       # Copied with minimal adjustments, source:
       # https://github.com/google/mdbook-i18n-helpers/blob/2168b9cea1f4f76b55426591a9bcc308a620194f/.github/workflows/test.yml
@@ -90,6 +158,11 @@ jobs:
           echo "Storing commit SHA ${{ github.event.pull_request.head.sha }}"
           echo "${{ github.event.pull_request.head.sha }}" > commit_sha.txt
 
+      - name: Move the JUnit file into the root directory
+        shell: bash
+        run: |
+          mv target/nextest/ci/junit.xml ./junit.xml
+
       # This stores the coverage report and metadata in artifacts.
       # The actual upload to Codecov is executed by a different workflow `upload_coverage.yml`.
       # The reason for this split is because `on.pull_request` workflows don't have access to secrets.
@@ -98,7 +171,8 @@ jobs:
         with:
           name: codecov_report
           path: |
-            cobertura.xml
+            coverage.xml
+            junit.xml
             pr_number.txt
             commit_sha.txt
           if-no-files-found: error

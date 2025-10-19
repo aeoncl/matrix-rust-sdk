@@ -1,9 +1,9 @@
 use ruma::{
+    RoomId,
     push::{
         Action, NewPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
         RemovePushRuleError, RuleKind, Ruleset,
     },
-    RoomId,
 };
 
 use super::command::Command;
@@ -39,7 +39,7 @@ impl RuleCommands {
             _ => {
                 return Err(NotificationSettingsError::InvalidParameter(
                     "cannot insert a rule for this kind.".to_owned(),
-                ))
+                ));
             }
         };
 
@@ -87,6 +87,9 @@ impl RuleCommands {
         Ok(())
     }
 
+    /// Enable or disable the given rule.
+    ///
+    /// Will return an error if the rule does not exist.
     fn set_enabled_internal(
         &mut self,
         kind: RuleKind,
@@ -133,22 +136,32 @@ impl RuleCommands {
         )?;
 
         // For compatibility purpose, we still need to add commands for
-        // `ContainsUserName` and `ContainsDisplayName` (deprecated rules).
+        // `ContainsUserName` and `ContainsDisplayName` (removed rules).
         #[allow(deprecated)]
         {
             // `ContainsUserName`
-            self.set_enabled_internal(
+            if let Err(err) = self.set_enabled_internal(
                 RuleKind::Content,
                 PredefinedContentRuleId::ContainsUserName.as_str(),
                 enabled,
-            )?;
+            ) {
+                // This rule has been removed from the spec, so it's fine if it wasn't found.
+                if !err.is_rule_not_found() {
+                    return Err(err);
+                }
+            }
 
             // `ContainsDisplayName`
-            self.set_enabled_internal(
+            if let Err(err) = self.set_enabled_internal(
                 RuleKind::Override,
                 PredefinedOverrideRuleId::ContainsDisplayName.as_str(),
                 enabled,
-            )?;
+            ) {
+                // This rule has been removed from the spec, so it's fine if it wasn't found.
+                if !err.is_rule_not_found() {
+                    return Err(err);
+                }
+            }
         }
 
         Ok(())
@@ -164,14 +177,19 @@ impl RuleCommands {
             enabled,
         )?;
 
-        // For compatibility purpose, we still need to set `RoomNotif` (deprecated
+        // For compatibility purpose, we still need to set `RoomNotif` (removed
         // rule).
         #[allow(deprecated)]
-        self.set_enabled_internal(
+        if let Err(err) = self.set_enabled_internal(
             RuleKind::Override,
             PredefinedOverrideRuleId::RoomNotif.as_str(),
             enabled,
-        )?;
+        ) {
+            // This rule has been removed from the spec, so it's fine if it wasn't found.
+            if !err.is_rule_not_found() {
+                return Err(err);
+            }
+        }
 
         Ok(())
     }
@@ -199,23 +217,23 @@ impl RuleCommands {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_test::{
+        async_test,
+        notification_settings::{
+            get_server_default_ruleset, server_default_ruleset_with_legacy_mentions,
+        },
+    };
     use ruma::{
+        OwnedRoomId, RoomId,
         push::{
             Action, NewPushRule, NewSimplePushRule, PredefinedContentRuleId,
             PredefinedOverrideRuleId, PredefinedUnderrideRuleId, RemovePushRuleError, RuleKind,
-            Ruleset, Tweak,
+            Tweak,
         },
-        OwnedRoomId, RoomId, UserId,
     };
 
     use super::RuleCommands;
     use crate::{error::NotificationSettingsError, notification_settings::command::Command};
-
-    fn get_server_default_ruleset() -> Ruleset {
-        let user_id = UserId::parse("@user:matrix.org").unwrap();
-        Ruleset::server_default(&user_id)
-    }
 
     fn get_test_room_id() -> OwnedRoomId {
         RoomId::parse("!AAAaAAAAAaaAAaaaaa:matrix.org").unwrap()
@@ -372,7 +390,7 @@ mod tests {
 
     #[async_test]
     async fn test_set_rule_enabled_user_mention() {
-        let mut ruleset = get_server_default_ruleset();
+        let mut ruleset = server_default_ruleset_with_legacy_mentions();
         let mut rule_commands = RuleCommands::new(ruleset.clone());
 
         ruleset
@@ -403,23 +421,29 @@ mod tests {
             .unwrap();
 
         // The ruleset must have been updated.
-        assert!(rule_commands
-            .rules
-            .get(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention)
-            .unwrap()
-            .enabled());
+        assert!(
+            rule_commands
+                .rules
+                .get(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention)
+                .unwrap()
+                .enabled()
+        );
         #[allow(deprecated)]
         {
-            assert!(rule_commands
-                .rules
-                .get(RuleKind::Override, PredefinedOverrideRuleId::ContainsDisplayName)
-                .unwrap()
-                .enabled());
-            assert!(rule_commands
-                .rules
-                .get(RuleKind::Content, PredefinedContentRuleId::ContainsUserName)
-                .unwrap()
-                .enabled());
+            assert!(
+                rule_commands
+                    .rules
+                    .get(RuleKind::Override, PredefinedOverrideRuleId::ContainsDisplayName)
+                    .unwrap()
+                    .enabled()
+            );
+            assert!(
+                rule_commands
+                    .rules
+                    .get(RuleKind::Content, PredefinedContentRuleId::ContainsUserName)
+                    .unwrap()
+                    .enabled()
+            );
         }
 
         // Three commands are expected.
@@ -455,7 +479,7 @@ mod tests {
 
     #[async_test]
     async fn test_set_rule_enabled_room_mention() {
-        let mut ruleset = get_server_default_ruleset();
+        let mut ruleset = server_default_ruleset_with_legacy_mentions();
         let mut rule_commands = RuleCommands::new(ruleset.clone());
 
         ruleset
@@ -478,18 +502,22 @@ mod tests {
             .unwrap();
 
         // The ruleset must have been updated.
-        assert!(rule_commands
-            .rules
-            .get(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention)
-            .unwrap()
-            .enabled());
+        assert!(
+            rule_commands
+                .rules
+                .get(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention)
+                .unwrap()
+                .enabled()
+        );
         #[allow(deprecated)]
         {
-            assert!(rule_commands
-                .rules
-                .get(RuleKind::Override, PredefinedOverrideRuleId::RoomNotif)
-                .unwrap()
-                .enabled());
+            assert!(
+                rule_commands
+                    .rules
+                    .get(RuleKind::Override, PredefinedOverrideRuleId::RoomNotif)
+                    .unwrap()
+                    .enabled()
+            );
         }
 
         // Two commands are expected.

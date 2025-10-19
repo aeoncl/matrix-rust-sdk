@@ -8,9 +8,109 @@ All notable changes to this project will be documented in this file.
 
 ### Refactor
 
+- `TimelineFocusKind::Event` can now handle both the existing event pagination and thread pagination if the focused 
+  event is part of a thread ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678)).
+
+### Bug Fixes
+
+- Avoid replacing timeline items when the encryption info is unchanged.
+  ([#5660](https://github.com/matrix-org/matrix-rust-sdk/pull/5660))
+- Improvement performance of `RoomList` by introducing a new `RoomListItem` type
+  (that replaces the `Room` type).
+  ([#5684](https://github.com/matrix-org/matrix-rust-sdk/pull/5684))
+
+### Refactor
+
+- [**breaking**] The `Room` type in `room_list_service` is renamed to
+  `RoomListItem`.
+  ([#5684](https://github.com/matrix-org/matrix-rust-sdk/pull/5684))
+
+## [0.14.0] - 2025-09-04
+
+### Features
+- Add a new [`SpaceService`] that provides high level reactive interfaces for listing 
+  the user's joined top level spaces as long as their children.
+  ([#5509](https://github.com/matrix-org/matrix-rust-sdk/pull/5509))
+- Add `new_filter_low_priority` and `new_filter_non_low_priority` filters to the room list filtering system,
+  allowing clients to filter rooms based on their low priority status. The filters use the `Room::is_low_priority()` 
+  method which checks for the `m.lowpriority` room tag.
+  ([#5508](https://github.com/matrix-org/matrix-rust-sdk/pull/5508))
+- [**breaking**] Refactor the `non_space` filter into a `space` filter, favouring its use in combination with the
+  `not` filter. ([#5508](https://github.com/matrix-org/matrix-rust-sdk/pull/5508))
+- [**breaking**] Space rooms are now being retrieved through sliding sync and the newly introduced 
+  [`room_list_service::filters::new_filter_non_space`] filter should be used to exclude them from any room list.
+  ([5479](https://github.com/matrix-org/matrix-rust-sdk/pull/5479))
+- [**breaking**] [`Timeline::send_gallery()`] now automatically fills in the thread relationship,
+  based on the timeline focus. As a result, the `GalleryConfig::reply()` builder method has been
+  replaced with `GalleryConfig::in_reply_to`, and only takes an optional event id (the event that is
+  effectively replied to) instead of the `Reply` type. The proper way to start a thread with a
+  gallery event is now thus to create a threaded-focused timeline, and then use
+  `Timeline::send_gallery()`.
+  ([5427](https://github.com/matrix-org/matrix-rust-sdk/pull/5427))
+- [**breaking**] [`Timeline::send_attachment()`] now automatically fills in the thread
+  relationship, based on the timeline focus. As a result, there's a new
+  `matrix_sdk_ui::timeline::AttachmentConfig` type in town, that has a simplified optional parameter
+  `replied_to` of type `OwnedEventId` instead of the `Reply` type and that must be used in place of
+  `matrix_sdk::attachment::AttachmentConfig`. The proper way to start a thread with a media
+  attachment is now thus to create a threaded-focused timeline, and then use
+  `Timeline::send_attachment()`.
+  ([5427](https://github.com/matrix-org/matrix-rust-sdk/pull/5427))
+- [**breaking**] [`Timeline::send_reply()`] now automatically fills in the thread relationship,
+  based on the timeline focus. As a result, it only takes an `OwnedEventId` parameter, instead of
+  the `Reply` type. The proper way to start a thread is now thus to create a threaded-focused
+  timeline, and then use `Timeline::send()`.
+  ([5427](https://github.com/matrix-org/matrix-rust-sdk/pull/5427))
+- `Timeline::send()` will now automatically fill the thread relationship, if the timeline has a
+  thread focus, and the sent event doesn't have a prefilled `relates_to` field (i.e. a relationship).
+  ([5427](https://github.com/matrix-org/matrix-rust-sdk/pull/5427))
+
+### Refactor
+
+- [**breaking**] The MSRV has been bumped to Rust 1.88.
+  ([#5431](https://github.com/matrix-org/matrix-rust-sdk/pull/5431)) 
+
+### Bug Fixes
+
+- Correctly remove unable-to-decrypt items that have been decrypted but contain
+  unsupported event types.
+  ([#5463](https://github.com/matrix-org/matrix-rust-sdk/pull/5463))
+
+## [0.13.0] - 2025-07-10
+
+### Features
+
+- Infer timeline read receipt threads for the `send_single_receipt` method from
+  the focus mode and associated `hide_threaded_events` flag.
+  ([5325](https://github.com/matrix-org/matrix-rust-sdk/pull/5325))
+- Add `NotificationItem::room_topic` to the `NotificationItem` struct, which
+  contains the topic of the room. This is useful for displaying the room topic
+  in notifications.
+  ([#5300](https://github.com/matrix-org/matrix-rust-sdk/pull/5300))
+- Add `EmbeddedEvent::timestamp` and `EmbeddedEvent::identifier` which are already
+  available in regular timeline items.
+  ([#5331](https://github.com/matrix-org/matrix-rust-sdk/pull/5331))
+- `RoomListService::subscribe_to_rooms` becomes `async` and automatically calls
+  `matrix_sdk::latest_events::LatestEvents::listen_to_room`
+  ([#5369](https://github.com/matrix-org/matrix-rust-sdk/pull/5369))
+
+### Refactor
+
+- [**breaking**] The function provided to `TimelineBuilder::event_filter()`
+  must take `RoomVersionRules` as second argument instead of a `RoomVersionId`.
+  The `default_event_filter()` reflects that change.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+
+## [0.12.0] - 2025-06-10
+
+### Refactor
+
 - [**breaking**] [`TimelineItemContent::reactions()`] returns an `Option<&ReactionsByKeyBySender>`
   instead of `ReactionsByKeyBySender`. This reflects the fact that some timeline items cannot hold
   reactions at all.
+- `NotificationItem::room_join_rule` is now optional to reflect that the join rule
+  state event might be missing, in which case it will be set to `None`. The
+  `NotificationItem::is_public` field has been replaced with a method that returns an `Option<bool>`, based on the same logic.
+  ([#5278](https://github.com/matrix-org/matrix-rust-sdk/pull/5278))
 
 ### Bug Fixes
 

@@ -18,6 +18,7 @@
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use as_variant::as_variant;
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_test::{ruma_response_from_json, test_json};
 use ruma::{
     api::client::keys::{
@@ -29,25 +30,24 @@ use ruma::{
     encryption::OneTimeKey,
     events::dummy::ToDeviceDummyEventContent,
     serde::Raw,
-    to_device::DeviceIdOrAllDevices,
     user_id, DeviceId, OwnedOneTimeKeyId, TransactionId, UserId,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::{
-    machine::tests,
     olm::PrivateCrossSigningIdentity,
-    store::{Changes, CryptoStoreWrapper, MemoryStore},
+    store::{types::Changes, CryptoStoreWrapper, MemoryStore},
     types::{
-        events::ToDeviceEvent,
-        requests::{AnyOutgoingRequest, ToDeviceRequest},
-        DeviceKeys, ProcessedToDeviceEvent,
+        events::{room::encrypted::ToDeviceEncryptedEventContent, ToDeviceEvent},
+        requests::AnyOutgoingRequest,
+        DeviceKeys,
     },
     utilities::json_convert,
     verification::VerificationMachine,
-    Account, CrossSigningBootstrapRequests, Device, DeviceData, EncryptionSyncChanges, OlmMachine,
-    OtherUserIdentityData,
+    Account, CollectStrategy, CrossSigningBootstrapRequests, DecryptionSettings, Device,
+    DeviceData, EncryptionSyncChanges, OlmMachine, OtherUserIdentityData, TrustRequirement,
 };
 
 /// These keys need to be periodically uploaded to the server.
@@ -186,26 +186,33 @@ pub async fn send_and_receive_encrypted_to_device_test_helper(
     sender: &OlmMachine,
     recipient: &OlmMachine,
     event_type: &str,
-    content: Value,
+    content: &Value,
+    decryption_settings: &DecryptionSettings,
 ) -> ProcessedToDeviceEvent {
     let device =
         sender.get_device(recipient.user_id(), recipient.device_id(), None).await.unwrap().unwrap();
 
     let raw_encrypted = device
-        .encrypt_event_raw(event_type, &content)
+        .encrypt_event_raw(event_type, content, CollectStrategy::AllDevices)
         .await
         .expect("Should have encrypted the content");
 
-    let request = ToDeviceRequest::new(
-        recipient.user_id(),
-        DeviceIdOrAllDevices::DeviceId(recipient.device_id().to_owned()),
-        "m.room.encrypted",
-        raw_encrypted.cast(),
-    );
-    let event = ToDeviceEvent::new(
-        sender.user_id().to_owned(),
-        tests::to_device_requests_to_content(vec![request.clone().into()]),
-    );
+    receive_encrypted_to_device_test_helper(
+        sender.user_id(),
+        recipient,
+        decryption_settings,
+        raw_encrypted,
+    )
+    .await
+}
+
+pub async fn receive_encrypted_to_device_test_helper(
+    sender: &UserId,
+    recipient: &OlmMachine,
+    decryption_settings: &DecryptionSettings,
+    raw_encrypted: Raw<ToDeviceEncryptedEventContent>,
+) -> ProcessedToDeviceEvent {
+    let event = ToDeviceEvent::new(sender.to_owned(), raw_encrypted);
 
     let event = json_convert(&event).unwrap();
 
@@ -217,9 +224,63 @@ pub async fn send_and_receive_encrypted_to_device_test_helper(
         next_batch_token: None,
     };
 
-    let (decrypted, _) = recipient.receive_sync_changes(sync_changes).await.unwrap();
+    let (decrypted, _) =
+        recipient.receive_sync_changes(sync_changes, decryption_settings).await.unwrap();
+
     assert_eq!(1, decrypted.len());
     decrypted[0].clone()
+}
+
+/// Encrypt the given event content into the content of an
+/// olm-encrypted to-device event, suppressing the `sender_device_keys` field in
+/// the encrypted content.
+///
+/// This is much the same as calling [`Device::encrypt`] on the recipient
+/// device, other than the suppression of `sender_device_keys`.
+///
+/// # Arguments
+///
+/// * `sender` - The OlmMachine to use to encrypt the event.
+/// * `recipient` - The recipient of the encrypted event.
+/// * `event_type` - The type of the event to encrypt.
+/// * `content` - The content of the event to encrypt.
+pub async fn build_encrypted_to_device_content_without_sender_data(
+    sender: &OlmMachine,
+    recipient_device: &DeviceKeys,
+    event_type: &str,
+    content: &impl Serialize,
+) -> ToDeviceEncryptedEventContent {
+    let sender_store = &sender.inner.store;
+
+    let sender_key = recipient_device.curve25519_key().unwrap();
+    let sessions = sender_store
+        .get_sessions(&sender_key.to_base64())
+        .await
+        .expect("Could not get most recent session")
+        .expect("No olm session found");
+    let mut olm_session = sessions.lock().await.first().unwrap().clone();
+
+    let plaintext = serde_json::to_string(&json!({
+        "sender": sender.user_id(),
+        "sender_device": sender.device_id(),
+        "keys": { "ed25519": sender.identity_keys().ed25519.to_base64() },
+        "recipient": recipient_device.user_id,
+        "recipient_keys": { "ed25519": recipient_device.ed25519_key().unwrap().to_base64() },
+        "type": event_type,
+        "content": content,
+    }))
+    .unwrap();
+
+    let ciphertext = olm_session.encrypt_helper(&plaintext).await;
+    let content =
+        olm_session.build_encrypted_event(ciphertext, None).await.expect("could not encrypt");
+
+    sender_store
+        .save_changes(Changes { sessions: vec![olm_session], ..Default::default() })
+        .await
+        .expect("Could not save session");
+
+    content
 }
 
 /// Create a session for the two supplied Olm machines to communicate.
@@ -262,12 +323,23 @@ pub async fn get_machine_pair_with_setup_sessions_test_helper(
         bob_device.encrypt("m.dummy", ToDeviceDummyEventContent::new()).await.unwrap();
     alice.store().save_sessions(&[session]).await.unwrap();
 
-    let event = ToDeviceEvent::new(alice.user_id().to_owned(), content.deserialize_as().unwrap());
+    let event =
+        ToDeviceEvent::new(alice.user_id().to_owned(), content.deserialize_as_unchecked().unwrap());
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
 
     let decrypted = bob
         .store()
         .with_transaction(|mut tr| async {
-            let res = bob.decrypt_to_device_event(&mut tr, &event, &mut Changes::default()).await?;
+            let res = bob
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
+                .await?;
             Ok((tr, res))
         })
         .await
@@ -333,7 +405,7 @@ pub fn bootstrap_requests_to_keys_query_response(
 /// Helper for [`create_signed_device_of_unverified_user`] and
 /// [`create_unsigned_device`].
 fn dummy_verification_machine() -> VerificationMachine {
-    let account = Account::new(user_id!("@TEST_USER:example.com"));
+    let account = Account::new(user_id!("@test_user:example.com"));
     VerificationMachine::new(
         account.deref().clone(),
         Arc::new(Mutex::new(PrivateCrossSigningIdentity::new(account.user_id().to_owned()))),

@@ -15,30 +15,35 @@
 //! The SDK's representation of the result of a `/sync` request.
 
 use std::{
-    collections::{btree_map, BTreeMap},
+    collections::{BTreeMap, btree_map},
     fmt,
     time::Duration,
 };
 
 pub use matrix_sdk_base::sync::*;
 use matrix_sdk_base::{
-    debug::{DebugInvitedRoom, DebugKnockedRoom, DebugListOfRawEventsNoId},
+    debug::{
+        DebugInvitedRoom, DebugKnockedRoom, DebugListOfProcessedToDeviceEvents,
+        DebugListOfRawEventsNoId,
+    },
     sleep::sleep,
     sync::SyncResponse as BaseSyncResponse,
+    timer,
 };
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use ruma::{
+    OwnedRoomId, RoomId,
     api::client::sync::sync_events::{
         self,
         v3::{InvitedRoom, KnockedRoom},
     },
-    events::{presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyToDeviceEvent},
+    events::{AnyGlobalAccountDataEvent, presence::PresenceEvent},
     serde::Raw,
     time::Instant,
-    OwnedRoomId, RoomId,
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, instrument, warn};
 
-use crate::{event_handler::HandlerKind, Client, Result, Room};
+use crate::{Client, Result, Room, event_handler::HandlerKind};
 
 /// The processed response of a `/sync` request.
 #[derive(Clone, Default)]
@@ -53,7 +58,7 @@ pub struct SyncResponse {
     /// The global private data created by this user.
     pub account_data: Vec<Raw<AnyGlobalAccountDataEvent>>,
     /// Messages sent directly between devices.
-    pub to_device: Vec<Raw<AnyToDeviceEvent>>,
+    pub to_device: Vec<ProcessedToDeviceEvent>,
     /// New notifications per room.
     pub notifications: BTreeMap<OwnedRoomId, Vec<Notification>>,
 }
@@ -74,7 +79,7 @@ impl fmt::Debug for SyncResponse {
             .field("next_batch", &self.next_batch)
             .field("rooms", &self.rooms)
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
-            .field("to_device", &DebugListOfRawEventsNoId(&self.to_device))
+            .field("to_device", &DebugListOfProcessedToDeviceEvents(&self.to_device))
             .field("notifications", &self.notifications)
             .finish_non_exhaustive()
     }
@@ -146,6 +151,12 @@ impl Client {
         &self,
         response: sync_events::v3::Response,
     ) -> Result<BaseSyncResponse> {
+        subscribe_to_room_latest_events(
+            self,
+            response.rooms.join.keys().chain(response.rooms.leave.keys()),
+        )
+        .await;
+
         let response = Box::pin(self.base_client().receive_sync_response(response)).await?;
 
         // Some new keys might have been received, so trigger a backup if needed.
@@ -168,12 +179,14 @@ impl Client {
         &self,
         response: &BaseSyncResponse,
     ) -> Result<()> {
+        let _timer = timer!(tracing::Level::TRACE, "_method");
+
         let BaseSyncResponse { rooms, presence, account_data, to_device, notifications } = response;
 
         let now = Instant::now();
         self.handle_sync_events(HandlerKind::GlobalAccountData, None, account_data).await?;
         self.handle_sync_events(HandlerKind::Presence, None, presence).await?;
-        self.handle_sync_events(HandlerKind::ToDevice, None, to_device).await?;
+        self.handle_sync_to_device_events(to_device).await?;
 
         // Ignore errors when there are no receivers.
         let _ = self.inner.room_updates_sender.send(rooms.clone());
@@ -311,7 +324,7 @@ impl Client {
 
         match response {
             Ok(r) => {
-                sync_settings.token = Some(r.next_batch.clone());
+                sync_settings.token = r.next_batch.clone().into();
                 Ok(r)
             }
             Err(e) => {
@@ -327,12 +340,34 @@ impl Client {
         // If the last sync happened less than a second ago, sleep for a
         // while to not hammer out requests if the server doesn't respect
         // the sync timeout.
-        if let Some(t) = last_sync_time {
-            if now - *t <= Duration::from_secs(1) {
-                Self::sleep().await;
-            }
+        if let Some(t) = last_sync_time
+            && now - *t <= Duration::from_secs(1)
+        {
+            Self::sleep().await;
         }
 
         *last_sync_time = Some(now);
+    }
+}
+
+/// Call `LatestEvents::listen_to_room` for rooms in `response`.
+///
+/// That way, the latest event is computed and updated for all rooms receiving
+/// an update from the sync.
+#[instrument(skip_all)]
+pub(crate) async fn subscribe_to_room_latest_events<'a, R>(client: &'a Client, room_ids: R)
+where
+    R: Iterator<Item = &'a OwnedRoomId>,
+{
+    if !client.event_cache().has_subscribed() {
+        return;
+    }
+
+    let latest_events = client.latest_events().await;
+
+    for room_id in room_ids {
+        if let Err(error) = latest_events.listen_to_room(room_id).await {
+            error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+        }
     }
 }

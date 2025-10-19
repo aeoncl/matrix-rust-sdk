@@ -6,15 +6,81 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Bug Fixes
+
+- Fix a bug which caused encrypted to-device messages from unknown devices to be ignored.
+  ([#5763](https://github.com/matrix-org/matrix-rust-sdk/pull/5763))
+- Fix a bug which caused history shared on invite to be ignored when "exclude insecure devices" was enabled.
+  ([#5763](https://github.com/matrix-org/matrix-rust-sdk/pull/5763))
+- Fix a bug introduced in 0.14.0 which meant that the serialization of the value returned by `OtherUserIdentity::verification_request_content` did not include a `msgtype` field.
+  ([#5642](https://github.com/matrix-org/matrix-rust-sdk/pull/5642))
+
+## [0.14.0] - 2025-09-04
+
+### Features
+
+- [**breaking**] Add `name` fields to some of the variants of
+  `store::SecretImportError` to indicate what secret was being imported when the
+  error occurred.
+  ([#5647](https://github.com/matrix-org/matrix-rust-sdk/pull/5647))
+- Log message index for Megolm sessions received over encrypted to-device messages. ([#5599](https://github.com/matrix-org/matrix-rust-sdk/pull/5599))
+- Add `RoomSettings::encrypt_state_events` flag. ([#5511](https://github.com/matrix-org/matrix-rust-sdk/pull/5511))
+- Make sure to accept historic room key bundles only if the sender is trusted
+  enough.
+  ([#5510](https://github.com/matrix-org/matrix-rust-sdk/pull/5510))
+- [**breaking**]: When in "exclude insecure devices" mode, refuse to decrypt
+  incoming to-device messages from unverified devices, except for some
+  exceptions for certain event types. To support this, a new variant has been
+  added to `ProcessedToDeviceEvent`: `UnverifiedSender`, which is returned from
+  `OlmMachine::receive_sync_changes` when we are excluding insecure devices and
+  the sender's device is not verified. Also, several methods now take a
+  `DecryptionSettings` argument to allow controlling the processing of to-device
+  events based on those settings. To recreate the previous behaviour pass in:
+  `DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted }`.
+  Affected methods are `OlmMachine::receive_sync_changes`,
+  `RehydratedDevice::receive_events`, and several internal methods.
+  ([#5319](https://github.com/matrix-org/matrix-rust-sdk/pull/5319))
+- [**breaking**] The `Device::encrypt_event_raw` and (experimental)
+  `OlmMachine::encrypt_content_for_devices` have new `share_strategy` parameters
+  to ensure that the recipients are sufficiently trusted.
+  ([#5457](https://github.com/matrix-org/matrix-rust-sdk/pull/5457/))
+
+### Refactor
+
+- [**breaking**] The `sender_key` and `device_id` fields of
+  `encrypted::MegolmV1AesSha2Content` and
+  `room_key_request::MegolmV1AesSha2Content` are now optional. The have been
+  deprecated in Matrix 1.3 and are no longer required.
+  ([#5489](https://github.com/matrix-org/matrix-rust-sdk/pull/5489))
+
+## [0.13.0] - 2025-07-10
+
+### Features
+
+- [**breaking**] Add a new `VerificationLevel::MismatchedSender` to indicate that the sender of an event appears to have been tampered with.
+  ([#5219](https://github.com/matrix-org/matrix-rust-sdk/pull/5219))
+
+### Refactor
+
+- [**breaking**] The `PendingChanges`, `Changes`, `StoredRoomKeyBundleData`,
+  `TrackedUser`, `IdentityChanges`, `DeviceChanges`, `DeviceUpdates`,
+  `IdentityUpdates`, `BackupDecryptionKey`, `DehydratedDeviceKey`,
+  `RoomKeyCounts`, `BackupKeys`, `CrossSigningKeyExport`, `UserKeyQueryResult`,
+  `RoomSettings`, `RoomKeyInfo`, and `RoomKeyWithheldInfo` types have been moved
+  from the `store` module into a new `store/types` module.
+  ([#5177](https://github.com/matrix-org/matrix-rust-sdk/pull/5177))
+
+## [0.12.0] - 2025-06-10
+
 ### Features
 
 - [**breaking**] The `ProcessedToDeviceEvent::Decrypted` variant now also have an `EncryptionInfo` field.
   Format changed from `Decrypted(Raw<AnyToDeviceEvent>)` to `Decrypted { raw: Raw<AnyToDeviceEvent>, encryption_info: EncryptionInfo) }`
-  ([5074](https://github.com/matrix-org/matrix-rust-sdk/pull/5074))
+  ([#5074](https://github.com/matrix-org/matrix-rust-sdk/pull/5074))
 
-- [**breaking**] Move `session_id` from `EncryptionInfo` to `AlgorithmInfo` as it is megolm specific. 
+- [**breaking**] Move `session_id` from `EncryptionInfo` to `AlgorithmInfo` as it is megolm specific.
   Use `EncryptionInfo::session_id()` helper for quick access.
-  ([4981](https://github.com/matrix-org/matrix-rust-sdk/pull/4981))
+  ([#4981](https://github.com/matrix-org/matrix-rust-sdk/pull/4981))
 
 - Send stable identifier `sender_device_keys` for MSC4147 (Including device
   keys with Olm-encrypted events).
@@ -36,11 +102,24 @@ All notable changes to this project will be documented in this file.
   cases can cause room key oversharing.
   ([#4975](https://github.com/matrix-org/matrix-rust-sdk/pull/4975))
 
-- [**breaking**] `OlmMachine.receive_sync_changes` returns now a list of `ProcessedToDeviceEvent` 
+- [**breaking**] `OlmMachine.receive_sync_changes` returns now a list of `ProcessedToDeviceEvent`
   instead of a list of `Raw<AnyToDeviceEvent>`. With variants like `Decrypted`|`UnableToDecrypt`|`PlainText`|`NotProcessed`.
   This allows for example to make the difference between an event sent in clear and an event successfully decrypted.
   For quick compatibility a helper `ProcessedToDeviceEvent::to_raw` allows to map back to the previous behaviour.
   ([#4935](https://github.com/matrix-org/matrix-rust-sdk/pull/4935))
+
+## [0.11.1] - 2025-06-10
+
+### Security Fixes
+- Check the sender of an event matches owner of session, preventing sender
+  spoofing by homeserver owners.
+  [13c1d20](https://github.com/matrix-org/matrix-rust-sdk/commit/13c1d2048286bbabf5e7bc6b015aafee98f04d55) (High, [CVE-2025-48937](https://www.cve.org/CVERecord?id=CVE-2025-48937), [GHSA-x958-rvg6-956w](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-x958-rvg6-956w)).
+
+### Bug Fixes
+- Remove a wildcard enum variant import which breaks compilation if used with
+  `tracing-attributes` version `0.1.29`. This is a workaround for a bug in
+  `tracing-attributes`.
+  ([#5190](https://github.com/matrix-org/matrix-rust-sdk/issues/5190)) ([#5191](https://github.com/matrix-org/matrix-rust-sdk/issues/5191)) ([#5193](https://github.com/matrix-org/matrix-rust-sdk/issues/5193))
 
 ## [0.11.0] - 2025-04-11
 
@@ -75,7 +154,7 @@ All notable changes to this project will be documented in this file.
 
 - Room keys are not shared with unsigned dehydrated devices.
   ([#4551](https://github.com/matrix-org/matrix-rust-sdk/pull/4551))
-  
+
 ## [0.9.0] - 2024-12-18
 
 ### Features

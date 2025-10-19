@@ -47,7 +47,7 @@ use crate::{
     identities::IdentityManager,
     olm::{InboundGroupSession, Session},
     session_manager::GroupSessionCache,
-    store::{Changes, CryptoStoreError, SecretImportError, Store, StoreCache},
+    store::{caches::StoreCache, types::Changes, CryptoStoreError, SecretImportError, Store},
     types::{
         events::{
             forwarded_room_key::ForwardedRoomKeyContent,
@@ -1119,7 +1119,7 @@ mod tests {
     use crate::{
         gossiping::KeyForwardDecision,
         olm::OutboundGroupSession,
-        store::{CryptoStore, DeviceChanges},
+        store::{types::DeviceChanges, CryptoStore},
         types::requests::AnyOutgoingRequest,
         types::{
             events::{
@@ -1134,11 +1134,15 @@ mod tests {
         identities::{DeviceData, IdentityManager, LocalTrust},
         olm::{Account, PrivateCrossSigningIdentity},
         session_manager::GroupSessionCache,
-        store::{Changes, CryptoStoreWrapper, MemoryStore, PendingChanges, Store},
+        store::{
+            types::{Changes, PendingChanges},
+            CryptoStoreWrapper, MemoryStore, Store,
+        },
         types::events::room::encrypted::{
             EncryptedEvent, EncryptedToDeviceEvent, RoomEncryptedEventContent,
         },
         verification::VerificationMachine,
+        DecryptionSettings, TrustRequirement,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1360,6 +1364,8 @@ mod tests {
         EncryptedEvent {
             sender: sender.to_owned(),
             event_id: event_id!("$143273582443PhrSn:example.org").to_owned(),
+            #[cfg(feature = "experimental-encrypted-state-events")]
+            state_key: None,
             content,
             origin_server_ts: ruma::MilliSecondsSinceUnixEpoch::now(),
             unsigned: Default::default(),
@@ -1379,7 +1385,7 @@ mod tests {
             + std::fmt::Debug,
     {
         let content = extract_content(recipient, request);
-        let content: C = content.deserialize_as().unwrap_or_else(|_| {
+        let content: C = content.deserialize_as_unchecked().unwrap_or_else(|_| {
             panic!("We can always deserialize the to-device event content {content:?}")
         });
 
@@ -1753,7 +1759,13 @@ mod tests {
                 let res = tr
                     .account()
                     .await?
-                    .decrypt_to_device_event(&alice_machine.inner.store, &event)
+                    .decrypt_to_device_event(
+                        &alice_machine.inner.store,
+                        &event,
+                        &DecryptionSettings {
+                            sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        },
+                    )
                     .await?;
                 Ok((tr, res))
             })
@@ -1834,7 +1846,13 @@ mod tests {
                 let res = tr
                     .account()
                     .await?
-                    .decrypt_to_device_event(&alice_machine.inner.store, &event)
+                    .decrypt_to_device_event(
+                        &alice_machine.inner.store,
+                        &event,
+                        &DecryptionSettings {
+                            sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        },
+                    )
                     .await?;
                 Ok((tr, res))
             })
@@ -1892,14 +1910,14 @@ mod tests {
 
         alice_machine.inner.store.save_sessions(&[alice_session]).await.unwrap();
 
-        let event = RumaToDeviceEvent {
-            sender: bob_account.user_id().to_owned(),
-            content: ToDeviceSecretRequestEventContent::new(
+        let event = RumaToDeviceEvent::new(
+            bob_account.user_id().to_owned(),
+            ToDeviceSecretRequestEventContent::new(
                 RequestAction::Request(SecretName::CrossSigningMasterKey),
                 bob_account.device_id().to_owned(),
                 "request_id".into(),
             ),
-        };
+        );
 
         // No secret found
         assert!(alice_machine.inner.outgoing_requests.read().is_empty());
@@ -1930,14 +1948,14 @@ mod tests {
         }
         assert!(alice_machine.inner.outgoing_requests.read().is_empty());
 
-        let event = RumaToDeviceEvent {
-            sender: alice_id().to_owned(),
-            content: ToDeviceSecretRequestEventContent::new(
+        let event = RumaToDeviceEvent::new(
+            alice_id().to_owned(),
+            ToDeviceSecretRequestEventContent::new(
                 RequestAction::Request(SecretName::CrossSigningMasterKey),
                 second_account.device_id().into(),
                 "request_id".into(),
             ),
-        };
+        );
 
         // The device isn't trusted
         alice_machine.receive_incoming_secret_request(&event);
@@ -1992,14 +2010,14 @@ mod tests {
                 .unwrap();
         }
 
-        let event = RumaToDeviceEvent {
-            sender: alice_machine.user_id().to_owned(),
-            content: ToDeviceSecretRequestEventContent::new(
+        let event = RumaToDeviceEvent::new(
+            alice_machine.user_id().to_owned(),
+            ToDeviceSecretRequestEventContent::new(
                 RequestAction::Request(SecretName::RecoveryKey),
                 bob_machine.device_id().to_owned(),
                 request_id,
             ),
-        };
+        );
 
         let bob_device = alice_machine
             .get_device(alice_id, bob_machine.device_id(), None)
@@ -2018,7 +2036,7 @@ mod tests {
         alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
         bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
 
-        let decryption_key = crate::store::BackupDecryptionKey::new().unwrap();
+        let decryption_key = crate::store::types::BackupDecryptionKey::new().unwrap();
         alice_machine
             .backup_machine()
             .save_decryption_key(Some(decryption_key), None)
@@ -2048,14 +2066,20 @@ mod tests {
         let stream = bob_machine.store().secrets_stream();
         pin_mut!(stream);
 
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
         bob_machine
-            .receive_sync_changes(EncryptionSyncChanges {
-                to_device_events: vec![event],
-                changed_devices: &Default::default(),
-                one_time_keys_counts: &Default::default(),
-                unused_fallback_keys: None,
-                next_batch_token: None,
-            })
+            .receive_sync_changes(
+                EncryptionSyncChanges {
+                    to_device_events: vec![event],
+                    changed_devices: &Default::default(),
+                    one_time_keys_counts: &Default::default(),
+                    unused_fallback_keys: None,
+                    next_batch_token: None,
+                },
+                &decryption_settings,
+            )
             .await
             .unwrap();
 
@@ -2156,7 +2180,13 @@ mod tests {
                 let res = tr
                     .account()
                     .await?
-                    .decrypt_to_device_event(&alice_machine.inner.store, &event)
+                    .decrypt_to_device_event(
+                        &alice_machine.inner.store,
+                        &event,
+                        &DecryptionSettings {
+                            sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        },
+                    )
                     .await?;
                 Ok((tr, res))
             })

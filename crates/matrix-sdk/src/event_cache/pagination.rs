@@ -17,20 +17,18 @@
 use std::{sync::Arc, time::Duration};
 
 use eyeball::{SharedObservable, Subscriber};
-use matrix_sdk_base::{
-    deserialized_responses::TimelineEvent, linked_chunk::ChunkIdentifier, timeout::timeout,
-};
-use matrix_sdk_common::linked_chunk::ChunkContent;
+use matrix_sdk_base::timeout::timeout;
 use ruma::api::Direction;
-use tokio::sync::RwLockWriteGuard;
 use tracing::{debug, instrument, trace};
 
 use super::{
-    deduplicator::DeduplicationOutcome,
-    room::{events::Gap, LoadMoreEventsBackwardsOutcome, RoomEventCacheInner},
-    BackPaginationOutcome, EventsOrigin, Result, RoomEventCacheState, RoomEventCacheUpdate,
+    BackPaginationOutcome, EventsOrigin, Result, RoomEventCacheUpdate,
+    room::{LoadMoreEventsBackwardsOutcome, RoomEventCacheInner},
 };
-use crate::{event_cache::EventCacheError, room::MessagesOptions};
+use crate::{
+    event_cache::{EventCacheError, RoomEventCacheGenericUpdate},
+    room::MessagesOptions,
+};
 
 /// Status for the back-pagination on a room event cache.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -105,7 +103,10 @@ impl RoomPagination {
                         events,
                     });
                 }
-                trace!("restarting back-pagination, because we haven't reached the start or obtained enough events yet");
+                trace!(
+                    "restarting back-pagination, because we haven't reached \
+                     the start or obtained enough events yet"
+                );
             }
 
             debug!("restarting back-pagination because of a timeline reset.");
@@ -128,6 +129,10 @@ impl RoomPagination {
 
     /// Paginate from either the storage or the network, and let pagination
     /// status observers know about updates.
+    ///
+    /// Returns `Ok(None)` if the pagination token used during a network
+    /// pagination has disappeared from the in-memory linked chunk after
+    /// handling the response.
     async fn run_backwards_impl(&self, batch_size: u16) -> Result<Option<BackPaginationOutcome>> {
         // There is at least one gap that must be resolved; reach the network.
         // First, ensure there's no other ongoing back-pagination.
@@ -156,11 +161,7 @@ impl RoomPagination {
                 Ok(Some(outcome))
             }
 
-            None => {
-                // We keep the previous status value, because we haven't obtained more
-                // information about the pagination.
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 
@@ -168,6 +169,10 @@ impl RoomPagination {
     ///
     /// This method isn't concerned with setting the pagination status; only the
     /// caller is.
+    ///
+    /// Returns `Ok(None)` if the pagination token used during a network
+    /// pagination has disappeared from the in-memory linked chunk after
+    /// handling the response.
     async fn paginate_backwards_impl(
         &self,
         batch_size: u16,
@@ -180,35 +185,39 @@ impl RoomPagination {
             let mut state_guard = self.inner.state.write().await;
 
             match state_guard.load_more_events_backwards().await? {
-                LoadMoreEventsBackwardsOutcome::WaitForInitialPrevToken => {
-                    const DEFAULT_WAIT_FOR_TOKEN_DURATION: Duration = Duration::from_secs(3);
-
-                    // Release the state guard while waiting, to not deadlock the sync task.
-                    drop(state_guard);
-
-                    // Otherwise, wait for a notification that we received a previous-batch token.
-                    trace!("waiting for a pagination token…");
-                    let _ = timeout(
-                        self.inner.pagination_batch_token_notifier.notified(),
-                        DEFAULT_WAIT_FOR_TOKEN_DURATION,
-                    )
-                    .await;
-                    trace!("done waiting");
-
-                    self.inner.state.write().await.waited_for_initial_prev_token = true;
-
-                    // Retry!
-                    //
-                    // Note: the next call to `load_more_events_backwards` can't return
-                    // `WaitForInitialPrevToken` because we've just set to
-                    // `waited_for_initial_prev_token`, so this is not an infinite loop.
-                    //
-                    // Note 2: not a recursive call, because recursive and async have a bad time
-                    // together.
-                    continue;
-                }
-
                 LoadMoreEventsBackwardsOutcome::Gap { prev_token } => {
+                    if prev_token.is_none() && !state_guard.waited_for_initial_prev_token {
+                        // We didn't reload a pagination token, and we haven't waited for one; wait
+                        // and start over.
+
+                        const DEFAULT_WAIT_FOR_TOKEN_DURATION: Duration = Duration::from_secs(3);
+
+                        // Release the state guard while waiting, to not deadlock the sync task.
+                        drop(state_guard);
+
+                        // Otherwise, wait for a notification that we received a previous-batch
+                        // token.
+                        trace!("waiting for a pagination token…");
+                        let _ = timeout(
+                            self.inner.pagination_batch_token_notifier.notified(),
+                            DEFAULT_WAIT_FOR_TOKEN_DURATION,
+                        )
+                        .await;
+                        trace!("done waiting");
+
+                        self.inner.state.write().await.waited_for_initial_prev_token = true;
+
+                        // Retry!
+                        //
+                        // Note: the next call to `load_more_events_backwards` can't return
+                        // `WaitForInitialPrevToken` because we've just set to
+                        // `waited_for_initial_prev_token`, so this is not an infinite loop.
+                        //
+                        // Note 2: not a recursive call, because recursive and async have a bad time
+                        // together.
+                        continue;
+                    }
+
                     // We have a gap, so resolve it with a network back-pagination.
                     drop(state_guard);
                     return self.paginate_backwards_with_network(batch_size, prev_token).await;
@@ -229,6 +238,12 @@ impl RoomPagination {
                                 diffs: timeline_event_diffs,
                                 origin: EventsOrigin::Cache,
                             });
+
+                        // Send a room event cache generic update.
+                        let _ =
+                            self.inner.generic_update_sender.send(RoomEventCacheGenericUpdate {
+                                room_id: self.inner.room_id.clone(),
+                            });
                     }
 
                     return Ok(Some(BackPaginationOutcome {
@@ -248,12 +263,16 @@ impl RoomPagination {
     /// while to get one, or if it's already done so or if it's seen a
     /// previous-batch token before, it will immediately indicate it's
     /// reached the end of the timeline.
+    ///
+    /// Returns `Ok(None)` if the pagination token used during the request has
+    /// disappeared from the in-memory linked chunk after handling the
+    /// response.
     async fn paginate_backwards_with_network(
         &self,
         batch_size: u16,
         prev_token: Option<String>,
     ) -> Result<Option<BackPaginationOutcome>> {
-        let (events, new_gap) = {
+        let (events, new_token) = {
             let Some(room) = self.inner.weak_room.get() else {
                 // The client is shutting down, return an empty default response.
                 return Ok(Some(BackPaginationOutcome {
@@ -265,226 +284,40 @@ impl RoomPagination {
             let mut options = MessagesOptions::new(Direction::Backward).from(prev_token.as_deref());
             options.limit = batch_size.into();
 
-            let response = room.messages(options).await.map_err(|err| {
-                EventCacheError::BackpaginationError(
-                    crate::event_cache::paginator::PaginatorError::SdkError(Box::new(err)),
-                )
-            })?;
+            let response = room
+                .messages(options)
+                .await
+                .map_err(|err| EventCacheError::BackpaginationError(Box::new(err)))?;
 
-            let new_gap = response.end.map(|prev_token| Gap { prev_token });
-
-            (response.chunk, new_gap)
+            (response.chunk, response.end)
         };
 
-        // Make sure the `RoomEvents` isn't updated while we are saving events from
-        // backpagination.
-        let state = self.inner.state.write().await;
-
-        // Check that the previous token still exists; otherwise it's a sign that the
-        // room's timeline has been cleared.
-        let prev_gap_chunk_id = if let Some(token) = prev_token {
-            let gap_chunk_id = state.events().chunk_identifier(|chunk| {
-                matches!(chunk.content(), ChunkContent::Gap(Gap { ref prev_token }) if *prev_token == token)
-            });
-
-            if gap_chunk_id.is_none() {
-                // We got a previous-batch token from the linked chunk *before* running the
-                // request, but it is missing *after* completing the
-                // request.
-                //
-                // It may be a sign the linked chunk has been reset, but it's fine, per this
-                // function's contract.
-                return Ok(None);
-            }
-
-            gap_chunk_id
-        } else {
-            None
-        };
-
-        self.handle_network_pagination_result(state, events, new_gap, prev_gap_chunk_id)
+        if let Some((outcome, timeline_event_diffs)) = self
+            .inner
+            .state
+            .write()
             .await
-            .map(Some)
-    }
-
-    /// Handle the result of a successful network back-pagination.
-    async fn handle_network_pagination_result(
-        &self,
-        mut state: RwLockWriteGuard<'_, RoomEventCacheState>,
-        events: Vec<TimelineEvent>,
-        new_gap: Option<Gap>,
-        prev_gap_id: Option<ChunkIdentifier>,
-    ) -> Result<BackPaginationOutcome> {
-        // If there's no new previous gap, then we've reached the start of the timeline.
-        let network_reached_start = new_gap.is_none();
-
-        let (
-            DeduplicationOutcome {
-                all_events: mut events,
-                in_memory_duplicated_event_ids,
-                in_store_duplicated_event_ids,
-            },
-            all_duplicates,
-        ) = state.collect_valid_and_duplicated_events(events).await?;
-
-        // If not all the events have been back-paginated, we need to remove the
-        // previous ones, otherwise we can end up with misordered events.
-        //
-        // Consider the following scenario:
-        // - sync returns [D, E, F]
-        // - then sync returns [] with a previous batch token PB1, so the internal
-        //   linked chunk state is [D, E, F, PB1].
-        // - back-paginating with PB1 may return [A, B, C, D, E, F].
-        //
-        // Only inserting the new events when replacing PB1 would result in a timeline
-        // ordering of [D, E, F, A, B, C], which is incorrect. So we do have to remove
-        // all the events, in case this happens (see also #4746).
-
-        let mut event_diffs = if !all_duplicates {
-            // Let's forget all the previous events.
-            state
-                .remove_events(in_memory_duplicated_event_ids, in_store_duplicated_event_ids)
-                .await?
-        } else {
-            // All new events are duplicated, they can all be ignored.
-            events.clear();
-            Default::default()
-        };
-
-        let next_diffs = state
-            .with_events_mut(false, |room_events| {
-            // Reverse the order of the events as `/messages` has been called with `dir=b`
-            // (backwards). The `RoomEvents` API expects the first event to be the oldest.
-            // Let's re-order them for this block.
-            let reversed_events = events
-                .iter()
-                .rev()
-                .cloned()
-                .collect::<Vec<_>>();
-
-            let first_event_pos = room_events.events().next().map(|(item_pos, _)| item_pos);
-
-            // First, insert events.
-            let insert_new_gap_pos = if let Some(gap_id) = prev_gap_id {
-                // There is a prior gap, let's replace it by new events!
-                if all_duplicates {
-                    assert!(reversed_events.is_empty());
-                }
-
-                trace!("replacing previous gap with the back-paginated events");
-
-                // Replace the gap with the events we just deduplicated. This might get rid of the
-                // underlying gap, if the conditions are favorable to us.
-                room_events.replace_gap_at(reversed_events.clone(), gap_id)
-                    .expect("gap_identifier is a valid chunk id we read previously")
-            } else if let Some(pos) = first_event_pos {
-                // No prior gap, but we had some events: assume we need to prepend events
-                // before those.
-                trace!("inserted events before the first known event");
-
-                room_events
-                    .insert_events_at(reversed_events.clone(), pos)
-                    .expect("pos is a valid position we just read above");
-
-                Some(pos)
-            } else {
-                // No prior gap, and no prior events: push the events.
-                trace!("pushing events received from back-pagination");
-
-                room_events.push_events(reversed_events.clone());
-
-                // A new gap may be inserted before the new events, if there are any.
-                room_events.events().next().map(|(item_pos, _)| item_pos)
-            };
-
-            // And insert the new gap if needs be.
-            //
-            // We only do this when at least one new, non-duplicated event, has been added to
-            // the chunk. Otherwise it means we've back-paginated all the known events.
-            if !all_duplicates {
-                if let Some(new_gap) = new_gap {
-                    if let Some(new_pos) = insert_new_gap_pos {
-                        room_events
-                            .insert_gap_at(new_gap, new_pos)
-                            .expect("events_chunk_pos represents a valid chunk position");
-                    } else {
-                        room_events.push_gap(new_gap);
-                    }
-                }
-            } else {
-                debug!("not storing previous batch token, because we deduplicated all new back-paginated events");
+            .handle_backpagination(events, new_token, prev_token)
+            .await?
+        {
+            if !timeline_event_diffs.is_empty() {
+                let _ = self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
+                    diffs: timeline_event_diffs,
+                    origin: EventsOrigin::Pagination,
+                });
             }
 
-            reversed_events
-        })
-        .await?;
-
-        event_diffs.extend(next_diffs);
-
-        // There could be an inconsistency between the network (which thinks we hit the
-        // start of the timeline) and the disk (which has the initial empty
-        // chunks), so tweak the `reached_start` value so that it reflects the disk
-        // state in priority instead.
-        let reached_start = {
-            // There are no gaps.
-            let has_gaps = state.events().chunks().any(|chunk| chunk.is_gap());
-
-            // The first chunk has no predecessors.
-            let first_chunk_is_definitive_head =
-                state.events().chunks().next().map(|chunk| chunk.is_definitive_head());
-
-            let reached_start =
-                !has_gaps && first_chunk_is_definitive_head.unwrap_or(network_reached_start);
-
-            trace!(
-                ?network_reached_start,
-                ?has_gaps,
-                ?first_chunk_is_definitive_head,
-                ?reached_start,
-                "finished handling network back-pagination"
-            );
-
-            reached_start
-        };
-
-        let backpagination_outcome = BackPaginationOutcome { events, reached_start };
-
-        if !event_diffs.is_empty() {
-            let _ = self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
-                diffs: event_diffs,
-                origin: EventsOrigin::Pagination,
-            });
+            Ok(Some(outcome))
+        } else {
+            // The previous token has gone missing, so the timeline has been reset in the
+            // meanwhile, but it's fine per this function's contract.
+            Ok(None)
         }
-
-        Ok(backpagination_outcome)
     }
 
     /// Returns a subscriber to the pagination status used for the
     /// back-pagination integrated to the event cache.
     pub fn status(&self) -> Subscriber<RoomPaginationStatus> {
         self.inner.pagination_status.subscribe()
-    }
-}
-
-/// Pagination token data, indicating in which state is the current pagination.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PaginationToken {
-    /// We never had a pagination token, so we'll start back-paginating from the
-    /// end, or forward-paginating from the start.
-    None,
-    /// We paginated once before, and we received a prev/next batch token that
-    /// we may reuse for the next query.
-    HasMore(String),
-    /// We've hit one end of the timeline (either the start or the actual end),
-    /// so there's no need to continue paginating.
-    HitEnd,
-}
-
-impl From<Option<String>> for PaginationToken {
-    fn from(token: Option<String>) -> Self {
-        match token {
-            Some(val) => Self::HasMore(val),
-            None => Self::None,
-        }
     }
 }

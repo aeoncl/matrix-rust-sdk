@@ -20,24 +20,24 @@ use std::{
 
 use bitflags::bitflags;
 use ruma::{
+    Int, MxcUri, OwnedUserId, UserId,
     events::{
+        MessageLikeEventType, StateEventType,
         ignored_user_list::IgnoredUserListEventContent,
         presence::PresenceEvent,
         room::{
             member::{MembershipState, RoomMemberEventContent},
-            power_levels::{PowerLevelAction, RoomPowerLevels, RoomPowerLevelsEventContent},
+            power_levels::{PowerLevelAction, RoomPowerLevels, UserPowerLevel},
         },
-        MessageLikeEventType, StateEventType,
     },
-    MxcUri, OwnedUserId, UserId,
 };
 use tracing::debug;
 
 use super::Room;
 use crate::{
-    deserialized_responses::{DisplayName, MemberEvent, SyncOrStrippedState},
-    store::{ambiguity_map::is_display_name_ambiguous, Result as StoreResult, StateStoreExt},
     MinimalRoomMemberEvent,
+    deserialized_responses::{DisplayName, MemberEvent},
+    store::{Result as StoreResult, StateStoreExt, ambiguity_map::is_display_name_ambiguous},
 };
 
 impl Room {
@@ -48,7 +48,7 @@ impl Room {
     ///
     /// Returns true if no members are missing, false otherwise.
     pub fn are_members_synced(&self) -> bool {
-        self.inner.read().members_synced
+        self.info.read().members_synced
     }
 
     /// Mark this Room as holding all member information.
@@ -57,14 +57,14 @@ impl Room {
     /// about its members.
     #[cfg(feature = "testing")]
     pub fn mark_members_synced(&self) {
-        self.inner.update(|info| {
+        self.info.update(|info| {
             info.members_synced = true;
         });
     }
 
     /// Mark this Room as still missing member information.
     pub fn mark_members_missing(&self) {
-        self.inner.update_if(|info| {
+        self.info.update_if(|info| {
             // notify observable subscribers only if the previous value was false
             mem::replace(&mut info.members_synced, false)
         })
@@ -119,17 +119,17 @@ impl Room {
     /// Returns the number of members who have joined or been invited to the
     /// room.
     pub fn active_members_count(&self) -> u64 {
-        self.inner.read().active_members_count()
+        self.info.read().active_members_count()
     }
 
     /// Returns the number of members who have been invited to the room.
     pub fn invited_members_count(&self) -> u64 {
-        self.inner.read().invited_members_count()
+        self.info.read().invited_members_count()
     }
 
     /// Returns the number of members who have joined the room.
     pub fn joined_members_count(&self) -> u64 {
-        self.inner.read().joined_members_count()
+        self.info.read().joined_members_count()
     }
 
     /// Get the `RoomMember` with the given `user_id`.
@@ -166,13 +166,7 @@ impl Room {
         display_names: &'a [DisplayName],
     ) -> StoreResult<MemberRoomInfo<'a>> {
         let max_power_level = self.max_power_level();
-        let room_creator = self.inner.read().creator().map(ToOwned::to_owned);
-
-        let power_levels = self
-            .store
-            .get_state_event_static(self.room_id())
-            .await?
-            .and_then(|e| e.deserialize().ok());
+        let power_levels = self.power_levels_or_default().await;
 
         let users_display_names =
             self.store.get_users_with_display_names(self.room_id(), display_names).await?;
@@ -188,7 +182,6 @@ impl Room {
         Ok(MemberRoomInfo {
             power_levels: power_levels.into(),
             max_power_level,
-            room_creator,
             users_display_names,
             ignored_users,
         })
@@ -205,9 +198,8 @@ pub struct RoomMember {
     pub(crate) profile: Arc<Option<MinimalRoomMemberEvent>>,
     #[allow(dead_code)]
     pub(crate) presence: Arc<Option<PresenceEvent>>,
-    pub(crate) power_levels: Arc<Option<SyncOrStrippedState<RoomPowerLevelsEventContent>>>,
+    pub(crate) power_levels: Arc<RoomPowerLevels>,
     pub(crate) max_power_level: i64,
-    pub(crate) is_room_creator: bool,
     pub(crate) display_name_ambiguous: bool,
     pub(crate) is_ignored: bool,
 }
@@ -219,15 +211,9 @@ impl RoomMember {
         presence: Option<PresenceEvent>,
         room_info: &MemberRoomInfo<'_>,
     ) -> Self {
-        let MemberRoomInfo {
-            power_levels,
-            max_power_level,
-            room_creator,
-            users_display_names,
-            ignored_users,
-        } = room_info;
+        let MemberRoomInfo { power_levels, max_power_level, users_display_names, ignored_users } =
+            room_info;
 
-        let is_room_creator = room_creator.as_deref() == Some(event.user_id());
         let display_name = event.display_name();
         let display_name_ambiguous = users_display_names
             .get(&display_name)
@@ -240,7 +226,6 @@ impl RoomMember {
             presence: presence.into(),
             power_levels: power_levels.clone(),
             max_power_level: *max_power_level,
-            is_room_creator,
             display_name_ambiguous,
             is_ignored,
         }
@@ -270,11 +255,7 @@ impl RoomMember {
     /// This returns either the display name or the local part of the user id if
     /// the member didn't set a display name.
     pub fn name(&self) -> &str {
-        if let Some(d) = self.display_name() {
-            d
-        } else {
-            self.user_id().localpart()
-        }
+        if let Some(d) = self.display_name() { d } else { self.user_id().localpart() }
     }
 
     /// Get the avatar url of the member, if there is one.
@@ -289,22 +270,25 @@ impl RoomMember {
     /// Get the normalized power level of this member.
     ///
     /// The normalized power level depends on the maximum power level that can
-    /// be found in a certain room, positive values are always in the range of
-    /// 0-100.
-    pub fn normalized_power_level(&self) -> i64 {
-        if self.max_power_level > 0 {
-            (self.power_level() * 100) / self.max_power_level
+    /// be found in a certain room, positive values that are not `Infinite` are
+    /// always in the range of 0-100.
+    pub fn normalized_power_level(&self) -> UserPowerLevel {
+        let UserPowerLevel::Int(power_level) = self.power_level() else {
+            return UserPowerLevel::Infinite;
+        };
+
+        let normalized_power_level = if self.max_power_level > 0 {
+            normalize_power_level(power_level, self.max_power_level)
         } else {
-            self.power_level()
-        }
+            power_level
+        };
+
+        UserPowerLevel::Int(normalized_power_level)
     }
 
     /// Get the power level of this member.
-    pub fn power_level(&self) -> i64 {
-        (*self.power_levels)
-            .as_ref()
-            .map(|e| e.power_levels().for_user(self.user_id()).into())
-            .unwrap_or_else(|| if self.is_room_creator { 100 } else { 0 })
+    pub fn power_level(&self) -> UserPowerLevel {
+        self.power_levels.for_user(self.user_id())
     }
 
     /// Whether this user can ban other users based on the power levels.
@@ -377,11 +361,8 @@ impl RoomMember {
         self.can_do_impl(|pls| pls.user_can_do(self.user_id(), action))
     }
 
-    fn can_do_impl(&self, f: impl FnOnce(RoomPowerLevels) -> bool) -> bool {
-        match &*self.power_levels {
-            Some(event) => f(event.power_levels()),
-            None => self.is_room_creator,
-        }
+    fn can_do_impl(&self, f: impl FnOnce(&RoomPowerLevels) -> bool) -> bool {
+        f(&self.power_levels)
     }
 
     /// Is the name that the member uses ambiguous in the room.
@@ -405,9 +386,8 @@ impl RoomMember {
 
 // Information about the room a member is in.
 pub(crate) struct MemberRoomInfo<'a> {
-    pub(crate) power_levels: Arc<Option<SyncOrStrippedState<RoomPowerLevelsEventContent>>>,
+    pub(crate) power_levels: Arc<RoomPowerLevels>,
     pub(crate) max_power_level: i64,
-    pub(crate) room_creator: Option<OwnedUserId>,
     pub(crate) users_display_names: HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>,
     pub(crate) ignored_users: Option<BTreeSet<OwnedUserId>>,
 }
@@ -484,5 +464,66 @@ impl RoomMemberships {
         }
 
         memberships
+    }
+}
+
+/// Scale the given `power_level` to a range between 0-100.
+pub fn normalize_power_level(power_level: Int, max_power_level: i64) -> Int {
+    let mut power_level = i64::from(power_level);
+    power_level = (power_level * 100) / max_power_level;
+
+    Int::try_from(power_level.clamp(0, 100))
+        .expect("We clamped the normalized power level so they must fit into the Int")
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    prop_compose! {
+        fn arb_int()(id in any::<i64>()) -> Int {
+            id.try_into().unwrap_or_default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #[test]
+        fn test_power_level_normalization_with_min_max_level(power_level in arb_int()) {
+            let normalized = normalize_power_level(power_level, 1);
+            let normalized = i64::from(normalized);
+
+            assert!(normalized >= 0);
+            assert!(normalized <= 100);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #[test]
+        fn test_power_level_normalization(power_level in arb_int(), max_level in 1i64..) {
+            let normalized = normalize_power_level(power_level, max_level);
+            let normalized = i64::from(normalized);
+
+            assert!(normalized >= 0);
+            assert!(normalized <= 100);
+        }
+    }
+
+    #[test]
+    fn test_power_level_normalization_limits() {
+        let level = Int::MIN;
+        let normalized = normalize_power_level(level, 1);
+        let normalized = i64::from(normalized);
+        assert!(normalized >= 0);
+        assert!(normalized <= 100);
+
+        let level = Int::MAX;
+        let normalized = normalize_power_level(level, 1);
+        let normalized = i64::from(normalized);
+        assert!(normalized >= 0);
+        assert!(normalized <= 100);
     }
 }

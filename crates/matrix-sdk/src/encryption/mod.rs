@@ -23,6 +23,7 @@ use std::{
     io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
 };
 
@@ -32,16 +33,26 @@ use futures_util::{
     future::try_join,
     stream::{self, StreamExt},
 };
-use matrix_sdk_base::crypto::{
-    store::RoomKeyInfo,
-    types::requests::{
-        OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+#[cfg(feature = "experimental-send-custom-to-device")]
+use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_base::{
+    StateStoreDataKey, StateStoreDataValue,
+    crypto::{
+        CrossSigningBootstrapRequests, OlmMachine,
+        store::types::{RoomKeyBundleInfo, RoomKeyInfo},
+        types::{
+            SignedKey,
+            requests::{
+                OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+            },
+        },
     },
-    CrossSigningBootstrapRequests, OlmMachine,
 };
 use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
+    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
     api::client::{
+        error::ErrorBody,
         keys::{
             get_keys, upload_keys, upload_signatures::v3::Request as UploadSignaturesRequest,
             upload_signing_keys::v3::Request as UploadSigningKeysRequest,
@@ -53,23 +64,20 @@ use ruma::{
         uiaa::{AuthData, UiaaInfo},
     },
     assign,
-    events::{
-        direct::DirectUserIdentifier,
-        room::{MediaSource, ThumbnailInfo},
-    },
-    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
+    events::room::{MediaSource, ThumbnailInfo},
 };
 #[cfg(feature = "experimental-send-custom-to-device")]
 use ruma::{events::AnyToDeviceEventContent, serde::Raw, to_device::DeviceIdOrAllDevices};
-use serde::Deserialize;
+use serde::{Deserialize, de::Error as _};
+use tasks::BundleReceiverTask;
 use tokio::sync::{Mutex, RwLockReadGuard};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, instrument, warn};
 use url::Url;
 use vodozemac::Curve25519PublicKey;
 
 use self::{
-    backups::{types::BackupClientState, Backups},
+    backups::{Backups, types::BackupClientState},
     futures::UploadEncryptedFile,
     identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
@@ -78,11 +86,11 @@ use self::{
     verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
+    Client, Error, HttpError, Result, RumaApiError, TransmissionProgress,
     attachment::Thumbnail,
     client::{ClientInner, WeakClient},
+    cross_process_lock::CrossProcessLockGuard,
     error::HttpResult,
-    store_locks::CrossProcessStoreLockGuard,
-    Client, Error, HttpError, Result, Room, TransmissionProgress,
 };
 
 pub mod backups;
@@ -94,13 +102,14 @@ pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
+    CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, KeyExportError, LocalTrust,
+    MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, SecretImportError,
+    SessionCreationError, SignatureError, VERSION,
     olm::{
         SessionCreationError as MegolmSessionCreationError,
         SessionExportError as OlmSessionExportError,
     },
-    vodozemac, CrossSigningStatus, CryptoStoreError, DecryptorError, EventError, KeyExportError,
-    LocalTrust, MediaEncryptionInfo, MegolmError, OlmError, RoomKeyImportResult, SecretImportError,
-    SessionCreationError, SignatureError, VERSION,
+    vodozemac,
 };
 
 #[cfg(feature = "experimental-send-custom-to-device")]
@@ -134,7 +143,7 @@ impl EncryptionData {
         }
     }
 
-    pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
+    pub fn initialize_tasks(&self, client: &Arc<ClientInner>) {
         let weak_client = WeakClient::from_inner(client);
 
         let mut tasks = self.tasks.lock();
@@ -227,7 +236,7 @@ pub enum VerificationState {
 /// Wraps together a `CrossProcessLockStoreGuard` and a generation number.
 #[derive(Debug)]
 pub struct CrossProcessLockStoreGuardWithGeneration {
-    _guard: CrossProcessStoreLockGuard,
+    _guard: CrossProcessLockGuard,
     generation: u64,
 }
 
@@ -348,8 +357,9 @@ pub struct OAuthCrossSigningResetInfo {
 
 impl OAuthCrossSigningResetInfo {
     fn from_auth_info(auth_info: &UiaaInfo) -> Result<Self> {
-        let parameters =
-            serde_json::from_str::<OAuthCrossSigningResetUiaaParameters>(auth_info.params.get())?;
+        let parameters = serde_json::from_str::<OAuthCrossSigningResetUiaaParameters>(
+            auth_info.params.as_ref().map(|value| value.get()).unwrap_or_default(),
+        )?;
 
         Ok(OAuthCrossSigningResetInfo { approval_url: parameters.reset.url })
     }
@@ -370,6 +380,66 @@ struct OAuthCrossSigningResetUiaaParameters {
 struct OAuthCrossSigningResetUiaaResetParameter {
     /// The URL where the user can approve the reset of the cross-signing keys.
     url: Url,
+}
+
+/// A struct that helps to parse the custom error message Synapse posts if a
+/// duplicate one-time key is uploaded.
+#[derive(Debug)]
+struct DuplicateOneTimeKeyErrorMessage {
+    /// The previously uploaded one-time key.
+    old_key: Curve25519PublicKey,
+    /// The one-time key we're attempting to upload right now.
+    new_key: Curve25519PublicKey,
+}
+
+impl FromStr for DuplicateOneTimeKeyErrorMessage {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        // First we split the string into two parts, the part containing the old key and
+        // the part containing the new key. The parts are conveniently separated
+        // by a `;` character.
+        let mut split = s.split_terminator(';');
+
+        let old_key = split
+            .next()
+            .ok_or(serde_json::Error::custom("Old key is missing in the error message"))?;
+        let new_key = split
+            .next()
+            .ok_or(serde_json::Error::custom("New key is missing in the error message"))?;
+
+        // Now we remove the lengthy prefix from the part containing the old key, we
+        // should be left with just the JSON of the signed key.
+        let old_key_index = old_key
+            .find("Old key:")
+            .ok_or(serde_json::Error::custom("Old key is missing the prefix"))?;
+
+        let old_key = old_key[old_key_index..]
+            .trim()
+            .strip_prefix("Old key:")
+            .ok_or(serde_json::Error::custom("Old key is missing the prefix"))?;
+
+        // The part containing the new key is much simpler, we just remove a static
+        // prefix.
+        let new_key = new_key
+            .trim()
+            .strip_prefix("new key:")
+            .ok_or(serde_json::Error::custom("New key is missing the prefix"))?;
+
+        // The JSON containing the new key is for some reason quoted using single
+        // quotes, so let's replace them with normal double quotes.
+        let new_key = new_key.replace("'", "\"");
+
+        // Let's deserialize now.
+        let old_key: SignedKey = serde_json::from_str(old_key)?;
+        let new_key: SignedKey = serde_json::from_str(&new_key)?;
+
+        // Pick out the Curve keys, we don't care about the rest that much.
+        let old_key = old_key.key();
+        let new_key = new_key.key();
+
+        Ok(Self { old_key, new_key })
+    }
 }
 
 impl Client {
@@ -596,20 +666,6 @@ impl Client {
         Ok(())
     }
 
-    /// Get the existing DM room with the given user, if any.
-    pub fn get_dm_room(&self, user_id: &UserId) -> Option<Room> {
-        let rooms = self.joined_rooms();
-
-        // Find the room we share with the `user_id` and only with `user_id`
-        let room = rooms.into_iter().find(|r| {
-            let targets = r.direct_targets();
-            targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(user_id))
-        });
-
-        trace!(?room, "Found room");
-        room
-    }
-
     async fn send_outgoing_request(&self, r: OutgoingRequest) -> Result<()> {
         use matrix_sdk_base::crypto::types::requests::AnyOutgoingRequest;
 
@@ -618,7 +674,55 @@ impl Client {
                 self.keys_query(r.request_id(), request.device_keys.clone()).await?;
             }
             AnyOutgoingRequest::KeysUpload(request) => {
-                self.keys_upload(r.request_id(), request).await?;
+                let response = self.keys_upload(r.request_id(), request).await;
+
+                if let Err(e) = &response {
+                    match e.as_ruma_api_error() {
+                        Some(RumaApiError::ClientApi(e)) if e.status_code == 400 => {
+                            if let ErrorBody::Standard { message, .. } = &e.body {
+                                // This is one of the nastiest errors we can have. The server
+                                // telling us that we already have a one-time key uploaded means
+                                // that we forgot about some of our one-time keys. This will lead to
+                                // UTDs.
+                                {
+                                    let already_reported = self
+                                        .state_store()
+                                        .get_kv_data(StateStoreDataKey::OneTimeKeyAlreadyUploaded)
+                                        .await?
+                                        .is_some();
+
+                                    if message.starts_with("One time key") && !already_reported {
+                                        if let Ok(message) =
+                                            DuplicateOneTimeKeyErrorMessage::from_str(message)
+                                        {
+                                            error!(
+                                                sentry = true,
+                                                old_key = %message.old_key,
+                                                new_key = %message.new_key,
+                                                "Duplicate one-time keys have been uploaded"
+                                            );
+                                        } else {
+                                            error!(
+                                                sentry = true,
+                                                "Duplicate one-time keys have been uploaded"
+                                            );
+                                        }
+
+                                        self.state_store()
+                                            .set_kv_data(
+                                                StateStoreDataKey::OneTimeKeyAlreadyUploaded,
+                                                StateStoreDataValue::OneTimeKeyAlreadyUploaded,
+                                            )
+                                            .await?;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    response?;
+                }
             }
             AnyOutgoingRequest::ToDeviceRequest(request) => {
                 let response = self.send_to_device(request).await?;
@@ -744,6 +848,29 @@ impl Encryption {
         Some(machine.cross_signing_status().await)
     }
 
+    /// Does the user have other devices that the current device can verify
+    /// against?
+    ///
+    /// The device must be signed by the user's cross-signing key, must have an
+    /// identity, and must not be a dehydrated device.
+    pub async fn has_devices_to_verify_against(&self) -> Result<bool> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+        let user_id = olm_machine.user_id();
+
+        self.ensure_initial_key_query().await?;
+
+        let devices = self.get_user_devices(user_id).await?;
+
+        let ret = devices.devices().any(|device| {
+            device.is_cross_signed_by_owner()
+                && device.curve25519_key().is_some()
+                && !device.is_dehydrated()
+        });
+
+        Ok(ret)
+    }
+
     /// Get all the tracked users we know about
     ///
     /// Tracked users are users for which we keep the device list of E2EE
@@ -761,7 +888,7 @@ impl Encryption {
     /// # Examples
     ///
     /// ```no_run
-    /// use matrix_sdk::{encryption, Client};
+    /// use matrix_sdk::{Client, encryption};
     /// use url::Url;
     ///
     /// # async {
@@ -1032,7 +1159,7 @@ impl Encryption {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    pub async fn devices_stream(&self) -> Result<impl Stream<Item = DeviceUpdates>> {
+    pub async fn devices_stream(&self) -> Result<impl Stream<Item = DeviceUpdates> + use<>> {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
         let client = self.client.to_owned();
@@ -1070,7 +1197,9 @@ impl Encryption {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    pub async fn user_identities_stream(&self) -> Result<impl Stream<Item = IdentityUpdates>> {
+    pub async fn user_identities_stream(
+        &self,
+    ) -> Result<impl Stream<Item = IdentityUpdates> + use<>> {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
         let client = self.client.to_owned();
@@ -1471,11 +1600,51 @@ impl Encryption {
     /// ```
     pub async fn room_keys_received_stream(
         &self,
-    ) -> Option<impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>> {
+    ) -> Option<impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> + use<>>
+    {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref()?;
 
         Some(olm.store().room_keys_received_stream())
+    }
+
+    /// Receive notifications of historic room key bundles as a [`Stream`].
+    ///
+    /// Historic room key bundles are defined in [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+    ///
+    /// Each time a historic room key bundle was received, an update will be
+    /// sent to the stream. This stream is useful for informative purposes
+    /// exclusively, historic room key bundles are handled by the SDK
+    /// automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// use futures_util::StreamExt;
+    ///
+    /// let Some(mut bundle_stream) =
+    ///     client.encryption().historic_room_key_stream().await
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// while let Some(bundle_info) = bundle_stream.next().await {
+    ///     println!("Received a historic room key bundle {bundle_info:?}");
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn historic_room_key_stream(
+        &self,
+    ) -> Option<impl Stream<Item = RoomKeyBundleInfo> + use<>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+
+        Some(olm.store().historic_room_key_stream())
     }
 
     /// Get the secret storage manager of the client.
@@ -1511,7 +1680,10 @@ impl Encryption {
             if prev_holder == lock_value {
                 return Ok(());
             }
-            warn!("Recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
+            warn!(
+                "Recreating cross-process store lock with a different holder value: \
+                 prev was {prev_holder}, new is {lock_value}"
+            );
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
@@ -1645,19 +1817,29 @@ impl Encryption {
     ///   there is a proposal (MSC3967) to remove this requirement, which would
     ///   allow for the initial upload of cross-signing keys without
     ///   authentication, rendering this parameter obsolete.
-    pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
+    pub(crate) async fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
+        // It's fine to be async here as we're only getting the lock protecting the
+        // `OlmMachine`. Since the lock shouldn't be that contested right after logging
+        // in we won't delay the login or restoration of the Client.
+        let bundle_receiver_task = if self.client.inner.enable_share_history_on_invite {
+            Some(BundleReceiverTask::new(&self.client).await)
+        } else {
+            None
+        };
+
         let mut tasks = self.client.inner.e2ee.tasks.lock();
 
         let this = self.clone();
+
         tasks.setup_e2ee = Some(spawn(async move {
             // Update the current state first, so we don't have to wait for the result of
             // network requests
             this.update_verification_state().await;
 
-            if this.settings().auto_enable_cross_signing {
-                if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
-                    error!("Couldn't bootstrap cross signing {e:?}");
-                }
+            if this.settings().auto_enable_cross_signing
+                && let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await
+            {
+                error!("Couldn't bootstrap cross signing {e:?}");
             }
 
             if let Err(e) = this.backups().setup_and_resume().await {
@@ -1667,6 +1849,8 @@ impl Encryption {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
         }));
+
+        tasks.receive_historic_room_key_bundles = bundle_receiver_task;
     }
 
     /// Waits for end-to-end encryption initialization tasks to finish, if any
@@ -1674,10 +1858,10 @@ impl Encryption {
     pub async fn wait_for_e2ee_initialization_tasks(&self) {
         let task = self.client.inner.e2ee.tasks.lock().setup_e2ee.take();
 
-        if let Some(task) = task {
-            if let Err(err) = task.await {
-                warn!("Error when initializing backups: {err}");
-            }
+        if let Some(task) = task
+            && let Err(err) = task.await
+        {
+            warn!("Error when initializing backups: {err}");
         }
     }
 
@@ -1754,6 +1938,7 @@ impl Encryption {
         recipient_devices: Vec<&Device>,
         event_type: &str,
         content: Raw<AnyToDeviceEventContent>,
+        share_strategy: CollectStrategy,
     ) -> Result<Vec<(OwnedUserId, OwnedDeviceId)>> {
         let users = recipient_devices.iter().map(|device| device.user_id());
 
@@ -1772,6 +1957,7 @@ impl Encryption {
                 &content
                     .deserialize_as::<serde_json::Value>()
                     .expect("Deserialize as Value will always work"),
+                share_strategy,
             )
             .await?;
 
@@ -1821,36 +2007,37 @@ impl Encryption {
 mod tests {
     use std::{
         ops::Not,
+        str::FromStr,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
 
     use matrix_sdk_test::{
-        async_test, test_json, GlobalAccountDataTestEvent, JoinedRoomBuilder, StateTestEvent,
-        SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
+        DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
+        test_json,
     };
     use ruma::{
         event_id,
         events::{reaction::ReactionEventContent, relation::Annotation},
-        user_id,
     };
     use serde_json::json;
     use wiremock::{
-        matchers::{header, method, path_regex},
         Mock, MockServer, Request, ResponseTemplate,
+        matchers::{header, method, path_regex},
     };
 
     use crate::{
-        assert_next_matches_with_timeout,
+        Client, assert_next_matches_with_timeout,
         config::RequestConfig,
-        encryption::{OAuthCrossSigningResetInfo, VerificationState},
+        encryption::{
+            DuplicateOneTimeKeyErrorMessage, OAuthCrossSigningResetInfo, VerificationState,
+        },
         test_utils::{
             client::mock_matrix_session, logged_in_client, no_retry_test_client, set_client_session,
         },
-        Client,
     };
 
     #[async_test]
@@ -1890,87 +2077,15 @@ mod tests {
         client.base_client().receive_sync_response(response).await.unwrap();
 
         let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
-        assert!(room
-            .latest_encryption_state()
-            .await
-            .expect("Getting encryption state")
-            .is_encrypted());
+        assert!(
+            room.latest_encryption_state().await.expect("Getting encryption state").is_encrypted()
+        );
 
         let event_id = event_id!("$1:example.org");
         let reaction = ReactionEventContent::new(Annotation::new(event_id.into(), "🐈".to_owned()));
         room.send(reaction).await.expect("Sending the reaction should not fail");
 
         room.send_raw("m.reaction", json!({})).await.expect("Sending the reaction should not fail");
-    }
-
-    #[async_test]
-    async fn test_get_dm_room_returns_the_room_we_have_with_this_user() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-        // This is the user ID that is inside MemberAdditional.
-        // Note the confusing username, so we can share
-        // GlobalAccountDataTestEvent::Direct with the invited test.
-        let user_id = user_id!("@invited:localhost");
-
-        // When we receive a sync response saying "invited" is invited to a DM
-        let response = SyncResponseBuilder::default()
-            .add_joined_room(
-                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberAdditional),
-            )
-            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
-            .build_sync_response();
-        client.base_client().receive_sync_response(response).await.unwrap();
-
-        // Then get_dm_room finds this room
-        let found_room = client.get_dm_room(user_id).expect("DM not found!");
-        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
-    }
-
-    #[async_test]
-    async fn test_get_dm_room_still_finds_room_where_participant_is_only_invited() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-        // This is the user ID that is inside MemberInvite
-        let user_id = user_id!("@invited:localhost");
-
-        // When we receive a sync response saying "invited" is invited to a DM
-        let response = SyncResponseBuilder::default()
-            .add_joined_room(
-                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberInvite),
-            )
-            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
-            .build_sync_response();
-        client.base_client().receive_sync_response(response).await.unwrap();
-
-        // Then get_dm_room finds this room
-        let found_room = client.get_dm_room(user_id).expect("DM not found!");
-        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
-    }
-
-    #[async_test]
-    async fn test_get_dm_room_still_finds_left_room() {
-        // See the discussion in https://github.com/matrix-org/matrix-rust-sdk/issues/2017
-        // and the high-level issue at https://github.com/vector-im/element-x-ios/issues/1077
-
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-        // This is the user ID that is inside MemberAdditional.
-        // Note the confusing username, so we can share
-        // GlobalAccountDataTestEvent::Direct with the invited test.
-        let user_id = user_id!("@invited:localhost");
-
-        // When we receive a sync response saying "invited" is invited to a DM
-        let response = SyncResponseBuilder::default()
-            .add_joined_room(
-                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberLeave),
-            )
-            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
-            .build_sync_response();
-        client.base_client().receive_sync_response(response).await.unwrap();
-
-        // Then get_dm_room finds this room
-        let found_room = client.get_dm_room(user_id).expect("DM not found!");
-        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
     }
 
     #[cfg(feature = "sqlite")]
@@ -2020,7 +2135,7 @@ mod tests {
             client1.olm_machine().await.clone().expect("must have an olm machine");
 
         // Also enable backup to check that new machine has the same backup keys.
-        let decryption_key = matrix_sdk_base::crypto::store::BackupDecryptionKey::new()
+        let decryption_key = matrix_sdk_base::crypto::store::types::BackupDecryptionKey::new()
             .expect("Can't create new recovery key");
         let backup_key = decryption_key.megolm_v1_public_key();
         backup_key.set_version("1".to_owned());
@@ -2217,5 +2332,199 @@ mod tests {
             .expect("We should be able to deserialize the UiaaInfo");
         OAuthCrossSigningResetInfo::from_auth_info(&auth_info)
             .expect("We should be able to fetch the cross-signing reset info from the auth info");
+    }
+
+    #[test]
+    fn test_duplicate_one_time_key_error_parsing() {
+        let message = concat!(
+            r#"One time key signed_curve25519:AAAAAAAAAAA already exists. "#,
+            r#"Old key: {"key":"dBcZBzQaiQYWf6rBPh2QypIOB/dxSoTeyaFaxNNbeHs","#,
+            r#""signatures":{"@example:matrix.org":{"ed25519:AAAAAAAAAA":""#,
+            r#"Fk45zHAbrd+1j9wZXLjL2Y/+DU/Mnz9yuvlfYBOOT7qExN2Jdud+5BAuNs8nZ/caS4wTF39Kg3zQpzaGERoCBg"}}};"#,
+            r#" new key: {'key': 'CY0TWVK1/Kj3ZADuBcGe3UKvpT+IKAPMUsMeJhSDqno', "#,
+            r#"'signatures': {'@example:matrix.org': {'ed25519:AAAAAAAAAA': "#,
+            r#"'BQ9Gp0p+6srF+c8OyruqKKd9R4yaub3THYAyyBB/7X/rG8BwcAqFynzl1aGyFYun4Q+087a5OSiglCXI+/kQAA'}}}"#
+        );
+        let message = DuplicateOneTimeKeyErrorMessage::from_str(message)
+            .expect("We should be able to parse the error message");
+
+        assert_eq!(message.old_key.to_base64(), "dBcZBzQaiQYWf6rBPh2QypIOB/dxSoTeyaFaxNNbeHs");
+        assert_eq!(message.new_key.to_base64(), "CY0TWVK1/Kj3ZADuBcGe3UKvpT+IKAPMUsMeJhSDqno");
+
+        DuplicateOneTimeKeyErrorMessage::from_str("One time key already exists.")
+            .expect_err("We shouldn't be able to parse an incomplete error message");
+    }
+
+    // Helper function for the test_devices_to_verify_against_* tests.  Make a
+    // response to a /keys/query request using the given device keys and a
+    // pre-defined set of cross-signing keys.
+    fn devices_to_verify_against_keys_query_response(
+        devices: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let device_keys: serde_json::Map<String, serde_json::Value> = devices
+            .into_iter()
+            .map(|device| (device.get("device_id").unwrap().as_str().unwrap().to_owned(), device))
+            .collect();
+        json!({
+            "device_keys": {
+                "@example:localhost": device_keys,
+            },
+            "master_keys": {
+                "@example:localhost": {
+                    "keys": {
+                        "ed25519:PJklDgml7Xtt1Wr8jsWvB+lC5YD/bVDpHL+fYuItNxU": "PJklDgml7Xtt1Wr8jsWvB+lC5YD/bVDpHL+fYuItNxU",
+                    },
+                    "usage": ["master"],
+                    "user_id": "@example:localhost",
+                },
+            },
+            "self_signing_keys": {
+                "@example:localhost": {
+                    "keys": {
+                        "ed25519:jobZVcxG+PBLwZMsF4XEJSJTVqOgDxd0Ud3J/bw3HYM": "jobZVcxG+PBLwZMsF4XEJSJTVqOgDxd0Ud3J/bw3HYM",
+                    },
+                    "usage": ["self_signing"],
+                    "user_id": "@example:localhost",
+                    "signatures": {
+                        "@example:localhost": {
+                            "ed25519:PJklDgml7Xtt1Wr8jsWvB+lC5YD/bVDpHL+fYuItNxU": "etO1bB+rCk+TQ/FcjQ8eWu/RsRNQNNQ1Ek+PD6//j8yz6igRjfvuHZaMvr/quAFrirfgExph2TdOwlDgN5bFCQ",
+                        },
+                    },
+                },
+            },
+            "user_signing_keys": {
+                "@example:localhost": {
+                    "keys": {
+                        "ed25519:CBaovtekFxzf2Ijjhk4B49drOH0/qmhBbptFlVW7HC0": "CBaovtekFxzf2Ijjhk4B49drOH0/qmhBbptFlVW7HC0",
+                    },
+                    "usage": ["user_signing"],
+                    "user_id": "@example:localhost",
+                    "signatures": {
+                        "@example:localhost": {
+                            "ed25519:PJklDgml7Xtt1Wr8jsWvB+lC5YD/bVDpHL+fYuItNxU": "E/DFi/hQTIb/7eSB+HbCXeTLFaLjqWHzLO9GwjL1qdhfO7ew4p6YdtXSH3T2YYr1dKCPteH/4nMYVwOhww2CBg",
+                        },
+                    },
+                },
+            }
+        })
+    }
+
+    // The following three tests test that we can detect whether the user has
+    // other devices that they can verify against under different conditions.
+    #[async_test]
+    /// Test that we detect that can't verify against another device if we have
+    /// no devices.
+    async fn test_devices_to_verify_against_no_devices() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/r0/keys/query".to_owned()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(devices_to_verify_against_keys_query_response(vec![])),
+            )
+            .mount(&server)
+            .await;
+
+        assert!(!client.encryption().has_devices_to_verify_against().await.unwrap());
+    }
+
+    #[async_test]
+    /// Test that we detect that we can verify against another cross-signed
+    /// regular device.
+    async fn test_devices_to_verify_against_cross_signed() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/r0/keys/query".to_owned()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                devices_to_verify_against_keys_query_response(vec![
+                    json!({
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2",
+                        ],
+                        "user_id": "@example:localhost",
+                        "device_id": "SIGNEDDEVICE",
+                        "keys": {
+                            "curve25519:SIGNEDDEVICE": "o1LqUtH/sqd3WF+BB2Qr77uw3sDmZhMOz68/IV9aHxs",
+                            "ed25519:SIGNEDDEVICE": "iVoEfMOoUqxXVMLdpZCOgvQuCrT3/kQWkBmB3Phi/lo",
+                        },
+                        "signatures": {
+                            "@example:localhost": {
+                                "ed25519:SIGNEDDEVICE": "C7yRu1fNrdD2EobVdtANMqk3LBtWtTRWrIU22xVS8/Om1kmA/luzek64R3N6JsZhYczVmZYBKhUC9kRvHHwOBg",
+                                "ed25519:jobZVcxG+PBLwZMsF4XEJSJTVqOgDxd0Ud3J/bw3HYM": "frfh2HP28GclmGvwTic00Fj4nZCvm4RlRA6U56mnD5920hOi04+L055ojzp6ybZXvC/GQYfyTHwQXlUN1nvxBA",
+                            },
+                        },
+                    })
+                ])
+            ))
+            .mount(&server)
+            .await;
+
+        assert!(client.encryption().has_devices_to_verify_against().await.unwrap());
+    }
+
+    #[async_test]
+    /// Test that we detect that we can't verify against a dehydrated or
+    /// unsigned device.
+    async fn test_devices_to_verify_against_dehydrated_and_unsigned() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        let user_id = client.user_id().unwrap();
+        let olm_machine = client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/r0/keys/query".to_owned()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                devices_to_verify_against_keys_query_response(vec![
+                    json!({
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2",
+                        ],
+                        "user_id": "@example:localhost",
+                        "device_id": "DEHYDRATEDDEVICE",
+                        "keys": {
+                            "curve25519:DEHYDRATEDDEVICE": "XOn5VguAgokZ3p9mBz2yOB395fn6j75G8jIPcXEWQGY",
+                            "ed25519:DEHYDRATEDDEVICE": "4GG5xmBT7z4rgUgmWNlKZ+ABE3QlGgTorF+luCnKfYI",
+                        },
+                        "dehydrated": true,
+                        "signatures": {
+                            "@example:localhost": {
+                                "ed25519:DEHYDRATEDDEVICE": "+OMasB7nzVlMV+zRDxkh4h8h/Q0bY42P1SPv7X2IURIelT5G+d+AYSmg30N4maphxEDBqt/vI8/lIr71exc3Dg",
+                                "ed25519:jobZVcxG+PBLwZMsF4XEJSJTVqOgDxd0Ud3J/bw3HYM": "8DzynAgbYgXX1Md5d4Vw91Zstpoi4dpG7levFeVhi4psCAWuBnV76Qu1s2TGjQQ0CLDXEqcxxuX9X4eUK5TGCg",
+                            },
+                        },
+                    }),
+                    json!({
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2",
+                        ],
+                        "user_id": "@example:localhost",
+                        "device_id": "UNSIGNEDDEVICE",
+                        "keys": {
+                            "curve25519:UNSIGNEDDEVICE": "mMby6NpprkHxj+ONfO9Z5lBqVUHJBMkrPFSNJhogBkg",
+                            "ed25519:UNSIGNEDDEVICE": "Zifq39ZDrlIaSRf0Hh22owEqXCPE+1JSSgs6LDlubwQ",
+                        },
+                        "signatures": {
+                            "@example:localhost": {
+                                "ed25519:UNSIGNEDDEVICE": "+L29RoDKoTufPGm/Bae65KHno7Z1H7GYhxSKpB4RQZRS7NrR29AMW1PVhEsIozYuDVEFuMZ0L8H3dlcaHxagBA",
+                            },
+                        },
+                    }),
+                ])
+            ))
+            .mount(&server)
+            .await;
+
+        let (request_id, request) = olm_machine.query_keys_for_users([user_id]);
+        client.keys_query(&request_id, request.device_keys).await.unwrap();
+
+        assert!(!client.encryption().has_devices_to_verify_against().await.unwrap());
     }
 }

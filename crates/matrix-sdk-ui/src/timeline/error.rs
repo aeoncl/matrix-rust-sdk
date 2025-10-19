@@ -13,14 +13,12 @@
 // limitations under the License.
 
 use matrix_sdk::{
-    event_cache::{paginator::PaginatorError, EventCacheError},
-    room::reply::ReplyError,
+    HttpError, event_cache::EventCacheError, paginators::PaginatorError, room::reply::ReplyError,
     send_queue::RoomSendQueueError,
-    HttpError,
 };
 use thiserror::Error;
 
-use crate::timeline::{pinned_events_loader::PinnedEventsLoaderError, TimelineEventItemId};
+use crate::timeline::{TimelineEventItemId, pinned_events_loader::PinnedEventsLoaderError};
 
 /// Errors specific to the timeline.
 #[derive(Error, Debug)]

@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
 #![warn(missing_docs, missing_debug_implementations)]
 
@@ -45,30 +45,34 @@ pub mod sync;
 mod test_utils;
 mod utils;
 
+#[cfg(feature = "experimental-element-recent-emojis")]
+pub mod recent_emojis;
+
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use client::BaseClient;
+pub use client::{BaseClient, ThreadingSupport};
 #[cfg(any(test, feature = "testing"))]
 pub use http;
 #[cfg(feature = "e2e-encryption")]
 pub use matrix_sdk_crypto as crypto;
 pub use once_cell;
 pub use room::{
-    apply_redaction, EncryptionState, PredecessorRoom, Room, RoomCreateWithCreatorEventContent,
-    RoomDisplayName, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
-    RoomMember, RoomMembersUpdate, RoomMemberships, RoomState, RoomStateFilter, SuccessorRoom,
+    EncryptionState, InviteAcceptanceDetails, PredecessorRoom, Room,
+    RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo, RoomInfoNotableUpdate,
+    RoomInfoNotableUpdateReasons, RoomMember, RoomMembersUpdate, RoomMemberships, RoomRecencyStamp,
+    RoomState, RoomStateFilter, SuccessorRoom, apply_redaction,
 };
 pub use store::{
     ComposerDraft, ComposerDraftType, QueueWedgeError, StateChanges, StateStore, StateStoreDataKey,
-    StateStoreDataValue, StoreError,
+    StateStoreDataValue, StoreError, ThreadSubscriptionCatchupToken,
 };
 pub use utils::{
     MinimalRoomMemberEvent, MinimalStateEvent, OriginalMinimalStateEvent, RedactedMinimalStateEvent,
 };
 
 #[cfg(test)]
-matrix_sdk_test::init_tracing_for_tests!();
+matrix_sdk_test_utils::init_tracing_for_tests!();
 
 /// The Matrix user session info.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

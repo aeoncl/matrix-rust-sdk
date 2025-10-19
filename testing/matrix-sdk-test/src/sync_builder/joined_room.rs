@@ -1,17 +1,18 @@
 use ruma::{
+    OwnedRoomId, RoomId,
     api::client::sync::sync_events::v3::JoinedRoom,
     events::{
-        receipt::ReceiptEventContent, typing::TypingEventContent, AnyRoomAccountDataEvent,
-        AnySyncStateEvent, AnySyncTimelineEvent,
+        AnyRoomAccountDataEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+        receipt::ReceiptEventContent, typing::TypingEventContent,
     },
     serde::Raw,
-    OwnedRoomId, RoomId,
 };
-use serde_json::{from_value as from_json_value, Value as JsonValue};
+use serde_json::{Value as JsonValue, from_value as from_json_value};
 
-use super::RoomAccountDataTestEvent;
-use crate::{event_factory::EventBuilder, DEFAULT_TEST_ROOM_ID};
+use super::{RoomAccountDataTestEvent, StateMutExt};
+use crate::{DEFAULT_TEST_ROOM_ID, event_factory::EventBuilder};
 
+#[derive(Debug, Clone)]
 pub struct JoinedRoomBuilder {
     pub(super) room_id: OwnedRoomId,
     pub(super) inner: JoinedRoom,
@@ -73,9 +74,15 @@ impl JoinedRoomBuilder {
         self
     }
 
+    /// Add state events to the `state_after` field rather than `state`.
+    pub fn use_state_after(mut self) -> Self {
+        self.inner.state.use_state_after();
+        self
+    }
+
     /// Add an event to the state.
     pub fn add_state_event(mut self, event: impl Into<Raw<AnySyncStateEvent>>) -> Self {
-        self.inner.state.events.push(event.into());
+        self.inner.state.events_mut().push(event.into());
         self
     }
 
@@ -84,19 +91,19 @@ impl JoinedRoomBuilder {
     where
         I: IntoIterator<Item = Raw<AnySyncStateEvent>>,
     {
-        self.inner.state.events.extend(events);
+        self.inner.state.events_mut().extend(events);
         self
     }
 
     /// Add a single read receipt to the joined room's ephemeral events.
     pub fn add_receipt(mut self, f: EventBuilder<ReceiptEventContent>) -> Self {
-        self.inner.ephemeral.events.push(f.into_raw());
+        self.inner.ephemeral.events.push(f.into());
         self
     }
 
     /// Add a typing notification event for this sync.
     pub fn add_typing(mut self, f: EventBuilder<TypingEventContent>) -> Self {
-        self.inner.ephemeral.events.push(f.into_raw());
+        self.inner.ephemeral.events.push(f.into());
         self
     }
 

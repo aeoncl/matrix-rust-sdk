@@ -19,9 +19,10 @@ use assign::assign;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{
+        RoomAliasId,
         api::client::{
             directory::get_public_rooms_filtered,
-            room::{create_room::v3::Request as CreateRoomRequest, Visibility},
+            room::{Visibility, create_room::v3::Request as CreateRoomRequest},
         },
         directory::Filter,
         events::room::{
@@ -32,7 +33,6 @@ use matrix_sdk::{
             },
         },
         serde::Raw,
-        RoomAliasId,
     },
 };
 use matrix_sdk_base::ruma::events::room::canonical_alias::SyncRoomCanonicalAliasEvent;
@@ -56,7 +56,7 @@ async fn test_publishing_room_alias() -> anyhow::Result<()> {
     // The room can only be visible in the public room directory later if its join
     // rule is one of  [public, knock, knock_restricted] or its history
     // visibility is `world_readable`. Let's use this last option.
-    let room_history_visibility = InitialRoomHistoryVisibilityEvent::new(
+    let room_history_visibility = InitialRoomHistoryVisibilityEvent::with_empty_state_key(
         RoomHistoryVisibilityEventContent::new(HistoryVisibility::WorldReadable),
     )
     .to_raw_any();
@@ -181,11 +181,11 @@ async fn test_removing_published_room_alias() -> anyhow::Result<()> {
     // visibility is `world_readable`. Let's use this last option.
     // This room will be created with a room alias and being visible in the public
     // room directory.
-    let room_history_visibility = InitialRoomHistoryVisibilityEvent::new(
+    let room_history_visibility = InitialRoomHistoryVisibilityEvent::with_empty_state_key(
         RoomHistoryVisibilityEventContent::new(HistoryVisibility::WorldReadable),
     )
     .to_raw_any();
-    let canonical_alias = InitialRoomCanonicalAliasEvent::new(
+    let canonical_alias = InitialRoomCanonicalAliasEvent::with_empty_state_key(
         assign!(RoomCanonicalAliasEventContent::new(), { alias: Some(room_alias.clone()) }),
     )
     .to_raw_any();

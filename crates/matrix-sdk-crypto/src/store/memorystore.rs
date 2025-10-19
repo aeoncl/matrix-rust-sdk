@@ -20,7 +20,7 @@ use std::{
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
-    locks::RwLock as StdRwLock, store_locks::memory_store_helper::try_take_leased_lock,
+    cross_process_lock::memory_store_helper::try_take_leased_lock, locks::RwLock as StdRwLock,
 };
 use ruma::{
     events::secret::request::SecretName, time::Instant, DeviceId, OwnedDeviceId, OwnedRoomId,
@@ -31,9 +31,12 @@ use tracing::warn;
 use vodozemac::Curve25519PublicKey;
 
 use super::{
-    caches::DeviceStore, Account, BackupKeys, Changes, CryptoStore, DehydratedDeviceKey,
-    InboundGroupSession, PendingChanges, RoomKeyCounts, RoomSettings, Session,
-    StoredRoomKeyBundleData,
+    caches::DeviceStore,
+    types::{
+        BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
+        StoredRoomKeyBundleData, TrackedUser,
+    },
+    Account, CryptoStore, InboundGroupSession, Session,
 };
 use crate::{
     gossiping::{GossipRequest, GossippedSecret, SecretInfo},
@@ -43,7 +46,6 @@ use crate::{
         PrivateCrossSigningIdentity, SenderDataType, StaticAccountData,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
-    TrackedUser,
 };
 
 fn encode_key_info(info: &SecretInfo) -> String {
@@ -463,6 +465,25 @@ impl CryptoStore for MemoryStore {
         Ok(RoomKeyCounts { total, backed_up })
     }
 
+    async fn get_inbound_group_sessions_by_room_id(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<InboundGroupSession>> {
+        let inbounds = match self.inbound_group_sessions.read().get(room_id) {
+            None => Vec::new(),
+            Some(v) => v
+                .values()
+                .map(|ser| {
+                    let pickle: PickledInboundGroupSession =
+                        serde_json::from_str(ser).expect("Pickle deserialization should work");
+                    InboundGroupSession::from_pickle(pickle)
+                        .expect("Expect from pickle to always work")
+                })
+                .collect(),
+        };
+        Ok(inbounds)
+    }
+
     async fn get_inbound_group_sessions_for_device_batch(
         &self,
         sender_key: Curve25519PublicKey,
@@ -755,7 +776,11 @@ mod tests {
             tests::get_account_and_session_test_helper, Account, InboundGroupSession,
             OlmMessageHash, PrivateCrossSigningIdentity, SenderData,
         },
-        store::{memorystore::MemoryStore, Changes, CryptoStore, DeviceChanges, PendingChanges},
+        store::{
+            memorystore::MemoryStore,
+            types::{Changes, DeviceChanges, PendingChanges},
+            CryptoStore,
+        },
         DeviceData,
     };
 
@@ -1245,12 +1270,14 @@ mod integration_tests {
             SenderDataType, StaticAccountData,
         },
         store::{
-            BackupKeys, Changes, CryptoStore, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-            RoomSettings, StoredRoomKeyBundleData,
+            types::{
+                BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
+                RoomSettings, StoredRoomKeyBundleData, TrackedUser,
+            },
+            CryptoStore,
         },
         types::events::room_key_withheld::RoomKeyWithheldEvent,
-        Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, Session, TrackedUser,
-        UserIdentityData,
+        Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, Session, UserIdentityData,
     };
 
     /// Holds on to a MemoryStore during a test, and moves it back into STORES
@@ -1360,6 +1387,13 @@ mod integration_tests {
             backup_version: Option<&str>,
         ) -> Result<RoomKeyCounts, Self::Error> {
             self.0.inbound_group_session_counts(backup_version).await
+        }
+
+        async fn get_inbound_group_sessions_by_room_id(
+            &self,
+            room_id: &RoomId,
+        ) -> Result<Vec<InboundGroupSession>, Self::Error> {
+            self.0.get_inbound_group_sessions_by_room_id(room_id).await
         }
 
         async fn get_inbound_group_sessions_for_device_batch(

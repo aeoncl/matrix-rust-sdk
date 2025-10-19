@@ -17,16 +17,16 @@
 use matrix_sdk_base::deserialized_responses::PrivOwnedStr;
 use oauth2::ErrorResponseType;
 pub use oauth2::{
+    ConfigurationError, HttpClientError, RequestTokenError, RevocationErrorResponseType,
+    StandardErrorResponse,
     basic::{
         BasicErrorResponse, BasicErrorResponseType, BasicRequestTokenError,
         BasicRevocationErrorResponse,
     },
-    ConfigurationError, HttpClientError, RequestTokenError, RevocationErrorResponseType,
-    StandardErrorResponse,
 };
 use ruma::{
-    api::client::discovery::get_authorization_server_metadata::msc2965::AuthorizationServerMetadataUrlError,
-    serde::{PartialEqAsRefStr, StringEnum},
+    api::client::discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadataUrlError,
+    serde::StringEnum,
 };
 
 #[cfg(feature = "e2e-encryption")]
@@ -182,7 +182,7 @@ impl From<StandardErrorResponse<AuthorizationCodeErrorResponseType>>
 /// The fields in this structure are defined in [Section 4.1.2.1 of RFC 6749].
 ///
 /// [Section 4.1.2.1 of RFC 6749]: https://datatracker.ietf.org/doc/html/rfc6749#section-4.1.2.1
-#[derive(Clone, StringEnum, PartialEqAsRefStr, Eq)]
+#[derive(Clone, StringEnum)]
 #[ruma_enum(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum AuthorizationCodeErrorResponseType {
@@ -263,7 +263,7 @@ pub enum OAuthClientRegistrationError {
 /// The variant of this enum are defined in [Section 3.2.2 of RFC 7591].
 ///
 /// [Section 3.2.2 of RFC 7591]: https://datatracker.ietf.org/doc/html/rfc7591#section-3.2.2
-#[derive(Clone, StringEnum, PartialEqAsRefStr, Eq)]
+#[derive(Clone, StringEnum)]
 #[ruma_enum(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ClientRegistrationErrorResponseType {

@@ -18,22 +18,23 @@ use std::{fmt::Debug, future::IntoFuture};
 
 use eyeball::{SharedObservable, Subscriber};
 use js_int::UInt;
-use matrix_sdk_common::{boxed_into_future, SendOutsideWasm, SyncOutsideWasm};
-use oauth2::{basic::BasicErrorResponseType, RequestTokenError};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm, boxed_into_future};
+use oauth2::{RequestTokenError, basic::BasicErrorResponseType};
 use ruma::api::{
+    OutgoingRequest,
     client::{error::ErrorKind, media},
     error::FromHttpResponseError,
-    OutgoingRequest,
 };
 use tracing::{error, trace};
 
 use super::super::Client;
 use crate::{
+    Error, RefreshTokenError, TransmissionProgress,
     authentication::oauth::OAuthError,
     config::RequestConfig,
     error::{HttpError, HttpResult},
+    http_client::SupportedAuthScheme,
     media::MediaError,
-    Error, RefreshTokenError, TransmissionProgress,
 };
 
 /// `IntoFuture` returned by [`Client::send`].
@@ -77,6 +78,7 @@ impl<R> SendRequest<R> {
 impl<R> IntoFuture for SendRequest<R>
 where
     R: OutgoingRequest + Clone + Debug + SendOutsideWasm + SyncOutsideWasm + 'static,
+    R::Authentication: SupportedAuthScheme,
     R::IncomingResponse: SendOutsideWasm + SyncOutsideWasm,
     HttpError: From<FromHttpResponseError<R::EndpointError>>,
 {
@@ -119,7 +121,10 @@ where
                                 )) if *error_response.error()
                                     == BasicErrorResponseType::InvalidGrant =>
                                 {
-                                    error!("Token refresh: OAuth 2.0 refresh_token rejected with invalid grant");
+                                    error!(
+                                        "Token refresh: OAuth 2.0 refresh_token rejected \
+                                         with invalid grant"
+                                    );
                                     // The refresh was denied, signal to sign out the user.
                                     client.broadcast_unknown_token(soft_logout);
                                 }
@@ -130,7 +135,7 @@ where
                                     // The refresh failed for other reasons, no
                                     // need to sign out.
                                 }
-                            };
+                            }
                             return Err(HttpError::RefreshToken(refresh_error));
                         }
 
@@ -182,7 +187,6 @@ impl SendMediaUploadRequest {
 
     /// Get a subscriber to observe the progress of sending the request
     /// body.
-    #[cfg(not(target_family = "wasm"))]
     pub fn subscribe_to_send_progress(&self) -> Subscriber<TransmissionProgress> {
         self.send_request.send_progress.subscribe()
     }

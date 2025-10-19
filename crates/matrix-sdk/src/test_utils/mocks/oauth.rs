@@ -15,14 +15,14 @@
 //! Helpers to mock an OAuth 2.0 server for the purpose of integration tests.
 
 use ruma::{
-    api::client::discovery::get_authorization_server_metadata::msc2965::AuthorizationServerMetadata,
+    api::client::discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadata,
     serde::Raw,
 };
 use serde_json::json;
 use url::Url;
 use wiremock::{
-    matchers::{method, path_regex},
     Mock, MockBuilder, ResponseTemplate,
+    matchers::{method, path_regex},
 };
 
 use super::{MatrixMock, MatrixMockServer, MockEndpoint};
@@ -69,7 +69,7 @@ impl<'a> OAuthMockServer<'a> {
 
     /// Get the mock OAuth 2.0 server metadata.
     pub fn server_metadata(&self) -> AuthorizationServerMetadata {
-        MockServerMetadataBuilder::new(&self.server.server().uri())
+        MockServerMetadataBuilder::new(&self.server.uri())
             .build()
             .deserialize()
             .expect("mock OAuth 2.0 server metadata should deserialize successfully")

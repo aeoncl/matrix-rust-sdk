@@ -2,24 +2,25 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use anyhow::{anyhow, Context as _};
 use futures_util::pin_mut;
+#[cfg(not(target_family = "wasm"))]
+use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::{
     authentication::oauth::{
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
     },
-    event_cache::EventCacheError,
-    media::{
-        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
-        MediaRetentionPolicy, MediaThumbnailSettings,
-    },
+    media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
     ruma::{
         api::client::{
-            discovery::get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
+            discovery::{
+                discover_homeserver::RtcFocusInfo,
+                get_authorization_server_metadata::v1::Prompt as RumaOidcPrompt,
+            },
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
             session::get_login_types,
@@ -37,23 +38,27 @@ use matrix_sdk::{
     },
     sliding_sync::Version as SdkSlidingSyncVersion,
     store::RoomLoadSettings as SdkRoomLoadSettings,
-    sync::RoomUpdate,
-    AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
+    Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
     STATE_STORE_DATABASE_NAME,
 };
-use matrix_sdk_common::{
-    runtime::get_runtime_handle, stream::StreamExt, SendOutsideWasm, SyncOutsideWasm,
-};
+use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     notification_client::{
         NotificationClient as MatrixNotificationClient,
         NotificationProcessSetup as MatrixNotificationProcessSetup,
     },
+    spaces::SpaceService as UISpaceService,
     unable_to_decrypt_hook::UtdHookManager,
 };
 use mime::Mime;
+use oauth2::Scope;
 use ruma::{
-    api::client::{alias::get_alias, error::ErrorKind, uiaa::UserIdentifier},
+    api::client::{
+        alias::get_alias,
+        error::ErrorKind,
+        profile::{AvatarUrl, DisplayName},
+        uiaa::UserIdentifier,
+    },
     events::{
         direct::DirectEventContent,
         fully_read::FullyReadEventContent,
@@ -75,11 +80,11 @@ use ruma::{
         },
         tag::TagEventContent,
         GlobalAccountDataEvent as RumaGlobalAccountDataEvent,
-        GlobalAccountDataEventType as RumaGlobalAccountDataEventType,
         RoomAccountDataEvent as RumaRoomAccountDataEvent,
     },
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
-    OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
+    room_version_rules::AuthorizationRules,
+    OwnedDeviceId, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -87,21 +92,26 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error};
 use url::Url;
 
-use super::{room::Room, session_verification::SessionVerificationController};
+use super::{
+    room::{room_info::RoomInfo, Room},
+    session_verification::SessionVerificationController,
+};
 use crate::{
     authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
+    qr_code::{HumanQrLoginError, QrCodeData, QrLoginProgressListener},
     room::{RoomHistoryVisibility, RoomInfoListener},
     room_directory_search::RoomDirectorySearch,
-    room_info::RoomInfo,
     room_preview::RoomPreview,
     ruma::{
         AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
         MediaPreviews, MediaSource, RoomAccountDataEvent, RoomAccountDataEventType,
     },
+    runtime::get_runtime_handle,
+    spaces::SpaceService,
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
     utd::{UnableToDecryptDelegate, UtdHook},
@@ -337,7 +347,24 @@ impl Client {
             }
         };
 
-        let supports_password_login = self.supports_password_login().await.ok().unwrap_or(false);
+        let login_types = self.inner.matrix_auth().get_login_types().await.ok();
+        let supports_password_login = login_types
+            .as_ref()
+            .map(|login_types| {
+                login_types.flows.iter().any(|login_type| {
+                    matches!(login_type, get_login_types::v3::LoginType::Password(_))
+                })
+            })
+            .unwrap_or(false);
+        let supports_sso_login = login_types
+            .as_ref()
+            .map(|login_types| {
+                login_types
+                    .flows
+                    .iter()
+                    .any(|login_type| matches!(login_type, get_login_types::v3::LoginType::Sso(_)))
+            })
+            .unwrap_or(false);
         let sliding_sync_version = self.sliding_sync_version();
 
         Arc::new(HomeserverLoginDetails {
@@ -345,6 +372,7 @@ impl Client {
             sliding_sync_version,
             supports_oidc_login,
             supported_oidc_prompts,
+            supports_sso_login,
             supports_password_login,
         })
     }
@@ -454,16 +482,39 @@ impl Client {
     ///   However, it should be noted that when providing a user ID as a hint
     ///   for MAS (with no upstream provider), then the format to use is defined
     ///   by [MSC4198]: https://github.com/matrix-org/matrix-spec-proposals/pull/4198
+    ///
+    /// * `device_id` - The unique ID that will be associated with the session.
+    ///   If not set, a random one will be generated. It can be an existing
+    ///   device ID from a previous login call. Note that this should be done
+    ///   only if the client also holds the corresponding encryption keys.
+    ///
+    /// * `additional_scopes` - Additional scopes to request from the
+    ///   authorization server, e.g. "urn:matrix:client:com.example.msc9999.foo".
+    ///   The scopes for API access and the device ID according to the
+    ///   [specification](https://spec.matrix.org/v1.15/client-server-api/#allocated-scope-tokens)
+    ///   are always requested.
     pub async fn url_for_oidc(
         &self,
         oidc_configuration: &OidcConfiguration,
         prompt: Option<OidcPrompt>,
         login_hint: Option<String>,
+        device_id: Option<String>,
+        additional_scopes: Option<Vec<String>>,
     ) -> Result<Arc<OAuthAuthorizationData>, OidcError> {
         let registration_data = oidc_configuration.registration_data()?;
         let redirect_uri = oidc_configuration.redirect_uri()?;
 
-        let mut url_builder = self.inner.oauth().login(redirect_uri, None, Some(registration_data));
+        let device_id = device_id.map(OwnedDeviceId::from);
+
+        let additional_scopes =
+            additional_scopes.map(|scopes| scopes.into_iter().map(Scope::new).collect::<Vec<_>>());
+
+        let mut url_builder = self.inner.oauth().login(
+            redirect_uri,
+            device_id,
+            Some(registration_data),
+            additional_scopes,
+        );
 
         if let Some(prompt) = prompt {
             url_builder = url_builder.prompt(vec![prompt.into()]);
@@ -492,30 +543,43 @@ impl Client {
         Ok(())
     }
 
-    pub async fn get_media_file(
-        &self,
-        media_source: Arc<MediaSource>,
-        filename: Option<String>,
-        mime_type: String,
-        use_cache: bool,
-        temp_dir: Option<String>,
-    ) -> Result<Arc<MediaFileHandle>, ClientError> {
-        let source = (*media_source).clone();
-        let mime_type: mime::Mime = mime_type.parse()?;
+    /// Log in using the provided [`QrCodeData`]. The `Client` must be built
+    /// by providing [`QrCodeData::server_name`] as the server name for this
+    /// login to succeed.
+    ///
+    /// This method uses the login mechanism described in [MSC4108]. As such
+    /// this method requires OAuth 2.0 support as well as sliding sync support.
+    ///
+    /// The usage of the progress_listener is required to transfer the
+    /// [`CheckCode`] to the existing client.
+    ///
+    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
+    pub async fn login_with_qr_code(
+        self: Arc<Self>,
+        qr_code_data: &QrCodeData,
+        oidc_configuration: &OidcConfiguration,
+        progress_listener: Box<dyn QrLoginProgressListener>,
+    ) -> Result<(), HumanQrLoginError> {
+        let registration_data = oidc_configuration
+            .registration_data()
+            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
 
-        let handle = self
-            .inner
-            .media()
-            .get_media_file(
-                &MediaRequestParameters { source: source.media_source, format: MediaFormat::File },
-                filename,
-                &mime_type,
-                use_cache,
-                temp_dir,
-            )
-            .await?;
+        let oauth = self.inner.oauth();
+        let login = oauth.login_with_qr_code(Some(&registration_data)).scan(&qr_code_data.inner);
 
-        Ok(Arc::new(MediaFileHandle::new(handle)))
+        let mut progress = login.subscribe_to_progress();
+
+        // We create this task, which will get cancelled once it's dropped, just in case
+        // the progress stream doesn't end.
+        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
+            while let Some(state) = progress.next().await {
+                progress_listener.on_update(state.into());
+            }
+        }));
+
+        login.await?;
+
+        Ok(())
     }
 
     /// Restores the client from a `Session`.
@@ -561,6 +625,12 @@ impl Client {
     /// [`Room::enable_send_queue`].
     pub async fn enable_all_send_queues(&self, enable: bool) {
         self.inner.send_queue().set_enabled(enable).await;
+    }
+
+    /// Enables or disables progress reporting for media uploads in the send
+    /// queue.
+    pub fn enable_send_queue_upload_progress(&self, enable: bool) {
+        self.inner.send_queue().enable_upload_progress(enable);
     }
 
     /// Subscribe to the global enablement status of the send queue, at the
@@ -718,32 +788,66 @@ impl Client {
         }
     }
 
-    /// Allows generic GET requests to be made through the SDKs internal HTTP
-    /// client
-    pub async fn get_url(&self, url: String) -> Result<String, ClientError> {
-        let http_client = self.inner.http_client();
-        Ok(http_client.get(url).send().await?.text().await?)
+    /// Allows generic GET requests to be made through the SDK's internal HTTP
+    /// client. This is useful when the caller's native HTTP client wouldn't
+    /// have the same configuration (such as certificates, proxies, etc.) This
+    /// method returns the raw bytes of the response, so that any kind of
+    /// resource can be fetched including images, files, etc.
+    ///
+    /// Note: When an HTTP error occurs, the error response can be found in the
+    /// `ClientError::Generic`'s `details` field.
+    pub async fn get_url(&self, url: String) -> Result<Vec<u8>, ClientError> {
+        let response = self.inner.http_client().get(url).send().await?;
+        if response.status().is_success() {
+            Ok(response.bytes().await?.into())
+        } else {
+            Err(ClientError::Generic {
+                msg: response.status().to_string(),
+                details: response.text().await.ok(),
+            })
+        }
     }
 
     /// Empty the server version and unstable features cache.
     ///
-    /// Since the SDK caches server capabilities (versions and unstable
-    /// features), it's possible to have a stale entry in the cache. This
-    /// functions makes it possible to force reset it.
-    pub async fn reset_server_capabilities(&self) -> Result<(), ClientError> {
-        Ok(self.inner.reset_server_capabilities().await?)
+    /// Since the SDK caches server info (versions, unstable features,
+    /// well-known etc), it's possible to have a stale entry in the cache.
+    /// This functions makes it possible to force reset it.
+    pub async fn reset_server_info(&self) -> Result<(), ClientError> {
+        Ok(self.inner.reset_server_info().await?)
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[matrix_sdk_ffi_macros::export]
 impl Client {
-    /// Whether or not the client's homeserver supports the password login flow.
-    pub(crate) async fn supports_password_login(&self) -> anyhow::Result<bool> {
-        let login_types = self.inner.matrix_auth().get_login_types().await?;
-        let supports_password = login_types
-            .flows
-            .iter()
-            .any(|login_type| matches!(login_type, get_login_types::v3::LoginType::Password(_)));
-        Ok(supports_password)
+    /// Retrieves a media file from the media source
+    ///
+    /// Not available on Wasm platforms, due to lack of accessible file system.
+    pub async fn get_media_file(
+        &self,
+        media_source: Arc<MediaSource>,
+        filename: Option<String>,
+        mime_type: String,
+        use_cache: bool,
+        temp_dir: Option<String>,
+    ) -> Result<Arc<MediaFileHandle>, ClientError> {
+        let source = (*media_source).clone();
+        let mime_type: mime::Mime = mime_type.parse()?;
+
+        let handle = self
+            .inner
+            .media()
+            .get_media_file(
+                &MediaRequestParameters { source: source.media_source, format: MediaFormat::File },
+                filename,
+                &mime_type,
+                use_cache,
+                temp_dir,
+            )
+            .await?;
+
+        Ok(Arc::new(MediaFileHandle::new(handle)))
     }
 }
 
@@ -824,7 +928,7 @@ impl Client {
         .with_max_delay(UTD_HOOK_GRACE_PERIOD);
 
         if let Err(e) = utd_hook_manager.reload_from_store().await {
-            error!("Unable to reload UTD hook data from data store: {}", e);
+            error!("Unable to reload UTD hook data from data store: {e}");
             // Carry on with the setup anyway; we shouldn't fail setup just
             // because the UTD hook failed to load its data.
         }
@@ -1135,15 +1239,8 @@ impl Client {
     }
 
     pub async fn get_profile(&self, user_id: String) -> Result<UserProfile, ClientError> {
-        let owned_user_id = UserId::parse(user_id.clone())?;
-
-        let response = self.inner.account().fetch_user_profile_of(&owned_user_id).await?;
-
-        Ok(UserProfile {
-            user_id,
-            display_name: response.displayname.clone(),
-            avatar_url: response.avatar_url.as_ref().map(|url| url.to_string()),
-        })
+        let user_id = <&UserId>::try_from(user_id.as_str())?;
+        UserProfile::fetch(&self.inner.account(), user_id).await
     }
 
     pub async fn notification_client(
@@ -1161,6 +1258,11 @@ impl Client {
         SyncServiceBuilder::new((*self.inner).clone(), self.utd_hook_manager.get().cloned())
     }
 
+    pub fn space_service(&self) -> Arc<SpaceService> {
+        let inner = UISpaceService::new((*self.inner).clone());
+        Arc::new(SpaceService::new(inner))
+    }
+
     pub async fn get_notification_settings(&self) -> Arc<NotificationSettings> {
         let inner = self.inner.notification_settings().await;
 
@@ -1174,13 +1276,10 @@ impl Client {
     // Ignored users
 
     pub async fn ignored_users(&self) -> Result<Vec<String>, ClientError> {
-        if let Some(raw_content) = self
-            .inner
-            .account()
-            .fetch_account_data(RumaGlobalAccountDataEventType::IgnoredUserList)
-            .await?
+        if let Some(raw_content) =
+            self.inner.account().fetch_account_data_static::<IgnoredUserListEventContent>().await?
         {
-            let content = raw_content.deserialize_as::<IgnoredUserListEventContent>()?;
+            let content = raw_content.deserialize()?;
             let user_ids: Vec<String> =
                 content.ignored_users.keys().map(|id| id.to_string()).collect();
 
@@ -1410,8 +1509,8 @@ impl Client {
         &self,
         policy: MediaRetentionPolicy,
     ) -> Result<(), ClientError> {
-        let closure = async || -> Result<_, EventCacheError> {
-            let store = self.inner.event_cache_store().lock().await?;
+        let closure = async || -> Result<_, Error> {
+            let store = self.inner.media_store().lock().await?;
             Ok(store.set_media_retention_policy(policy).await?)
         };
 
@@ -1421,9 +1520,16 @@ impl Client {
     /// Clear all the non-critical caches for this Client instance.
     ///
     /// WARNING: This will clear all the caches, including the base store (state
-    /// store), so callers must make sure that any sync is inactive before
-    /// calling this method. In particular, the `SyncService` must not be
-    /// running. After the method returns, the Client will be in an unstable
+    /// store), so callers must make sure that the Client is at rest before
+    /// calling it.
+    ///
+    /// In particular, if a [`SyncService`] is running, it must be passed here
+    /// as a parameter, or stopped before calling this method. Ideally, the
+    /// send queues should have been disabled and must all be inactive (i.e.
+    /// not sending events); this method will disable them, but it might not
+    /// be enough if the queues are still processing events.
+    ///
+    /// After the method returns, the Client will be in an unstable
     /// state, and it is required that the caller reinstantiates a new
     /// Client instance, be it via dropping the previous and re-creating it,
     /// restarting their application, or any other similar means.
@@ -1433,20 +1539,35 @@ impl Client {
     ///   will start as if they were empty.
     /// - This will empty the media cache according to the current media
     ///   retention policy.
-    pub async fn clear_caches(&self) -> Result<(), ClientError> {
+    pub async fn clear_caches(
+        &self,
+        sync_service: Option<Arc<SyncService>>,
+    ) -> Result<(), ClientError> {
         let closure = async || -> Result<_, ClientError> {
+            // First, make sure to expire sessions in the sync service.
+            if let Some(sync_service) = sync_service {
+                sync_service.inner.expire_sessions().await;
+            }
+
+            // Disable the send queues, as they might read and write to the state store.
+            // Events being send might still be active, and cause errors if
+            // processing finishes, so this will only minimize damage. Since
+            // this method should only be called in exceptional cases, this has
+            // been deemed acceptable.
+            self.inner.send_queue().set_enabled(false).await;
+
             // Clean up the media cache according to the current media retention policy.
             self.inner
-                .event_cache_store()
+                .media_store()
                 .lock()
                 .await
-                .map_err(EventCacheError::from)?
-                .clean_up_media_cache()
+                .map_err(Error::from)?
+                .clean()
                 .await
-                .map_err(EventCacheError::from)?;
+                .map_err(Error::from)?;
 
             // Clear all the room chunks. It's important to *not* call
-            // `EventCacheStore::clear_all_rooms_chunks` here, because there might be live
+            // `EventCacheStore::clear_all_linked_chunks` here, because there might be live
             // observers of the linked chunks, and that would cause some very bad state
             // mismatch.
             self.inner.event_cache().clear_all_rooms().await?;
@@ -1491,6 +1612,24 @@ impl Client {
         Ok(self.inner.server_versions().await?.contains(&ruma::api::MatrixVersion::V1_13))
     }
 
+    /// Checks if the server supports the LiveKit RTC focus for placing calls.
+    pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
+        Ok(self
+            .inner
+            .rtc_foci()
+            .await?
+            .iter()
+            .any(|focus| matches!(focus, RtcFocusInfo::LiveKit(_))))
+    }
+
+    /// Get server vendor information from the federation API.
+    ///
+    /// This method retrieves information about the server's name and version
+    /// by calling the `/_matrix/federation/v1/version` endpoint.
+    pub async fn server_vendor_info(&self) -> Result<matrix_sdk::ServerVendorInfo, ClientError> {
+        Ok(self.inner.server_vendor_info(None).await?)
+    }
+
     /// Subscribe to changes in the media preview configuration.
     pub async fn subscribe_to_media_preview_config(
         &self,
@@ -1524,7 +1663,7 @@ impl Client {
     ) -> Result<Option<MediaPreviews>, ClientError> {
         let configuration = self.inner.account().get_media_preview_config_event_content().await?;
         match configuration {
-            Some(configuration) => Ok(Some(configuration.media_previews.into())),
+            Some(configuration) => Ok(configuration.media_previews.map(Into::into)),
             None => Ok(None),
         }
     }
@@ -1545,7 +1684,7 @@ impl Client {
     ) -> Result<Option<InviteAvatars>, ClientError> {
         let configuration = self.inner.account().get_media_preview_config_event_content().await?;
         match configuration {
-            Some(configuration) => Ok(Some(configuration.invite_avatars.into())),
+            Some(configuration) => Ok(configuration.invite_avatars.map(Into::into)),
             None => Ok(None),
         }
     }
@@ -1580,7 +1719,6 @@ impl Client {
         listener: Box<dyn RoomInfoListener>,
     ) -> Result<Arc<TaskHandle>, ClientError> {
         let room_id = RoomId::parse(room_id)?;
-        let receiver = self.inner.subscribe_to_room_updates(&room_id);
 
         // Emit the initial event, if present
         if let Some(room) = self.inner.get_room(&room_id) {
@@ -1589,20 +1727,59 @@ impl Client {
             }
         }
 
-        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(receiver);
-            while let Ok(room_update) = receiver.recv().await {
-                let room = match room_update {
-                    RoomUpdate::Invited { room, .. } => room,
-                    RoomUpdate::Joined { room, .. } => room,
-                    RoomUpdate::Knocked { room, .. } => room,
-                    RoomUpdate::Left { room, .. } => room,
-                };
-                if let Ok(room_info) = RoomInfo::new(&room).await {
-                    listener.call(room_info);
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn({
+            let client = self.inner.clone();
+            let mut receiver = client.room_info_notable_update_receiver();
+            async move {
+                while let Ok(room_update) = receiver.recv().await {
+                    if room_update.room_id != room_id {
+                        continue;
+                    }
+
+                    if let Some(room) = client.get_room(&room_id) {
+                        if let Ok(room_info) = RoomInfo::new(&room).await {
+                            listener.call(room_info);
+                        }
+                    }
                 }
             }
         }))))
+    }
+}
+
+#[cfg(feature = "experimental-element-recent-emojis")]
+mod recent_emoji {
+    use crate::{client::Client, error::ClientError};
+
+    /// Represents an emoji recently used for reactions.
+    #[derive(Debug, uniffi::Record)]
+    pub struct RecentEmoji {
+        /// The actual emoji text representation.
+        pub emoji: String,
+        /// The number of times this emoji has been used for reactions.
+        pub count: u64,
+    }
+
+    #[matrix_sdk_ffi_macros::export]
+    impl Client {
+        /// Adds a recently used emoji to the list and uploads the updated
+        /// `io.element.recent_emoji` content to the global account data.
+        pub async fn add_recent_emoji(&self, emoji: String) -> Result<(), ClientError> {
+            Ok(self.inner.account().add_recent_emoji(&emoji).await?)
+        }
+
+        /// Gets the list of recently used emojis from the
+        /// `io.element.recent_emoji` global account data.
+        pub async fn get_recent_emojis(&self) -> Result<Vec<RecentEmoji>, ClientError> {
+            Ok(self
+                .inner
+                .account()
+                .get_recent_emojis(false)
+                .await?
+                .into_iter()
+                .map(|(emoji, count)| RecentEmoji { emoji, count: count.into() })
+                .collect::<Vec<RecentEmoji>>())
+        }
     }
 }
 
@@ -1673,6 +1850,18 @@ pub struct UserProfile {
     pub user_id: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+impl UserProfile {
+    /// Fetch the profile for the given user ID, using the given [`Account`]
+    /// API.
+    pub(crate) async fn fetch(account: &Account, user_id: &UserId) -> Result<Self, ClientError> {
+        let response = account.fetch_user_profile_of(user_id).await?;
+        let display_name = response.get_static::<DisplayName>()?;
+        let avatar_url = response.get_static::<AvatarUrl>()?.map(|url| url.to_string());
+
+        Ok(UserProfile { user_id: user_id.to_string(), display_name, avatar_url })
+    }
 }
 
 impl From<&search_users::v3::User> for UserProfile {
@@ -1789,7 +1978,7 @@ pub struct PowerLevels {
 
 impl From<PowerLevels> for RoomPowerLevelsEventContent {
     fn from(value: PowerLevels) -> Self {
-        let mut power_levels = RoomPowerLevelsEventContent::new();
+        let mut power_levels = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
 
         if let Some(users_default) = value.users_default {
             power_levels.users_default = users_default.into();
@@ -1894,24 +2083,24 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         if value.is_encrypted {
             let content =
                 RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(url) = value.avatar {
             let mut content = RoomAvatarEventContent::new();
             content.url = Some(url.into());
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(join_rule_override) = value.join_rule_override {
             let content = RoomJoinRulesEventContent::new(join_rule_override.try_into()?);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(history_visibility_override) = value.history_visibility_override {
             let content =
                 RoomHistoryVisibilityEventContent::new(history_visibility_override.try_into()?);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         request.initial_state = initial_state;
@@ -2153,17 +2342,20 @@ fn gen_transaction_id() -> String {
 
 /// A file handle that takes ownership of a media file on disk. When the handle
 /// is dropped, the file will be removed from the disk.
+#[cfg(not(target_family = "wasm"))]
 #[derive(uniffi::Object)]
 pub struct MediaFileHandle {
-    inner: RwLock<Option<SdkMediaFileHandle>>,
+    inner: std::sync::RwLock<Option<SdkMediaFileHandle>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl MediaFileHandle {
     fn new(handle: SdkMediaFileHandle) -> Self {
-        Self { inner: RwLock::new(Some(handle)) }
+        Self { inner: std::sync::RwLock::new(Some(handle)) }
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[matrix_sdk_ffi_macros::export]
 impl MediaFileHandle {
     /// Get the media file's path.
@@ -2356,9 +2548,7 @@ impl TryFrom<AllowRule> for RumaAllowRule {
         match value {
             AllowRule::RoomMembership { room_id } => {
                 let room_id = RoomId::parse(room_id)?;
-                Ok(Self::RoomMembership(ruma::events::room::join_rules::RoomMembership::new(
-                    room_id,
-                )))
+                Ok(Self::RoomMembership(ruma::room::RoomMembership::new(room_id)))
             }
             AllowRule::Custom { json } => Ok(Self::_Custom(Box::new(serde_json::from_str(&json)?))),
         }

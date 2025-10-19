@@ -17,15 +17,14 @@
 use std::time::Duration;
 
 use ruma::{
-    assign,
+    OwnedTransactionId, UInt, assign,
     events::{
-        room::{
-            message::{AudioInfo, FileInfo, FormattedBody, VideoInfo},
-            ImageInfo, ThumbnailInfo,
-        },
         Mentions,
+        room::{
+            ImageInfo, ThumbnailInfo,
+            message::{AudioInfo, FileInfo, TextMessageEventContent, VideoInfo},
+        },
     },
-    OwnedTransactionId, UInt,
 };
 
 use crate::room::reply::Reply;
@@ -67,6 +66,10 @@ pub struct BaseAudioInfo {
     pub duration: Option<Duration>,
     /// The file size of the audio clip in bytes.
     pub size: Option<UInt>,
+    /// The waveform of the audio clip.
+    ///
+    /// Must only include values between 0 and 1.
+    pub waveform: Option<Vec<f32>>,
 }
 
 /// Base metadata about a file.
@@ -88,12 +91,7 @@ pub enum AttachmentInfo {
     /// The metadata of a file.
     File(BaseFileInfo),
     /// The metadata of a voice message
-    Voice {
-        /// The audio info
-        audio_info: BaseAudioInfo,
-        /// The waveform of the voice message
-        waveform: Option<Vec<u16>>,
-    },
+    Voice(BaseAudioInfo),
 }
 
 impl From<AttachmentInfo> for ImageInfo {
@@ -129,14 +127,12 @@ impl From<AttachmentInfo> for VideoInfo {
 impl From<AttachmentInfo> for AudioInfo {
     fn from(info: AttachmentInfo) -> Self {
         match info {
-            AttachmentInfo::Audio(info) => assign!(AudioInfo::new(), {
-                duration: info.duration,
-                size: info.size,
-            }),
-            AttachmentInfo::Voice { audio_info, .. } => assign!(AudioInfo::new(), {
-                duration: audio_info.duration,
-                size: audio_info.size,
-            }),
+            AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => {
+                assign!(AudioInfo::new(), {
+                    duration: info.duration,
+                    size: info.size,
+                })
+            }
             _ => AudioInfo::new(),
         }
     }
@@ -184,13 +180,26 @@ impl Thumbnail {
 /// Configuration for sending an attachment.
 #[derive(Debug, Default)]
 pub struct AttachmentConfig {
-    pub(crate) txn_id: Option<OwnedTransactionId>,
-    pub(crate) info: Option<AttachmentInfo>,
-    pub(crate) thumbnail: Option<Thumbnail>,
-    pub(crate) caption: Option<String>,
-    pub(crate) formatted_caption: Option<FormattedBody>,
-    pub(crate) mentions: Option<Mentions>,
-    pub(crate) reply: Option<Reply>,
+    /// A fixed transaction id to be used for sending this attachment.
+    ///
+    /// Otherwise, a random one will be generated.
+    pub txn_id: Option<OwnedTransactionId>,
+
+    /// Type-specific metadata about the attachment.
+    pub info: Option<AttachmentInfo>,
+
+    /// An optional thumbnail to send with the attachment.
+    pub thumbnail: Option<Thumbnail>,
+
+    /// An optional caption for the attachment.
+    pub caption: Option<TextMessageEventContent>,
+
+    /// Intentional mentions to be included in the media event.
+    pub mentions: Option<Mentions>,
+
+    /// Reply parameters for the attachment (replied-to event and thread-related
+    /// metadata).
+    pub reply: Option<Reply>,
 }
 
 impl AttachmentConfig {
@@ -241,18 +250,8 @@ impl AttachmentConfig {
     /// # Arguments
     ///
     /// * `caption` - The optional caption.
-    pub fn caption(mut self, caption: Option<String>) -> Self {
+    pub fn caption(mut self, caption: Option<TextMessageEventContent>) -> Self {
         self.caption = caption;
-        self
-    }
-
-    /// Set the optional formatted caption.
-    ///
-    /// # Arguments
-    ///
-    /// * `formatted_caption` - The optional formatted caption.
-    pub fn formatted_caption(mut self, formatted_caption: Option<FormattedBody>) -> Self {
-        self.formatted_caption = formatted_caption;
         self
     }
 
@@ -283,8 +282,7 @@ impl AttachmentConfig {
 pub struct GalleryConfig {
     pub(crate) txn_id: Option<OwnedTransactionId>,
     pub(crate) items: Vec<GalleryItemInfo>,
-    pub(crate) caption: Option<String>,
-    pub(crate) formatted_caption: Option<FormattedBody>,
+    pub(crate) caption: Option<TextMessageEventContent>,
     pub(crate) mentions: Option<Mentions>,
     pub(crate) reply: Option<Reply>,
 }
@@ -325,18 +323,8 @@ impl GalleryConfig {
     /// # Arguments
     ///
     /// * `caption` - The optional caption.
-    pub fn caption(mut self, caption: Option<String>) -> Self {
+    pub fn caption(mut self, caption: Option<TextMessageEventContent>) -> Self {
         self.caption = caption;
-        self
-    }
-
-    /// Set the optional formatted caption.
-    ///
-    /// # Arguments
-    ///
-    /// * `formatted_caption` - The optional formatted caption.
-    pub fn formatted_caption(mut self, formatted_caption: Option<FormattedBody>) -> Self {
-        self.formatted_caption = formatted_caption;
         self
     }
 
@@ -384,9 +372,7 @@ pub struct GalleryItemInfo {
     /// The attachment info.
     pub attachment_info: AttachmentInfo,
     /// The caption.
-    pub caption: Option<String>,
-    /// The formatted caption.
-    pub formatted_caption: Option<FormattedBody>,
+    pub caption: Option<TextMessageEventContent>,
     /// The thumbnail.
     pub thumbnail: Option<Thumbnail>,
 }

@@ -27,6 +27,8 @@ use itertools::Itertools;
 use matrix_sdk_common::{
     deserialized_responses::WithheldCode, executor::spawn, locks::RwLock as StdRwLock,
 };
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::events::AnyStateEventContent;
 use ruma::{
     events::{AnyMessageLikeEventContent, AnyToDeviceEventContent, ToDeviceEventType},
     serde::Raw,
@@ -35,8 +37,12 @@ use ruma::{
     UserId,
 };
 use serde::Serialize;
-pub(crate) use share_strategy::CollectRecipientsResult;
+#[cfg(feature = "experimental-send-custom-to-device")]
+pub(crate) use share_strategy::split_devices_for_share_strategy;
 pub use share_strategy::CollectStrategy;
+pub(crate) use share_strategy::{
+    withheld_code_for_device_for_share_strategy, CollectRecipientsResult,
+};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument};
 
 use crate::{
@@ -46,7 +52,7 @@ use crate::{
         InboundGroupSession, OutboundGroupSession, SenderData, SenderDataFinder, Session,
         ShareInfo, ShareState,
     },
-    store::{Changes, CryptoStoreWrapper, Result as StoreResult, Store},
+    store::{types::Changes, CryptoStoreWrapper, Result as StoreResult, Store},
     types::{
         events::{
             room::encrypted::{RoomEncryptedEventContent, ToDeviceEncryptedEventContent},
@@ -212,6 +218,50 @@ impl GroupSessionManager {
         assert!(!session.expired(), "Session expired");
 
         let content = session.encrypt(event_type, content).await;
+
+        let mut changes = Changes::default();
+        changes.outbound_group_sessions.push(session);
+        self.store.save_changes(changes).await?;
+
+        Ok(content)
+    }
+
+    /// Encrypts a state event for the given room using its outbound group
+    /// session.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The ID of the room where the state event will be sent.
+    /// * `event_type` - The type of the state event to encrypt.
+    /// * `state_key` - The state key associated with the event.
+    /// * `content` - The raw content of the state event to encrypt.
+    ///
+    /// # Returns
+    ///
+    /// Returns the raw encrypted state event content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if saving changes to the store fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no session exists for the given room ID, or the session
+    /// has expired.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub async fn encrypt_state(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        state_key: &str,
+        content: &Raw<AnyStateEventContent>,
+    ) -> MegolmResult<Raw<RoomEncryptedEventContent>> {
+        let session =
+            self.sessions.get_or_load(room_id).await.expect("Session wasn't created nor shared");
+
+        assert!(!session.expired(), "Session expired");
+
+        let content = session.encrypt_state(event_type, state_key, content).await;
 
         let mut changes = Changes::default();
         changes.outbound_group_sessions.push(session);
@@ -602,7 +652,7 @@ impl GroupSessionManager {
         for (user_id, device_map) in &request.messages {
             for (device, content) in device_map {
                 let message_id: Option<&str> = content
-                    .deserialize_as::<ContentStub<'_>>()
+                    .deserialize_as_unchecked::<ContentStub<'_>>()
                     .expect("We should be able to deserialize the content we generated")
                     .message_id;
 
@@ -779,7 +829,10 @@ impl GroupSessionManager {
         // Only allow conservative sharing strategies
         let collect_strategy = match collect_strategy {
             CollectStrategy::AllDevices | CollectStrategy::ErrorOnVerifiedUserProblem => {
-                warn!("Ignoring request to use unsafe sharing strategy {:?} for room key history sharing", collect_strategy);
+                warn!(
+                    "Ignoring request to use unsafe sharing strategy {collect_strategy:?} \
+                     for room key history sharing",
+                );
                 &CollectStrategy::IdentityBasedStrategy
             }
             CollectStrategy::IdentityBasedStrategy | CollectStrategy::OnlyTrustedDevices => {
@@ -1005,7 +1058,7 @@ impl EncryptForDevicesResultBuilder {
                 "Created a to-device request carrying room keys",
             );
             encrypt_for_devices_result.to_device_request = Some(request);
-        };
+        }
 
         encrypt_for_devices_result
     }
@@ -1031,7 +1084,7 @@ mod tests {
     };
 
     use assert_matches2::assert_let;
-    use matrix_sdk_common::deserialized_responses::WithheldCode;
+    use matrix_sdk_common::deserialized_responses::{ProcessedToDeviceEvent, WithheldCode};
     use matrix_sdk_test::{async_test, ruma_response_from_json};
     use ruma::{
         api::client::{
@@ -1063,9 +1116,9 @@ mod tests {
                 room_key_withheld::RoomKeyWithheldContent::{self, MegolmV1AesSha2},
             },
             requests::ToDeviceRequest,
-            DeviceKeys, EventEncryptionAlgorithm, ProcessedToDeviceEvent,
+            DeviceKeys, EventEncryptionAlgorithm,
         },
-        EncryptionSettings, LocalTrust, OlmMachine,
+        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, TrustRequirement,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1240,7 +1293,7 @@ mod tests {
                 for message in r.messages.values() {
                     message.iter().for_each(|(_, content)| {
                         let withheld: RoomKeyWithheldContent =
-                            content.deserialize_as::<RoomKeyWithheldContent>().unwrap();
+                            content.deserialize_as_unchecked::<RoomKeyWithheldContent>().unwrap();
 
                         if let MegolmV1AesSha2(content) = withheld {
                             if content.withheld_code() == code {
@@ -1525,7 +1578,7 @@ mod tests {
                 let device_key = DeviceIdOrAllDevices::from(device_id!("MWVTUXDNNM").to_owned());
                 let content = &r.messages[user_id][&device_key];
                 let withheld: RoomKeyWithheldContent =
-                    content.deserialize_as::<RoomKeyWithheldContent>().unwrap();
+                    content.deserialize_as_unchecked::<RoomKeyWithheldContent>().unwrap();
                 if let MegolmV1AesSha2(content) = withheld {
                     content.withheld_code() == WithheldCode::Blacklisted
                 } else {
@@ -1646,7 +1699,12 @@ mod tests {
                 unused_fallback_keys: None,
                 next_batch_token: None,
             };
-            let (decrypted, _) = machine.receive_sync_changes(sync_changes).await.unwrap();
+
+            let decryption_settings =
+                DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+            let (decrypted, _) =
+                machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
         }
@@ -1711,7 +1769,12 @@ mod tests {
                 unused_fallback_keys: None,
                 next_batch_token: None,
             };
-            let (decrypted, _) = machine.receive_sync_changes(sync_changes).await.unwrap();
+
+            let decryption_settings =
+                DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+            let (decrypted, _) =
+                machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
         }
@@ -1809,7 +1872,7 @@ mod tests {
             .unwrap();
         let to_device = EncryptedToDeviceEvent::new(
             alice.user_id().to_owned(),
-            bob_message.cast_ref().deserialize().unwrap(),
+            bob_message.deserialize_as_unchecked().unwrap(),
         );
 
         let sync_changes = EncryptionSyncChanges {
@@ -1819,7 +1882,12 @@ mod tests {
             unused_fallback_keys: None,
             next_batch_token: None,
         };
-        let (decrypted, _) = bob.receive_sync_changes(sync_changes).await.unwrap();
+
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+        let (decrypted, _) =
+            bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
         assert_eq!(1, decrypted.len());
         use crate::types::events::EventType;
         assert_let!(

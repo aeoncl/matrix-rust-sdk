@@ -15,14 +15,23 @@
 // limitations under the License.
 
 use futures_core::Stream;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
+#[cfg(feature = "experimental-element-recent-emojis")]
+use itertools::Itertools;
+#[cfg(feature = "experimental-element-recent-emojis")]
+use js_int::uint;
+#[cfg(feature = "experimental-element-recent-emojis")]
+use matrix_sdk_base::recent_emojis::RecentEmojisContent;
 use matrix_sdk_base::{
+    StateStoreDataKey, StateStoreDataValue,
     media::{MediaFormat, MediaRequestParameters},
     store::StateStoreExt,
-    StateStoreDataKey, StateStoreDataValue,
 };
 use mime::Mime;
+#[cfg(feature = "experimental-element-recent-emojis")]
+use ruma::api::client::config::set_global_account_data::v3::Request as UpdateGlobalAccountDataRequest;
 use ruma::{
+    ClientSecret, MxcUri, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, SessionId, UInt, UserId,
     api::client::{
         account::{
             add_3pid, change_password, deactivate, delete_3pid, get_3pids,
@@ -37,6 +46,8 @@ use ruma::{
     },
     assign,
     events::{
+        AnyGlobalAccountDataEventContent, GlobalAccountDataEvent, GlobalAccountDataEventContent,
+        GlobalAccountDataEventType, StaticEventContent,
         ignored_user_list::{IgnoredUser, IgnoredUserListEventContent},
         media_preview_config::{
             InviteAvatars, MediaPreviewConfigEventContent, MediaPreviews,
@@ -44,18 +55,19 @@ use ruma::{
         },
         push_rules::PushRulesEventContent,
         room::MediaSource,
-        AnyGlobalAccountDataEventContent, GlobalAccountDataEvent, GlobalAccountDataEventContent,
-        GlobalAccountDataEventType, StaticEventContent,
     },
     push::Ruleset,
     serde::Raw,
     thirdparty::Medium,
-    ClientSecret, MxcUri, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, SessionId, UInt, UserId,
 };
 use serde::Deserialize;
 use tracing::error;
 
-use crate::{config::RequestConfig, Client, Error, Result};
+use crate::{Client, Error, Result, config::RequestConfig};
+
+/// The maximum number of recent emojis that should be stored and loaded.
+#[cfg(feature = "experimental-element-recent-emojis")]
+const MAX_RECENT_EMOJI_COUNT: usize = 100;
 
 /// A high-level API to manage the client owner's account.
 ///
@@ -95,6 +107,7 @@ impl Account {
     /// ```
     pub async fn get_display_name(&self) -> Result<Option<String>> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        #[allow(deprecated)]
         let request = get_display_name::v3::Request::new(user_id.to_owned());
         let request_config = self.client.request_config().force_auth();
         let response = self.client.send(request).with_request_config(request_config).await?;
@@ -119,6 +132,7 @@ impl Account {
     /// ```
     pub async fn set_display_name(&self, name: Option<&str>) -> Result<()> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        #[allow(deprecated)]
         let request =
             set_display_name::v3::Request::new(user_id.to_owned(), name.map(ToOwned::to_owned));
         self.client.send(request).await?;
@@ -149,6 +163,7 @@ impl Account {
     /// ```
     pub async fn get_avatar_url(&self) -> Result<Option<OwnedMxcUri>> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        #[allow(deprecated)]
         let request = get_avatar_url::v3::Request::new(user_id.to_owned());
 
         let config = Some(RequestConfig::new().force_auth());
@@ -191,6 +206,7 @@ impl Account {
     /// The avatar is unset if `url` is `None`.
     pub async fn set_avatar_url(&self, url: Option<&MxcUri>) -> Result<()> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        #[allow(deprecated)]
         let request =
             set_avatar_url::v3::Request::new(user_id.to_owned(), url.map(ToOwned::to_owned));
         self.client.send(request).await?;
@@ -269,23 +285,25 @@ impl Account {
         Ok(upload_response.content_uri)
     }
 
-    /// Get the profile of the account.
+    /// Get the profile of this account.
     ///
-    /// Allows to get both the display name and avatar URL in a single call.
+    /// Allows to get all the profile data in a single call.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use matrix_sdk::Client;
+    /// use ruma::api::client::profile::{AvatarUrl, DisplayName};
     /// # use url::Url;
     /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let client = Client::new(homeserver).await?;
+    ///
     /// let profile = client.account().fetch_user_profile().await?;
-    /// println!(
-    ///     "You are '{:?}' with avatar '{:?}'",
-    ///     profile.displayname, profile.avatar_url
-    /// );
+    /// let display_name = profile.get_static::<DisplayName>()?;
+    /// let avatar_url = profile.get_static::<AvatarUrl>()?;
+    ///
+    /// println!("You are '{display_name:?}' with avatar '{avatar_url:?}'");
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn fetch_user_profile(&self) -> Result<get_profile::v3::Response> {
@@ -698,7 +716,8 @@ impl Account {
         Ok(self.client.send(request).await?)
     }
 
-    /// Get the content of an account data event of statically-known type.
+    /// Get the content of an account data event of statically-known type, from
+    /// storage.
     ///
     /// # Examples
     ///
@@ -721,12 +740,12 @@ impl Account {
     /// ```
     pub async fn account_data<C>(&self) -> Result<Option<Raw<C>>>
     where
-        C: GlobalAccountDataEventContent + StaticEventContent,
+        C: GlobalAccountDataEventContent + StaticEventContent<IsPrefix = ruma::events::False>,
     {
         get_raw_content(self.client.state_store().get_account_data_event_static::<C>().await?)
     }
 
-    /// Get the content of an account data event of a given type.
+    /// Get the content of an account data event of a given type, from storage.
     pub async fn account_data_raw(
         &self,
         event_type: GlobalAccountDataEventType,
@@ -748,7 +767,7 @@ impl Account {
     /// use matrix_sdk::ruma::events::{ignored_user_list::IgnoredUserListEventContent, GlobalAccountDataEventType};
     ///
     /// if let Some(raw_content) = account.fetch_account_data(GlobalAccountDataEventType::IgnoredUserList).await? {
-    ///     let content = raw_content.deserialize_as::<IgnoredUserListEventContent>()?;
+    ///     let content = raw_content.deserialize_as_unchecked::<IgnoredUserListEventContent>()?;
     ///
     ///     println!("Ignored users:");
     ///
@@ -769,16 +788,20 @@ impl Account {
             Ok(r) => Ok(Some(r.account_data)),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
-                    if kind == &ErrorKind::NotFound {
-                        Ok(None)
-                    } else {
-                        Err(e.into())
-                    }
+                    if kind == &ErrorKind::NotFound { Ok(None) } else { Err(e.into()) }
                 } else {
                     Err(e.into())
                 }
             }
         }
+    }
+
+    /// Fetch an account data event of statically-known type from the server.
+    pub async fn fetch_account_data_static<C>(&self) -> Result<Option<Raw<C>>>
+    where
+        C: GlobalAccountDataEventContent + StaticEventContent<IsPrefix = ruma::events::False>,
+    {
+        Ok(self.fetch_account_data(C::TYPE.into()).await?.map(Raw::cast_unchecked))
     }
 
     /// Set the given account data event.
@@ -862,12 +885,12 @@ impl Account {
 
         // We are fetching the content from the server because we currently can't rely
         // on `/sync` giving us the correct data in a timely manner.
-        let raw_content = self.fetch_account_data(GlobalAccountDataEventType::Direct).await?;
+        let raw_content = self.fetch_account_data_static::<DirectEventContent>().await?;
 
         let mut content = if let Some(raw_content) = raw_content {
             // Log the error and pass it upwards if we fail to deserialize the m.direct
             // event.
-            raw_content.deserialize_as::<DirectEventContent>().map_err(|err| {
+            raw_content.deserialize().map_err(|err| {
                 error!("unable to deserialize m.direct event content; aborting request to mark {room_id} as dm: {err}");
                 err
             })?
@@ -890,25 +913,34 @@ impl Account {
 
     /// Adds the given user ID to the account's ignore list.
     pub async fn ignore_user(&self, user_id: &UserId) -> Result<()> {
+        let own_user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
+        if user_id == own_user_id {
+            return Err(Error::CantIgnoreLoggedInUser);
+        }
+
         let mut ignored_user_list = self.get_ignored_user_list_event_content().await?;
         ignored_user_list.ignored_users.insert(user_id.to_owned(), IgnoredUser::new());
 
-        // Updating the account data
         self.set_account_data(ignored_user_list).await?;
-        // TODO: I think I should reset all the storage and perform a new local sync
-        // here but I don't know how
+
+        // In theory, we should also clear some caches here, because they may include
+        // events sent by the ignored user. In practice, we expect callers to
+        // take care of this, or subsystems to listen to user list changes and
+        // clear caches accordingly.
+
         Ok(())
     }
 
     /// Removes the given user ID from the account's ignore list.
     pub async fn unignore_user(&self, user_id: &UserId) -> Result<()> {
         let mut ignored_user_list = self.get_ignored_user_list_event_content().await?;
-        ignored_user_list.ignored_users.remove(user_id);
 
-        // Updating the account data
-        self.set_account_data(ignored_user_list).await?;
-        // TODO: I think I should reset all the storage and perform a new local sync
-        // here but I don't know how
+        // Only update account data if the user was ignored in the first place.
+        if ignored_user_list.ignored_users.remove(user_id).is_some() {
+            self.set_account_data(ignored_user_list).await?;
+        }
+
+        // See comment in `ignore_user`.
         Ok(())
     }
 
@@ -1027,7 +1059,7 @@ impl Account {
     ) -> Result<
         (
             Option<MediaPreviewConfigEventContent>,
-            impl Stream<Item = MediaPreviewConfigEventContent>,
+            impl Stream<Item = MediaPreviewConfigEventContent> + use<>,
         ),
         Error,
     > {
@@ -1072,21 +1104,22 @@ impl Account {
     pub async fn fetch_media_preview_config_event_content(
         &self,
     ) -> Result<Option<MediaPreviewConfigEventContent>> {
-        // First we check if there is avalue in the stable event
+        // First we check if there is a value in the stable event
         let media_preview_config =
-            self.fetch_account_data(GlobalAccountDataEventType::MediaPreviewConfig).await?;
+            self.fetch_account_data_static::<MediaPreviewConfigEventContent>().await?;
 
         let media_preview_config = if let Some(media_preview_config) = media_preview_config {
             Some(media_preview_config)
         } else {
             // If there is no value in the stable event, we check the unstable
-            self.fetch_account_data(GlobalAccountDataEventType::UnstableMediaPreviewConfig).await?
+            self.fetch_account_data_static::<UnstableMediaPreviewConfigEventContent>()
+                .await?
+                .map(Raw::cast)
         };
 
         // We deserialize the content of the event, if is not found we return the
         // default
-        let media_preview_config = media_preview_config
-            .and_then(|value| value.deserialize_as::<MediaPreviewConfigEventContent>().ok());
+        let media_preview_config = media_preview_config.and_then(|value| value.deserialize().ok());
 
         Ok(media_preview_config)
     }
@@ -1120,7 +1153,7 @@ impl Account {
     pub async fn set_media_previews_display_policy(&self, policy: MediaPreviews) -> Result<()> {
         let mut media_preview_config =
             self.fetch_media_preview_config_event_content().await?.unwrap_or_default();
-        media_preview_config.media_previews = policy;
+        media_preview_config.media_previews = Some(policy);
 
         // Updating the unstable account data
         let unstable_media_preview_config =
@@ -1136,13 +1169,101 @@ impl Account {
     pub async fn set_invite_avatars_display_policy(&self, policy: InviteAvatars) -> Result<()> {
         let mut media_preview_config =
             self.fetch_media_preview_config_event_content().await?.unwrap_or_default();
-        media_preview_config.invite_avatars = policy;
+        media_preview_config.invite_avatars = Some(policy);
 
         // Updating the unstable account data
         let unstable_media_preview_config =
             UnstableMediaPreviewConfigEventContent::from(media_preview_config);
         self.set_account_data(unstable_media_preview_config).await?;
         Ok(())
+    }
+
+    /// Adds a recently used emoji to the list and uploads the updated
+    /// `io.element.recent_emoji` content to the global account data.
+    ///
+    /// Before updating the data, it'll fetch it from the homeserver, to make
+    /// sure the updated values are always used. However, note this could still
+    /// result in a race condition if it's used concurrently.
+    #[cfg(feature = "experimental-element-recent-emojis")]
+    pub async fn add_recent_emoji(&self, emoji: &str) -> Result<()> {
+        let Some(user_id) = self.client.user_id() else {
+            return Err(Error::AuthenticationRequired);
+        };
+        let mut recent_emojis = self.get_recent_emojis(true).await?;
+
+        let index = recent_emojis.iter().position(|(unicode, _)| unicode == emoji);
+
+        // Truncate to the max allowed size, which will remove any emojis that
+        // haven't been used in a very long time. This will also ease the pressure on
+        // `remove` and `insert` shifting lots of elements in the list
+        recent_emojis.truncate(MAX_RECENT_EMOJI_COUNT);
+
+        // Remove the emoji from the list if it was present and get it's `count` value
+        let count = if let Some(index) = index { recent_emojis.remove(index).1 } else { uint!(0) };
+
+        // Insert the emoji with the updated count at the start of the list, so it's
+        // considered the most recently used emoji
+        recent_emojis.insert(0, (emoji.to_owned(), count + uint!(1)));
+
+        // If the item was a new one, the list will now be `MAX_RECENT_EMOJI_COUNT` + 1,
+        // so truncate it again (this is a no-op if it already has the right size)
+        recent_emojis.truncate(MAX_RECENT_EMOJI_COUNT);
+
+        let request = UpdateGlobalAccountDataRequest::new(
+            user_id.to_owned(),
+            &RecentEmojisContent::new(recent_emojis),
+        )?;
+        let _ = self.client.send(request).await?;
+
+        Ok(())
+    }
+
+    /// Gets the list of recently used emojis from the `io.element.recent_emoji`
+    /// global account data.
+    ///
+    /// If the `refresh` param is `true`, the data will be fetched from the
+    /// homeserver instead of the local storage.
+    #[cfg(feature = "experimental-element-recent-emojis")]
+    pub async fn get_recent_emojis(&self, refresh: bool) -> Result<Vec<(String, UInt)>> {
+        let content = if refresh {
+            let Some(user_id) = self.client.user_id() else {
+                return Err(Error::AuthenticationRequired);
+            };
+            let event_type = RecentEmojisContent::default().event_type();
+            let response = self
+                .client
+                .send(get_global_account_data::v3::Request::new(
+                    user_id.to_owned(),
+                    event_type.clone(),
+                ))
+                .await?;
+            let content = response.account_data.cast_unchecked().deserialize()?;
+            Some(content)
+        } else {
+            self.client
+                .state_store()
+                .get_account_data_event_static::<RecentEmojisContent>()
+                .await?
+                .map(|raw| raw.deserialize().map(|event| event.content))
+                .transpose()?
+        };
+
+        if let Some(content) = content {
+            // Sort by count, descending. For items with the same count, since they were
+            // previously ordered by recency in the list, more recent emojis will be
+            // returned first.
+            let sorted_emojis = content
+                .recent_emoji
+                .into_iter()
+                // Items with higher counts should be first
+                .sorted_by(|(_, count_a), (_, count_b)| count_b.cmp(count_a))
+                // Make sure we take only up to MAX_RECENT_EMOJI_COUNT
+                .take(MAX_RECENT_EMOJI_COUNT)
+                .collect();
+            Ok(sorted_emojis)
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -1154,7 +1275,172 @@ fn get_raw_content<Ev, C>(raw: Option<Raw<Ev>>) -> Result<Option<Raw<C>>> {
     }
 
     Ok(raw
-        .map(|event| event.deserialize_as::<GetRawContent<C>>())
+        .map(|event| event.deserialize_as_unchecked::<GetRawContent<C>>())
         .transpose()?
         .map(|get_raw| get_raw.content))
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+    use matrix_sdk_test::async_test;
+
+    use crate::{Error, test_utils::client::MockClientBuilder};
+
+    #[async_test]
+    async fn test_dont_ignore_oneself() {
+        let client = MockClientBuilder::new(None).build().await;
+
+        // It's forbidden to ignore the logged-in user.
+        assert_matches!(
+            client.account().ignore_user(client.user_id().unwrap()).await,
+            Err(Error::CantIgnoreLoggedInUser)
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "experimental-element-recent-emojis")]
+mod test_recent_emojis {
+    use js_int::{UInt, uint};
+    use matrix_sdk_base::recent_emojis::RecentEmojisContent;
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+
+    use crate::{
+        account::MAX_RECENT_EMOJI_COUNT, config::SyncSettings, test_utils::mocks::MatrixMockServer,
+    };
+
+    #[async_test]
+    async fn test_recent_emojis() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let user_id = client.user_id().expect("session_id");
+
+        server
+            .mock_add_recent_emojis()
+            .ok(user_id)
+            .named("Update recent emojis global account data")
+            .mock_once()
+            .mount()
+            .await;
+
+        let recent_emojis = client.account().get_recent_emojis(false).await.expect("recent emojis");
+        assert!(recent_emojis.is_empty());
+
+        let emoji_list = vec![
+            (":/".to_owned(), uint!(1)),
+            (":)".to_owned(), uint!(12)),
+            (":D".to_owned(), uint!(12)),
+        ];
+
+        server
+            .mock_get_recent_emojis()
+            .ok(user_id, emoji_list.clone())
+            .named("Fetch recent emojis")
+            .mock_once()
+            .mount()
+            .await;
+
+        client.account().add_recent_emoji(":)").await.expect("adding emoji");
+
+        server
+            .mock_sync()
+            .ok(|builder| {
+                let content = RecentEmojisContent::new(emoji_list);
+                let event_builder = EventFactory::new().global_account_data(content);
+                builder.add_global_account_data(event_builder);
+            })
+            .named("Sync")
+            .mount()
+            .await;
+
+        client.sync_once(SyncSettings::default()).await.expect("sync failed");
+
+        let recent_emojis = client.account().get_recent_emojis(false).await.expect("recent emojis");
+
+        // Assert size
+        assert_eq!(recent_emojis.len(), 3);
+
+        // Assert ordering: first by times used, then by recency
+        assert_eq!(recent_emojis[0].0, ":)");
+        assert_eq!(recent_emojis[1].0, ":D");
+        assert_eq!(recent_emojis[2].0, ":/");
+    }
+
+    #[async_test]
+    async fn test_max_recent_emoji_count() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let user_id = client.user_id().expect("session_id");
+
+        // This list is > the MAX_RECENT_EMOJI_COUNT
+        let long_emoji_list = (0..MAX_RECENT_EMOJI_COUNT * 2)
+            .map(|i| (i.to_string(), uint!(1)))
+            .collect::<Vec<(String, UInt)>>();
+
+        // Initially we locally don't have any emojis
+        let recent_emojis = client.account().get_recent_emojis(false).await.expect("recent emojis");
+        assert!(recent_emojis.is_empty());
+
+        server
+            .mock_get_recent_emojis()
+            .ok(user_id, long_emoji_list.clone())
+            .named("Fetch recent emojis")
+            .expect(3)
+            .mount()
+            .await;
+
+        // Now with a list of emojis longer than the max count, we fetch the emoji list
+        let recent_emojis = client.account().get_recent_emojis(true).await.expect("recent emojis");
+
+        // It should only return until the max count
+        assert_eq!(recent_emojis.len(), MAX_RECENT_EMOJI_COUNT);
+        assert_eq!(recent_emojis, long_emoji_list[..MAX_RECENT_EMOJI_COUNT]);
+
+        // Simulate the logic we expect when adding a new emoji:
+        // 1. Remove the existing emoji if present
+        // 2. Increase its count value and insert it at the front.
+        // 3. Truncate at MAX_RECENT_EMOJI_COUNT
+        let expected_updated_emoji_list = {
+            let mut list = long_emoji_list.clone();
+            let item = list.remove(50);
+            list.insert(0, (item.0, item.1 + uint!(1)));
+            list.truncate(MAX_RECENT_EMOJI_COUNT);
+            list
+        };
+
+        // Now if we add a new emoji that was not in the list, the last one in the list
+        // should be gone
+        server
+            .mock_add_recent_emojis()
+            .match_emojis_in_request_body(expected_updated_emoji_list)
+            .ok(user_id)
+            .named("Update recent emojis global account data with existing emoji")
+            .mock_once()
+            .mount()
+            .await;
+
+        client.account().add_recent_emoji("50").await.expect("adding emoji");
+
+        // Do the same, but now with a new emoji that wasn't previously in the list
+        let expected_updated_emoji_list = {
+            let mut list = long_emoji_list.clone();
+            let item = (":D".to_owned(), uint!(1));
+            list.insert(0, item);
+            list.truncate(MAX_RECENT_EMOJI_COUNT);
+            list
+        };
+
+        // We should still have `MAX_RECENT_EMOJI_COUNT` items
+        server
+            .mock_add_recent_emojis()
+            .match_emojis_in_request_body(expected_updated_emoji_list)
+            .ok(user_id)
+            .named("Update recent emojis global account data with new emoji")
+            .mock_once()
+            .mount()
+            .await;
+
+        client.account().add_recent_emoji(":D").await.expect("adding emoji");
+    }
 }

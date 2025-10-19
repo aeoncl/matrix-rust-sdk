@@ -22,14 +22,14 @@
 //! [`OAuth::login_with_qr_code()`] method.
 
 use as_variant::as_variant;
+use matrix_sdk_base::crypto::SecretImportError;
 pub use matrix_sdk_base::crypto::types::qr_login::{
     LoginQrCodeDecodeError, QrCodeData, QrCodeMode, QrCodeModeData,
 };
-use matrix_sdk_base::crypto::SecretImportError;
 pub use oauth2::{
-    basic::{BasicErrorResponse, BasicRequestTokenError},
     ConfigurationError, DeviceCodeErrorResponse, DeviceCodeErrorResponseType, HttpClientError,
     RequestTokenError, StandardErrorResponse,
+    basic::{BasicErrorResponse, BasicRequestTokenError},
 };
 use thiserror::Error;
 use url::Url;
@@ -41,7 +41,9 @@ mod rendezvous_channel;
 mod secure_channel;
 
 pub use self::{
-    login::{LoginProgress, LoginWithQrCode},
+    login::{
+        GeneratedQrProgress, LoginProgress, LoginWithGeneratedQrCode, LoginWithQrCode, QrProgress,
+    },
     messages::{LoginFailureReason, LoginProtocolType, QrAuthMessage},
 };
 use super::CrossProcessRefreshLockError;
@@ -104,6 +106,11 @@ pub enum QRCodeLoginError {
     /// imported.
     #[error(transparent)]
     SecretImport(#[from] SecretImportError),
+
+    /// The other party told us to use a different homeserver but we failed to
+    /// reset the server URL.
+    #[error(transparent)]
+    ServerReset(crate::Error),
 }
 
 /// Error type describing failures in the interaction between the device
@@ -187,6 +194,17 @@ pub enum SecureChannelError {
 
     /// Both devices have advertised the same intent in the login attempt, i.e.
     /// both sides claim to be a new device.
-    #[error("The secure channel could not have been established, the two devices have the same login intent")]
+    #[error(
+        "The secure channel could not have been established, \
+         the two devices have the same login intent"
+    )]
     InvalidIntent,
+
+    /// The secure channel could not have been established, the check code
+    /// cannot be received.
+    #[error(
+        "The secure channel could not have been established, \
+         the check code cannot be received"
+    )]
+    CannotReceiveCheckCode,
 }

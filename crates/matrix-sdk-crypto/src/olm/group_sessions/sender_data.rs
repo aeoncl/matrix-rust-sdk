@@ -161,6 +161,25 @@ pub enum SenderData {
 }
 
 impl SenderData {
+    /// Whether we should recalculate the Megolm sender's data, given the
+    /// current sender data. We only want to recalculate if it might
+    /// increase trust and allow us to decrypt messages that we
+    /// otherwise might refuse to decrypt.
+    ///
+    /// We recalculate for all states except:
+    ///
+    /// - SenderUnverified: the sender is trusted enough that we will decrypt
+    ///   their messages in all cases, or
+    /// - SenderVerified: the sender is the most trusted they can be.
+    pub fn should_recalculate(&self) -> bool {
+        matches!(
+            self,
+            SenderData::UnknownDevice { .. }
+                | SenderData::DeviceInfo { .. }
+                | SenderData::VerificationViolation { .. }
+        )
+    }
+
     /// Create a [`SenderData`] which contains no device info.
     pub fn unknown() -> Self {
         Self::UnknownDevice { legacy_session: false, owner_check_failed: false }
@@ -234,7 +253,7 @@ impl SenderData {
         let cross_signed = sender_device.is_cross_signed_by_owner();
 
         if cross_signed {
-            Self::from_cross_signed_device(sender_device)
+            SenderData::from_cross_signed_device(sender_device)
         } else {
             // We have device keys, but they are not signed by the sender
             SenderData::device_info(sender_device.as_device_keys().clone())
@@ -306,6 +325,26 @@ impl SenderData {
             Self::VerificationViolation { .. } => SenderDataType::VerificationViolation,
             Self::SenderUnverified { .. } => SenderDataType::SenderUnverified,
             Self::SenderVerified { .. } => SenderDataType::SenderVerified,
+        }
+    }
+
+    /// Return our best guess of the owner of the associated megolm session.
+    ///
+    /// For `SenderData::UnknownDevice`, we don't record any information about
+    /// the owner of the sender, so returns `None`.
+    pub(crate) fn user_id(&self) -> Option<OwnedUserId> {
+        match &self {
+            SenderData::UnknownDevice { .. } => None,
+            SenderData::DeviceInfo { device_keys, .. } => Some(device_keys.user_id.clone()),
+            SenderData::VerificationViolation(known_sender_data) => {
+                Some(known_sender_data.user_id.clone())
+            }
+            SenderData::SenderUnverified(known_sender_data) => {
+                Some(known_sender_data.user_id.clone())
+            }
+            SenderData::SenderVerified(known_sender_data) => {
+                Some(known_sender_data.user_id.clone())
+            }
         }
     }
 }
@@ -686,18 +725,18 @@ mod tests {
         // This export usse a more efficient serialization format for bytes. This was
         // exported when the `KnownSenderData` master_key was serialized as an byte
         // array instead of a base64 encoded string.
-        const SERIALIZED_B64: &str =
-            "iaZwaWNrbGWEr2luaXRpYWxfcmF0Y2hldIKlaW5uZXLcAIABYMzfSnBRzMlPKF1uKjYbzLtkzNJ4RcylzN0HzP\
-             9DzON1Tm05zO7M2MzFQsy9Acz9zPnMqDvM4syQzNrMzxF5KzbM4sy9zPUbBWfM7m4/zJzM18zDzMESKgfMkE7M\
-             yszIHszqWjYyQURbzKTMkx7M58zANsy+AGPM2A8tbcyFYczge8ykzMFdbVxJMMyAzN8azJEXGsy8zPJazMMaP8\
-             ziDszmWwfM+My2ajLMr8y+eczTRm9TFadjb3VudGVyAKtzaWduaW5nX2tlecQgefpCr6Duu7QUWzKIeMOFmxv/\
-             NjfcsYwZz8IN2ZOhdaS0c2lnbmluZ19rZXlfdmVyaWZpZWTDpmNvbmZpZ4GndmVyc2lvbqJWMapzZW5kZXJfa2\
-             V52StoMkIySDg2ajFpYmk2SW13ak9UUkhzbTVMamtyT2kyUGtiSXVUb0w0TWtFq3NpZ25pbmdfa2V5gadlZDI1\
-             NTE52StUWHJqNS9UYXpia3Yram1CZDl4UlB4NWNVaFFzNUNnblc1Q1pNRjgvNjZzq3NlbmRlcl9kYXRhgbBTZW\
-             5kZXJVbnZlcmlmaWVkg6d1c2VyX2lks0B2YWxvdTM1Om1hdHJpeC5vcmepZGV2aWNlX2lkqkZJQlNaRlJLUE2q\
-             bWFzdGVyX2tlecQgkOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuGncm9vbV9pZL4hRWt5VEtGdkViYl\
-             B6SmxhaUhFOm1hdHJpeC5vcmeoaW1wb3J0ZWTCqWJhY2tlZF91cMKyaGlzdG9yeV92aXNpYmlsaXR5wKlhbGdv\
-             cml0aG20bS5tZWdvbG0udjEuYWVzLXNoYTI";
+        const SERIALIZED_B64: &str = "\
+            iaZwaWNrbGWEr2luaXRpYWxfcmF0Y2hldIKlaW5uZXLcAIABYMzfSnBRzMlPKF1uKjYbzLtkzNJ4RcylzN0HzP\
+            9DzON1Tm05zO7M2MzFQsy9Acz9zPnMqDvM4syQzNrMzxF5KzbM4sy9zPUbBWfM7m4/zJzM18zDzMESKgfMkE7M\
+            yszIHszqWjYyQURbzKTMkx7M58zANsy+AGPM2A8tbcyFYczge8ykzMFdbVxJMMyAzN8azJEXGsy8zPJazMMaP8\
+            ziDszmWwfM+My2ajLMr8y+eczTRm9TFadjb3VudGVyAKtzaWduaW5nX2tlecQgefpCr6Duu7QUWzKIeMOFmxv/\
+            NjfcsYwZz8IN2ZOhdaS0c2lnbmluZ19rZXlfdmVyaWZpZWTDpmNvbmZpZ4GndmVyc2lvbqJWMapzZW5kZXJfa2\
+            V52StoMkIySDg2ajFpYmk2SW13ak9UUkhzbTVMamtyT2kyUGtiSXVUb0w0TWtFq3NpZ25pbmdfa2V5gadlZDI1\
+            NTE52StUWHJqNS9UYXpia3Yram1CZDl4UlB4NWNVaFFzNUNnblc1Q1pNRjgvNjZzq3NlbmRlcl9kYXRhgbBTZW\
+            5kZXJVbnZlcmlmaWVkg6d1c2VyX2lks0B2YWxvdTM1Om1hdHJpeC5vcmepZGV2aWNlX2lkqkZJQlNaRlJLUE2q\
+            bWFzdGVyX2tlecQgkOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuGncm9vbV9pZL4hRWt5VEtGdkViYl\
+            B6SmxhaUhFOm1hdHJpeC5vcmeoaW1wb3J0ZWTCqWJhY2tlZF91cMKyaGlzdG9yeV92aXNpYmlsaXR5wKlhbGdv\
+            cml0aG20bS5tZWdvbG0udjEuYWVzLXNoYTI";
 
         let input = base64_decode(SERIALIZED_B64).unwrap();
         let sender_data: PickledInboundGroupSession = rmp_serde::from_slice(&input)
@@ -758,7 +797,7 @@ mod tests {
     async fn test_from_device_for_verified_user() {
         let alice_account =
             Account::with_device_id(user_id!("@alice:example.com"), device_id!("ALICE_DEVICE"));
-        let alice_identity = PrivateCrossSigningIdentity::with_account(&alice_account).await.0;
+        let alice_identity = PrivateCrossSigningIdentity::for_account(&alice_account);
 
         let bob_identity =
             PrivateCrossSigningIdentity::new(user_id!("@bob:example.com").to_owned());

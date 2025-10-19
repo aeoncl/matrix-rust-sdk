@@ -6,12 +6,15 @@ use matrix_sdk::{
     room::reply::{EnforceThread, Reply},
     test_utils::mocks::MatrixMockServer,
 };
-use matrix_sdk_test::{async_test, event_factory::EventFactory, ALICE, DEFAULT_TEST_ROOM_ID};
+use matrix_sdk_test::{ALICE, DEFAULT_TEST_ROOM_ID, async_test, event_factory::EventFactory};
 use ruma::{
     event_id,
     events::{
-        room::{message::ReplyWithinThread, MediaSource},
         Mentions,
+        room::{
+            MediaSource,
+            message::{ReplyWithinThread, TextMessageEventContent},
+        },
     },
     mxc_uri, owned_mxc_uri, owned_user_id, uint,
 };
@@ -135,7 +138,7 @@ async fn test_room_attachment_send_info() {
             width: Some(uint!(800)),
             ..Default::default()
         }))
-        .caption(Some("image caption".to_owned()));
+        .caption(Some(TextMessageEventContent::plain("image caption")));
 
     let response = room
         .send_attachment("image.jpg", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)
@@ -188,7 +191,7 @@ async fn test_room_attachment_send_wrong_info() {
             duration: Some(Duration::from_millis(3600)),
             ..Default::default()
         }))
-        .caption(Some("image caption".to_owned()));
+        .caption(Some(TextMessageEventContent::plain("image caption")));
 
     // But here, using `image/jpeg`.
     let response =
@@ -652,7 +655,7 @@ async fn test_room_attachment_send_is_animated() {
             is_animated: Some(false),
             ..Default::default()
         }))
-        .caption(Some("image caption".to_owned()));
+        .caption(Some(TextMessageEventContent::plain("image caption")));
 
     let response = room
         .send_attachment("image.jpg", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)

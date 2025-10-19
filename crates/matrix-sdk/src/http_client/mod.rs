@@ -17,8 +17,8 @@ use std::{
     fmt::Debug,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -28,8 +28,8 @@ use bytesize::ByteSize;
 use eyeball::SharedObservable;
 use http::Method;
 use ruma::api::{
+    OutgoingRequest, SendAccessToken, SupportedVersions, auth_scheme,
     error::{FromHttpResponseError, IntoHttpError},
-    AuthScheme, MatrixVersion, OutgoingRequest, SendAccessToken,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, field::debug, instrument, trace};
@@ -101,18 +101,12 @@ impl HttpClient {
         config: RequestConfig,
         homeserver: String,
         access_token: Option<&str>,
-        server_versions: &[MatrixVersion],
+        supported_versions: &SupportedVersions,
     ) -> Result<http::Request<Bytes>, IntoHttpError>
     where
         R: OutgoingRequest + Debug,
     {
         trace!(request_type = type_name::<R>(), "Serializing request");
-
-        let server_versions = if config.force_matrix_version.is_some() {
-            config.force_matrix_version.as_slice()
-        } else {
-            server_versions
-        };
 
         let send_access_token = match access_token {
             Some(access_token) => {
@@ -126,7 +120,7 @@ impl HttpClient {
         };
 
         let request = request
-            .try_into_http_request::<BytesMut>(&homeserver, send_access_token, server_versions)?
+            .try_into_http_request::<BytesMut>(&homeserver, send_access_token, supported_versions)?
             .map(|body| body.freeze());
 
         Ok(request)
@@ -134,8 +128,17 @@ impl HttpClient {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, request, config, homeserver, access_token, server_versions, send_progress),
-        fields(uri, method, request_size, request_id, status, response_size, sentry_event_id)
+        skip(self, request, config, homeserver, access_token, supported_versions, send_progress),
+        fields(
+            uri,
+            method,
+            request_id,
+            request_size,
+            request_duration,
+            status,
+            response_size,
+            sentry_event_id
+        )
     )]
     pub async fn send<R>(
         &self,
@@ -143,11 +146,12 @@ impl HttpClient {
         config: Option<RequestConfig>,
         homeserver: String,
         access_token: Option<&str>,
-        server_versions: &[MatrixVersion],
+        supported_versions: &SupportedVersions,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<R::IncomingResponse, HttpError>
     where
         R: OutgoingRequest + Debug,
+        R::Authentication: SupportedAuthScheme,
         HttpError: From<FromHttpResponseError<R::EndpointError>>,
     {
         let config = match config {
@@ -165,19 +169,8 @@ impl HttpClient {
             // why we record it here, instead of in the #[instrument] macro.
             span.record("config", debug(config)).record("request_id", request_id);
 
-            let auth_scheme = R::METADATA.authentication;
-            match auth_scheme {
-                AuthScheme::AccessToken
-                | AuthScheme::AccessTokenOptional
-                | AuthScheme::AppserviceToken
-                | AuthScheme::None => {}
-                AuthScheme::ServerSignatures => {
-                    return Err(HttpError::NotClientRequest);
-                }
-            }
-
             let request = self
-                .serialize_request(request, config, homeserver, access_token, server_versions)
+                .serialize_request(request, config, homeserver, access_token, supported_versions)
                 .map_err(HttpError::IntoHttp)?;
 
             let method = request.method();
@@ -250,13 +243,30 @@ async fn response_to_http_response(
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
 }
 
+/// Marker trait to identify the authentication schemes that the [`HttpClient`]
+/// supports.
+///
+/// This trait can also be implemented for custom
+/// [`AuthScheme`](auth_scheme::AuthScheme)s if necessary.
+pub trait SupportedAuthScheme: auth_scheme::AuthScheme {}
+
+impl SupportedAuthScheme for auth_scheme::NoAuthentication {}
+
+impl SupportedAuthScheme for auth_scheme::AccessToken {}
+
+impl SupportedAuthScheme for auth_scheme::AccessTokenOptional {}
+
+impl SupportedAuthScheme for auth_scheme::AppserviceToken {}
+
+impl SupportedAuthScheme for auth_scheme::AppserviceTokenOptional {}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
         num::NonZeroUsize,
         sync::{
-            atomic::{AtomicU8, Ordering},
             Arc,
+            atomic::{AtomicU8, Ordering},
         },
         time::Duration,
     };
@@ -264,8 +274,8 @@ mod tests {
     use matrix_sdk_common::executor::spawn;
     use matrix_sdk_test::{async_test, test_json};
     use wiremock::{
-        matchers::{method, path},
         Mock, Request, ResponseTemplate,
+        matchers::{method, path},
     };
 
     use crate::{

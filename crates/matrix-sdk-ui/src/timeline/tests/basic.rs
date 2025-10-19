@@ -18,33 +18,32 @@ use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use imbl::vector;
 use matrix_sdk_test::{
-    async_test,
+    ALICE, BOB, CAROL, async_test,
     event_factory::{EventFactory, PreviousMembership},
-    ALICE, BOB, CAROL,
 };
 use ruma::{
-    event_id,
+    MilliSecondsSinceUnixEpoch, event_id,
     events::{
+        FullStateEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
+            ImageInfo,
             member::{MembershipState, RedactedRoomMemberEventContent},
             message::MessageType,
             topic::RedactedRoomTopicEventContent,
-            ImageInfo,
         },
-        FullStateEventContent,
     },
-    mxc_uri, owned_event_id, owned_mxc_uri, user_id, MilliSecondsSinceUnixEpoch,
+    mxc_uri, owned_event_id, owned_mxc_uri, user_id,
 };
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
+    MembershipChange, MsgLikeContent, MsgLikeKind, TimelineDetails, TimelineItemContent,
+    TimelineItemKind, VirtualTimelineItem,
     controller::TimelineSettings,
     event_item::{AnyOtherFullStateEventContent, RemoteEventOrigin},
     tests::{ReadReceiptMap, TestRoomDataProvider, TestTimelineBuilder},
-    MembershipChange, MsgLikeContent, MsgLikeKind, TimelineDetails, TimelineItemContent,
-    TimelineItemKind, VirtualTimelineItem,
 };
 
 #[async_test]
@@ -117,10 +116,7 @@ async fn test_replace_with_initial_events_and_read_marker() {
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "hey");
 
     let ev = f.text_msg("yo").sender(*BOB).into_event();
-    timeline
-        .controller
-        .replace_with_initial_remote_events([ev].into_iter(), RemoteEventOrigin::Sync)
-        .await;
+    timeline.controller.replace_with_initial_remote_events([ev], RemoteEventOrigin::Sync).await;
 
     let items = timeline.controller.items().await;
     assert_eq!(items.len(), 2);
@@ -381,17 +377,19 @@ async fn test_reply() {
     let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert!(date_divider.is_date_divider());
 
-    let reply_formatted_body = format!("\
-        <mx-reply>\
-            <blockquote>\
-                <a href=\"https://matrix.to/#/!my_room:server.name/{first_event_id}\">In reply to</a> \
-                <a href=\"https://matrix.to/#/{first_event_sender}\">{first_event_sender}</a>\
-                <br>\
-                I want you to reply\
-            </blockquote>\
-        </mx-reply>\
-        <p>I'm replying!</p>\
-    ");
+    let reply_formatted_body = format!(
+        "\
+            <mx-reply>\
+                <blockquote>\
+                    <a href=\"https://matrix.to/#/!my_room:server.name/{first_event_id}\">In reply to</a> \
+                    <a href=\"https://matrix.to/#/{first_event_sender}\">{first_event_sender}</a>\
+                    <br>\
+                    I want you to reply\
+                </blockquote>\
+            </mx-reply>\
+            <p>I'm replying!</p>\
+        "
+    );
     let reply_plain = format!(
         "> <{first_event_sender}> I want you to reply\n\
          I'm replying!"
@@ -488,10 +486,7 @@ async fn test_replace_with_initial_events_when_batched() {
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "hey");
 
     let ev = f.text_msg("yo").sender(*BOB).into_event();
-    timeline
-        .controller
-        .replace_with_initial_remote_events([ev].into_iter(), RemoteEventOrigin::Sync)
-        .await;
+    timeline.controller.replace_with_initial_remote_events([ev], RemoteEventOrigin::Sync).await;
 
     // Assert there are more than a single Clear diff in the next batch:
     // Clear + PushBack (event) + PushFront (date divider)

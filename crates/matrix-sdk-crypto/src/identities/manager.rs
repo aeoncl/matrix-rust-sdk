@@ -32,10 +32,14 @@ use tracing::{debug, enabled, info, instrument, trace, warn, Level};
 use crate::{
     error::OlmResult,
     identities::{DeviceData, OtherUserIdentityData, OwnUserIdentityData, UserIdentityData},
-    olm::{InboundGroupSession, PrivateCrossSigningIdentity, SenderDataFinder, SenderDataType},
+    olm::{
+        sender_data_finder::SessionDeviceCheckError, InboundGroupSession,
+        PrivateCrossSigningIdentity, SenderDataFinder, SenderDataType,
+    },
     store::{
-        caches::SequenceNumber, Changes, DeviceChanges, IdentityChanges, KeyQueryManager,
-        Result as StoreResult, Store, StoreCache, StoreCacheGuard, UserKeyQueryResult,
+        caches::{SequenceNumber, StoreCache, StoreCacheGuard},
+        types::{Changes, DeviceChanges, IdentityChanges, UserKeyQueryResult},
+        KeyQueryManager, Result as StoreResult, Store,
     },
     types::{
         requests::KeysQueryRequest, CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey,
@@ -583,16 +587,18 @@ impl IdentityManager {
         master_key: &Raw<CrossSigningKey>,
         response: &KeysQueryResponse,
     ) -> Option<(MasterPubkey, SelfSigningPubkey)> {
-        match master_key.deserialize_as::<MasterPubkey>() {
+        match master_key.deserialize_as_unchecked::<MasterPubkey>() {
             Ok(master_key) => {
                 if let Some(self_signing) = response
                     .self_signing_keys
                     .get(master_key.user_id())
-                    .and_then(|k| k.deserialize_as::<SelfSigningPubkey>().ok())
+                    .and_then(|k| k.deserialize_as_unchecked::<SelfSigningPubkey>().ok())
                 {
                     Some((master_key, self_signing))
                 } else {
-                    warn!("A user identity didn't contain a self signing pubkey or the key was invalid");
+                    warn!(
+                        "A user identity didn't contain a self signing pubkey or the key was invalid"
+                    );
                     None
                 }
             }
@@ -623,7 +629,7 @@ impl IdentityManager {
         let Some(user_signing) = response
             .user_signing_keys
             .get(self.user_id())
-            .and_then(|k| k.deserialize_as::<UserSigningPubkey>().ok())
+            .and_then(|k| k.deserialize_as_unchecked::<UserSigningPubkey>().ok())
         else {
             warn!(
                 "User identity for our own user didn't contain a user signing pubkey or the key \
@@ -718,7 +724,7 @@ impl IdentityManager {
                     warn!(error = ?e, "Couldn't create new user identity");
                 }
             }
-        };
+        }
 
         Ok(())
     }
@@ -1124,28 +1130,22 @@ impl IdentityManager {
         session: &mut InboundGroupSession,
         device: &DeviceData,
     ) -> Result<(), CryptoStoreError> {
-        use crate::olm::sender_data_finder::SessionDeviceCheckError::*;
-
         match SenderDataFinder::find_using_device_data(&self.store, device.clone(), session).await {
             Ok(sender_data) => {
-                debug!(
-                    "Updating existing InboundGroupSession with new SenderData {:?}",
-                    sender_data
-                );
+                debug!("Updating existing InboundGroupSession with new SenderData {sender_data:?}");
                 session.sender_data = sender_data;
             }
-            Err(CryptoStoreError(e)) => {
+            Err(SessionDeviceCheckError::CryptoStoreError(e)) => {
                 return Err(e);
             }
-            Err(MismatchedIdentityKeys(e)) => {
+            Err(SessionDeviceCheckError::MismatchedIdentityKeys(e)) => {
                 warn!(
                     ?session,
                     ?device,
-                    "cannot update existing InboundGroupSession due to ownership error: {}",
-                    e
+                    "cannot update existing InboundGroupSession due to ownership error: {e}",
                 );
             }
-        };
+        }
 
         Ok(())
     }
@@ -1229,7 +1229,7 @@ pub(crate) mod testing {
     use crate::{
         identities::IdentityManager,
         olm::{Account, PrivateCrossSigningIdentity},
-        store::{CryptoStoreWrapper, MemoryStore, PendingChanges, Store},
+        store::{types::PendingChanges, CryptoStoreWrapper, MemoryStore, Store},
         types::{requests::UploadSigningKeysRequest, DeviceKeys},
         verification::VerificationMachine,
     };
@@ -1537,6 +1537,7 @@ pub(crate) mod tests {
     use crate::{
         identities::manager::testing::{other_key_query_cross_signed, own_key_query},
         olm::PrivateCrossSigningIdentity,
+        store::types::Changes,
         CrossSigningKeyExport, OlmMachine,
     };
 
@@ -1870,7 +1871,6 @@ pub(crate) mod tests {
             manager.receive_keys_query_response(&reqid, &own_key_query()).await.unwrap();
         assert_eq!(device_changes.new.len(), 1);
         let test_device_id = device_changes.new.first().unwrap().device_id().to_owned();
-        use crate::store::Changes;
         let changes =
             Changes { devices: device_changes, identities: identity_changes, ..Changes::default() };
         manager.store.save_changes(changes).await.unwrap();
@@ -2435,7 +2435,7 @@ pub(crate) mod tests {
         use crate::{
             identities::manager::testing::{other_user_id, user_id},
             olm::{InboundGroupSession, SenderData},
-            store::{Changes, DeviceChanges},
+            store::types::{Changes, DeviceChanges},
             Account, DeviceData, EncryptionSettings,
         };
 

@@ -640,7 +640,7 @@ impl QrVerification {
                 }
                 check_master_key(qr_code.second_key(), other_identity)?;
             }
-        };
+        }
 
         let secret = qr_code.secret().to_owned();
         let own_device_id = store.account.device_id.clone();
@@ -681,7 +681,7 @@ impl QrVerification {
     /// Listen for changes in the QrCode verification process.
     ///
     /// The changes are presented as a stream of [`QrVerificationState`] values.
-    pub fn changes(&self) -> impl Stream<Item = QrVerificationState> {
+    pub fn changes(&self) -> impl Stream<Item = QrVerificationState> + use<> {
         self.state.subscribe().map(|s| (&s).into())
     }
 
@@ -898,7 +898,7 @@ mod tests {
 
     use crate::{
         olm::{Account, PrivateCrossSigningIdentity},
-        store::{Changes, CryptoStoreWrapper, MemoryStore},
+        store::{types::Changes, CryptoStoreWrapper, MemoryStore},
         verification::{
             event_enums::{DoneContent, OutgoingContent, StartContent},
             FlowId, VerificationStore,

@@ -24,7 +24,7 @@ use ruma::{
 };
 
 use super::UserIdentity;
-use crate::store::IdentityUpdates;
+use crate::store::types::IdentityUpdates;
 
 /// Something that can answer questions about the membership of a room and the
 /// identities of users.
@@ -331,23 +331,16 @@ mod tests {
     };
 
     use matrix_sdk_common::BoxFuture;
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
-        device_id,
-        events::{
-            room::member::{
-                MembershipState, RoomMemberEventContent, RoomMemberUnsigned, SyncRoomMemberEvent,
-            },
-            OriginalSyncStateEvent,
-        },
-        owned_event_id, owned_user_id, user_id, MilliSecondsSinceUnixEpoch, OwnedUserId, UInt,
+        device_id, events::room::member::MembershipState, owned_user_id, user_id, OwnedUserId,
         UserId,
     };
 
     use super::{IdentityState, RoomIdentityChange, RoomIdentityProvider, RoomIdentityState};
     use crate::{
         identities::user::testing::own_identity_wrapped,
-        store::{IdentityUpdates, Store},
+        store::{types::IdentityUpdates, Store},
         IdentityStatusChange, OtherUserIdentity, OtherUserIdentityData, OwnUserIdentityData,
         UserIdentity,
     };
@@ -1049,14 +1042,11 @@ mod tests {
     }
 
     fn room_change(user_id: &UserId, new_state: MembershipState) -> RoomIdentityChange {
-        let event = SyncRoomMemberEvent::Original(OriginalSyncStateEvent {
-            content: RoomMemberEventContent::new(new_state),
-            event_id: owned_event_id!("$1"),
-            sender: owned_user_id!("@admin:b.c"),
-            origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-            unsigned: RoomMemberUnsigned::new(),
-            state_key: user_id.to_owned(),
-        });
+        let event = EventFactory::new()
+            .sender(user_id!("@admin:b.c"))
+            .member(user_id)
+            .membership(new_state)
+            .into();
         RoomIdentityChange::SyncRoomMemberEvent(Box::new(event))
     }
 
@@ -1122,7 +1112,7 @@ mod tests {
         let account = Account::with_device_id(user_id, &device_id);
 
         let private_identity =
-            Arc::new(Mutex::new(PrivateCrossSigningIdentity::with_account(&account).await.0));
+            Arc::new(Mutex::new(PrivateCrossSigningIdentity::for_account(&account)));
 
         let other_user_identity_data =
             OtherUserIdentityData::from_private(&*private_identity.lock().await).await;
@@ -1162,7 +1152,7 @@ mod tests {
         let account = Account::with_device_id(user_id, &device_id);
 
         let private_identity =
-            Arc::new(Mutex::new(PrivateCrossSigningIdentity::with_account(&account).await.0));
+            Arc::new(Mutex::new(PrivateCrossSigningIdentity::for_account(&account)));
 
         let own_user_identity_data =
             OwnUserIdentityData::from_private(&*private_identity.lock().await).await;

@@ -17,17 +17,18 @@ use std::{
     mem,
 };
 
+use matrix_sdk_common::timer;
 use ruma::{
+    RoomId,
     events::{
-        direct::OwnedDirectUserIdentifier, AnyGlobalAccountDataEvent, GlobalAccountDataEventType,
+        AnyGlobalAccountDataEvent, GlobalAccountDataEventType, direct::OwnedDirectUserIdentifier,
     },
     serde::Raw,
-    RoomId,
 };
 use tracing::{debug, instrument, trace, warn};
 
 use super::super::Context;
-use crate::{store::BaseStateStore, RoomInfo, StateChanges};
+use crate::{RoomInfo, StateChanges, store::BaseStateStore};
 
 /// Create the [`Global`] account data processor.
 pub fn global(events: &[Raw<AnyGlobalAccountDataEvent>]) -> Global {
@@ -43,6 +44,8 @@ pub struct Global {
 impl Global {
     /// Creates a new processor for global account data.
     fn process(events: &[Raw<AnyGlobalAccountDataEvent>]) -> Self {
+        let _timer = timer!(tracing::Level::TRACE, "Global::process (global account data)");
+
         let mut raw_by_type = BTreeMap::new();
         let mut parsed_events = Vec::new();
 
@@ -102,10 +105,10 @@ impl Global {
 
             // Update the direct targets of rooms if they changed.
             for (room_id, new_direct_targets) in new_dms {
-                if let Some(old_direct_targets) = old_dms.remove(&room_id) {
-                    if old_direct_targets == new_direct_targets {
-                        continue;
-                    }
+                if let Some(old_direct_targets) = old_dms.remove(&room_id)
+                    && old_direct_targets == new_direct_targets
+                {
+                    continue;
                 }
                 trace!(?room_id, targets = ?new_direct_targets, "Marking room as direct room");
                 map_info(room_id, state_changes, state_store, |info| {
@@ -125,6 +128,8 @@ impl Global {
 
     /// Applies the processed data to the state changes and the state store.
     pub async fn apply(mut self, context: &mut Context, state_store: &BaseStateStore) {
+        let _timer = timer!(tracing::Level::TRACE, "Global::apply (global account data)");
+
         // Fill in the content of `changes.account_data`.
         mem::swap(&mut context.state_changes.account_data, &mut self.raw_by_type);
 
@@ -167,7 +172,7 @@ fn map_info<F: FnOnce(&mut RoomInfo)>(
         let mut info = room.clone_info();
         f(&mut info);
         changes.add_room(info);
-    } else {
+    } else if store.already_logged_missing_room.lock().insert(room_id.to_owned()) {
         debug!(room = %room_id, "couldn't find room in state changes or store");
     }
 }

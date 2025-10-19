@@ -17,10 +17,14 @@
 
 use std::pin::Pin;
 
+#[cfg(test)]
+matrix_sdk_test_utils::init_tracing_for_tests!();
+
 use futures_core::Future;
 #[doc(no_inline)]
 pub use ruma;
 
+pub mod cross_process_lock;
 pub mod debug;
 pub mod deserialized_responses;
 pub mod executor;
@@ -28,10 +32,8 @@ pub mod failures_cache;
 pub mod linked_chunk;
 pub mod locks;
 pub mod ring_buffer;
-pub mod runtime;
 pub mod serde_helpers;
 pub mod sleep;
-pub mod store_locks;
 pub mod stream;
 pub mod timeout;
 pub mod tracing_timer;
@@ -43,7 +45,8 @@ pub mod ttl_cache;
 #[cfg(all(target_family = "wasm", not(tarpaulin_include)))]
 pub mod js_tracing;
 
-pub use store_locks::LEASE_DURATION_MS;
+pub use cross_process_lock::LEASE_DURATION_MS;
+use ruma::{RoomVersionId, room_version_rules::RoomVersionRules};
 
 /// Alias for `Send` on non-wasm, empty trait (implemented by everything) on
 /// wasm.
@@ -105,3 +108,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
+
+/// The room version to use as a fallback when the version of a room is unknown.
+pub const ROOM_VERSION_FALLBACK: RoomVersionId = RoomVersionId::V11;
+
+/// The room version rules to use as a fallback when the version of a room is
+/// unknown or unsupported.
+///
+/// These are the rules of the [`ROOM_VERSION_FALLBACK`].
+pub const ROOM_VERSION_RULES_FALLBACK: RoomVersionRules = RoomVersionRules::V11;

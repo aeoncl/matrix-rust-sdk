@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::{
-    borrow::Cow,
     collections::HashMap,
     fmt,
     path::Path,
@@ -28,8 +27,11 @@ use matrix_sdk_crypto::{
         PrivateCrossSigningIdentity, SenderDataType, Session, StaticAccountData,
     },
     store::{
-        BackupKeys, Changes, CryptoStore, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-        RoomSettings, StoredRoomKeyBundleData,
+        types::{
+            BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
+            StoredRoomKeyBundleData,
+        },
+        CryptoStore,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
@@ -40,7 +42,6 @@ use ruma::{
     RoomId, TransactionId, UserId,
 };
 use rusqlite::{named_params, params_from_iter, OptionalExtension};
-use serde::{de::DeserializeOwned, Serialize};
 use tokio::{fs, sync::Mutex};
 use tracing::{debug, instrument, warn};
 use vodozemac::Curve25519PublicKey;
@@ -48,10 +49,10 @@ use vodozemac::Curve25519PublicKey;
 use crate::{
     error::{Error, Result},
     utils::{
-        repeat_vars, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        repeat_vars, EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
         SqliteKeyValueStoreConnExt,
     },
-    OpenStoreError, SqliteStoreConfig,
+    OpenStoreError, Secret, SqliteStoreConfig,
 };
 
 /// The database name.
@@ -75,6 +76,12 @@ impl fmt::Debug for SqliteCryptoStore {
     }
 }
 
+impl EncryptableStore for SqliteCryptoStore {
+    fn get_cypher(&self) -> Option<&StoreCipher> {
+        self.store_cipher.as_deref()
+    }
+}
+
 impl SqliteCryptoStore {
     /// Open the SQLite-based crypto store at the given path using the given
     /// passphrase to encrypt private data.
@@ -85,9 +92,18 @@ impl SqliteCryptoStore {
         Self::open_with_config(SqliteStoreConfig::new(path).passphrase(passphrase)).await
     }
 
+    /// Open the SQLite-based crypto store at the given path using the given
+    /// key to encrypt private data.
+    pub async fn open_with_key(
+        path: impl AsRef<Path>,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Self, OpenStoreError> {
+        Self::open_with_config(SqliteStoreConfig::new(path).key(key)).await
+    }
+
     /// Open the SQLite-based crypto store with the config open config.
     pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
-        let SqliteStoreConfig { path, passphrase, pool_config, runtime_config } = config;
+        let SqliteStoreConfig { path, pool_config, runtime_config, secret } = config;
 
         fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
 
@@ -96,17 +112,17 @@ impl SqliteCryptoStore {
 
         let pool = config.create_pool(Runtime::Tokio1)?;
 
-        let this = Self::open_with_pool(pool, passphrase.as_deref()).await?;
+        let this = Self::open_with_pool(pool, secret).await?;
         this.pool.get().await?.apply_runtime_config(runtime_config).await?;
 
         Ok(this)
     }
 
     /// Create an SQLite-based crypto store using the given SQLite database
-    /// pool. The given passphrase will be used to encrypt private data.
+    /// pool. The given secret will be used to encrypt private data.
     async fn open_with_pool(
         pool: SqlitePool,
-        passphrase: Option<&str>,
+        secret: Option<Secret>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
 
@@ -114,8 +130,8 @@ impl SqliteCryptoStore {
         debug!("Opened sqlite store with version {}", version);
         run_migrations(&conn, version).await?;
 
-        let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
+        let store_cipher = match secret {
+            Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s).await?)),
             None => None,
         };
 
@@ -125,45 +141,6 @@ impl SqliteCryptoStore {
             static_account: Arc::new(RwLock::new(None)),
             save_changes_lock: Default::default(),
         })
-    }
-
-    fn encode_value(&self, value: Vec<u8>) -> Result<Vec<u8>> {
-        if let Some(key) = &self.store_cipher {
-            let encrypted = key.encrypt_value_data(value)?;
-            Ok(rmp_serde::to_vec_named(&encrypted)?)
-        } else {
-            Ok(value)
-        }
-    }
-
-    fn decode_value<'a>(&self, value: &'a [u8]) -> Result<Cow<'a, [u8]>> {
-        if let Some(key) = &self.store_cipher {
-            let encrypted = rmp_serde::from_slice(value)?;
-            let decrypted = key.decrypt_value_data(encrypted)?;
-            Ok(Cow::Owned(decrypted))
-        } else {
-            Ok(Cow::Borrowed(value))
-        }
-    }
-
-    fn serialize_json(&self, value: &impl Serialize) -> Result<Vec<u8>> {
-        let serialized = serde_json::to_vec(value)?;
-        self.encode_value(serialized)
-    }
-
-    fn deserialize_json<T: DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
-        let decoded = self.decode_value(data)?;
-        Ok(serde_json::from_slice(&decoded)?)
-    }
-
-    fn serialize_value(&self, value: &impl Serialize) -> Result<Vec<u8>> {
-        let serialized = rmp_serde::to_vec_named(value)?;
-        self.encode_value(serialized)
-    }
-
-    fn deserialize_value<T: DeserializeOwned>(&self, value: &[u8]) -> Result<T> {
-        let decoded = self.decode_value(value)?;
-        Ok(rmp_serde::from_slice(&decoded)?)
     }
 
     fn deserialize_and_unpickle_inbound_group_session(
@@ -190,15 +167,6 @@ impl SqliteCryptoStore {
         Ok(request)
     }
 
-    fn encode_key(&self, table_name: &str, key: impl AsRef<[u8]>) -> Key {
-        let bytes = key.as_ref();
-        if let Some(store_cipher) = &self.store_cipher {
-            Key::Hashed(store_cipher.hash_key(table_name, bytes))
-        } else {
-            Key::Plain(bytes.to_owned())
-        }
-    }
-
     fn get_static_account(&self) -> Option<StaticAccountData> {
         self.static_account.read().unwrap().clone()
     }
@@ -208,7 +176,7 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 10;
+const DATABASE_VERSION: u8 = 11;
 
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
@@ -310,6 +278,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
                 "../migrations/crypto_store/010_received_room_key_bundles.sql"
             ))?;
             txn.set_db_version(10)
+        })
+        .await?;
+    }
+
+    if version < 11 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/011_received_room_key_bundles_with_curve_key.sql"
+            ))?;
+            txn.set_db_version(11)
         })
         .await?;
     }
@@ -560,6 +538,24 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             )
             .await?;
         Ok(RoomKeyCounts { total, backed_up })
+    }
+
+    async fn get_inbound_group_sessions_by_room_id(
+        &self,
+        room_id: Key,
+    ) -> Result<Vec<(Vec<u8>, bool)>> {
+        Ok(self
+            .prepare(
+                "SELECT data, backed_up FROM inbound_group_session WHERE room_id = :room_id",
+                move |mut stmt| {
+                    stmt.query(named_params! {
+                        ":room_id": room_id,
+                    })?
+                    .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                    .collect()
+                },
+            )
+            .await?)
     }
 
     async fn get_inbound_group_sessions_for_device_batch(
@@ -1080,6 +1076,22 @@ impl CryptoStore for SqliteCryptoStore {
         self.acquire()
             .await?
             .get_inbound_group_sessions()
+            .await?
+            .into_iter()
+            .map(|(value, backed_up)| {
+                self.deserialize_and_unpickle_inbound_group_session(value, backed_up)
+            })
+            .collect()
+    }
+
+    async fn get_inbound_group_sessions_by_room_id(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<InboundGroupSession>> {
+        let room_id = self.encode_key("inbound_group_session", room_id.as_bytes());
+        self.acquire()
+            .await?
+            .get_inbound_group_sessions_by_room_id(room_id)
             .await?
             .into_iter()
             .map(|(value, backed_up)| {
@@ -1902,7 +1914,7 @@ mod tests {
 
         SqliteCryptoStore::open(tmpdir_path.to_str().unwrap(), passphrase)
             .await
-            .expect("Can't create a passphrase protected store")
+            .expect("Can't create a secret protected store")
     }
 
     cryptostore_integration_tests!();
@@ -1934,7 +1946,7 @@ mod encrypted_tests {
 
         SqliteCryptoStore::open(tmpdir_path.to_str().unwrap(), Some(pass))
             .await
-            .expect("Can't create a passphrase protected store")
+            .expect("Can't create a secret protected store")
     }
 
     cryptostore_integration_tests!();

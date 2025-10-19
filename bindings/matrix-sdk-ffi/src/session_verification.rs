@@ -10,11 +10,13 @@ use matrix_sdk::{
     ruma::events::key::verification::VerificationMethod,
     Account,
 };
-use matrix_sdk_common::{runtime::get_runtime_handle, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::UserId;
 use tracing::{error, warn};
 
-use crate::{client::UserProfile, error::ClientError, utils::Timestamp};
+use crate::{
+    client::UserProfile, error::ClientError, runtime::get_runtime_handle, utils::Timestamp,
+};
 
 #[derive(uniffi::Object)]
 pub struct SessionVerificationEmoji {
@@ -114,11 +116,8 @@ impl SessionVerificationController {
     /// Request verification for the current device
     pub async fn request_device_verification(&self) -> Result<(), ClientError> {
         let methods = vec![VerificationMethod::SasV1];
-        let verification_request = self
-            .user_identity
-            .request_verification_with_methods(methods)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let verification_request =
+            self.user_identity.request_verification_with_methods(methods).await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -139,10 +138,7 @@ impl SessionVerificationController {
 
         let methods = vec![VerificationMethod::SasV1];
 
-        let verification_request = user_identity
-            .request_verification_with_methods(methods)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let verification_request = user_identity.request_verification_with_methods(methods).await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -239,7 +235,10 @@ impl SessionVerificationController {
         if sender != self.user_identity.user_id() {
             if let Some(status) = self.encryption.cross_signing_status().await {
                 if !status.is_complete() {
-                    warn!("Cannot verify other users until our own device's cross-signing status is complete: {:?}", status);
+                    warn!(
+                        "Cannot verify other users until our own device's cross-signing status \
+                         is complete: {status:?}"
+                    );
                     return;
                 }
             }
@@ -255,18 +254,14 @@ impl SessionVerificationController {
             return;
         };
 
-        let Ok(sender_profile) = self.account.fetch_user_profile_of(sender).await else {
+        let Ok(sender_profile) = UserProfile::fetch(&self.account, sender).await else {
             error!("Failed fetching user profile for verification request");
             return;
         };
 
         if let Some(delegate) = &*self.delegate.read().unwrap() {
             delegate.did_receive_verification_request(SessionVerificationRequestDetails {
-                sender_profile: UserProfile {
-                    user_id: request.other_user_id().to_string(),
-                    display_name: sender_profile.displayname,
-                    avatar_url: sender_profile.avatar_url.as_ref().map(|url| url.to_string()),
-                },
+                sender_profile,
                 flow_id: request.flow_id().into(),
                 device_id: other_device_data.device_id().into(),
                 device_display_name: other_device_data.display_name().map(str::to_string),

@@ -60,19 +60,21 @@ use std::{sync::Arc, time::Duration};
 
 use async_stream::stream;
 use eyeball::Subscriber;
-use futures_util::{pin_mut, Stream, StreamExt};
+use futures_util::{Stream, StreamExt, pin_mut};
 use matrix_sdk::{
-    event_cache::EventCacheError, timeout::timeout, Client, Error as SlidingSyncError, Room,
-    SlidingSync, SlidingSyncList, SlidingSyncMode,
+    Client, Error as SlidingSyncError, Room, SlidingSync, SlidingSyncList, SlidingSyncMode,
+    event_cache::EventCacheError, timeout::timeout,
 };
 pub use room_list::*;
 use ruma::{
-    api::client::sync::sync_events::v5 as http, assign, directory::RoomTypeFilter,
-    events::StateEventType, OwnedRoomId, RoomId, UInt,
+    OwnedRoomId, RoomId, UInt,
+    api::{FeatureFlag, client::sync::sync_events::v5 as http},
+    assign,
+    events::StateEventType,
 };
 pub use state::*;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
@@ -82,6 +84,8 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomMember, "$LAZY"),
     (StateEventType::RoomMember, "$ME"),
     (StateEventType::RoomTopic, ""),
+    // Temporary workaround for https://github.com/matrix-org/matrix-rust-sdk/issues/5285
+    (StateEventType::RoomAvatar, ""),
     (StateEventType::RoomCanonicalAlias, ""),
     (StateEventType::RoomPowerLevels, ""),
     (StateEventType::CallMember, "*"),
@@ -94,6 +98,8 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomHistoryVisibility, ""),
     // Required to correctly calculate the room display name.
     (StateEventType::MemberHints, ""),
+    (StateEventType::SpaceParent, "*"),
+    (StateEventType::SpaceChild, "*"),
 ];
 
 /// The default `required_state` constant value for sliding sync room
@@ -129,7 +135,15 @@ impl RoomListService {
     /// to create one in this case using
     /// [`EncryptionSyncService`][crate::encryption_sync_service::EncryptionSyncService].
     pub async fn new(client: Client) -> Result<Self, Error> {
-        let builder = client
+        Self::new_with_share_pos(client, true).await
+    }
+
+    /// Like [`RoomListService::new`] but with a flag to turn the
+    /// [`SlidingSyncBuilder::share_pos`] on and off.
+    ///
+    /// [`SlidingSyncBuilder::share_pos`]: matrix_sdk::sliding_sync::SlidingSyncBuilder::share_pos
+    pub async fn new_with_share_pos(client: Client, share_pos: bool) -> Result<Self, Error> {
+        let mut builder = client
             .sliding_sync("room-list")
             .map_err(Error::SlidingSync)?
             .with_account_data_extension(
@@ -142,9 +156,37 @@ impl RoomListService {
             .with_typing_extension(assign!(http::request::Typing::default(), {
                 enabled: Some(true),
             }));
-        // TODO: Re-enable once we know it creates slowness.
-        // // We don't deal with encryption device messages here so this is safe
-        // .share_pos();
+
+        if client.enabled_thread_subscriptions() {
+            let server_features = client
+                .supported_versions()
+                .await
+                .map_err(|err| Error::SlidingSync(err.into()))?
+                .features;
+
+            if !server_features.contains(&FeatureFlag::from("org.matrix.msc4306")) {
+                warn!(
+                    "Thread subscriptions extension is requested on the client, but the server doesn't advertise support for it: not enabling."
+                );
+            } else {
+                debug!("Enabling the thread subscriptions extension");
+                builder = builder.with_thread_subscriptions_extension(
+                    assign!(http::request::ThreadSubscriptions::default(), {
+                        enabled: Some(true),
+                        limit: Some(ruma::uint!(10))
+                    }),
+                );
+            }
+        }
+
+        if share_pos {
+            // The e2ee extensions aren't enabled in this sliding sync instance, and this is
+            // the only one that could be used from a different process. So it's
+            // fine to enable position sharing (i.e. reloading it from disk),
+            // since it's always exclusively owned by the current process.
+            debug!("Enabling `share_pos` for the room list sliding sync");
+            builder = builder.share_pos();
+        }
 
         let sliding_sync = builder
             .add_cached_list(
@@ -165,7 +207,6 @@ impl RoomListService {
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
                         // returned. If true, only invited rooms are returned.
                         is_invite: None,
-                        not_room_types: vec![RoomTypeFilter::Space],
                     }))),
             )
             .await
@@ -178,14 +219,24 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state_machine: StateMachine::new() })
+        let state_machine = StateMachine::new();
+
+        // If the sliding sync has successfully restored a sync position, skip the
+        // waiting for the initial sync, and set the state to `SettingUp`; this
+        // way, the first sync will move us to the steady state, and update the
+        // sliding sync list to use the growing sync mode.
+        if sliding_sync.has_pos().await {
+            state_machine.set(State::SettingUp);
+        }
+
+        Ok(Self { client, sliding_sync, state_machine })
     }
 
     /// Start to sync the room list.
     ///
     /// It's the main method of this entire API. Calling `sync` allows to
     /// receive updates on the room list: new rooms, rooms updates etc. Those
-    /// updates can be read with [`RoomList::entries`] for example. This method
+    /// updates can be read with `RoomList::entries` for example. This method
     /// returns a [`Stream`] where produced items only hold an empty value
     /// in case of a sync success, otherwise an error.
     ///
@@ -196,7 +247,7 @@ impl RoomListService {
     /// the state machine.
     ///
     /// This should be used only for testing. In practice, most users should be
-    /// using the [`SyncService`] instead.
+    /// using the [`SyncService`](crate::sync_service::SyncService) instead.
     #[doc(hidden)]
     pub fn sync(&self) -> impl Stream<Item = Result<(), Error>> + '_ {
         stream! {
@@ -271,7 +322,7 @@ impl RoomListService {
     /// state-machine into the [`State::Terminated`] state.
     ///
     /// This should be used only for testing. In practice, most users should be
-    /// using the [`SyncService`] instead.
+    /// using the [`SyncService`](crate::sync_service::SyncService) instead.
     #[doc(hidden)]
     pub fn stop_sync(&self) -> Result<(), Error> {
         self.sliding_sync.stop_sync().map_err(Error::SlidingSync)
@@ -279,7 +330,7 @@ impl RoomListService {
 
     /// Force the sliding sync session to expire.
     ///
-    /// This is used by [`SyncService`][crate::SyncService].
+    /// This is used by [`SyncService`](crate::sync_service::SyncService).
     ///
     /// **Warning**: This method **must not** be called while the sync loop is
     /// running!
@@ -304,7 +355,7 @@ impl RoomListService {
         &self,
         delay_before_showing: Duration,
         delay_before_hiding: Duration,
-    ) -> impl Stream<Item = SyncIndicator> {
+    ) -> impl Stream<Item = SyncIndicator> + use<> {
         let mut state = self.state();
 
         stream! {
@@ -317,11 +368,11 @@ impl RoomListService {
 
             loop {
                 let (sync_indicator, yield_delay) = match current_state {
-                    State::Init | State::Error { .. } => {
+                    State::Init | State::SettingUp | State::Error { .. } => {
                         (SyncIndicator::Show, delay_before_showing)
                     }
 
-                    State::SettingUp | State::Recovering | State::Running | State::Terminated { .. } => {
+                    State::Recovering | State::Running | State::Terminated { .. } => {
                         (SyncIndicator::Hide, delay_before_hiding)
                     }
                 };
@@ -382,7 +433,15 @@ impl RoomListService {
     ///
     /// It means that all events from these rooms will be received every time,
     /// no matter how the `RoomList` is configured.
-    pub fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
+    ///
+    /// [`LatestEvents::listen_to_room`][listen_to_room] will be called for each
+    /// room in `room_ids`, so that the [`LatestEventValue`] will automatically
+    /// be calculated and updated for these rooms, for free.
+    ///
+    /// [listen_to_room]: matrix_sdk::latest_events::LatestEvents::listen_to_room
+    /// [`LatestEventValue`]: matrix_sdk::latest_events::LatestEventValue
+    pub async fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
+        // Calculate the settings for the room subscriptions.
         let settings = assign!(http::request::RoomSubscription::default(), {
             required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
                 (state_event.clone(), (*value).to_owned())
@@ -396,6 +455,7 @@ impl RoomListService {
             timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
         });
 
+        // Decide whether the in-flight request (if any) should be cancelled if needed.
         let cancel_in_flight_request = match self.state_machine.get() {
             State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
                 false
@@ -403,6 +463,21 @@ impl RoomListService {
             State::SettingUp | State::Running => true,
         };
 
+        // Before subscribing, let's listen these rooms to calculate their latest
+        // events.
+        if self.client.event_cache().has_subscribed() {
+            let latest_events = self.client.latest_events().await;
+
+            for room_id in room_ids {
+                if let Err(error) = latest_events.listen_to_room(room_id).await {
+                    // Let's not fail the room subscription. Instead, emit a log because it's very
+                    // unlikely to happen.
+                    error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+                }
+            }
+        }
+
+        // Subscribe to the rooms.
         self.sliding_sync.subscribe_to_rooms(room_ids, Some(settings), cancel_in_flight_request)
     }
 
@@ -457,16 +532,16 @@ pub enum SyncIndicator {
 mod tests {
     use std::future::ready;
 
-    use futures_util::{pin_mut, StreamExt};
+    use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{
-        config::RequestConfig, test_utils::client::mock_matrix_session, Client, SlidingSyncMode,
+        Client, SlidingSyncMode, config::RequestConfig, test_utils::client::mock_matrix_session,
     };
     use matrix_sdk_test::async_test;
     use ruma::api::MatrixVersion;
     use serde_json::json;
-    use wiremock::{http::Method, Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate, http::Method};
 
-    use super::{Error, RoomListService, State, ALL_ROOMS_LIST_NAME};
+    use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, State};
 
     async fn new_client() -> (Client, MockServer) {
         let session = mock_matrix_session();

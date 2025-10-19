@@ -16,18 +16,21 @@
 
 #![allow(dead_code)]
 
-use ruma::{owned_user_id, UserId};
+use ruma::{UserId, owned_user_id};
 
 use crate::{
-    store::{RoomLoadSettings, StoreConfig},
     BaseClient, SessionMeta,
+    client::ThreadingSupport,
+    store::{RoomLoadSettings, StoreConfig},
 };
 
 /// Create a [`BaseClient`] with the given user id, if provided, or an hardcoded
 /// one otherwise.
 pub(crate) async fn logged_in_base_client(user_id: Option<&UserId>) -> BaseClient {
-    let client =
-        BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+    let client = BaseClient::new(
+        StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+        ThreadingSupport::Disabled,
+    );
     let user_id =
         user_id.map(|user_id| user_id.to_owned()).unwrap_or_else(|| owned_user_id!("@u:e.uk"));
     client

@@ -10,21 +10,23 @@ use std::{
 use anyhow::Result;
 use assign::assign;
 use matrix_sdk::{
+    Client, ClientBuilder, Room,
     config::{RequestConfig, SyncSettings},
+    crypto::{CollectStrategy, DecryptionSettings},
     encryption::EncryptionSettings,
     ruma::{
+        RoomId,
         api::client::{account::register::v3::Request as RegistrationRequest, uiaa},
         time::Instant,
-        RoomId,
     },
     sliding_sync::VersionBuilder,
     sync::SyncResponse,
     timeout::ElapsedError,
-    Client, ClientBuilder, Room,
 };
+use matrix_sdk_base::crypto::TrustRequirement;
 use once_cell::sync::Lazy;
 use rand::Rng as _;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 use tokio::{sync::Mutex, time::sleep};
 
 /// This global maintains temp directories alive for the whole lifetime of the
@@ -39,6 +41,8 @@ enum SqlitePath {
 pub struct TestClientBuilder {
     username: String,
     use_sqlite_dir: Option<SqlitePath>,
+    decryption_settings: Option<DecryptionSettings>,
+    room_key_recipient_strategy: CollectStrategy,
     encryption_settings: EncryptionSettings,
     enable_share_history_on_invite: bool,
     http_proxy: Option<String>,
@@ -47,7 +51,7 @@ pub struct TestClientBuilder {
 
 impl TestClientBuilder {
     pub fn new(username: impl AsRef<str>) -> Self {
-        let suffix: u128 = rand::thread_rng().gen();
+        let suffix: u128 = rand::thread_rng().r#gen();
         let randomized_username = format!("{}{}", username.as_ref(), suffix);
         Self::with_exact_username(randomized_username)
     }
@@ -56,7 +60,9 @@ impl TestClientBuilder {
         Self {
             username,
             use_sqlite_dir: None,
+            decryption_settings: None,
             encryption_settings: Default::default(),
+            room_key_recipient_strategy: Default::default(),
             enable_share_history_on_invite: false,
             http_proxy: None,
             cross_process_store_locks_holder_name: None,
@@ -87,6 +93,21 @@ impl TestClientBuilder {
         self
     }
 
+    /// Simulate the behaviour of the clients when the "exclude insecure
+    /// devices" (MSC4153) labs flag is enabled.
+    pub fn exclude_insecure_devices(mut self, exclude_insecure_devices: bool) -> Self {
+        let (sender_device_trust_requirement, room_key_recipient_strategy) =
+            if exclude_insecure_devices {
+                (TrustRequirement::CrossSignedOrLegacy, CollectStrategy::IdentityBasedStrategy)
+            } else {
+                (TrustRequirement::Untrusted, CollectStrategy::AllDevices)
+            };
+        self.decryption_settings = Some(DecryptionSettings { sender_device_trust_requirement });
+        self.room_key_recipient_strategy = room_key_recipient_strategy;
+
+        self
+    }
+
     pub fn http_proxy(mut self, url: String) -> Self {
         self.http_proxy = Some(url);
         self
@@ -106,8 +127,13 @@ impl TestClientBuilder {
             .homeserver_url(homeserver_url)
             .sliding_sync_version_builder(VersionBuilder::Native)
             .with_encryption_settings(self.encryption_settings)
+            .with_room_key_recipient_strategy(self.room_key_recipient_strategy.clone())
             .with_enable_share_history_on_invite(self.enable_share_history_on_invite)
             .request_config(RequestConfig::short_retry());
+
+        if let Some(decryption_settings) = &self.decryption_settings {
+            client_builder = client_builder.with_decryption_settings(decryption_settings.clone())
+        }
 
         if let Some(holder_name) = &self.cross_process_store_locks_holder_name {
             client_builder =
@@ -245,7 +271,7 @@ where
     loop {
         if let Some(r) = cb(attempt_count).await {
             return Ok(r);
-        };
+        }
         if start - Instant::now() > timeout_duration {
             return Err(ElapsedError());
         }

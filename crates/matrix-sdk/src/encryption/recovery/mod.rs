@@ -32,7 +32,7 @@
 //! doesn't exist, as well:
 //!
 //! ```no_run
-//! use matrix_sdk::{encryption::EncryptionSettings, Client};
+//! use matrix_sdk::{Client, encryption::EncryptionSettings};
 //!
 //! # async {
 //! # let homeserver = "http://example.org";
@@ -95,9 +95,9 @@ use futures_util::StreamExt as _;
 use ruma::{
     api::client::keys::get_keys,
     events::{
+        GlobalAccountDataEventType,
         secret::{request::SecretName, send::ToDeviceSecretSendEvent},
         secret_storage::{default_key::SecretStorageDefaultKeyEvent, secret::SecretEventContent},
-        GlobalAccountDataEventType,
     },
     serde::Raw,
 };
@@ -109,7 +109,7 @@ use crate::encryption::{
     backups::Backups,
     secret_storage::{SecretStorage, SecretStore},
 };
-use crate::{client::WeakClient, encryption::backups::BackupState, Client};
+use crate::{Client, client::WeakClient, encryption::backups::BackupState};
 
 pub mod futures;
 mod types;
@@ -169,7 +169,7 @@ impl Recovery {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn state_stream(&self) -> impl Stream<Item = RecoveryState> {
+    pub fn state_stream(&self) -> impl Stream<Item = RecoveryState> + use<> {
         self.client.inner.e2ee.recovery_state.subscribe_reset()
     }
 
@@ -307,16 +307,15 @@ impl Recovery {
         // Then we finally set the event to an empty JSON content.
         if let Ok(Some(default_event)) =
             self.client.encryption().secret_storage().fetch_default_key_id().await
+            && let Ok(default_event) = default_event.deserialize()
         {
-            if let Ok(default_event) = default_event.deserialize() {
-                let key_id = default_event.key_id;
-                let event_type = GlobalAccountDataEventType::SecretStorageKey(key_id);
+            let key_id = default_event.key_id;
+            let event_type = GlobalAccountDataEventType::SecretStorageKey(key_id);
 
-                self.client
-                    .account()
-                    .set_account_data_raw(event_type, Raw::new(&json!({})).expect("").cast())
-                    .await?;
-            }
+            self.client
+                .account()
+                .set_account_data_raw(event_type, Raw::new(&json!({})).expect("").cast_unchecked())
+                .await?;
         }
 
         // Now let's "delete" the actual `m.secret.storage.default_key` event.
@@ -408,7 +407,7 @@ impl Recovery {
     /// # let client = Client::new(homeserver).await?;
     /// # let user_id = unimplemented!();
     /// let encryption = client.encryption();
-    ///       
+    ///
     /// if let Some(handle) = encryption.recovery().reset_identity().await? {
     ///     match handle.auth_type() {
     ///         CrossSigningResetAuthType::Uiaa(uiaa) => {
@@ -592,14 +591,9 @@ impl Recovery {
         Ok(self
             .client
             .account()
-            .fetch_account_data(BackupDisabledContent::event_type())
+            .fetch_account_data_static::<BackupDisabledContent>()
             .await?
-            .map(|event| {
-                event
-                    .deserialize_as::<BackupDisabledContent>()
-                    .map(|event| event.disabled)
-                    .unwrap_or(false)
-            })
+            .map(|event| event.deserialize().map(|event| event.disabled).unwrap_or(false))
             .unwrap_or(false))
     }
 
@@ -655,7 +649,7 @@ impl Recovery {
     /// task which is always listening for updates in the [`BackupState`].
     pub(crate) fn update_state_after_backup_state_change(
         client: &Client,
-    ) -> impl Future<Output = ()> {
+    ) -> impl Future<Output = ()> + use<> {
         let mut stream = client.encryption().backups().state_stream();
         let weak = WeakClient::from_client(client);
 
@@ -690,13 +684,13 @@ impl Recovery {
 
     #[instrument(skip_all)]
     pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {
-        if let Some(user_id) = self.client.user_id() {
-            if response.master_keys.contains_key(user_id) {
-                // TODO: This is unnecessarily expensive, we could let the crypto crate notify
-                // us that our private keys got erased... But, the OlmMachine
-                // gets recreated and... You know the drill by now...
-                self.update_recovery_state_no_fail().await;
-            }
+        if let Some(user_id) = self.client.user_id()
+            && response.master_keys.contains_key(user_id)
+        {
+            // TODO: This is unnecessarily expensive, we could let the crypto crate notify
+            // us that our private keys got erased... But, the OlmMachine
+            // gets recreated and... You know the drill by now...
+            self.update_recovery_state_no_fail().await;
         }
     }
 }
@@ -732,5 +726,175 @@ impl IdentityResetHandle {
     /// Cancel the ongoing identity reset process
     pub async fn cancel(&self) {
         self.cross_signing_reset_handle.cancel().await;
+    }
+}
+
+// The http mocking library is not supported for wasm32
+#[cfg(all(test, not(target_family = "wasm")))]
+pub(crate) mod tests {
+    use assert_matches::assert_matches;
+    use matrix_sdk_test::async_test;
+    use ruma::{
+        events::{secret::request::SecretName, secret_storage::key},
+        serde::Base64,
+    };
+    use serde_json::json;
+
+    use super::Recovery;
+    use crate::{
+        encryption::{recovery::types::RecoveryError, secret_storage::SecretStorageError},
+        test_utils::mocks::MatrixMockServer,
+    };
+
+    // If recovery fails due when importing a secret from secret storage, we
+    // should get the `ImportError` variant of `SecretStorageError`.  The
+    // following tests test different import failures.
+    #[async_test]
+    async fn test_recover_with_no_cross_signing_key() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_get_secret_storage_key()
+            .ok(
+                client.user_id().unwrap(),
+                &key::SecretStorageKeyEventContent::new(
+                    "abc".into(),
+                    key::SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                        key::SecretStorageV1AesHmacSha2Properties::new(
+                            Some(Base64::parse("xv5b6/p3ExEw++wTyfSHEg==").unwrap()),
+                            Some(
+                                Base64::parse("ujBBbXahnTAMkmPUX2/0+VTfUh63pGyVRuBcDMgmJC8=")
+                                    .unwrap(),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .mount()
+            .await;
+        server
+            .mock_get_default_secret_storage_key()
+            .ok(client.user_id().unwrap(), "abc")
+            .mount()
+            .await;
+
+        let recovery = Recovery { client };
+
+        let ret =
+            recovery.recover("EsTj 3yST y93F SLpB jJsz eAXc 2XzA ygD3 w69H fGaN TKBj jXEd").await;
+
+        assert_matches!(
+            ret,
+            Err(RecoveryError::SecretStorage(SecretStorageError::ImportError {
+                name: SecretName::CrossSigningMasterKey,
+                error: _
+            }))
+        );
+    }
+
+    #[async_test]
+    async fn test_recover_with_invalid_cross_signing_key() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_get_secret_storage_key()
+            .ok(
+                client.user_id().unwrap(),
+                &key::SecretStorageKeyEventContent::new(
+                    "abc".into(),
+                    key::SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                        key::SecretStorageV1AesHmacSha2Properties::new(
+                            Some(Base64::parse("xv5b6/p3ExEw++wTyfSHEg==").unwrap()),
+                            Some(
+                                Base64::parse("ujBBbXahnTAMkmPUX2/0+VTfUh63pGyVRuBcDMgmJC8=")
+                                    .unwrap(),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .mount()
+            .await;
+        server
+            .mock_get_default_secret_storage_key()
+            .ok(client.user_id().unwrap(), "abc")
+            .mount()
+            .await;
+        server.mock_get_master_signing_key().ok(client.user_id().unwrap(), json!({})).mount().await;
+
+        let recovery = Recovery { client };
+
+        let ret =
+            recovery.recover("EsTj 3yST y93F SLpB jJsz eAXc 2XzA ygD3 w69H fGaN TKBj jXEd").await;
+
+        assert_matches!(
+            ret,
+            Err(RecoveryError::SecretStorage(SecretStorageError::ImportError {
+                name: SecretName::CrossSigningMasterKey,
+                error: _
+            }))
+        );
+    }
+
+    #[async_test]
+    async fn test_recover_with_undecryptable_cross_signing_key() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_get_secret_storage_key()
+            .ok(
+                client.user_id().unwrap(),
+                &key::SecretStorageKeyEventContent::new(
+                    "abc".into(),
+                    key::SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                        key::SecretStorageV1AesHmacSha2Properties::new(
+                            Some(Base64::parse("xv5b6/p3ExEw++wTyfSHEg==").unwrap()),
+                            Some(
+                                Base64::parse("ujBBbXahnTAMkmPUX2/0+VTfUh63pGyVRuBcDMgmJC8=")
+                                    .unwrap(),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .mount()
+            .await;
+        server
+            .mock_get_default_secret_storage_key()
+            .ok(client.user_id().unwrap(), "abc")
+            .mount()
+            .await;
+        server
+            .mock_get_master_signing_key()
+            .ok(
+                client.user_id().unwrap(),
+                json!({
+                    "encrypted": {
+                        "abc": {
+                            "iv": "xv5b6/p3ExEw++wTyfSHEg==",
+                            "mac": "ujBBbXahnTAMkmPUX2/0+VTfUh63pGyVRuBcDMgmJC8=",
+                            "ciphertext": "abcd"
+                        }
+                    }
+                }),
+            )
+            .mount()
+            .await;
+
+        let recovery = Recovery { client };
+
+        let ret =
+            recovery.recover("EsTj 3yST y93F SLpB jJsz eAXc 2XzA ygD3 w69H fGaN TKBj jXEd").await;
+
+        assert_matches!(
+            ret,
+            Err(RecoveryError::SecretStorage(SecretStorageError::ImportError {
+                name: SecretName::CrossSigningMasterKey,
+                error: _
+            }))
+        );
     }
 }

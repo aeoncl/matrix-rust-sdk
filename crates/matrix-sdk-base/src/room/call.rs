@@ -20,7 +20,7 @@ impl Room {
     /// Is there a non expired membership with application `m.call` and scope
     /// `m.room` in this room.
     pub fn has_active_room_call(&self) -> bool {
-        self.inner.read().has_active_room_call()
+        self.info.read().has_active_room_call()
     }
 
     /// Returns a `Vec` of `OwnedUserId`'s that participate in the room call.
@@ -32,7 +32,7 @@ impl Room {
     ///
     /// The vector is ordered by oldest membership user to newest.
     pub fn active_room_call_participants(&self) -> Vec<OwnedUserId> {
-        self.inner.read().active_room_call_participants()
+        self.info.read().active_room_call_participants()
     }
 }
 
@@ -41,20 +41,20 @@ mod tests {
     use std::{ops::Sub, sync::Arc, time::Duration};
 
     use assign::assign;
-    use matrix_sdk_test::{ALICE, BOB, CAROL};
+    use matrix_sdk_test::{ALICE, BOB, CAROL, event_factory::EventFactory};
     use ruma::{
-        device_id, event_id,
+        DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId, device_id, event_id,
         events::{
+            AnySyncStateEvent,
             call::member::{
                 ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
                 CallMemberEventContent, CallMemberStateKey, Focus, LegacyMembershipData,
-                LegacyMembershipDataInit, LivekitFocus, OriginalSyncCallMemberEvent,
+                LegacyMembershipDataInit, LivekitFocus,
             },
-            AnySyncStateEvent, StateUnsigned, SyncStateEvent,
         },
         room_id,
         time::SystemTime,
-        user_id, DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+        user_id,
     };
     use similar_asserts::assert_eq;
 
@@ -101,17 +101,15 @@ mod tests {
         user_id: &UserId,
     ) -> AnySyncStateEvent {
         let content = CallMemberEventContent::new_legacy(memberships);
-
-        AnySyncStateEvent::CallMember(SyncStateEvent::Original(OriginalSyncCallMemberEvent {
-            content,
-            event_id: ev_id.to_owned(),
-            sender: user_id.to_owned(),
+        EventFactory::new()
+            .sender(user_id)
+            .event(content)
+            .state_key(CallMemberStateKey::new(user_id.to_owned(), None, false).as_ref())
+            .event_id(ev_id)
             // we can simply use now here since this will be dropped when using a MinimalStateEvent
             // in the roomInfo
-            origin_server_ts: timestamp(0),
-            state_key: CallMemberStateKey::new(user_id.to_owned(), None, false),
-            unsigned: StateUnsigned::new(),
-        }))
+            .server_ts(timestamp(0))
+            .into()
     }
 
     struct InitData<'a> {
@@ -133,33 +131,38 @@ mod tests {
             "https://lk.org".to_owned(),
         ))];
         let focus_active = ActiveFocus::Livekit(ActiveLivekitFocus::new());
+
         let (content, state_key) = match init_data {
-            Some(InitData { device_id, minutes_ago }) => (
-                CallMemberEventContent::new(
-                    application,
-                    device_id.to_owned(),
-                    focus_active,
-                    foci_preferred,
-                    Some(timestamp(minutes_ago)),
-                ),
-                CallMemberStateKey::new(user_id.to_owned(), Some(device_id.to_owned()), false),
-            ),
+            Some(InitData { device_id, minutes_ago }) => {
+                let member_id = format!("{device_id}_m.call");
+                (
+                    CallMemberEventContent::new(
+                        application,
+                        device_id.to_owned(),
+                        focus_active,
+                        foci_preferred,
+                        Some(timestamp(minutes_ago)),
+                        None,
+                    ),
+                    CallMemberStateKey::new(user_id.to_owned(), Some(member_id), false),
+                )
+            }
+
             None => (
                 CallMemberEventContent::new_empty(None),
                 CallMemberStateKey::new(user_id.to_owned(), None, false),
             ),
         };
 
-        AnySyncStateEvent::CallMember(SyncStateEvent::Original(OriginalSyncCallMemberEvent {
-            content,
-            event_id: ev_id.to_owned(),
-            sender: user_id.to_owned(),
+        EventFactory::new()
+            .sender(user_id)
+            .event(content)
+            .state_key(state_key.as_ref())
+            .event_id(ev_id)
             // we can simply use now here since this will be dropped when using a MinimalStateEvent
             // in the roomInfo
-            origin_server_ts: timestamp(0),
-            state_key,
-            unsigned: StateUnsigned::new(),
-        }))
+            .server_ts(timestamp(0))
+            .into()
     }
 
     fn foci_and_application() -> (Application, Vec<Focus>) {
@@ -176,7 +179,7 @@ mod tests {
     }
 
     fn receive_state_events(room: &Room, events: Vec<&AnySyncStateEvent>) {
-        room.inner.update_if(|info| {
+        room.info.update_if(|info| {
             let mut res = false;
             for ev in events {
                 res |= info.handle_state_event(ev);

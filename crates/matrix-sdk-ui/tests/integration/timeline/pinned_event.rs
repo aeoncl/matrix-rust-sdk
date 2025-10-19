@@ -4,23 +4,25 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt as _;
 use matrix_sdk::{
+    Client, Room,
     config::SyncSettings,
     test_utils::{
         logged_in_client_with_server,
         mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
     },
-    Client, Room,
 };
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use matrix_sdk_common::executor::spawn;
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, JoinedRoomBuilder, StateTestEvent,
-    SyncResponseBuilder, BOB,
+    BOB, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
+    event_factory::EventFactory,
 };
 use matrix_sdk_ui::timeline::{RoomExt, TimelineBuilder, TimelineFocus};
 use ruma::{
-    assign, event_id,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId, UserId, assign,
+    event_id,
     events::{
+        AnySyncTimelineEvent,
         room::{
             encrypted::{
                 EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
@@ -28,18 +30,17 @@ use ruma::{
             message::RoomMessageEventContentWithoutRelation,
             pinned_events::RoomPinnedEventsEventContent,
         },
-        AnySyncTimelineEvent,
     },
     owned_device_id, owned_room_id, owned_user_id, room_id,
     serde::Raw,
-    user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, RoomId, UserId,
+    user_id,
 };
 use serde_json::json;
 use stream_assert::assert_pending;
 use tokio::time::sleep;
 use wiremock::{
-    matchers::{header, method, path_regex},
     Mock, ResponseTemplate,
+    matchers::{header, method, path_regex},
 };
 
 use crate::mock_sync;
@@ -255,7 +256,7 @@ async fn test_cached_events_are_kept_for_different_room_instances() {
     assert!(!items.is_empty()); // We just loaded some events
     assert_pending!(timeline_stream);
 
-    assert!(room_cache.event(event_id!("$1")).await.is_some());
+    assert!(room_cache.find_event(event_id!("$1")).await.is_some());
 
     // Drop the existing room and timeline instances
     drop(timeline_stream);
@@ -276,7 +277,7 @@ async fn test_cached_events_are_kept_for_different_room_instances() {
 
     let (items, _) = timeline.subscribe().await;
     assert!(!items.is_empty()); // These events came from the cache
-    assert!(room_cache.event(event_id!("$1")).await.is_some());
+    assert!(room_cache.find_event(event_id!("$1")).await.is_some());
 
     // Drop the existing room and timeline instances
     server.server().reset().await;
@@ -401,7 +402,7 @@ async fn test_pinned_timeline_with_no_pinned_events_on_pagination_is_just_empty(
         .expect("Pagination of events should successful");
 
     // Assert the event is loaded and added to the cache
-    assert!(event_cache.event(event_id).await.is_some());
+    assert!(event_cache.find_event(event_id).await.is_some());
 
     // And it won't cause an update in the pinned events timeline since it's not
     // pinned
@@ -659,7 +660,7 @@ async fn mock_events_endpoint(
             .mock_room_event()
             .room(room_id.to_owned())
             .match_event_id()
-            .ok(TimelineEvent::new(event.cast()))
+            .ok(TimelineEvent::from_plaintext(event))
             .mount()
             .await;
     }
@@ -714,10 +715,9 @@ impl PinnedEventsSync {
                 .event(RoomPinnedEventsEventContent::new(pinned_event_ids))
                 .sender(user_id!("@example:localhost"))
                 .state_key("")
-                .into_raw_sync();
+                .into();
 
-            joined_room_builder =
-                joined_room_builder.add_state_bulk(vec![pinned_events_event.cast()]);
+            joined_room_builder = joined_room_builder.add_state_bulk(vec![pinned_events_event]);
         }
 
         Ok(server.sync_room(client, joined_room_builder).await)

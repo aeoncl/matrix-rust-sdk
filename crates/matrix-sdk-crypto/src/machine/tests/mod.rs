@@ -19,12 +19,18 @@ use futures_util::{pin_mut, FutureExt, StreamExt};
 use itertools::Itertools;
 use matrix_sdk_common::{
     deserialized_responses::{
-        AlgorithmInfo, UnableToDecryptInfo, UnableToDecryptReason, UnsignedDecryptionResult,
-        UnsignedEventLocation, VerificationLevel, VerificationState, WithheldCode,
+        AlgorithmInfo, ProcessedToDeviceEvent, UnableToDecryptInfo, UnableToDecryptReason,
+        UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel, VerificationState,
+        WithheldCode,
     },
     executor::spawn,
 };
 use matrix_sdk_test::{async_test, message_like_event_content, ruma_response_from_json, test_json};
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::events::{
+    room::topic::{OriginalRoomTopicEvent, RoomTopicEventContent},
+    StateEvent,
+};
 use ruma::{
     api::client::{
         keys::{get_keys, upload_keys},
@@ -35,8 +41,8 @@ use ruma::{
         room::message::{
             AddMentions, MessageType, Relation, ReplyWithinThread, RoomMessageEventContent,
         },
-        AnyMessageLikeEvent, AnyMessageLikeEventContent, AnyToDeviceEvent, MessageLikeEvent,
-        OriginalMessageLikeEvent, ToDeviceEventType,
+        AnyMessageLikeEvent, AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnyTimelineEvent,
+        AnyToDeviceEvent, MessageLikeEvent, OriginalMessageLikeEvent, ToDeviceEventType,
     },
     room_id,
     serde::Raw,
@@ -63,8 +69,8 @@ use crate::{
     olm::{BackedUpRoomKey, ExportedRoomKey, SenderData, VerifyJson},
     session_manager::CollectStrategy,
     store::{
-        BackupDecryptionKey, Changes, CryptoStore, DeviceChanges, MemoryStore, PendingChanges,
-        RoomKeyInfo,
+        types::{BackupDecryptionKey, Changes, DeviceChanges, PendingChanges, RoomKeyInfo},
+        CryptoStore, MemoryStore,
     },
     types::{
         events::{
@@ -73,7 +79,7 @@ use crate::{
             ToDeviceEvent,
         },
         requests::{AnyOutgoingRequest, ToDeviceRequest},
-        DeviceKeys, ProcessedToDeviceEvent, SignedKey, SigningKeys,
+        DeviceKeys, SignedKey, SigningKeys,
     },
     utilities::json_convert,
     verification::tests::bob_id,
@@ -128,7 +134,7 @@ pub fn to_device_requests_to_content(
         .values()
         .next()
         .unwrap()
-        .deserialize_as()
+        .deserialize_as_unchecked()
         .unwrap()
 }
 
@@ -267,7 +273,7 @@ fn test_one_time_key_signing() {
         .values_mut()
         .next()
         .expect("One time keys should be generated")
-        .deserialize_as()
+        .deserialize_as_unchecked()
         .unwrap();
 
     ed25519_key
@@ -283,15 +289,22 @@ fn test_one_time_key_signing() {
 async fn test_keys_for_upload() {
     let machine = OlmMachine::new(user_id(), alice_device_id()).await;
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     let key_counts = BTreeMap::from([(OneTimeKeyAlgorithm::SignedCurve25519, 49u8.into())]);
+
     machine
-        .receive_sync_changes(EncryptionSyncChanges {
-            to_device_events: Vec::new(),
-            changed_devices: &Default::default(),
-            one_time_keys_counts: &key_counts,
-            unused_fallback_keys: None,
-            next_batch_token: None,
-        })
+        .receive_sync_changes(
+            EncryptionSyncChanges {
+                to_device_events: Vec::new(),
+                changed_devices: &Default::default(),
+                one_time_keys_counts: &key_counts,
+                unused_fallback_keys: None,
+                next_batch_token: None,
+            },
+            &decryption_settings,
+        )
         .await
         .expect("We should be able to update our one-time key counts");
 
@@ -310,7 +323,7 @@ async fn test_keys_for_upload() {
         .values_mut()
         .next()
         .expect("One time keys should be generated")
-        .deserialize_as()
+        .deserialize_as_unchecked()
         .unwrap();
 
     let ret = ed25519_key.verify_json(
@@ -505,14 +518,20 @@ async fn send_room_key_to_device(
     );
     let event = json_convert(&event).unwrap();
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     receiver
-        .receive_sync_changes(EncryptionSyncChanges {
-            to_device_events: vec![event],
-            changed_devices: &Default::default(),
-            one_time_keys_counts: &Default::default(),
-            unused_fallback_keys: None,
-            next_batch_token: None,
-        })
+        .receive_sync_changes(
+            EncryptionSyncChanges {
+                to_device_events: vec![event],
+                changed_devices: &Default::default(),
+                one_time_keys_counts: &Default::default(),
+                unused_fallback_keys: None,
+                next_batch_token: None,
+            },
+            &decryption_settings,
+        )
         .await
 }
 
@@ -630,10 +649,20 @@ async fn test_megolm_encryption() {
 
     let mut room_keys_received_stream = Box::pin(bob.store().room_keys_received_stream());
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     let group_session = bob
         .store()
         .with_transaction(|mut tr| async {
-            let res = bob.decrypt_to_device_event(&mut tr, &event, &mut Changes::default()).await?;
+            let res = bob
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
+                .await?;
             Ok((tr, res))
         })
         .await
@@ -682,8 +711,8 @@ async fn test_megolm_encryption() {
     assert_let!(RoomEventDecryptionResult::Decrypted(decrypted_event) = decryption_result);
     let decrypted_event = decrypted_event.event.deserialize().unwrap();
 
-    if let AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(
-        OriginalMessageLikeEvent { sender, content, .. },
+    if let AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(
+        MessageLikeEvent::Original(OriginalMessageLikeEvent { sender, content, .. }),
     )) = decrypted_event
     {
         assert_eq!(&sender, alice.user_id());
@@ -701,6 +730,275 @@ async fn test_megolm_encryption() {
     if let Some(igs) = room_keys_received_stream.next().now_or_never() {
         panic!("Session stream unexpectedly returned update: {igs:?}");
     }
+}
+
+/// Helper function to set up end-to-end Megolm encryption between two devices.
+///
+/// Creates two devices, Alice and Bob, and has Alice create an outgoing Megolm
+/// session in the given room, whose decryption key is shared with Bob via a
+/// to-device message.
+///
+/// # Arguments
+///
+/// * `room_id` - The RoomId for which to set up Megolm encryption.
+///
+/// # Returns
+///
+/// A tuple containing the alice and bob OlmMachine instances.
+#[cfg(feature = "experimental-encrypted-state-events")]
+async fn megolm_encryption_setup_helper(room_id: &RoomId) -> (OlmMachine, OlmMachine) {
+    let (alice, bob) =
+        get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
+
+    let to_device_requests = alice
+        .share_room_key(room_id, iter::once(bob.user_id()), EncryptionSettings::default())
+        .await
+        .unwrap();
+
+    let event = ToDeviceEvent::new(
+        alice.user_id().to_owned(),
+        to_device_requests_to_content(to_device_requests),
+    );
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let group_session = bob
+        .store()
+        .with_transaction(|mut tr| async {
+            let res = bob
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
+                .await?;
+            Ok((tr, res))
+        })
+        .await
+        .unwrap()
+        .inbound_group_session
+        .unwrap();
+    let sessions = std::slice::from_ref(&group_session);
+    bob.store().save_inbound_group_sessions(sessions).await.unwrap();
+
+    (alice, bob)
+}
+
+/// Verifies that Megolm-encrypted state events can be encrypted and decrypted
+/// correctly, and that the decrypted event matches the expected type and
+/// content.
+#[cfg(feature = "experimental-encrypted-state-events")]
+#[async_test]
+async fn test_megolm_state_encryption() {
+    use ruma::events::{AnyStateEvent, EmptyStateKey};
+
+    let room_id = room_id!("!test:example.org");
+    let (alice, bob) = megolm_encryption_setup_helper(room_id).await;
+
+    let plaintext = "It is a secret to everybody";
+    let content = RoomTopicEventContent::new(plaintext.to_owned());
+    let encrypted_content =
+        alice.encrypt_state_event(room_id, content, EmptyStateKey).await.unwrap();
+
+    let event = json!({
+        "event_id": "$xxxxx:example.org",
+        "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+        "sender": alice.user_id(),
+        "type": "m.room.encrypted",
+        "state_key": "m.room.topic:",
+        "content": encrypted_content,
+    });
+
+    let event = json_convert(&event).unwrap();
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let decryption_result =
+        bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
+
+    assert_let!(RoomEventDecryptionResult::Decrypted(decrypted_event) = decryption_result);
+
+    let decrypted_event = decrypted_event.event.deserialize().unwrap();
+
+    if let AnyTimelineEvent::State(AnyStateEvent::RoomTopic(StateEvent::Original(
+        OriginalRoomTopicEvent { sender, content, .. },
+    ))) = decrypted_event
+    {
+        assert_eq!(&sender, alice.user_id());
+        assert_eq!(&content.topic, plaintext);
+    } else {
+        panic!("Decrypted room event has the wrong type");
+    }
+}
+
+/// Verifies that decryption fails with StateKeyVerificationFailed
+/// when unpacking the state_key of the decrypted event yields an event type
+/// that does not exist or does not match the type in the decrypted ciphertext.
+#[cfg(feature = "experimental-encrypted-state-events")]
+#[async_test]
+async fn test_megolm_state_encryption_bad_type() {
+    use ruma::events::EmptyStateKey;
+
+    let room_id = room_id!("!test:example.org");
+    let (alice, bob) = megolm_encryption_setup_helper(room_id).await;
+
+    let plaintext = "It is a secret to everybody";
+    let content = RoomTopicEventContent::new(plaintext.to_owned());
+    let encrypted_content =
+        alice.encrypt_state_event(room_id, content, EmptyStateKey).await.unwrap();
+
+    let bad_type_event = json!({
+        "event_id": "$xxxxx:example.org",
+        "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+        "sender": alice.user_id(),
+        "type": "m.room.encrypted",
+        "state_key": "m.room.malformed:",
+        "content": encrypted_content,
+    });
+
+    let bad_type_event = json_convert(&bad_type_event).unwrap();
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let bad_type_decryption_result =
+        bob.try_decrypt_room_event(&bad_type_event, room_id, &decryption_settings).await.unwrap();
+
+    assert_matches!(
+        bad_type_decryption_result,
+        RoomEventDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+            reason: UnableToDecryptReason::StateKeyVerificationFailed,
+            ..
+        })
+    );
+}
+
+/// Verifies that decryption fails with StateKeyVerificationFailed
+/// when unpacking the state_key of the decrypted event yields a state_key
+/// that does not match the state_key in the decrypted ciphertext.
+#[cfg(feature = "experimental-encrypted-state-events")]
+#[async_test]
+async fn test_megolm_state_encryption_bad_state_key() {
+    use ruma::events::EmptyStateKey;
+
+    let room_id = room_id!("!test:example.org");
+    let (alice, bob) = megolm_encryption_setup_helper(room_id).await;
+
+    let plaintext = "It is a secret to everybody";
+    let content = RoomTopicEventContent::new(plaintext.to_owned());
+    let encrypted_content =
+        alice.encrypt_state_event(room_id, content, EmptyStateKey).await.unwrap();
+
+    let bad_state_key_event = json!({
+        "event_id": "$xxxxx:example.org",
+        "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+        "sender": alice.user_id(),
+        "type": "m.room.encrypted",
+        "state_key": "m.room.malformed:",
+        "content": encrypted_content,
+    });
+
+    let bad_state_key_event = json_convert(&bad_state_key_event).unwrap();
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let bad_state_key_decryption_result = bob
+        .try_decrypt_room_event(&bad_state_key_event, room_id, &decryption_settings)
+        .await
+        .unwrap();
+
+    assert_matches!(
+        bad_state_key_decryption_result,
+        RoomEventDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+            reason: UnableToDecryptReason::StateKeyVerificationFailed,
+            ..
+        })
+    );
+}
+
+#[cfg(feature = "experimental-encrypted-state-events")]
+#[async_test]
+async fn test_megolm_state_encryption_outer_state_key_no_inner() {
+    let room_id = room_id!("!test:example.org");
+    let (alice, bob) = megolm_encryption_setup_helper(room_id).await;
+
+    // Construct an inner message-like event and encrypt it.
+    let plaintext = "It is a secret to everybody";
+    let content = RoomMessageEventContent::text_plain(plaintext);
+    let encrypted_content = alice
+        .encrypt_room_event(room_id, AnyMessageLikeEventContent::RoomMessage(content))
+        .await
+        .unwrap();
+
+    // Construct an outer event that has `state_key` defined.
+    let event = json!({
+        "event_id": "$xxxxx:example.org",
+        "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+        "sender": alice.user_id(),
+        "type": "m.room.encrypted",
+        "state_key": "m.room.message:",
+        "content": encrypted_content,
+    });
+
+    let event = json_convert(&event).unwrap();
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let decryption_result =
+        bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
+
+    assert_matches!(
+        decryption_result,
+        RoomEventDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+            reason: UnableToDecryptReason::StateKeyVerificationFailed,
+            ..
+        })
+    );
+}
+
+#[cfg(feature = "experimental-encrypted-state-events")]
+#[async_test]
+async fn test_megolm_state_encryption_inner_state_key_no_outer() {
+    use ruma::events::EmptyStateKey;
+
+    let room_id = room_id!("!test:example.org");
+    let (alice, bob) = megolm_encryption_setup_helper(room_id).await;
+
+    // Construct an inner state event (with state key) and encrypt it.
+    let plaintext = "It is a secret to everybody";
+    let content = RoomTopicEventContent::new(plaintext.to_owned());
+    let encrypted_content =
+        alice.encrypt_state_event(room_id, content, EmptyStateKey).await.unwrap();
+
+    // Construct an outer event without a state key.
+    let event = json!({
+        "event_id": "$xxxxx:example.org",
+        "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+        "sender": alice.user_id(),
+        "type": "m.room.encrypted",
+        "content": encrypted_content,
+    });
+
+    let event = json_convert(&event).unwrap();
+
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    let decryption_result =
+        bob.try_decrypt_room_event(&event, room_id, &decryption_settings).await.unwrap();
+
+    assert_matches!(
+        decryption_result,
+        RoomEventDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+            reason: UnableToDecryptReason::StateKeyVerificationFailed,
+            ..
+        })
+    );
 }
 
 #[async_test]
@@ -734,20 +1032,26 @@ async fn test_withheld_unverified() {
         .values()
         .next()
         .unwrap()
-        .deserialize_as::<RoomKeyWithheldContent>()
+        .deserialize_as_unchecked::<RoomKeyWithheldContent>()
         .expect("Deserialize should work");
 
     let event = ToDeviceEvent::new(alice.user_id().to_owned(), wh_content);
 
     let event = json_convert(&event).unwrap();
 
-    bob.receive_sync_changes(EncryptionSyncChanges {
-        to_device_events: vec![event],
-        changed_devices: &Default::default(),
-        one_time_keys_counts: &Default::default(),
-        unused_fallback_keys: None,
-        next_batch_token: None,
-    })
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    bob.receive_sync_changes(
+        EncryptionSyncChanges {
+            to_device_events: vec![event],
+            changed_devices: &Default::default(),
+            one_time_keys_counts: &Default::default(),
+            unused_fallback_keys: None,
+            next_batch_token: None,
+        },
+        &decryption_settings,
+    )
     .await
     .unwrap();
 
@@ -1001,10 +1305,20 @@ async fn test_query_ratcheted_key() {
         to_device_requests_to_content(to_device_requests),
     );
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     let group_session = bob
         .store()
         .with_transaction(|mut tr| async {
-            let res = bob.decrypt_to_device_event(&mut tr, &event, &mut Changes::default()).await?;
+            let res = bob
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
+                .await?;
             Ok((tr, res))
         })
         .await
@@ -1053,14 +1367,20 @@ async fn test_room_key_over_megolm() {
     let changed_devices = DeviceLists::new();
     let key_counts: BTreeMap<_, _> = Default::default();
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     let _ = bob
-        .receive_sync_changes(EncryptionSyncChanges {
-            to_device_events: vec![event],
-            changed_devices: &changed_devices,
-            one_time_keys_counts: &key_counts,
-            unused_fallback_keys: None,
-            next_batch_token: None,
-        })
+        .receive_sync_changes(
+            EncryptionSyncChanges {
+                to_device_events: vec![event],
+                changed_devices: &changed_devices,
+                one_time_keys_counts: &key_counts,
+                unused_fallback_keys: None,
+                next_batch_token: None,
+            },
+            &decryption_settings,
+        )
         .await
         .unwrap();
 
@@ -1085,10 +1405,20 @@ async fn test_room_key_over_megolm() {
 
     let event: EncryptedToDeviceEvent = serde_json::from_value(event).unwrap();
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     let decrypt_result = bob
         .store()
         .with_transaction(|mut tr| async {
-            let res = bob.decrypt_to_device_event(&mut tr, &event, &mut Changes::default()).await?;
+            let res = bob
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
+                .await?;
             Ok((tr, res))
         })
         .await;
@@ -1097,13 +1427,19 @@ async fn test_room_key_over_megolm() {
 
     let event: Raw<AnyToDeviceEvent> = json_convert(&event).unwrap();
 
-    bob.receive_sync_changes(EncryptionSyncChanges {
-        to_device_events: vec![event],
-        changed_devices: &changed_devices,
-        one_time_keys_counts: &key_counts,
-        unused_fallback_keys: None,
-        next_batch_token: None,
-    })
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+    bob.receive_sync_changes(
+        EncryptionSyncChanges {
+            to_device_events: vec![event],
+            changed_devices: &changed_devices,
+            one_time_keys_counts: &key_counts,
+            unused_fallback_keys: None,
+            next_batch_token: None,
+        },
+        &decryption_settings,
+    )
     .await
     .unwrap();
 
@@ -1384,12 +1720,20 @@ async fn test_unsigned_decryption() {
         to_device_requests_to_content(to_device_requests),
     );
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     // Save the first room key.
     let group_session = bob
         .store()
         .with_transaction(|mut tr| async {
             let res = bob
-                .decrypt_to_device_event(&mut tr, &first_room_key_event, &mut Changes::default())
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &first_room_key_event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
                 .await?;
             Ok((tr, res))
         })
@@ -1420,7 +1764,10 @@ async fn test_unsigned_decryption() {
         bob.decrypt_room_event(&raw_encrypted_event, room_id, &decryption_settings).await.unwrap();
 
     let decrypted_event = raw_decrypted_event.event.deserialize().unwrap();
-    assert_matches!(decrypted_event, AnyMessageLikeEvent::RoomMessage(first_message));
+    assert_matches!(
+        decrypted_event,
+        AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(first_message))
+    );
 
     let first_message = first_message.as_original().unwrap();
     assert_eq!(first_message.content.body(), first_message_text);
@@ -1441,8 +1788,8 @@ async fn test_unsigned_decryption() {
 
     // Encrypt a second message, an edit.
     let second_message_text = "This is the ~~original~~ edited message";
-    let second_message_content = RoomMessageEventContent::text_plain(second_message_text)
-        .make_replacement(first_message, None);
+    let second_message_content =
+        RoomMessageEventContent::text_plain(second_message_text).make_replacement(first_message);
     let second_message_encrypted_content =
         alice.encrypt_room_event(room_id, second_message_content).await.unwrap();
 
@@ -1469,7 +1816,10 @@ async fn test_unsigned_decryption() {
         bob.decrypt_room_event(&raw_encrypted_event, room_id, &decryption_settings).await.unwrap();
 
     let decrypted_event = raw_decrypted_event.event.deserialize().unwrap();
-    assert_matches!(decrypted_event, AnyMessageLikeEvent::RoomMessage(first_message));
+    assert_matches!(
+        decrypted_event,
+        AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(first_message))
+    );
 
     let first_message = first_message.as_original().unwrap();
     assert_eq!(first_message.content.body(), first_message_text);
@@ -1489,12 +1839,20 @@ async fn test_unsigned_decryption() {
         })
     );
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     // Give Bob the second room key.
     let group_session = bob
         .store()
         .with_transaction(|mut tr| async {
             let res = bob
-                .decrypt_to_device_event(&mut tr, &second_room_key_event, &mut Changes::default())
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &second_room_key_event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
                 .await?;
             Ok((tr, res))
         })
@@ -1510,7 +1868,10 @@ async fn test_unsigned_decryption() {
         bob.decrypt_room_event(&raw_encrypted_event, room_id, &decryption_settings).await.unwrap();
 
     let decrypted_event = raw_decrypted_event.event.deserialize().unwrap();
-    assert_matches!(decrypted_event, AnyMessageLikeEvent::RoomMessage(first_message));
+    assert_matches!(
+        decrypted_event,
+        AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(first_message))
+    );
 
     let first_message = first_message.as_original().unwrap();
     assert_eq!(first_message.content.body(), first_message_text);
@@ -1571,14 +1932,20 @@ async fn test_unsigned_decryption() {
         bob.decrypt_room_event(&raw_encrypted_event, room_id, &decryption_settings).await.unwrap();
 
     let decrypted_event = raw_decrypted_event.event.deserialize().unwrap();
-    assert_matches!(decrypted_event, AnyMessageLikeEvent::RoomMessage(first_message));
+    assert_matches!(
+        decrypted_event,
+        AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(first_message))
+    );
 
     let first_message = first_message.as_original().unwrap();
     assert_eq!(first_message.content.body(), first_message_text);
     assert!(first_message.unsigned.relations.replace.is_some());
     // Deserialization of the thread event succeeded, but it is still encrypted.
     let thread = first_message.unsigned.relations.thread.as_ref().unwrap();
-    assert_matches!(thread.latest_event.deserialize(), Ok(AnyMessageLikeEvent::RoomEncrypted(_)));
+    assert_matches!(
+        thread.latest_event.deserialize(),
+        Ok(AnySyncMessageLikeEvent::RoomEncrypted(_))
+    );
 
     let unsigned_encryption_info = raw_decrypted_event.unsigned_encryption_info.unwrap();
     assert_eq!(unsigned_encryption_info.len(), 2);
@@ -1595,12 +1962,20 @@ async fn test_unsigned_decryption() {
         })
     );
 
+    let decryption_settings =
+        DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
     // Give Bob the third room key.
     let group_session = bob
         .store()
         .with_transaction(|mut tr| async {
             let res = bob
-                .decrypt_to_device_event(&mut tr, &third_room_key_event, &mut Changes::default())
+                .decrypt_to_device_event(
+                    &mut tr,
+                    &third_room_key_event,
+                    &mut Changes::default(),
+                    &decryption_settings,
+                )
                 .await?;
             Ok((tr, res))
         })
@@ -1616,7 +1991,10 @@ async fn test_unsigned_decryption() {
         bob.decrypt_room_event(&raw_encrypted_event, room_id, &decryption_settings).await.unwrap();
 
     let decrypted_event = raw_decrypted_event.event.deserialize().unwrap();
-    assert_matches!(decrypted_event, AnyMessageLikeEvent::RoomMessage(first_message));
+    assert_matches!(
+        decrypted_event,
+        AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(first_message))
+    );
 
     let first_message = first_message.as_original().unwrap();
     assert_eq!(first_message.content.body(), first_message_text);
@@ -1624,7 +2002,7 @@ async fn test_unsigned_decryption() {
     let thread = &first_message.unsigned.relations.thread.as_ref().unwrap();
     assert_matches!(
         thread.latest_event.deserialize(),
-        Ok(AnyMessageLikeEvent::RoomMessage(third_message))
+        Ok(AnySyncMessageLikeEvent::RoomMessage(third_message))
     );
     let third_message = third_message.as_original().unwrap();
     assert_eq!(third_message.content.body(), third_message_text);

@@ -19,7 +19,6 @@ use std::{
 };
 
 use matrix_sdk_common::debug::DebugStructExt;
-use ruma::api::MatrixVersion;
 
 use crate::http_client::DEFAULT_REQUEST_TIMEOUT;
 
@@ -43,12 +42,12 @@ use crate::http_client::DEFAULT_REQUEST_TIMEOUT;
 /// ```
 #[derive(Copy, Clone)]
 pub struct RequestConfig {
-    pub(crate) timeout: Duration,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
     pub(crate) retry_limit: Option<usize>,
     pub(crate) max_retry_time: Option<Duration>,
     pub(crate) max_concurrent_requests: Option<NonZeroUsize>,
     pub(crate) force_auth: bool,
-    pub(crate) force_matrix_version: Option<MatrixVersion>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -56,19 +55,19 @@ impl Debug for RequestConfig {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             timeout,
+            read_timeout,
             retry_limit,
             max_retry_time: retry_timeout,
             force_auth,
             max_concurrent_requests,
-            force_matrix_version,
         } = self;
 
         let mut res = fmt.debug_struct("RequestConfig");
         res.field("timeout", timeout)
+            .maybe_field("read_timeout", read_timeout)
             .maybe_field("retry_limit", retry_limit)
             .maybe_field("max_retry_time", retry_timeout)
-            .maybe_field("max_concurrent_requests", max_concurrent_requests)
-            .maybe_field("force_matrix_version", force_matrix_version);
+            .maybe_field("max_concurrent_requests", max_concurrent_requests);
 
         if *force_auth {
             res.field("force_auth", &true);
@@ -81,12 +80,12 @@ impl Debug for RequestConfig {
 impl Default for RequestConfig {
     fn default() -> Self {
         Self {
-            timeout: DEFAULT_REQUEST_TIMEOUT,
+            timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            read_timeout: None,
             retry_limit: Default::default(),
             max_retry_time: Default::default(),
             max_concurrent_requests: Default::default(),
             force_auth: false,
-            force_matrix_version: Default::default(),
         }
     }
 }
@@ -132,8 +131,22 @@ impl RequestConfig {
 
     /// Set the timeout duration for all HTTP requests.
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.timeout = timeout.into();
+        self
+    }
+
+    /// Set the read timeout duration for all HTTP requests.
+    ///
+    /// The timeout applies to each read operation, and resets after a
+    /// successful read. This is more appropriate for detecting stalled
+    /// connections when the size isn’t known beforehand.
+    ///
+    /// **IMPORTANT**: note this value can only be applied when the HTTP client
+    /// is instantiated, it won't have any effect on a per-request basis.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.read_timeout = timeout.into();
         self
     }
 
@@ -155,17 +168,6 @@ impl RequestConfig {
         self.force_auth = true;
         self
     }
-
-    /// Force the Matrix version used to select which version of the endpoint to
-    /// use.
-    ///
-    /// Can be used to force the use of a stable endpoint when the versions
-    /// advertised by the homeserver do not support it.
-    #[must_use]
-    pub(crate) fn force_matrix_version(mut self, version: MatrixVersion) -> Self {
-        self.force_matrix_version = Some(version);
-        self
-    }
 }
 
 #[cfg(test)]
@@ -180,12 +182,14 @@ mod tests {
             .force_auth()
             .max_retry_time(Duration::from_secs(32))
             .retry_limit(4)
-            .timeout(Duration::from_secs(600));
+            .timeout(Duration::from_secs(600))
+            .read_timeout(Duration::from_secs(10));
 
         assert!(cfg.force_auth);
         assert_eq!(cfg.retry_limit, Some(4));
         assert_eq!(cfg.max_retry_time, Some(Duration::from_secs(32)));
-        assert_eq!(cfg.timeout, Duration::from_secs(600));
+        assert_eq!(cfg.timeout, Some(Duration::from_secs(600)));
+        assert_eq!(cfg.read_timeout, Some(Duration::from_secs(10)));
     }
 
     #[test]

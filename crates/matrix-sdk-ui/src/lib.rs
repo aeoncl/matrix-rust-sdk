@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use eyeball_im;
 use ruma::html::HtmlSanitizerMode;
@@ -21,6 +21,7 @@ use ruma::html::HtmlSanitizerMode;
 pub mod encryption_sync_service;
 pub mod notification_client;
 pub mod room_list_service;
+pub mod spaces;
 pub mod sync_service;
 pub mod timeline;
 pub mod unable_to_decrypt_hook;
@@ -31,7 +32,7 @@ pub use self::{room_list_service::RoomListService, timeline::Timeline};
 const DEFAULT_SANITIZER_MODE: HtmlSanitizerMode = HtmlSanitizerMode::Compat;
 
 #[cfg(test)]
-matrix_sdk_test::init_tracing_for_tests!();
+matrix_sdk_test_utils::init_tracing_for_tests!();
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();

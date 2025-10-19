@@ -12,38 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use matrix_sdk_common::deserialized_responses::TimelineEvent;
+use matrix_sdk_common::{deserialized_responses::TimelineEvent, timer};
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::SyncMessageLikeEvent;
 use ruma::{
-    events::{
-        room::power_levels::{
-            RoomPowerLevelsEvent, RoomPowerLevelsEventContent, StrippedRoomPowerLevelsEvent,
-        },
-        AnyStrippedStateEvent, AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent,
-        StateEventType,
-    },
+    MilliSecondsSinceUnixEpoch, UInt, UserId, assign,
+    events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent},
     push::{Action, PushConditionRoomCtx},
-    RoomVersionId, UInt, UserId,
 };
 use tracing::{instrument, trace, warn};
 
+use super::{Context, notification};
 #[cfg(feature = "e2e-encryption")]
 use super::{e2ee, verification};
-use super::{notification, Context};
-use crate::{
-    store::{BaseStateStore, StateStoreExt as _},
-    sync::Timeline,
-    Result, Room, RoomInfo,
-};
+use crate::{Result, Room, RoomInfo, sync::Timeline};
 
 /// Process a set of sync timeline event, and create a [`Timeline`].
 ///
 /// For each event:
 /// - will try to decrypt it,
+/// - will fix the `origin_server_ts` if considered invalid,
 /// - will process verification,
 /// - will process redaction,
 /// - will process notification.
+#[allow(clippy::extra_unused_lifetimes)]
 #[instrument(skip_all, fields(room_id = ?room_info.room_id))]
 pub async fn build<'notification, 'e2ee>(
     context: &mut Context,
@@ -53,15 +45,17 @@ pub async fn build<'notification, 'e2ee>(
     mut notification: notification::Notification<'notification>,
     #[cfg(feature = "e2e-encryption")] e2ee: e2ee::E2EE<'e2ee>,
 ) -> Result<Timeline> {
+    let _timer = timer!(tracing::Level::TRACE, "build a timeline from sync");
+
+    let now = MilliSecondsSinceUnixEpoch::now();
     let mut timeline = Timeline::new(timeline_inputs.limited, timeline_inputs.prev_batch);
-    let mut push_condition_room_ctx =
-        get_push_room_context(context, room, room_info, notification.state_store).await?;
+    let mut push_condition_room_ctx = get_push_room_context(context, room, room_info).await?;
     let room_id = room.room_id();
 
     for raw_event in timeline_inputs.raw_events {
         // Start by assuming we have a plaintext event. We'll replace it with a
         // decrypted or UTD event below if necessary.
-        let mut timeline_event = TimelineEvent::new(raw_event);
+        let mut timeline_event = TimelineEvent::from_plaintext_with_max_timestamp(raw_event, now);
 
         // Do some special stuff on the `timeline_event` before collecting it.
         match timeline_event.raw().deserialize() {
@@ -76,16 +70,18 @@ pub async fn build<'notification, 'e2ee>(
                     AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
                         redaction_event,
                     )) => {
-                        let room_version = room_info.room_version().unwrap_or(&RoomVersionId::V1);
+                        let redaction_rules = room_info.room_version_rules_or_default().redaction;
 
-                        if let Some(redacts) = redaction_event.redacts(room_version) {
-                            room_info
-                                .handle_redaction(redaction_event, timeline_event.raw().cast_ref());
+                        if let Some(redacts) = redaction_event.redacts(&redaction_rules) {
+                            room_info.handle_redaction(
+                                redaction_event,
+                                timeline_event.raw().cast_ref_unchecked(),
+                            );
 
                             context.state_changes.add_redaction(
                                 room_id,
                                 redacts,
-                                timeline_event.raw().clone().cast(),
+                                timeline_event.raw().clone().cast_unchecked(),
                             );
                         }
                     }
@@ -100,7 +96,7 @@ pub async fn build<'notification, 'e2ee>(
                                 if let Some(decrypted_timeline_event) =
                                     Box::pin(e2ee::decrypt::sync_timeline_event(
                                         e2ee.clone(),
-                                        timeline_event.raw(),
+                                        &timeline_event,
                                         room_id,
                                     ))
                                     .await?
@@ -134,19 +130,19 @@ pub async fn build<'notification, 'e2ee>(
                     )
                 } else {
                     push_condition_room_ctx =
-                        get_push_room_context(context, room, room_info, notification.state_store)
-                            .await?;
+                        get_push_room_context(context, room, room_info).await?;
                 }
 
                 if let Some(push_condition_room_ctx) = &push_condition_room_ctx {
-                    let actions = notification.push_notification_from_event_if(
-                        room_id,
-                        push_condition_room_ctx,
-                        timeline_event.raw(),
-                        Action::should_notify,
-                    );
+                    let actions = notification
+                        .push_notification_from_event_if(
+                            push_condition_room_ctx,
+                            timeline_event.raw(),
+                            Action::should_notify,
+                        )
+                        .await;
 
-                    timeline_event.push_actions = Some(actions.to_owned());
+                    timeline_event.set_push_actions(actions.to_owned());
                 }
             }
             Err(error) => {
@@ -197,7 +193,7 @@ pub mod builder {
 ///
 /// Updates the context data from `context.state_changes` or `room_info`.
 fn update_push_room_context(
-    context: &mut Context,
+    context: &Context,
     push_rules: &mut PushConditionRoomCtx,
     user_id: &UserId,
     room_info: &RoomInfo,
@@ -207,23 +203,13 @@ fn update_push_room_context(
     push_rules.member_count = UInt::new(room_info.active_members_count()).unwrap_or(UInt::MAX);
 
     // TODO: Use if let chain once stable
-    if let Some(AnySyncStateEvent::RoomMember(member)) =
-        context.state_changes.state.get(room_id).and_then(|events| {
-            events.get(&StateEventType::RoomMember)?.get(user_id.as_str())?.deserialize().ok()
-        })
-    {
-        push_rules.user_display_name = member
-            .as_original()
-            .and_then(|ev| ev.content.displayname.clone())
-            .unwrap_or_else(|| user_id.localpart().to_owned())
+    if let Some(member) = context.state_changes.member(room_id, user_id) {
+        push_rules.user_display_name =
+            member.content.displayname.unwrap_or_else(|| user_id.localpart().to_owned())
     }
 
-    if let Some(AnySyncStateEvent::RoomPowerLevels(event)) =
-        context.state_changes.state.get(room_id).and_then(|types| {
-            types.get(&StateEventType::RoomPowerLevels)?.get("")?.deserialize().ok()
-        })
-    {
-        push_rules.power_levels = Some(event.power_levels().into());
+    if let Some(power_levels) = context.state_changes.power_levels(room_id) {
+        push_rules.power_levels = Some(power_levels.into());
     }
 }
 
@@ -235,10 +221,9 @@ fn update_push_room_context(
 /// Returns `None` if some data couldn't be found. This should only happen
 /// in brand new rooms, while we process its state.
 pub async fn get_push_room_context(
-    context: &mut Context,
+    context: &Context,
     room: &Room,
     room_info: &RoomInfo,
-    state_store: &BaseStateStore,
 ) -> Result<Option<PushConditionRoomCtx>> {
     let room_id = room.room_id();
     let user_id = room.own_user_id();
@@ -246,19 +231,7 @@ pub async fn get_push_room_context(
     let member_count = room_info.active_members_count();
 
     // TODO: Use if let chain once stable
-    let user_display_name = if let Some(AnySyncStateEvent::RoomMember(member)) =
-        context.state_changes.state.get(room_id).and_then(|events| {
-            events.get(&StateEventType::RoomMember)?.get(user_id.as_str())?.deserialize().ok()
-        }) {
-        member
-            .as_original()
-            .and_then(|ev| ev.content.displayname.clone())
-            .unwrap_or_else(|| user_id.localpart().to_owned())
-    } else if let Some(AnyStrippedStateEvent::RoomMember(member)) =
-        context.state_changes.stripped_state.get(room_id).and_then(|events| {
-            events.get(&StateEventType::RoomMember)?.get(user_id.as_str())?.deserialize().ok()
-        })
-    {
+    let user_display_name = if let Some(member) = context.state_changes.member(room_id, user_id) {
         member.content.displayname.unwrap_or_else(|| user_id.localpart().to_owned())
     } else if let Some(member) = Box::pin(room.get_member(user_id)).await? {
         member.name().to_owned()
@@ -267,38 +240,19 @@ pub async fn get_push_room_context(
         return Ok(None);
     };
 
-    let power_levels = if let Some(event) =
-        context.state_changes.state.get(room_id).and_then(|types| {
-            types
-                .get(&StateEventType::RoomPowerLevels)?
-                .get("")?
-                .deserialize_as::<RoomPowerLevelsEvent>()
-                .ok()
-        }) {
-        Some(event.power_levels().into())
-    } else if let Some(event) =
-        context.state_changes.stripped_state.get(room_id).and_then(|types| {
-            types
-                .get(&StateEventType::RoomPowerLevels)?
-                .get("")?
-                .deserialize_as::<StrippedRoomPowerLevelsEvent>()
-                .ok()
-        })
-    {
-        Some(event.power_levels().into())
+    let power_levels = if let Some(power_levels) = context.state_changes.power_levels(room_id) {
+        Some(power_levels)
     } else {
-        state_store
-            .get_state_event_static::<RoomPowerLevelsEventContent>(room_id)
-            .await?
-            .and_then(|e| e.deserialize().ok())
-            .map(|event| event.power_levels().into())
+        room.power_levels().await.ok()
     };
 
-    Ok(Some(PushConditionRoomCtx {
-        user_id: user_id.to_owned(),
-        room_id: room_id.to_owned(),
-        member_count: UInt::new(member_count).unwrap_or(UInt::MAX),
-        user_display_name,
-        power_levels,
-    }))
+    Ok(Some(assign!(
+        PushConditionRoomCtx::new(
+            room_id.to_owned(),
+            UInt::new(member_count).unwrap_or(UInt::MAX),
+            user_id.to_owned(),
+            user_display_name
+        ),
+        { power_levels: power_levels.map(Into::into) }
+    )))
 }

@@ -1,20 +1,22 @@
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use matrix_sdk::{store::RoomLoadSettings, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::{
-    store::StoreConfig, BaseClient, RoomInfo, RoomState, SessionMeta, StateChanges, StateStore,
+    BaseClient, RoomInfo, RoomState, SessionMeta, StateChanges, StateStore, ThreadingSupport,
+    store::StoreConfig,
 };
 use matrix_sdk_sqlite::SqliteStateStore;
-use matrix_sdk_test::{event_factory::EventFactory, JoinedRoomBuilder, StateTestEvent};
+use matrix_sdk_test::{JoinedRoomBuilder, StateTestEvent, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{TimelineBuilder, TimelineFocus};
 use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
     api::client::membership::get_member_events,
     device_id,
     events::room::member::{MembershipState, RoomMemberEvent},
     mxc_uri, owned_room_id, owned_user_id,
     serde::Raw,
-    user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
+    user_id,
 };
 use serde_json::json;
 use tokio::runtime::Builder;
@@ -58,6 +60,7 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
     let base_client = BaseClient::new(
         StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
             .state_store(sqlite_store),
+        ThreadingSupport::Disabled,
     );
 
     runtime
@@ -82,7 +85,7 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
     group.throughput(Throughput::Elements(count as u64));
     group.sample_size(50);
 
-    group.bench_function(BenchmarkId::new("receive_members", name), |b| {
+    group.bench_function(BenchmarkId::new("Handle /members request [SQLite]", name), |b| {
         b.to_async(&runtime).iter(|| async {
             base_client.receive_all_members(&room_id, &request, &response).await.unwrap();
         });
@@ -162,11 +165,11 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
 
     let count = PINNED_EVENTS_COUNT;
     let name = format!("{count} pinned events");
-    let mut group = c.benchmark_group("Test");
+    let mut group = c.benchmark_group("Load pinned events");
     group.throughput(Throughput::Elements(count as u64));
     group.sample_size(10);
 
-    group.bench_function(BenchmarkId::new("load_pinned_events", name), |b| {
+    group.bench_function(BenchmarkId::new("Load pinned events [memory]", name), |b| {
         b.to_async(&runtime).iter(|| async {
             let pinned_event_ids = room.pinned_event_ids().unwrap_or_default();
             assert!(!pinned_event_ids.is_empty());
@@ -178,7 +181,7 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
                 .lock()
                 .await
                 .unwrap()
-                .clear_all_rooms_chunks()
+                .clear_all_linked_chunks()
                 .await
                 .unwrap();
 
@@ -205,24 +208,9 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-fn criterion() -> Criterion {
-    #[cfg(target_os = "linux")]
-    {
-        Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
-            100,
-            pprof::criterion::Output::Flamegraph(None),
-        ))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Criterion::default()
-    }
-}
-
 criterion_group! {
     name = room;
-    config = criterion();
+    config = Criterion::default();
     targets = receive_all_members_benchmark, load_pinned_events_benchmark,
 }
 criterion_main!(room);

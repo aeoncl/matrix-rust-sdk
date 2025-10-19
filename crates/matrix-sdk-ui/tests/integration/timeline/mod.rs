@@ -19,34 +19,38 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    linked_chunk::{ChunkIdentifier, Position, Update},
-    test_utils::mocks::MatrixMockServer,
+    linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
+    test_utils::mocks::{MatrixMockServer, RoomContextResponseTemplate},
 };
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, JoinedRoomBuilder, RoomAccountDataTestEvent,
-    StateTestEvent, ALICE, BOB,
+    ALICE, BOB, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent, async_test,
+    event_factory::EventFactory,
 };
 use matrix_sdk_ui::{
-    timeline::{
-        AnyOtherFullStateEventContent, Error, EventSendState, RedactError, RoomExt,
-        TimelineBuilder, TimelineEventItemId, TimelineItemContent, VirtualTimelineItem,
-    },
     Timeline,
+    timeline::{
+        AnyOtherFullStateEventContent, Error, EventSendState, MsgLikeKind, OtherMessageLike,
+        RedactError, RoomExt, TimelineBuilder, TimelineEventItemId, TimelineFocus,
+        TimelineItemContent, VirtualTimelineItem, default_event_filter,
+    },
 };
 use ruma::{
-    event_id,
-    events::room::{
-        encryption::RoomEncryptionEventContent,
-        message::{RedactedRoomMessageEventContent, RoomMessageEventContent},
+    EventId, MilliSecondsSinceUnixEpoch, event_id,
+    events::{
+        MessageLikeEventType, TimelineEventType,
+        room::{
+            encryption::RoomEncryptionEventContent,
+            message::{RedactedRoomMessageEventContent, RoomMessageEventContent},
+        },
     },
-    owned_event_id, room_id, user_id, EventId, MilliSecondsSinceUnixEpoch,
+    owned_event_id, room_id, user_id,
 };
 use serde_json::json;
 use sliding_sync::assert_timeline_stream;
 use stream_assert::assert_pending;
 use wiremock::{
-    matchers::{header, method, path_regex},
     Mock, ResponseTemplate,
+    matchers::{header, method, path_regex},
 };
 
 mod decryption;
@@ -60,11 +64,111 @@ mod profiles;
 mod queue;
 mod reactions;
 mod read_receipts;
+mod redecryption;
 mod replies;
 mod subscribe;
 mod thread;
 
 pub(crate) mod sliding_sync;
+
+#[async_test]
+async fn test_timeline_is_threaded() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    {
+        // A live timeline isn't threaded.
+        let timeline = room.timeline().await.unwrap();
+        assert!(timeline.is_threaded().not());
+    }
+
+    {
+        // A thread timeline is threaded.
+        let timeline = TimelineBuilder::new(&room)
+            .with_focus(TimelineFocus::Thread { root_event_id: owned_event_id!("$thread_root") })
+            .build()
+            .await
+            .unwrap();
+        assert!(timeline.is_threaded());
+    }
+
+    {
+        // An event-focused timeline, focused on a non-thread event, isn't threaded.
+        let f = EventFactory::new();
+        let event = f
+            .text_msg("hello world")
+            .event_id(event_id!("$target"))
+            .room(room_id)
+            .sender(&ALICE)
+            .into_event();
+        server
+            .mock_room_event_context()
+            .ok(RoomContextResponseTemplate::new(event))
+            .mock_once()
+            .mount()
+            .await;
+
+        let timeline = TimelineBuilder::new(&room)
+            .with_focus(TimelineFocus::Event {
+                target: owned_event_id!("$target"),
+                num_context_events: 0,
+                hide_threaded_events: true,
+            })
+            .build()
+            .await
+            .unwrap();
+        assert!(timeline.is_threaded().not());
+    }
+
+    {
+        // But an event-focused timeline, focused on an in-thread event, is threaded \o/
+        let f = EventFactory::new();
+        let thread_root = event_id!("$thread_root");
+        let event = f
+            .text_msg("hey to you too")
+            .event_id(event_id!("$target"))
+            .in_thread(thread_root, thread_root)
+            .room(room_id)
+            .sender(&ALICE)
+            .into_event();
+
+        server
+            .mock_room_event_context()
+            .ok(RoomContextResponseTemplate::new(event))
+            .mock_once()
+            .mount()
+            .await;
+
+        let timeline = TimelineBuilder::new(&room)
+            .with_focus(TimelineFocus::Event {
+                target: owned_event_id!("$target"),
+                num_context_events: 0,
+                hide_threaded_events: true,
+            })
+            .build()
+            .await
+            .unwrap();
+        assert!(timeline.is_threaded());
+    }
+
+    {
+        // A pinned events timeline isn't threaded.
+        let timeline = TimelineBuilder::new(&room)
+            .with_focus(TimelineFocus::PinnedEvents {
+                max_events_to_load: 0,
+                max_concurrent_requests: 10,
+            })
+            .build()
+            .await
+            .unwrap();
+        assert!(timeline.is_threaded().not());
+    }
+}
 
 #[async_test]
 async fn test_reaction() {
@@ -243,7 +347,7 @@ async fn test_redact_message() {
     assert_let!(VectorDiff::PushBack { value: second } = &timeline_updates[0]);
 
     let second = second.as_event().unwrap();
-    assert_matches!(second.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(second.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     assert_let!(Some(timeline_updates) = timeline_stream.next().await);
     assert_eq!(timeline_updates.len(), 1);
@@ -297,7 +401,7 @@ async fn test_redact_local_sent_message() {
     assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
     let event = item.as_event().unwrap();
     assert!(event.is_local_echo());
-    assert_matches!(event.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(event.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     // As well as a date divider.
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
@@ -724,7 +828,7 @@ async fn test_timeline_receives_a_limited_number_of_events_when_subscribing() {
         // The event cache contains 30 events.
         event_cache_store
             .handle_linked_chunk_updates(
-                room_id,
+                LinkedChunkId::Room(room_id),
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -781,6 +885,50 @@ async fn test_timeline_receives_a_limited_number_of_events_when_subscribing() {
         prepend "$ev5";
     };
     assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_custom_msglike_event_in_timeline() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room
+        .timeline_builder()
+        .event_filter(|event, room_version| {
+            event.event_type() == TimelineEventType::from("rs.matrix-sdk.custom.test")
+                || default_event_filter(event, room_version)
+        })
+        .build()
+        .await
+        .unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let event_id = event_id!("$eeG0HA0FAZ37wP8kXlNk123I");
+    let f = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.custom_message_like_event().event_id(event_id).sender(user_id!("@a:b.c")),
+            ),
+        )
+        .await;
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: first } = &timeline_updates[0]);
+    let event_type = MessageLikeEventType::from("rs.matrix-sdk.custom.test");
+    let other_msglike = OtherMessageLike::from_event_type(event_type);
+    assert_matches!(
+        first.as_event().unwrap().content().as_msglike().unwrap().kind.clone(),
+        MsgLikeKind::Other(observed_other) => {
+           assert_eq!(observed_other, other_msglike);
+       }
+    );
 }
 
 struct PinningTestSetup<'a> {

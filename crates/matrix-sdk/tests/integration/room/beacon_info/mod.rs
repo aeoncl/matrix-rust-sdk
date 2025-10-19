@@ -1,17 +1,16 @@
 use std::time::Duration;
 
 use js_int::uint;
-use matrix_sdk::config::SyncSettings;
-use matrix_sdk_test::{async_test, test_json, DEFAULT_TEST_ROOM_ID};
+use matrix_sdk::config::{SyncSettings, SyncToken};
+use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, async_test, test_json};
 use ruma::{
-    event_id,
-    events::{location::AssetType, AnySyncStateEvent, StateEventType},
-    MilliSecondsSinceUnixEpoch,
+    MilliSecondsSinceUnixEpoch, event_id,
+    events::{AnySyncStateEvent, StateEventType, location::AssetType},
 };
 use serde_json::json;
 use wiremock::{
-    matchers::{body_partial_json, header, method, path_regex},
     Mock, ResponseTemplate,
+    matchers::{body_partial_json, header, method, path_regex},
 };
 
 use crate::{logged_in_client_with_server, mock_sync};
@@ -35,7 +34,8 @@ async fn test_start_live_location_share_for_room() {
         .mount(&server)
         .await;
 
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(3000)).token(SyncToken::NoToken);
 
     mock_sync(&server, &*test_json::SYNC, None).await;
 
@@ -95,9 +95,8 @@ async fn test_start_live_location_share_for_room() {
     let raw_event = state_events.first().expect("There should be a beacon_info state event");
 
     let ev = raw_event.deserialize().expect("Failed to deserialize event");
-    let ev = match ev.as_sync() {
-        Some(AnySyncStateEvent::BeaconInfo(ev)) => ev,
-        _ => panic!("Expected a BeaconInfo event"),
+    let Some(AnySyncStateEvent::BeaconInfo(ev)) = ev.as_sync() else {
+        panic!("Expected a BeaconInfo event");
     };
 
     let content = ev.as_original().unwrap().content.clone();
@@ -135,7 +134,8 @@ async fn test_stop_sharing_live_location() {
         .mount(&server)
         .await;
 
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(3000)).token(SyncToken::NoToken);
 
     mock_sync(
         &server,
@@ -229,9 +229,8 @@ async fn test_stop_sharing_live_location() {
     let raw_event = state_events.first().expect("There should be a beacon_info state event");
 
     let ev = raw_event.deserialize().expect("Failed to deserialize event");
-    let ev = match ev.as_sync() {
-        Some(AnySyncStateEvent::BeaconInfo(ev)) => ev,
-        _ => panic!("Expected a BeaconInfo event"),
+    let Some(AnySyncStateEvent::BeaconInfo(ev)) = ev.as_sync() else {
+        panic!("Expected a BeaconInfo event");
     };
 
     let content = ev.as_original().unwrap().content.clone();

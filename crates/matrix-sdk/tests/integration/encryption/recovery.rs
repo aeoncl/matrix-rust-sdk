@@ -17,28 +17,28 @@ use std::sync::{Arc, Mutex};
 use assert_matches2::assert_let;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    Client,
     authentication::matrix::MatrixSession,
     config::RequestConfig,
     encryption::{
+        BackupDownloadStrategy, CrossSigningResetAuthType,
         backups::BackupState,
         recovery::{EnableProgress, RecoveryState},
-        BackupDownloadStrategy, CrossSigningResetAuthType,
     },
     test_utils::{
         client::mock_session_tokens, no_retry_test_client_with_server,
         test_client_builder_with_server,
     },
-    Client,
 };
 use matrix_sdk_base::SessionMeta;
 use matrix_sdk_test::async_test;
-use ruma::{api::client::uiaa, device_id, user_id, UserId};
+use ruma::{UserId, api::client::uiaa, device_id, user_id};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::spawn;
 use wiremock::{
-    matchers::{header, method, path, path_regex},
     Mock, ResponseTemplate,
+    matchers::{header, method, path, path_regex},
 };
 
 use crate::{encryption::mock_secret_store_with_backup_key, logged_in_client_with_server};
@@ -652,7 +652,7 @@ async fn test_recovery_disabling() {
         .await;
 
     Mock::given(method("PUT"))
-        .and(path(format!("_matrix/client/r0/user/{user_id}/account_data/m.megolm_backup.v1",)))
+        .and(path(format!("_matrix/client/r0/user/{user_id}/account_data/m.megolm_backup.v1")))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1..)

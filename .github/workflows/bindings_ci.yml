@@ -31,7 +31,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install protoc
         uses: taiki-e/install-action@v2
@@ -69,17 +69,17 @@ jobs:
 
     steps:
       - name: Checkout Rust SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout Kotlin Rust Components project
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: matrix-org/matrix-rust-components-kotlin
           path: rust-components-kotlin
           ref: main
 
       - name: Use JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin' # See 'Supported distributions' for available options
           java-version: '17'
@@ -136,7 +136,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # install protoc in case we end up rebuilding opentelemetry-proto
       - name: Install protoc
@@ -175,7 +175,7 @@ jobs:
         run: swift test
 
       - name: Build Framework
-        run: target/debug/xtask swift build-framework --target=aarch64-apple-ios --profile=reldbg
+        run: target/debug/xtask swift build-framework --target=aarch64-apple-ios --profile=dev --ios-deployment-target=18.0
 
   complement-crypto:
     name: "Run Complement Crypto tests"
@@ -191,7 +191,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # install protoc in case we end up rebuilding opentelemetry-proto
       - name: Install protoc

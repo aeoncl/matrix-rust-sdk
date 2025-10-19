@@ -34,7 +34,7 @@ use vodozemac::Curve25519PublicKey;
 use crate::{
     error::OlmResult,
     gossiping::GossipMachine,
-    store::{Changes, Result as StoreResult, Store},
+    store::{types::Changes, Result as StoreResult, Store},
     types::{
         events::EventType,
         requests::{OutgoingRequest, ToDeviceRequest},
@@ -414,7 +414,7 @@ impl SessionManager {
                     failed_devices_lock.entry(user_id.clone()).or_default().extend(device_set);
                 }
             }
-        };
+        }
     }
 
     /// Receive a successful key claim response and create new Olm sessions with
@@ -606,7 +606,10 @@ mod tests {
         identities::{DeviceData, IdentityManager},
         olm::{Account, PrivateCrossSigningIdentity},
         session_manager::GroupSessionCache,
-        store::{Changes, CryptoStoreWrapper, DeviceChanges, MemoryStore, PendingChanges, Store},
+        store::{
+            types::{Changes, DeviceChanges, PendingChanges},
+            CryptoStoreWrapper, MemoryStore, Store,
+        },
         verification::VerificationMachine,
     };
 

@@ -1,15 +1,22 @@
 use std::collections::BTreeSet;
 
-use matrix_sdk_base::{sync::SyncResponse, RequestedRequiredStates};
+use futures_util::future::try_join_all;
+use matrix_sdk_base::{
+    RequestedRequiredStates, ThreadSubscriptionCatchupToken, sync::SyncResponse, timer,
+};
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use ruma::{
-    api::client::{discovery::get_supported_versions, sync::sync_events::v5 as http},
-    events::AnyToDeviceEvent,
-    serde::Raw,
+    OwnedRoomId,
+    api::{
+        FeatureFlag, SupportedVersions,
+        client::sync::sync_events::v5::{self as http, response},
+    },
+    events::GlobalAccountDataEventType,
 };
 use tracing::error;
 
 use super::{SlidingSync, SlidingSyncBuilder};
-use crate::{Client, Result};
+use crate::{Client, Result, sync::subscribe_to_room_latest_events};
 
 /// A sliding sync version.
 #[derive(Clone, Debug)]
@@ -43,7 +50,10 @@ pub enum VersionBuilderError {
 
     /// `/versions` does not contain `org.matrix.simplified_msc3575` in its
     /// `unstable_features`, or it's not set to true.
-    #[error("`/versions` does not contain `org.matrix.simplified_msc3575` in its `unstable_features`, or it's not set to true.")]
+    #[error(
+        "`/versions` does not contain `org.matrix.simplified_msc3575` in its `unstable_features`, \
+         or it's not set to true."
+    )]
     NativeVersionIsUnset,
 }
 
@@ -73,7 +83,7 @@ impl VersionBuilder {
     /// invalid data.
     pub fn build(
         self,
-        versions: Option<&get_supported_versions::Response>,
+        supported: Option<&SupportedVersions>,
     ) -> Result<Version, VersionBuilderError> {
         Ok(match self {
             Self::None => Version::None,
@@ -81,13 +91,14 @@ impl VersionBuilder {
             Self::Native => Version::Native,
 
             Self::DiscoverNative => {
-                let Some(versions) = versions else {
+                let Some(supported) = supported else {
                     return Err(VersionBuilderError::MissingVersionsResponse);
                 };
 
-                match versions.unstable_features.get("org.matrix.simplified_msc3575") {
-                    Some(value) if *value => Version::Native,
-                    _ => return Err(VersionBuilderError::NativeVersionIsUnset),
+                if supported.features.contains(&FeatureFlag::Msc4186) {
+                    Version::Native
+                } else {
+                    return Err(VersionBuilderError::NativeVersionIsUnset);
                 }
             }
         })
@@ -103,12 +114,7 @@ impl Client {
     /// If `.well-known` or `/versions` is unreachable, it will simply move
     /// potential sliding sync versions aside. No error will be reported.
     pub async fn available_sliding_sync_versions(&self) -> Vec<Version> {
-        let supported_versions = self.unstable_features().await.ok().map(|unstable_features| {
-            let mut response = get_supported_versions::Response::new(vec![]);
-            response.unstable_features = unstable_features;
-
-            response
-        });
+        let supported_versions = self.supported_versions().await.ok();
 
         [VersionBuilder::DiscoverNative]
             .into_iter()
@@ -154,7 +160,7 @@ impl Client {
 #[must_use]
 pub(crate) struct SlidingSyncResponseProcessor {
     client: Client,
-    to_device_events: Vec<Raw<AnyToDeviceEvent>>,
+    to_device_events: Vec<ProcessedToDeviceEvent>,
     response: Option<SyncResponse>,
 }
 
@@ -164,10 +170,7 @@ impl SlidingSyncResponseProcessor {
     }
 
     #[cfg(feature = "e2e-encryption")]
-    pub async fn handle_encryption(
-        &mut self,
-        extensions: &http::response::Extensions,
-    ) -> Result<()> {
+    pub async fn handle_encryption(&mut self, extensions: &response::Extensions) -> Result<()> {
         // This is an internal API misuse if this is triggered (calling
         // `handle_room_response` before this function), so panic is fine.
         assert!(self.response.is_none());
@@ -194,23 +197,45 @@ impl SlidingSyncResponseProcessor {
         response: &http::Response,
         requested_required_states: &RequestedRequiredStates,
     ) -> Result<()> {
+        subscribe_to_room_latest_events(&self.client, response.rooms.keys()).await;
+
+        let previously_joined_rooms = self
+            .client
+            .joined_rooms()
+            .into_iter()
+            .map(|r| r.room_id().to_owned())
+            .collect::<BTreeSet<_>>();
+
         let mut sync_response = self
             .client
             .base_client()
             .process_sliding_sync(response, requested_required_states)
             .await?;
+
         handle_receipts_extension(&self.client, response, &mut sync_response).await?;
 
+        update_in_memory_caches(&self.client, &previously_joined_rooms, &sync_response).await;
+
         self.response = Some(sync_response);
-        self.post_process().await
+
+        Ok(())
     }
 
-    async fn post_process(&mut self) -> Result<()> {
-        // This is an internal API misuse if this is triggered (calling
-        // `handle_room_response` after this function), so panic is fine.
-        let response = self.response.as_ref().unwrap();
+    pub async fn handle_thread_subscriptions(
+        &mut self,
+        previous_pos: Option<&str>,
+        thread_subs: response::ThreadSubscriptions,
+    ) -> Result<()> {
+        let catchup_token =
+            thread_subs.prev_batch.map(|prev_batch| ThreadSubscriptionCatchupToken {
+                from: prev_batch,
+                to: previous_pos.map(|s| s.to_owned()),
+            });
 
-        update_in_memory_caches(&self.client, response).await?;
+        self.client
+            .thread_subscription_catchup()
+            .sync_subscriptions(thread_subs.subscribed, thread_subs.unsubscribed, catchup_token)
+            .await?;
 
         Ok(())
     }
@@ -229,17 +254,64 @@ impl SlidingSyncResponseProcessor {
 /// Update the caches for the rooms that received updates.
 ///
 /// This will only fill the in-memory caches, not save the info on disk.
-async fn update_in_memory_caches(client: &Client, response: &SyncResponse) -> Result<()> {
-    for room_id in response.rooms.joined.keys() {
-        let Some(room) = client.get_room(room_id) else {
-            error!(room_id = ?room_id, "Cannot post process a room in sliding sync because it is missing");
-            continue;
-        };
+async fn update_in_memory_caches(
+    client: &Client,
+    previously_joined_rooms: &BTreeSet<OwnedRoomId>,
+    response: &SyncResponse,
+) {
+    let _timer = timer!(tracing::Level::TRACE, "update_in_memory_caches");
 
-        room.user_defined_notification_mode().await;
+    // If the push rules have changed, update the cached notification mode for *all*
+    // the joined rooms.
+    if response.account_data.iter().any(|event| {
+        event
+            .get_field::<GlobalAccountDataEventType>("type")
+            .ok()
+            .flatten()
+            .is_some_and(|event_type| event_type == GlobalAccountDataEventType::PushRules)
+    }) {
+        let notification_settings = client.notification_settings().await;
+        let rules = notification_settings.rules().await;
+
+        // Update all joined rooms.
+        for room in client.joined_rooms() {
+            if let Some(mode) = rules.get_user_defined_room_notification_mode(room.room_id()) {
+                room.update_cached_user_defined_notification_mode(mode);
+            } else {
+                room.clear_user_defined_notification_mode();
+            }
+        }
+    } else {
+        // Otherwise, precompute the cached user-defined notification mode only for the
+        // newly joined rooms.
+
+        // We'll compute the rules only once, lazily, if needs be.
+        let mut rules = None;
+
+        for room_id in response
+            .rooms
+            .joined
+            .keys()
+            .filter(|room_id| !previously_joined_rooms.contains(*room_id))
+        {
+            let Some(room) = client.get_room(room_id) else {
+                error!(?room_id, "The room must exist since it has been joined");
+                continue;
+            };
+
+            // Reuse the previous `Rules` instance, or compute it once and for all.
+            let rules = if let Some(rules) = &mut rules {
+                rules
+            } else {
+                rules.insert(client.notification_settings().await.rules().await.clone())
+            };
+
+            // Define an initial value for the cached user-defined notification mode.
+            if let Some(mode) = rules.get_user_defined_room_notification_mode(room.room_id()) {
+                room.update_cached_user_defined_notification_mode(mode);
+            }
+        }
     }
-
-    Ok(())
 }
 
 /// Update the receipts extension and compute the read receipt accordingly.
@@ -248,6 +320,8 @@ async fn handle_receipts_extension(
     response: &http::Response,
     sync_response: &mut SyncResponse,
 ) -> Result<()> {
+    let _timer = timer!(tracing::Level::TRACE, "handle_receipts_extension");
+
     // We need to compute read receipts for each joined room that has received an
     // update, or from each room that has received a receipt ephemeral event.
     let room_ids = BTreeSet::from_iter(
@@ -259,55 +333,77 @@ async fn handle_receipts_extension(
             .chain(response.extensions.receipts.rooms.keys().cloned()),
     );
 
-    for room_id in room_ids {
-        let Ok((room_event_cache, _drop_handle)) = client.event_cache().for_room(&room_id).await
-        else {
-            tracing::info!(
-                ?room_id,
-                "Failed to fetch the `RoomEventCache` when computing unread counts"
-            );
+    // Process each room concurrently.
+    let futures = room_ids.into_iter().map(|room_id| {
+        let new_sync_events = sync_response
+            .rooms
+            .joined
+            .entry(room_id.to_owned())
+            .or_default()
+            .timeline
+            .events
+            .clone();
 
-            continue;
-        };
+        async {
+            let Ok((room_event_cache, _drop_handle)) =
+                client.event_cache().for_room(&room_id).await
+            else {
+                tracing::info!(
+                    ?room_id,
+                    "Failed to fetch the `RoomEventCache` when computing unread counts"
+                );
+                return Ok::<_, crate::Error>(None);
+            };
 
-        let previous_events = room_event_cache.events().await;
+            let previous_events = room_event_cache.events().await;
 
-        client
-            .base_client()
-            .process_sliding_sync_receipts_extension_for_room(
-                &room_id,
-                response,
-                sync_response,
-                previous_events,
-            )
-            .await?;
+            let receipt_event = client
+                .base_client()
+                .process_sliding_sync_receipts_extension_for_room(
+                    &room_id,
+                    response,
+                    new_sync_events,
+                    previous_events,
+                )
+                .await?;
+
+            Ok(Some((room_id, receipt_event)))
+        }
+    });
+
+    let updates = try_join_all(futures).await?;
+
+    for (room_id, receipt_event_content) in updates.into_iter().flatten() {
+        if let Some(event) = receipt_event_content {
+            sync_response.rooms.joined.entry(room_id).or_default().ephemeral.push(event.cast());
+        }
     }
+
     Ok(())
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, ops::Not};
 
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
-        notification_settings::RoomNotificationMode, RequestedRequiredStates,
-        RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
+        RequestedRequiredStates, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
+        notification_settings::RoomNotificationMode,
     };
     use matrix_sdk_test::async_test;
-    use ruma::{assign, events::AnySyncTimelineEvent, room_id, serde::Raw};
-    use serde_json::json;
-    use wiremock::{
-        matchers::{method, path},
-        Mock, ResponseTemplate,
+    use ruma::{
+        api::client::discovery::get_supported_versions, assign, events::AnySyncTimelineEvent,
+        room_id, serde::Raw,
     };
+    use serde_json::json;
 
-    use super::{get_supported_versions, Version, VersionBuilder};
+    use super::{Version, VersionBuilder};
     use crate::{
-        error::Result,
-        sliding_sync::{client::SlidingSyncResponseProcessor, http, VersionBuilderError},
-        test_utils::{logged_in_client, logged_in_client_with_server},
         SlidingSyncList, SlidingSyncMode,
+        error::Result,
+        sliding_sync::{VersionBuilderError, client::SlidingSyncResponseProcessor, http},
+        test_utils::{client::MockClientBuilder, mocks::MatrixMockServer},
     };
 
     #[test]
@@ -325,7 +421,10 @@ mod tests {
         let mut response = get_supported_versions::Response::new(vec![]);
         response.unstable_features = [("org.matrix.simplified_msc3575".to_owned(), true)].into();
 
-        assert_matches!(VersionBuilder::DiscoverNative.build(Some(&response)), Ok(Version::Native));
+        assert_matches!(
+            VersionBuilder::DiscoverNative.build(Some(&response.as_supported_versions())),
+            Ok(Version::Native)
+        );
     }
 
     #[test]
@@ -342,14 +441,14 @@ mod tests {
         response.unstable_features = [("org.matrix.simplified_msc3575".to_owned(), false)].into();
 
         assert_matches!(
-            VersionBuilder::DiscoverNative.build(Some(&response)),
+            VersionBuilder::DiscoverNative.build(Some(&response.as_supported_versions())),
             Err(VersionBuilderError::NativeVersionIsUnset)
         );
     }
 
     #[async_test]
     async fn test_available_sliding_sync_versions_none() {
-        let (client, _server) = logged_in_client_with_server().await;
+        let client = MockClientBuilder::new(None).build().await;
         let available_versions = client.available_sliding_sync_versions().await;
 
         // `.well-known` and `/versions` aren't available. It's impossible to find any
@@ -359,18 +458,10 @@ mod tests {
 
     #[async_test]
     async fn test_available_sliding_sync_versions_native() {
-        let (client, server) = logged_in_client_with_server().await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "versions": [],
-                "unstable_features": {
-                    "org.matrix.simplified_msc3575": true,
-                },
-            })))
-            .mount(&server)
-            .await;
+        server.mock_versions().ok_with_unstable_features().mock_once().mount().await;
 
         let available_versions = client.available_sliding_sync_versions().await;
 
@@ -381,7 +472,7 @@ mod tests {
 
     #[async_test]
     async fn test_cache_user_defined_notification_mode() -> Result<()> {
-        let (client, _server) = logged_in_client_with_server().await;
+        let client = MockClientBuilder::new(None).build().await;
         let room_id = room_id!("!r0:matrix.org");
 
         let sliding_sync = client
@@ -500,6 +591,106 @@ mod tests {
             Some(RoomNotificationMode::MentionsAndKeywordsOnly),
         );
 
+        // Mock a sync response.
+        // Even if the room doesn't appear in the response, its notification mode will
+        // be updated immediately if a new `m.push_rules` is received.
+        {
+            let server_response = assign!(http::Response::new("0".to_owned()), {
+                extensions: assign!(http::response::Extensions::default(), {
+                    account_data: assign!(http::response::AccountData::default(), {
+                        global: vec![
+                            Raw::from_json_string(
+                                json!({
+                                    "type": "m.push_rules",
+                                    "content": {
+                                        "global": {
+                                            "room": [
+                                                {
+                                                    "actions": ["notify"],
+                                                    "rule_id": room_id,
+                                                    "default": false,
+                                                    "enabled": true,
+                                                },
+                                            ],
+                                        },
+                                    },
+                                })
+                                .to_string(),
+                            ).unwrap()
+                        ]
+                    })
+                })
+            });
+
+            let mut pos_guard = sliding_sync.inner.position.clone().lock_owned().await;
+            sliding_sync
+                .handle_response(
+                    server_response.clone(),
+                    &mut pos_guard,
+                    RequestedRequiredStates::default(),
+                )
+                .await?;
+        }
+
+        // The room notification mode has been updated again!
+        assert_eq!(
+            room.cached_user_defined_notification_mode(),
+            Some(RoomNotificationMode::AllMessages),
+        );
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_auto_listen_to_latest_events() -> Result<()> {
+        let client = MockClientBuilder::new(None).build().await;
+        let room_id = room_id!("!r0");
+
+        // Create the room beforehand.
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+
+        // Enable the event cache (required for the latest events).
+        client.event_cache().subscribe()?;
+
+        // The latest event “listener” for this room has NOT been enabled.
+        assert!(client.latest_events().await.is_listening_to_room(room_id).await.not());
+
+        // Create the sliding sync client.
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .add_list(
+                SlidingSyncList::builder("all")
+                    .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+            )
+            .build()
+            .await?;
+
+        // Receive a (mocked) response.
+        {
+            let server_response = assign!(http::Response::new("0".to_owned()), {
+                rooms: BTreeMap::from([(
+                    room_id.to_owned(),
+                    http::response::Room::default(),
+                )]),
+            });
+
+            let mut pos_guard = sliding_sync.inner.position.clone().lock_owned().await;
+
+            sliding_sync
+                .handle_response(
+                    server_response.clone(),
+                    &mut pos_guard,
+                    RequestedRequiredStates::default(),
+                )
+                .await?;
+        }
+
+        // The room still exists.
+        assert!(client.get_room(room_id).is_some());
+
+        // The latest event “listener” for this room has been enabled.
+        assert!(client.latest_events().await.is_listening_to_room(room_id).await);
+
         Ok(())
     }
 
@@ -507,8 +698,8 @@ mod tests {
     async fn test_read_receipt_can_trigger_a_notable_update_reason() {
         use ruma::api::client::sync::sync_events::v5 as http;
 
-        // Given a logged-in client
-        let client = logged_in_client(None).await;
+        // Given a logged-in client.
+        let client = MockClientBuilder::new(None).build().await;
         client.event_cache().subscribe().unwrap();
 
         let mut room_info_notable_update_stream = client.room_info_notable_update_receiver();

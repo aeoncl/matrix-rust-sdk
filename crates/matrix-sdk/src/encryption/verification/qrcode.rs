@@ -14,8 +14,8 @@
 
 use futures_core::Stream;
 use matrix_sdk_base::crypto::{
-    matrix_sdk_qrcode::{qrcode::QrCode, EncodingError},
     CancelInfo, DeviceData, QrVerification as BaseQrVerification, QrVerificationState,
+    matrix_sdk_qrcode::{EncodingError, qrcode::QrCode},
 };
 use ruma::{RoomId, UserId};
 
@@ -207,7 +207,7 @@ impl QrVerification {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn changes(&self) -> impl Stream<Item = QrVerificationState> {
+    pub fn changes(&self) -> impl Stream<Item = QrVerificationState> + use<> {
         self.inner.changes()
     }
 

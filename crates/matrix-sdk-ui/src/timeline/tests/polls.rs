@@ -1,23 +1,16 @@
 use assert_matches2::assert_let;
 use fakes::poll_a2;
-use matrix_sdk_test::{async_test, ALICE, BOB};
+use matrix_sdk_test::{ALICE, BOB, async_test};
 use ruma::{
-    event_id,
-    events::{
-        poll::{
-            unstable_end::UnstablePollEndEventContent,
-            unstable_response::UnstablePollResponseEventContent,
-            unstable_start::{
-                NewUnstablePollStartEventContent, ReplacementUnstablePollStartEventContent,
-                UnstablePollStartContentBlock,
-            },
-        },
-        AnyMessageLikeEventContent,
+    EventId, OwnedEventId, UserId, event_id,
+    events::poll::unstable_start::{
+        NewUnstablePollStartEventContent, ReplacementUnstablePollStartEventContent,
+        UnstablePollStartContentBlock, UnstablePollStartEventContent,
     },
-    server_name, EventId, OwnedEventId, UserId,
+    server_name,
 };
 
-use crate::timeline::{event_item::PollState, tests::TestTimeline, EventTimelineItem};
+use crate::timeline::{EventTimelineItem, event_item::PollState, tests::TestTimeline};
 
 #[async_test]
 async fn test_poll_is_displayed() {
@@ -26,7 +19,7 @@ async fn test_poll_is_displayed() {
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_state = timeline.poll_state().await;
 
-    assert_poll_start_eq(&poll_state.start_event_content.poll_start, &fakes::poll_a());
+    assert_poll_start_eq(&poll_state.poll_start, &fakes::poll_a());
     assert!(poll_state.response_data.is_empty());
 }
 
@@ -41,8 +34,8 @@ async fn test_edited_poll_is_displayed() {
     let poll_state = event.content().as_poll().unwrap();
     let edited_poll_state = timeline.poll_state().await;
 
-    assert_poll_start_eq(&poll_state.start_event_content.poll_start, &fakes::poll_a());
-    assert_poll_start_eq(&edited_poll_state.start_event_content.poll_start, &fakes::poll_b());
+    assert_poll_start_eq(&poll_state.poll_start, &fakes::poll_a());
+    assert_poll_start_eq(&edited_poll_state.poll_start, &fakes::poll_b());
     assert!(!poll_state.has_been_edited);
     assert!(edited_poll_state.has_been_edited);
 }
@@ -268,27 +261,17 @@ impl TestTimeline {
     }
 
     async fn send_poll_start(&self, sender: &UserId, content: UnstablePollStartContentBlock) {
-        let event_content = AnyMessageLikeEventContent::UnstablePollStart(
-            NewUnstablePollStartEventContent::new(content).into(),
-        );
+        let event_content =
+            UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(content));
         self.handle_live_event(self.factory.event(event_content).sender(sender)).await;
     }
 
     async fn send_poll_response(&self, sender: &UserId, answers: Vec<&str>, poll_id: &EventId) {
-        let event_content = AnyMessageLikeEventContent::UnstablePollResponse(
-            UnstablePollResponseEventContent::new(
-                answers.into_iter().map(|i| i.to_owned()).collect(),
-                poll_id.to_owned(),
-            ),
-        );
-        self.handle_live_event(self.factory.event(event_content).sender(sender)).await
+        self.handle_live_event(self.factory.poll_response(answers, poll_id).sender(sender)).await
     }
 
     async fn send_poll_end(&self, sender: &UserId, text: &str, poll_id: &EventId) {
-        let event_content = AnyMessageLikeEventContent::UnstablePollEnd(
-            UnstablePollEndEventContent::new(text, poll_id.to_owned()),
-        );
-        self.handle_live_event(self.factory.event(event_content).sender(sender)).await
+        self.handle_live_event(self.factory.poll_end(text, poll_id).sender(sender)).await
     }
 
     async fn send_poll_edit(
@@ -297,9 +280,9 @@ impl TestTimeline {
         original_id: &EventId,
         content: UnstablePollStartContentBlock,
     ) {
-        let content =
-            ReplacementUnstablePollStartEventContent::new(content, original_id.to_owned());
-        let event_content = AnyMessageLikeEventContent::UnstablePollStart(content.into());
+        let event_content = UnstablePollStartEventContent::from(
+            ReplacementUnstablePollStartEventContent::new(content, original_id.to_owned()),
+        );
         self.handle_live_event(self.factory.event(event_content).sender(sender)).await
     }
 }

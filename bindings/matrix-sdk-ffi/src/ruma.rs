@@ -23,7 +23,6 @@ use matrix_sdk::attachment::{BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVid
 use ruma::{
     assign,
     events::{
-        call::notify::NotifyType as RumaNotifyType,
         direct::DirectEventContent,
         fully_read::FullyReadEventContent,
         identity_server::IdentityServerEventContent,
@@ -57,6 +56,7 @@ use ruma::{
             ImageInfo as RumaImageInfo, MediaSource as RumaMediaSource,
             ThumbnailInfo as RumaThumbnailInfo,
         },
+        rtc::notification::NotificationType as RumaNotificationType,
         secret_storage::{
             default_key::SecretStorageDefaultKeyEventContent,
             key::{
@@ -487,25 +487,25 @@ impl TryFrom<RumaMessageType> for MessageType {
 }
 
 #[derive(Clone, uniffi::Enum)]
-pub enum NotifyType {
+pub enum RtcNotificationType {
     Ring,
-    Notify,
+    Notification,
 }
 
-impl From<RumaNotifyType> for NotifyType {
-    fn from(val: RumaNotifyType) -> Self {
+impl From<RumaNotificationType> for RtcNotificationType {
+    fn from(val: RumaNotificationType) -> Self {
         match val {
-            RumaNotifyType::Ring => Self::Ring,
-            _ => Self::Notify,
+            RumaNotificationType::Ring => Self::Ring,
+            _ => Self::Notification,
         }
     }
 }
 
-impl From<NotifyType> for RumaNotifyType {
-    fn from(value: NotifyType) -> Self {
+impl From<RtcNotificationType> for RumaNotificationType {
+    fn from(value: RtcNotificationType) -> Self {
         match value {
-            NotifyType::Ring => RumaNotifyType::Ring,
-            NotifyType::Notify => RumaNotifyType::Notify,
+            RtcNotificationType::Ring => RumaNotificationType::Ring,
+            RtcNotificationType::Notification => RumaNotificationType::Notification,
         }
     }
 }
@@ -736,7 +736,7 @@ impl TryFrom<&AudioInfo> for BaseAudioInfo {
         let size = UInt::try_from(value.size.ok_or(MediaInfoError::MissingField)?)
             .map_err(|_| MediaInfoError::InvalidField)?;
 
-        Ok(BaseAudioInfo { duration: Some(duration), size: Some(size) })
+        Ok(BaseAudioInfo { duration: Some(duration), size: Some(size), waveform: None })
     }
 }
 
@@ -1486,17 +1486,17 @@ impl From<RumaSecretStorageV1AesHmacSha2Properties> for SecretStorageV1AesHmacSh
 #[derive(Clone, uniffi::Record, Default)]
 pub struct MediaPreviewConfig {
     /// The media previews setting for the user.
-    pub media_previews: MediaPreviews,
+    pub media_previews: Option<MediaPreviews>,
 
     /// The invite avatars setting for the user.
-    pub invite_avatars: InviteAvatars,
+    pub invite_avatars: Option<InviteAvatars>,
 }
 
 impl From<MediaPreviewConfigEventContent> for MediaPreviewConfig {
     fn from(value: MediaPreviewConfigEventContent) -> Self {
         Self {
-            media_previews: value.media_previews.into(),
-            invite_avatars: value.invite_avatars.into(),
+            media_previews: value.media_previews.map(Into::into),
+            invite_avatars: value.invite_avatars.map(Into::into),
         }
     }
 }

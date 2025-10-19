@@ -16,9 +16,10 @@ use matrix_sdk_crypto::{
     },
     decrypt_room_key_export, encrypt_room_key_export,
     olm::ExportedRoomKey,
-    store::{BackupDecryptionKey, Changes},
+    store::types::{BackupDecryptionKey, Changes},
     types::requests::ToDeviceRequest,
-    DecryptionSettings, LocalTrust, OlmMachine as InnerMachine, UserIdentity as SdkUserIdentity,
+    CollectStrategy, DecryptionSettings, LocalTrust, OlmMachine as InnerMachine,
+    UserIdentity as SdkUserIdentity,
 };
 use ruma::{
     api::{
@@ -38,7 +39,7 @@ use ruma::{
     },
     events::{
         key::verification::VerificationMethod, room::message::MessageType, AnyMessageLikeEvent,
-        AnySyncMessageLikeEvent, MessageLikeEvent,
+        AnySyncMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent,
     },
     serde::Raw,
     to_device::DeviceIdOrAllDevices,
@@ -96,8 +97,8 @@ pub struct RoomKeyInfo {
     pub session_id: String,
 }
 
-impl From<matrix_sdk_crypto::store::RoomKeyInfo> for RoomKeyInfo {
-    fn from(value: matrix_sdk_crypto::store::RoomKeyInfo) -> Self {
+impl From<matrix_sdk_crypto::store::types::RoomKeyInfo> for RoomKeyInfo {
+    fn from(value: matrix_sdk_crypto::store::types::RoomKeyInfo) -> Self {
         Self {
             algorithm: value.algorithm.to_string(),
             room_id: value.room_id.to_string(),
@@ -526,6 +527,7 @@ impl OlmMachine {
         key_counts: HashMap<String, i32>,
         unused_fallback_keys: Option<Vec<String>>,
         next_batch_token: String,
+        decryption_settings: &DecryptionSettings,
     ) -> Result<SyncChangesResult, CryptoStoreError> {
         let to_device: ToDevice = serde_json::from_str(&events)?;
         let device_changes: RumaDeviceLists = device_changes.into();
@@ -544,15 +546,17 @@ impl OlmMachine {
         let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> =
             unused_fallback_keys.map(|u| u.into_iter().map(OneTimeKeyAlgorithm::from).collect());
 
-        let (to_device_events, room_key_infos) = self.runtime.block_on(
-            self.inner.receive_sync_changes(matrix_sdk_crypto::EncryptionSyncChanges {
-                to_device_events: to_device.events,
-                changed_devices: &device_changes,
-                one_time_keys_counts: &key_counts,
-                unused_fallback_keys: unused_fallback_keys.as_deref(),
-                next_batch_token: Some(next_batch_token),
-            }),
-        )?;
+        let (to_device_events, room_key_infos) =
+            self.runtime.block_on(self.inner.receive_sync_changes(
+                matrix_sdk_crypto::EncryptionSyncChanges {
+                    to_device_events: to_device.events,
+                    changed_devices: &device_changes,
+                    one_time_keys_counts: &key_counts,
+                    unused_fallback_keys: unused_fallback_keys.as_deref(),
+                    next_batch_token: Some(next_batch_token),
+                },
+                decryption_settings,
+            ))?;
 
         let to_device_events = to_device_events
             .into_iter()
@@ -829,6 +833,7 @@ impl OlmMachine {
         device_id: String,
         event_type: String,
         content: String,
+        share_strategy: CollectStrategy,
     ) -> Result<Option<Request>, CryptoStoreError> {
         let user_id = parse_user_id(&user_id)?;
         let device_id = device_id.as_str().into();
@@ -837,8 +842,11 @@ impl OlmMachine {
         let device = self.runtime.block_on(self.inner.get_device(&user_id, device_id, None))?;
 
         if let Some(device) = device {
-            let encrypted_content =
-                self.runtime.block_on(device.encrypt_event_raw(&event_type, &content))?;
+            let encrypted_content = self.runtime.block_on(device.encrypt_event_raw(
+                &event_type,
+                &content,
+                share_strategy,
+            ))?;
 
             let request = ToDeviceRequest::new(
                 user_id.as_ref(),
@@ -861,9 +869,18 @@ impl OlmMachine {
     ///
     /// * `room_id` - The unique id of the room where the event was sent to.
     ///
+    /// * `handle_verification_events` - if the supplied event is a verification
+    ///   event, use it to update the verification state. **Note**: it is
+    ///   recommended to avoid setting this flag to true and use the explicit
+    ///   [`OlmMachine::receive_verification_event`] method instead:
+    ///   verification events sometimes need preparation before we can handle
+    ///   them: see the documentation for
+    ///   [`OlmMachine::receive_verification_event`].
+    ///
     /// * `strict_shields` - If `true`, messages will be decorated with strict
     ///   warnings (use `false` to match legacy behaviour where unsafe keys have
     ///   lower severity warnings and unverified identities are not decorated).
+    ///
     /// * `decryption_settings` - The setting for decrypting messages.
     pub fn decrypt_room_event(
         &self,
@@ -894,7 +911,7 @@ impl OlmMachine {
         ))?;
 
         if handle_verification_events {
-            if let Ok(e) = decrypted.event.deserialize() {
+            if let Ok(AnyTimelineEvent::MessageLike(e)) = decrypted.event.deserialize() {
                 match &e {
                     AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(
                         original_event,
@@ -1092,6 +1109,14 @@ impl OlmMachine {
     ///
     /// This method can be used to pass verification events that are happening
     /// in rooms to the `OlmMachine`. The event should be in the decrypted form.
+    ///
+    /// **Note**: If the supplied event is an `m.room.message` event with
+    /// `msgtype: m.key.verification.request`, then the device information for
+    /// the sending user must be up-to-date before calling this method
+    /// (otherwise, the request will be ignored). It is hard to guarantee this
+    /// is the case, but you can maximize your chances by explicitly making a
+    /// request to /keys/query for the user's device info, and processing the
+    /// response with [`OlmMachine::mark_request_as_sent`].
     pub fn receive_verification_event(
         &self,
         event: String,

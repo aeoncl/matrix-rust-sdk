@@ -63,15 +63,16 @@
 use std::string::FromUtf8Error;
 
 use matrix_sdk_base::crypto::{
-    secret_storage::{DecodeError, MacError, SecretStorageKey},
     CryptoStoreError, SecretImportError,
+    secret_storage::{DecodeError, MacError, SecretStorageKey},
 };
 use ruma::{
     events::{
+        EventContentFromType, GlobalAccountDataEventType,
+        secret::request::SecretName,
         secret_storage::{
             default_key::SecretStorageDefaultKeyEventContent, key::SecretStorageKeyEventContent,
         },
-        EventContentFromType, GlobalAccountDataEventType,
     },
     serde::Raw,
 };
@@ -89,6 +90,34 @@ pub use secret_store::SecretStore;
 
 /// Convenicence type alias for the secret-storage specific results.
 pub type Result<T, E = SecretStorageError> = std::result::Result<T, E>;
+
+/// Error type for errors when importing a secret from secret storage.
+#[derive(Debug, Error)]
+pub enum ImportError {
+    /// A typical SDK error.
+    #[error(transparent)]
+    Sdk(#[from] crate::Error),
+
+    /// Error when deserializing account data events.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    /// The key that we tried to import was invalid.
+    #[error(transparent)]
+    Key(vodozemac::KeyError),
+
+    /// The public key of the imported private key doesn't match the public
+    /// key that was uploaded to the server.
+    #[error(
+        "The public key of the imported private key doesn't match the public\
+            key that was uploaded to the server"
+    )]
+    MismatchedPublicKeys,
+
+    /// Error describing a decryption failure of a secret.
+    #[error(transparent)]
+    Decryption(#[from] DecryptionError),
+}
 
 /// Error type for the secret-storage subsystem.
 #[derive(Debug, Error)]
@@ -120,10 +149,15 @@ pub enum SecretStorageError {
         key_id: Option<String>,
     },
 
-    /// A secret could not have been imported from the secret store into the
-    /// local store.
-    #[error(transparent)]
-    SecretImportError(#[from] SecretImportError),
+    /// An error when importing from the secret store into the local store.
+    #[error("Error while importing {name}: {error}")]
+    ImportError {
+        /// The name of the secret that was being imported when the error
+        /// occurred.
+        name: SecretName,
+        /// The error that occurred.
+        error: ImportError,
+    },
 
     /// A general storage error.
     #[error(transparent)]
@@ -137,6 +171,33 @@ pub enum SecretStorageError {
     /// Error describing a decryption failure of a secret.
     #[error(transparent)]
     Decryption(#[from] DecryptionError),
+}
+
+impl SecretStorageError {
+    /// Create a `SecretStorageError::ImportError` from a secret name and any
+    /// error that can be converted directly into an `ImportError`
+    fn into_import_error(secret_name: SecretName, error: impl Into<ImportError>) -> Self {
+        SecretStorageError::ImportError { name: secret_name, error: error.into() }
+    }
+
+    /// Create a `SecretStorageError` from a `SecretImportError`
+    ///
+    /// `SecretImportError::Key` and `SecretImportError::MismatchedPublicKeys`
+    /// become `SecretStorageError::ImportError`s, whereas
+    /// `SecretImportError::Store` becomes `SecretStorageError::Storage` since
+    /// the error is with the crypto storage rather than in importing the
+    /// secret.
+    fn from_secret_import_error(error: SecretImportError) -> Self {
+        match error {
+            SecretImportError::Key { name, error } => {
+                SecretStorageError::ImportError { name, error: ImportError::Key(error) }
+            }
+            SecretImportError::MismatchedPublicKeys { name } => {
+                SecretStorageError::ImportError { name, error: ImportError::MismatchedPublicKeys }
+            }
+            SecretImportError::Store(error) => SecretStorageError::Storage(error),
+        }
+    }
 }
 
 /// Error type describing decryption failures of the secret-storage system.
@@ -153,7 +214,8 @@ pub enum DecryptionError {
 
 /// A high-level API to manage secret storage.
 ///
-/// To get this, use [`Client::encryption()::secret_storage()`].
+/// To get this, use
+/// [`client.encryption().secret_storage()`](super::Encryption::secret_storage).
 #[derive(Debug)]
 pub struct SecretStorage {
     pub(super) client: Client,
@@ -192,8 +254,7 @@ impl SecretStorage {
         let maybe_default_key_id = self.fetch_default_key_id().await?;
 
         if let Some(default_key_id) = maybe_default_key_id {
-            let default_key_id =
-                default_key_id.deserialize_as::<SecretStorageDefaultKeyEventContent>()?;
+            let default_key_id = default_key_id.deserialize()?;
 
             let event_type =
                 GlobalAccountDataEventType::SecretStorageKey(default_key_id.key_id.to_owned());
@@ -273,7 +334,7 @@ impl SecretStorage {
         if let Some(content) = self.fetch_default_key_id().await? {
             // Since we can't delete account data events, we're going to treat
             // deserialization failures as secret storage being disabled.
-            Ok(content.deserialize_as::<SecretStorageDefaultKeyEventContent>().is_ok())
+            Ok(content.deserialize().is_ok())
         } else {
             // No account data event found, must be disabled.
             Ok(false)
@@ -284,12 +345,9 @@ impl SecretStorage {
     pub async fn fetch_default_key_id(
         &self,
     ) -> crate::Result<Option<Raw<SecretStorageDefaultKeyEventContent>>> {
-        let maybe_default_key_id = self
-            .client
+        self.client
             .account()
-            .fetch_account_data(GlobalAccountDataEventType::SecretStorageDefaultKey)
-            .await?;
-
-        Ok(maybe_default_key_id.map(|event| event.cast()))
+            .fetch_account_data_static::<SecretStorageDefaultKeyEventContent>()
+            .await
     }
 }

@@ -16,18 +16,18 @@ use std::sync::Arc;
 
 use as_variant::as_variant;
 use matrix_sdk::crypto::types::events::UtdCause;
-use matrix_sdk_base::latest_event::{is_suitable_for_latest_event, PossibleLatestEvent};
+use matrix_sdk_base::latest_event::{PossibleLatestEvent, is_suitable_for_latest_event};
 use ruma::{
+    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
     events::{
-        call::{invite::SyncCallInviteEvent, notify::SyncCallNotifyEvent},
+        AnyFullStateEventContent, AnySyncTimelineEvent, FullStateEventContent, Mentions,
+        MessageLikeEventType, StateEventType,
+        call::invite::SyncCallInviteEvent,
         policy::rule::{
             room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
             user::PolicyRuleUserEventContent,
         },
-        poll::unstable_start::{
-            NewUnstablePollStartEventContent, SyncUnstablePollStartEvent,
-            UnstablePollStartEventContent,
-        },
+        poll::unstable_start::{SyncUnstablePollStartEvent, UnstablePollStartEventContent},
         room::{
             aliases::RoomAliasesEventContent,
             avatar::RoomAvatarEventContent,
@@ -48,18 +48,18 @@ use ruma::{
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
         },
+        rtc::notification::SyncRtcNotificationEvent,
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         sticker::{StickerEventContent, SyncStickerEvent},
-        AnyFullStateEventContent, AnySyncTimelineEvent, FullStateEventContent, Mentions,
-        MessageLikeEventType, StateEventType,
     },
     html::RemoveReplyFallback,
-    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, RoomVersionId, UserId,
+    room_version_rules::RedactionRules,
 };
 use tracing::warn;
 
 mod message;
 mod msg_like;
+pub(super) mod other;
 pub(crate) mod pinned_events;
 mod polls;
 mod reply;
@@ -72,6 +72,7 @@ pub(in crate::timeline) use self::message::{
 pub use self::{
     message::Message,
     msg_like::{MsgLikeContent, MsgLikeKind, ThreadSummary},
+    other::OtherMessageLike,
     polls::{PollResult, PollState},
     reply::{EmbeddedEvent, InReplyToDetails},
 };
@@ -115,8 +116,8 @@ pub enum TimelineItemContent {
     /// An `m.call.invite` event
     CallInvite,
 
-    /// An `m.call.notify` event
-    CallNotify,
+    /// An `m.rtc.notification` event
+    RtcNotification,
 }
 
 impl TimelineItemContent {
@@ -140,8 +141,8 @@ impl TimelineItemContent {
             PossibleLatestEvent::YesCallInvite(call_invite) => {
                 Some(Self::from_suitable_latest_call_invite_content(call_invite))
             }
-            PossibleLatestEvent::YesCallNotify(call_notify) => {
-                Some(Self::from_suitable_latest_call_notify_content(call_notify))
+            PossibleLatestEvent::YesRtcNotification(rtc_notification) => {
+                Some(Self::from_suitable_latest_rtc_notification_content(rtc_notification))
             }
             PossibleLatestEvent::NoUnsupportedEventType => {
                 // TODO: when we support state events in message previews, this will need change
@@ -290,9 +291,7 @@ impl TimelineItemContent {
                 }
             });
 
-        let mut poll = PollState::new(NewUnstablePollStartEventContent::new(
-            event.content.poll_start().clone(),
-        ));
+        let mut poll = PollState::new(event.content.poll_start().clone(), None);
         if let Some(edit) = edit {
             poll = poll.edit(edit).expect("the poll can't be ended yet!"); // TODO or can it?
         }
@@ -325,12 +324,12 @@ impl TimelineItemContent {
         }
     }
 
-    fn from_suitable_latest_call_notify_content(
-        event: &SyncCallNotifyEvent,
+    fn from_suitable_latest_rtc_notification_content(
+        event: &SyncRtcNotificationEvent,
     ) -> TimelineItemContent {
         match event {
-            SyncCallNotifyEvent::Original(_) => TimelineItemContent::CallNotify,
-            SyncCallNotifyEvent::Redacted(_) => {
+            SyncRtcNotificationEvent::Original(_) => TimelineItemContent::RtcNotification,
+            SyncRtcNotificationEvent::Redacted(_) => {
                 TimelineItemContent::MsgLike(MsgLikeContent::redacted())
             }
         }
@@ -445,7 +444,7 @@ impl TimelineItemContent {
             TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. } => "an event that couldn't be parsed",
             TimelineItemContent::CallInvite => "a call invite",
-            TimelineItemContent::CallNotify => "a call notification",
+            TimelineItemContent::RtcNotification => "a call notification",
         }
     }
 
@@ -514,14 +513,14 @@ impl TimelineItemContent {
         }
     }
 
-    pub(in crate::timeline) fn redact(&self, room_version: &RoomVersionId) -> Self {
+    pub(in crate::timeline) fn redact(&self, rules: &RedactionRules) -> Self {
         match self {
-            Self::MsgLike(_) | Self::CallInvite | Self::CallNotify => {
+            Self::MsgLike(_) | Self::CallInvite | Self::RtcNotification => {
                 TimelineItemContent::MsgLike(MsgLikeContent::redacted())
             }
-            Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(room_version)),
+            Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(rules)),
             Self::ProfileChange(ev) => Self::ProfileChange(ev.redact()),
-            Self::OtherState(ev) => Self::OtherState(ev.redact(room_version)),
+            Self::OtherState(ev) => Self::OtherState(ev.redact(rules)),
             Self::FailedToParseMessageLike { .. } | Self::FailedToParseState { .. } => self.clone(),
         }
     }
@@ -548,7 +547,7 @@ impl TimelineItemContent {
             | TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. }
             | TimelineItemContent::CallInvite
-            | TimelineItemContent::CallNotify => {
+            | TimelineItemContent::RtcNotification => {
                 // No reactions for these kind of items.
                 None
             }
@@ -573,7 +572,7 @@ impl TimelineItemContent {
             | TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. }
             | TimelineItemContent::CallInvite
-            | TimelineItemContent::CallNotify => {
+            | TimelineItemContent::RtcNotification => {
                 // No reactions for these kind of items.
                 None
             }
@@ -601,14 +600,14 @@ pub enum EncryptedMessage {
     /// Metadata about an event using the `m.megolm.v1.aes-sha2` algorithm.
     MegolmV1AesSha2 {
         /// The Curve25519 key of the sender.
-        #[deprecated = "this field still needs to be sent but should not be used when received"]
+        #[deprecated = "this field should still be sent but should not be used when received"]
         #[doc(hidden)] // Included for Debug formatting only
-        sender_key: String,
+        sender_key: Option<String>,
 
         /// The ID of the sending device.
-        #[deprecated = "this field still needs to be sent but should not be used when received"]
+        #[deprecated = "this field should still be sent but should not be used when received"]
         #[doc(hidden)] // Included for Debug formatting only
-        device_id: OwnedDeviceId,
+        device_id: Option<OwnedDeviceId>,
 
         /// The ID of the session used to encrypt the message.
         session_id: String,
@@ -723,10 +722,10 @@ impl RoomMembershipChange {
         self.change
     }
 
-    fn redact(&self, room_version: &RoomVersionId) -> Self {
+    fn redact(&self, rules: &RedactionRules) -> Self {
         Self {
             user_id: self.user_id.clone(),
-            content: FullStateEventContent::Redacted(self.content.clone().redact(room_version)),
+            content: FullStateEventContent::Redacted(self.content.clone().redact(rules)),
             change: self.change,
         }
     }
@@ -957,67 +956,67 @@ impl AnyOtherFullStateEventContent {
         }
     }
 
-    fn redact(&self, room_version: &RoomVersionId) -> Self {
+    fn redact(&self, rules: &RedactionRules) -> Self {
         match self {
-            Self::PolicyRuleRoom(c) => Self::PolicyRuleRoom(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
-            Self::PolicyRuleServer(c) => Self::PolicyRuleServer(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
-            Self::PolicyRuleUser(c) => Self::PolicyRuleUser(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
+            Self::PolicyRuleRoom(c) => {
+                Self::PolicyRuleRoom(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
+            Self::PolicyRuleServer(c) => {
+                Self::PolicyRuleServer(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
+            Self::PolicyRuleUser(c) => {
+                Self::PolicyRuleUser(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
             Self::RoomAliases(c) => {
-                Self::RoomAliases(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomAliases(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
             Self::RoomAvatar(c) => {
-                Self::RoomAvatar(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomAvatar(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
-            Self::RoomCanonicalAlias(c) => Self::RoomCanonicalAlias(
-                FullStateEventContent::Redacted(c.clone().redact(room_version)),
-            ),
+            Self::RoomCanonicalAlias(c) => {
+                Self::RoomCanonicalAlias(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
             Self::RoomCreate(c) => {
-                Self::RoomCreate(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomCreate(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
-            Self::RoomEncryption(c) => Self::RoomEncryption(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
-            Self::RoomGuestAccess(c) => Self::RoomGuestAccess(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
+            Self::RoomEncryption(c) => {
+                Self::RoomEncryption(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomGuestAccess(c) => {
+                Self::RoomGuestAccess(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
             Self::RoomHistoryVisibility(c) => Self::RoomHistoryVisibility(
-                FullStateEventContent::Redacted(c.clone().redact(room_version)),
+                FullStateEventContent::Redacted(c.clone().redact(rules)),
             ),
             Self::RoomJoinRules(c) => {
-                Self::RoomJoinRules(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomJoinRules(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
             Self::RoomName(c) => {
-                Self::RoomName(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomName(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
-            Self::RoomPinnedEvents(c) => Self::RoomPinnedEvents(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
-            Self::RoomPowerLevels(c) => Self::RoomPowerLevels(FullStateEventContent::Redacted(
-                c.clone().redact(room_version),
-            )),
+            Self::RoomPinnedEvents(c) => {
+                Self::RoomPinnedEvents(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomPowerLevels(c) => {
+                Self::RoomPowerLevels(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
             Self::RoomServerAcl(c) => {
-                Self::RoomServerAcl(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomServerAcl(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
-            Self::RoomThirdPartyInvite(c) => Self::RoomThirdPartyInvite(
-                FullStateEventContent::Redacted(c.clone().redact(room_version)),
-            ),
+            Self::RoomThirdPartyInvite(c) => {
+                Self::RoomThirdPartyInvite(FullStateEventContent::Redacted(c.clone().redact(rules)))
+            }
             Self::RoomTombstone(c) => {
-                Self::RoomTombstone(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomTombstone(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
             Self::RoomTopic(c) => {
-                Self::RoomTopic(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::RoomTopic(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
             Self::SpaceChild(c) => {
-                Self::SpaceChild(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::SpaceChild(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
             Self::SpaceParent(c) => {
-                Self::SpaceParent(FullStateEventContent::Redacted(c.clone().redact(room_version)))
+                Self::SpaceParent(FullStateEventContent::Redacted(c.clone().redact(rules)))
             }
             Self::_Custom { event_type } => Self::_Custom { event_type: event_type.clone() },
         }
@@ -1042,8 +1041,8 @@ impl OtherState {
         &self.content
     }
 
-    fn redact(&self, room_version: &RoomVersionId) -> Self {
-        Self { state_key: self.state_key.clone(), content: self.content.redact(room_version) }
+    fn redact(&self, rules: &RedactionRules) -> Self {
+        Self { state_key: self.state_key.clone(), content: self.content.redact(rules) }
     }
 }
 
@@ -1054,10 +1053,10 @@ mod tests {
     use ruma::{
         assign,
         events::{
-            room::member::{MembershipState, RoomMemberEventContent},
             FullStateEventContent,
+            room::member::{MembershipState, RoomMemberEventContent},
         },
-        RoomVersionId,
+        room_version_rules::RedactionRules,
     };
 
     use super::{MembershipChange, RoomMembershipChange, TimelineItemContent};
@@ -1075,7 +1074,7 @@ mod tests {
             change: Some(MembershipChange::Banned),
         });
 
-        let redacted = content.redact(&RoomVersionId::V11);
+        let redacted = content.redact(&RedactionRules::V11);
         assert_let!(TimelineItemContent::MembershipChange(inner) = redacted);
         assert_eq!(inner.change, Some(MembershipChange::Banned));
         assert_let!(FullStateEventContent::Redacted(inner_content_redacted) = inner.content);

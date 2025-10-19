@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The event cache stores holds events and downloaded media when the cache was
+//! The event cache stores holds events when the cache was
 //! activated to save bandwidth at the cost of increased storage space usage.
 //!
 //! Implementing the `EventCacheStore` trait, you can plug any storage backend
@@ -24,33 +24,28 @@ use std::{fmt, ops::Deref, str::Utf8Error, sync::Arc};
 #[cfg(any(test, feature = "testing"))]
 #[macro_use]
 pub mod integration_tests;
-pub mod media;
 mod memory_store;
 mod traits;
 
-use matrix_sdk_common::store_locks::{
-    BackingStore, CrossProcessStoreLock, CrossProcessStoreLockGuard, LockStoreError,
+use matrix_sdk_common::cross_process_lock::{
+    CrossProcessLock, CrossProcessLockError, CrossProcessLockGuard, TryLock,
 };
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
-use ruma::{
-    events::{relation::RelationType, AnySyncTimelineEvent},
-    serde::Raw,
-    OwnedEventId,
-};
+use ruma::{OwnedEventId, events::AnySyncTimelineEvent, serde::Raw};
 use tracing::trace;
 
 #[cfg(any(test, feature = "testing"))]
 pub use self::integration_tests::EventCacheStoreIntegrationTests;
 pub use self::{
     memory_store::MemoryStore,
-    traits::{DynEventCacheStore, EventCacheStore, IntoEventCacheStore, DEFAULT_CHUNK_CAPACITY},
+    traits::{DEFAULT_CHUNK_CAPACITY, DynEventCacheStore, EventCacheStore, IntoEventCacheStore},
 };
 
 /// The high-level public type to represent an `EventCacheStore` lock.
 #[derive(Clone)]
 pub struct EventCacheStoreLock {
     /// The inner cross process lock that is used to lock the `EventCacheStore`.
-    cross_process_lock: Arc<CrossProcessStoreLock<LockableEventCacheStore>>,
+    cross_process_lock: Arc<CrossProcessLock<LockableEventCacheStore>>,
 
     /// The store itself.
     ///
@@ -69,7 +64,7 @@ impl EventCacheStoreLock {
     /// Create a new lock around the [`EventCacheStore`].
     ///
     /// The `holder` argument represents the holder inside the
-    /// [`CrossProcessStoreLock::new`].
+    /// [`CrossProcessLock::new`].
     pub fn new<S>(store: S, holder: String) -> Self
     where
         S: IntoEventCacheStore,
@@ -77,7 +72,7 @@ impl EventCacheStoreLock {
         let store = store.into_event_cache_store();
 
         Self {
-            cross_process_lock: Arc::new(CrossProcessStoreLock::new(
+            cross_process_lock: Arc::new(CrossProcessLock::new(
                 LockableEventCacheStore(store.clone()),
                 "default".to_owned(),
                 holder,
@@ -86,8 +81,8 @@ impl EventCacheStoreLock {
         }
     }
 
-    /// Acquire a spin lock (see [`CrossProcessStoreLock::spin_lock`]).
-    pub async fn lock(&self) -> Result<EventCacheStoreLockGuard<'_>, LockStoreError> {
+    /// Acquire a spin lock (see [`CrossProcessLock::spin_lock`]).
+    pub async fn lock(&self) -> Result<EventCacheStoreLockGuard<'_>, CrossProcessLockError> {
         let cross_process_lock_guard = self.cross_process_lock.spin_lock(None).await?;
 
         Ok(EventCacheStoreLockGuard { cross_process_lock_guard, store: self.store.deref() })
@@ -100,7 +95,7 @@ impl EventCacheStoreLock {
 pub struct EventCacheStoreLockGuard<'a> {
     /// The cross process lock guard.
     #[allow(unused)]
-    cross_process_lock_guard: CrossProcessStoreLockGuard,
+    cross_process_lock_guard: CrossProcessLockGuard,
 
     /// A reference to the store.
     store: &'a DynEventCacheStore,
@@ -126,13 +121,7 @@ impl Deref for EventCacheStoreLockGuard<'_> {
 pub enum EventCacheStoreError {
     /// An error happened in the underlying database backend.
     #[error(transparent)]
-    #[cfg(not(target_family = "wasm"))]
     Backend(Box<dyn std::error::Error + Send + Sync>),
-
-    /// An error happened in the underlying database backend.
-    #[error(transparent)]
-    #[cfg(target_family = "wasm")]
-    Backend(Box<dyn std::error::Error>),
 
     /// The store is locked with a passphrase and an incorrect passphrase
     /// was given.
@@ -175,22 +164,9 @@ impl EventCacheStoreError {
     ///
     /// Shorthand for `EventCacheStoreError::Backend(Box::new(error))`.
     #[inline]
-    #[cfg(not(target_family = "wasm"))]
     pub fn backend<E>(error: E) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,
-    {
-        Self::Backend(Box::new(error))
-    }
-
-    /// Create a new [`Backend`][Self::Backend] error.
-    ///
-    /// Shorthand for `EventCacheStoreError::Backend(Box::new(error))`.
-    #[inline]
-    #[cfg(target_family = "wasm")]
-    pub fn backend<E>(error: E) -> Self
-    where
-        E: std::error::Error + 'static,
     {
         Self::Backend(Box::new(error))
     }
@@ -199,12 +175,12 @@ impl EventCacheStoreError {
 /// An `EventCacheStore` specific result type.
 pub type Result<T, E = EventCacheStoreError> = std::result::Result<T, E>;
 
-/// A type that wraps the [`EventCacheStore`] but implements [`BackingStore`] to
+/// A type that wraps the [`EventCacheStore`] but implements [`TryLock`] to
 /// make it usable inside the cross process lock.
 #[derive(Clone, Debug)]
 struct LockableEventCacheStore(Arc<DynEventCacheStore>);
 
-impl BackingStore for LockableEventCacheStore {
+impl TryLock for LockableEventCacheStore {
     type LockError = EventCacheStoreError;
 
     async fn try_lock(
@@ -244,23 +220,4 @@ pub fn extract_event_relation(event: &Raw<AnySyncTimelineEvent>) -> Option<(Owne
             None
         }
     }
-}
-
-/// Compute the list of string filters to be applied when looking for an event's
-/// relations.
-// TODO: get Ruma fix from https://github.com/ruma/ruma/pull/2052, and get rid of this function
-// then.
-pub fn compute_filters_string(filters: Option<&[RelationType]>) -> Option<Vec<String>> {
-    filters.map(|filter| {
-        filter
-            .iter()
-            .map(|f| {
-                if *f == RelationType::Replacement {
-                    "m.replace".to_owned()
-                } else {
-                    f.to_string()
-                }
-            })
-            .collect()
-    })
 }

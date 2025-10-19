@@ -1,28 +1,28 @@
-use std::ops::Not;
+use std::{collections::BTreeMap, ops::Not, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
-use futures_util::{pin_mut, FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, pin_mut};
 use matrix_sdk::{
+    Client, RoomDisplayName,
     config::RequestConfig,
     test_utils::{
         logged_in_client_with_server,
         mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
         set_client_session, test_client_builder,
     },
-    Client, RoomDisplayName,
 };
 use matrix_sdk_base::sync::UnreadNotificationsCount;
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, mocks::mock_encryption_state, ALICE,
+    ALICE, async_test, event_factory::EventFactory, mocks::mock_encryption_state,
 };
 use matrix_sdk_ui::{
+    RoomListService,
     room_list_service::{
+        ALL_ROOMS_LIST_NAME as ALL_ROOMS, Error, RoomListLoadingState, State, SyncIndicator,
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
-        Error, RoomListLoadingState, State, SyncIndicator, ALL_ROOMS_LIST_NAME as ALL_ROOMS,
     },
     timeline::{RoomExt as _, TimelineItemKind, VirtualTimelineItem},
-    RoomListService,
 };
 use ruma::{
     api::client::room::create_room::v3::Request as CreateRoomRequest,
@@ -34,10 +34,10 @@ use ruma::{
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
 use tempfile::TempDir;
-use tokio::{spawn, sync::mpsc::channel, task::yield_now, time::sleep};
+use tokio::{spawn, sync::Barrier, task::yield_now, time::sleep};
 use wiremock::{
-    matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
@@ -360,6 +360,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                         ["org.matrix.msc3401.call.member", "*"],
@@ -368,10 +369,10 @@ async fn test_sync_all_states() -> Result<(), Error> {
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
                     ],
-                    "filters": {
-                        "not_room_types": ["m.space"],
-                    },
+                    "filters": {},
                     "timeline_limit": 1,
                 },
             },
@@ -1292,19 +1293,21 @@ async fn test_loading_states() -> Result<(), Error> {
             RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
         );
 
+        // The sync skips the `Init` state, and immediately starts in the `SettingUp`
+        // state, as the sync `pos`ition marker was set.
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = Init => SettingUp,
+            states = SettingUp => Running,
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
-                        "ranges": [[0, 19]],
+                        "ranges": [[0, 11]],
                         "timeline_limit": 1,
                     },
                 },
             },
             respond with = {
-                "pos": "0",
+                "pos": "3",
                 "lists": {
                     ALL_ROOMS: {
                         "count": 13, // 1 more room
@@ -1732,7 +1735,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
     assert_entries_batch! {
         [dynamic_entries_stream]
         pop back;
-        insert [ 0 ] [ "!r0:bar.org" ];
+        push front [ "!r0:bar.org" ];
         end;
     };
     assert_pending!(dynamic_entries_stream);
@@ -1903,7 +1906,7 @@ async fn test_room_sorting() -> Result<(), Error> {
     assert_entries_batch! {
         [stream]
         remove [ 3 ];
-        insert [ 0 ] [ "!r0:bar.org" ];
+        push front [ "!r0:bar.org" ];
         end;
     };
 
@@ -1937,7 +1940,7 @@ async fn test_room_sorting() -> Result<(), Error> {
     assert_entries_batch! {
         [stream]
         remove [ 4 ];
-        insert [ 0 ] [ "!r2:bar.org" ];
+        push front [ "!r2:bar.org" ];
         end;
     };
 
@@ -2003,7 +2006,7 @@ async fn test_room_sorting() -> Result<(), Error> {
     assert_entries_batch! {
         [stream]
         remove [ 5 ];
-        insert [ 0 ] [ "!r3:bar.org" ];
+        push front [ "!r3:bar.org" ];
         end;
     };
 
@@ -2244,7 +2247,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe.
 
-    room_list.subscribe_to_rooms(&[room_id_1]);
+    room_list.subscribe_to_rooms(&[room_id_1]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2263,6 +2266,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                         ["org.matrix.msc3401.call.member", "*"],
@@ -2271,6 +2275,8 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
                         ["m.room.pinned_events", ""],
                     ],
                     "timeline_limit": 20,
@@ -2286,7 +2292,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe to another room.
 
-    room_list.subscribe_to_rooms(&[room_id_2]);
+    room_list.subscribe_to_rooms(&[room_id_2]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2305,6 +2311,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                         ["org.matrix.msc3401.call.member", "*"],
@@ -2313,6 +2320,8 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
                         ["m.room.pinned_events", ""],
                     ],
                     "timeline_limit": 20,
@@ -2328,7 +2337,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe to an already subscribed room. Nothing happens.
 
-    room_list.subscribe_to_rooms(&[room_id_1]);
+    room_list.subscribe_to_rooms(&[room_id_1]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2642,12 +2651,11 @@ async fn test_room_latest_event() -> Result<(), Error> {
     Ok(())
 }
 
-// #[ignore = "Flaky"]
 #[async_test]
 async fn test_sync_indicator() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
-    const DELAY_BEFORE_SHOWING: Duration = Duration::from_millis(20);
+    const DELAY_BEFORE_SHOWING: Duration = Duration::from_millis(100);
     const DELAY_BEFORE_HIDING: Duration = Duration::from_millis(0);
 
     let sync = room_list.sync();
@@ -2656,13 +2664,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
     let sync_indicator = room_list.sync_indicator(DELAY_BEFORE_SHOWING, DELAY_BEFORE_HIDING);
 
     let request_margin = Duration::from_millis(100);
-    let request_1_delay = DELAY_BEFORE_SHOWING * 2;
-    let request_2_delay = DELAY_BEFORE_SHOWING * 3;
-    let request_4_delay = DELAY_BEFORE_SHOWING * 2;
-    let request_5_delay = DELAY_BEFORE_SHOWING * 2;
+    let request_delay = DELAY_BEFORE_SHOWING * 2;
 
-    let (in_between_requests_synchronizer_sender, mut in_between_requests_synchronizer) =
-        channel(1);
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_sync_indicator = barrier.clone();
 
     macro_rules! assert_next_sync_indicator {
         ($sync_indicator:ident, $pattern:pat, now $(,)?) => {
@@ -2679,81 +2684,75 @@ async fn test_sync_indicator() -> Result<(), Error> {
     let sync_indicator_task = spawn(async move {
         pin_mut!(sync_indicator);
 
+        let barrier = barrier_sync_indicator;
+
         // `SyncIndicator` is forced to be hidden to begin with.
         assert_next_sync_indicator!(sync_indicator, SyncIndicator::Hide, now);
 
+        barrier.wait().await;
+
         // Request 1.
         {
-            // Sync has started, the `SyncIndicator` must be shown… but not immediately!
+            // The state transitions into `Init`. The `SyncIndicator` must be `Show`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,
                 under DELAY_BEFORE_SHOWING + request_margin,
             );
-
-            // Then, once the sync is done, the `SyncIndicator` must be hidden.
-            assert_next_sync_indicator!(
-                sync_indicator,
-                SyncIndicator::Hide,
-                under request_1_delay - DELAY_BEFORE_SHOWING
-                    + DELAY_BEFORE_HIDING
-                    + request_margin,
-            );
         }
 
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
+        barrier.wait().await;
 
         // Request 2.
         {
-            // Nothing happens, as the state transitions from `SettingUp` to
-            // `Running`, no `SyncIndicator` must be shown.
-        }
-
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
-
-        // Request 3.
-        {
-            // Sync has errored, the `SyncIndicator` should be show. Fortunately
-            // for us (fictional situation), the sync is restarted
-            // immediately, and `SyncIndicator` doesn't have time to
-            // be shown for this particular state update.
-        }
-
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
-
-        // Request 4.
-        {
-            // The system is recovering, It takes times (fictional situation)!
-            // `SyncIndicator` has time to show (off).
+            // The state transitions into `SettingUp`. The `SyncIndicator` stays in `Show`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,
                 under DELAY_BEFORE_SHOWING + request_margin,
             );
+        }
 
-            // Then, once the sync is done, the `SyncIndicator` must be hidden.
+        barrier.wait().await;
+
+        // Request 3.
+        {
+            // The state transitions into `Running`. The `SyncIndicator` must be `Hide`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Hide,
-                under request_4_delay - DELAY_BEFORE_SHOWING
-                    + DELAY_BEFORE_HIDING
-                    + request_margin,
+                under DELAY_BEFORE_HIDING + request_margin,
             );
         }
 
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
+        barrier.wait().await;
+
+        // Request 4.
+        {
+            // The state transitions into `Error`. The `SyncIndicator` must be `Show`.
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Show,
+                under DELAY_BEFORE_SHOWING + request_margin,
+            );
+        }
+
+        barrier.wait().await;
 
         // Request 5.
+        {
+            // The state transitions into `Recovering`. The `SyncIndicator` must be `Hide`.
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Hide,
+                under DELAY_BEFORE_HIDING + request_margin,
+            );
+        }
 
-        in_between_requests_synchronizer.recv().await.unwrap();
-
-        // Even though request 5 took a while, the `SyncIndicator` shouldn't show.
         assert_pending!(sync_indicator);
     });
+
+    barrier.wait().await;
 
     // Request 1.
     sync_then_assert_request_and_fake_response! {
@@ -2763,10 +2762,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "0",
         },
-        after delay = request_1_delay, // Slow request!
+        after delay = request_delay,
     };
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 2.
     sync_then_assert_request_and_fake_response! {
@@ -2776,10 +2775,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "1",
         },
-        after delay = request_2_delay, // Slow request!
+        after delay = request_delay,
     };
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 3.
     sync_then_assert_request_and_fake_response! {
@@ -2791,12 +2790,13 @@ async fn test_sync_indicator() -> Result<(), Error> {
             "error": "foo",
             "errcode": "M_UNKNOWN",
         },
+        after delay = request_delay,
     };
 
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 4.
     sync_then_assert_request_and_fake_response! {
@@ -2806,10 +2806,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "2",
         },
-        after delay = request_4_delay, // Slow request!
+        after delay = request_delay,
     };
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 5.
     sync_then_assert_request_and_fake_response! {
@@ -2819,10 +2819,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "3",
         },
-        after delay = request_5_delay, // Slow request!
+        after delay = request_delay,
     };
-
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
 
     sync_indicator_task.await.unwrap();
 
@@ -2894,4 +2892,197 @@ async fn test_multiple_timeline_init() {
 
     // A new timeline for the same room can still be constructed.
     room.timeline_builder().build().await.unwrap();
+}
+
+#[async_test]
+async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_it() {
+    let server = MatrixMockServer::new().await;
+
+    {
+        // The first time, don't advertise support for MSC4306; the extension will NOT
+        // enabled in this case, despite the client requesting it.
+        let features_map = BTreeMap::new();
+
+        server
+            .mock_versions()
+            .ok_custom(&["v1.11"], &features_map)
+            .named("/versions, first time")
+            .mock_once()
+            .mount()
+            .await;
+
+        let client = server
+            .client_builder()
+            .no_server_versions()
+            .on_builder(|b| {
+                b.with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
+                    with_subscriptions: true,
+                })
+            })
+            .build()
+            .await;
+        let room_list = RoomListService::new(client.clone()).await.unwrap();
+
+        let sync = room_list.sync();
+        pin_mut!(sync);
+
+        let room_id = room_id!("!r0:bar.org");
+
+        let mock_server = server.server();
+        sync_then_assert_request_and_fake_response! {
+            [mock_server, room_list, sync]
+            assert request = {
+                "conn_id": "room-list",
+                "extensions": {
+                    "account_data": {
+                        "enabled": true,
+                    },
+                    "receipts": {
+                        "enabled": true,
+                        "rooms": ["*"],
+                    },
+                    "typing": {
+                        "enabled": true,
+                    },
+                },
+                "lists": {
+                    "all_rooms": {
+                        "filters": {},
+                        "ranges": [ [ 0, 19, ], ],
+                        "required_state": [
+                            [ "m.room.name", "" ],
+                            [ "m.room.encryption", "" ],
+                            [ "m.room.member", "$LAZY" ],
+                            [ "m.room.member", "$ME" ],
+                            [ "m.room.topic", "", ],
+                            [ "m.room.avatar", "", ],
+                            [ "m.room.canonical_alias", "", ],
+                            [ "m.room.power_levels", "", ],
+                            [ "org.matrix.msc3401.call.member", "*", ],
+                            [ "m.room.join_rules", "", ],
+                            [ "m.room.tombstone", "", ],
+                            [ "m.room.create", "", ],
+                            [ "m.room.history_visibility", "", ],
+                            [ "io.element.functional_members", "", ],
+                            [ "m.space.parent", "*", ],
+                            [ "m.space.child", "*", ],
+                        ],
+                        "timeline_limit": 1,
+                    },
+                },
+            },
+            respond with = {
+                "pos": "0",
+                "lists": {
+                    ALL_ROOMS: {
+                        "count": 2,
+                    },
+                },
+                "rooms": {
+                    room_id: {
+                        "initial": true,
+                        "timeline": [
+                            timeline_event!("$x0:bar.org" at 0 sec),
+                        ],
+                        "prev_batch": "prev-batch-token"
+                    },
+                },
+            },
+        };
+    }
+
+    // Then, advertise support with support for MSC4306; the extension will be
+    // enabled in this case.
+    let features_map = BTreeMap::from([("org.matrix.msc4306", true)]);
+
+    server
+        .mock_versions()
+        .ok_custom(&["v1.11"], &features_map)
+        .named("/versions, second time")
+        .mock_once()
+        .mount()
+        .await;
+
+    let client = server
+        .client_builder()
+        .no_server_versions()
+        .on_builder(|b| {
+            b.with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
+                with_subscriptions: true,
+            })
+        })
+        .build()
+        .await;
+    let room_list = RoomListService::new(client.clone()).await.unwrap();
+
+    let sync = room_list.sync();
+    pin_mut!(sync);
+
+    let room_id = room_id!("!r0:bar.org");
+
+    let mock_server = server.server();
+    sync_then_assert_request_and_fake_response! {
+        [mock_server, room_list, sync]
+        assert request = {
+            "conn_id": "room-list",
+            "extensions": {
+                "account_data": {
+                    "enabled": true,
+                },
+                "receipts": {
+                    "enabled": true,
+                    "rooms": ["*"],
+                },
+                "typing": {
+                    "enabled": true,
+                },
+                "io.element.msc4308.thread_subscriptions": {
+                    "enabled": true,
+                    "limit": 10,
+                },
+            },
+            "lists": {
+                "all_rooms": {
+                    "filters": {},
+                    "ranges": [ [ 0, 19, ], ],
+                    "required_state": [
+                        [ "m.room.name", "" ],
+                        [ "m.room.encryption", "" ],
+                        [ "m.room.member", "$LAZY" ],
+                        [ "m.room.member", "$ME" ],
+                        [ "m.room.topic", "", ],
+                        [ "m.room.avatar", "", ],
+                        [ "m.room.canonical_alias", "", ],
+                        [ "m.room.power_levels", "", ],
+                        [ "org.matrix.msc3401.call.member", "*", ],
+                        [ "m.room.join_rules", "", ],
+                        [ "m.room.tombstone", "", ],
+                        [ "m.room.create", "", ],
+                        [ "m.room.history_visibility", "", ],
+                        [ "io.element.functional_members", "", ],
+                        [ "m.space.parent", "*", ],
+                        [ "m.space.child", "*", ],
+                    ],
+                    "timeline_limit": 1,
+                },
+            },
+        },
+        respond with = {
+            "pos": "0",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 2,
+                },
+            },
+            "rooms": {
+                room_id: {
+                    "initial": true,
+                    "timeline": [
+                        timeline_event!("$x0:bar.org" at 0 sec),
+                    ],
+                    "prev_batch": "prev-batch-token"
+                },
+            },
+        },
+    };
 }

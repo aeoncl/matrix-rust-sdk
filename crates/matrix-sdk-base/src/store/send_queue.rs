@@ -18,13 +18,13 @@ use std::{collections::BTreeMap, fmt, ops::Deref};
 
 use as_variant::as_variant;
 use ruma::{
-    events::{
-        room::{message::RoomMessageEventContent, MediaSource},
-        AnyMessageLikeEventContent, EventContent as _, RawExt as _,
-    },
-    serde::Raw,
     MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedTransactionId, OwnedUserId,
     TransactionId, UInt,
+    events::{
+        AnyMessageLikeEventContent, MessageLikeEventContent as _, RawExt as _,
+        room::{MediaSource, message::RoomMessageEventContent},
+    },
+    serde::Raw,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,14 +63,21 @@ impl SerializableEventContent {
     /// Convert a [`SerializableEventContent`] back into a
     /// [`AnyMessageLikeEventContent`].
     pub fn deserialize(&self) -> Result<AnyMessageLikeEventContent, serde_json::Error> {
-        self.event.deserialize_with_type(self.event_type.clone().into())
+        self.event.deserialize_with_type(&self.event_type)
     }
 
-    /// Returns the raw event content along with its type.
+    /// Returns the raw event content along with its type, borrowed variant.
     ///
     /// Useful for callers manipulating custom events.
     pub fn raw(&self) -> (&Raw<AnyMessageLikeEventContent>, &str) {
         (&self.event, &self.event_type)
+    }
+
+    /// Returns the raw event content along with its type, owned variant.
+    ///
+    /// Useful for callers manipulating custom events.
+    pub fn into_raw(self) -> (Raw<AnyMessageLikeEventContent>, String) {
+        (self.event, self.event_type)
     }
 }
 
@@ -206,8 +213,7 @@ pub enum QueueWedgeError {
     },
 }
 
-/// The specific user intent that characterizes a
-/// [`DependentQueuedRequestKind`].
+/// The specific user intent that characterizes a [`DependentQueuedRequest`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DependentQueuedRequestKind {
     /// The event should be edited.
@@ -239,7 +245,6 @@ pub enum DependentQueuedRequestKind {
         related_to: OwnedTransactionId,
 
         /// Whether the depended upon request was a thumbnail or a file upload.
-        #[cfg(feature = "unstable-msc4274")]
         #[serde(default = "default_parent_is_thumbnail_upload")]
         parent_is_thumbnail_upload: bool,
     },
@@ -276,7 +281,6 @@ pub enum DependentQueuedRequestKind {
 /// If parent_is_thumbnail_upload is missing, we assume the request is for a
 /// file upload following a thumbnail upload. This was the only possible case
 /// before parent_is_thumbnail_upload was introduced.
-#[cfg(feature = "unstable-msc4274")]
 fn default_parent_is_thumbnail_upload() -> bool {
     true
 }

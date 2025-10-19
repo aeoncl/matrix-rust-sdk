@@ -17,6 +17,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicU64, Ordering::SeqCst},
+    time::Duration,
 };
 
 use as_variant::as_variant;
@@ -24,8 +25,23 @@ use matrix_sdk_common::deserialized_responses::{
     TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
 };
 use ruma::{
+    EventId, Int, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, OwnedVoipId, RoomId, RoomVersionId,
+    TransactionId, UInt, UserId, VoipVersionId,
     events::{
+        AnyGlobalAccountDataEvent, AnyMessageLikeEvent, AnyStateEvent, AnyStrippedStateEvent,
+        AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
+        AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations,
+        EphemeralRoomEventContent, EventContentFromType, False, GlobalAccountDataEventContent,
+        Mentions, MessageLikeEvent, MessageLikeEventContent, PossiblyRedactedStateEventContent,
+        RedactContent, RedactedMessageLikeEventContent, RedactedStateEventContent, StateEvent,
+        StateEventContent, StaticEventContent, StaticStateEventContent, StrippedStateEvent,
+        SyncMessageLikeEvent, SyncStateEvent,
         beacon::BeaconEventContent,
+        call::{SessionDescription, invite::CallInviteEventContent},
+        direct::{DirectEventContent, OwnedDirectUserIdentifier},
+        ignored_user_list::IgnoredUserListEventContent,
+        macros::EventContent,
         member_hints::MemberHintsEventContent,
         poll::{
             unstable_end::UnstablePollEndEventContent,
@@ -35,10 +51,12 @@ use ruma::{
                 UnstablePollAnswer, UnstablePollStartContentBlock, UnstablePollStartEventContent,
             },
         },
+        push_rules::PushRulesEventContent,
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
-        relation::{Annotation, BundledThread, InReplyTo, Replacement, Thread},
+        relation::{Annotation, BundledThread, InReplyTo, Reference, Replacement, Thread},
         room::{
+            ImageInfo,
             avatar::{self, RoomAvatarEventContent},
             canonical_alias::RoomCanonicalAliasEventContent,
             create::{PreviousRoom, RoomCreateEventContent},
@@ -46,8 +64,9 @@ use ruma::{
             member::{MembershipState, RoomMemberEventContent},
             message::{
                 FormattedBody, GalleryItemType, GalleryMessageEventContent,
-                ImageMessageEventContent, MessageType, Relation, RelationWithoutReplacement,
-                RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                ImageMessageEventContent, MessageType, OriginalSyncRoomMessageEvent, Relation,
+                RelationWithoutReplacement, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
             },
             name::RoomNameEventContent,
             power_levels::RoomPowerLevelsEventContent,
@@ -55,18 +74,20 @@ use ruma::{
             server_acl::RoomServerAclEventContent,
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
-            ImageInfo,
         },
+        rtc::{
+            decline::RtcDeclineEventContent,
+            notification::{NotificationType, RtcNotificationEventContent},
+        },
+        space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         sticker::StickerEventContent,
         typing::TypingEventContent,
-        AnyMessageLikeEvent, AnyStateEvent, AnySyncStateEvent, AnySyncTimelineEvent,
-        AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
-        RedactedMessageLikeEventContent, RedactedStateEventContent, StateEventContent,
     },
+    push::Ruleset,
+    room::RoomType,
+    room_version_rules::AuthorizationRules,
     serde::Raw,
-    server_name, EventId, Int, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri,
-    OwnedRoomAliasId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId,
-    TransactionId, UInt, UserId,
+    server_name,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -105,7 +126,7 @@ struct RedactedBecause {
 }
 
 #[derive(Debug, Serialize)]
-struct Unsigned<C: EventContent> {
+struct Unsigned<C: StaticEventContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
     prev_content: Option<C>,
 
@@ -123,7 +144,7 @@ struct Unsigned<C: EventContent> {
 }
 
 // rustc can't derive Default because C isn't marked as `Default` 🤔 oh well.
-impl<C: EventContent> Default for Unsigned<C> {
+impl<C: StaticEventContent> Default for Unsigned<C> {
     fn default() -> Self {
         Self {
             prev_content: None,
@@ -135,12 +156,46 @@ impl<C: EventContent> Default for Unsigned<C> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EventFormat {
+    /// An event that can be received in the timeline, via `/messages` for
+    /// example.
+    #[default]
+    Timeline,
+    /// An event that can be received in the timeline, via `/sync`.
+    SyncTimeline,
+    /// An event that is received in stripped state.
+    StrippedState,
+    /// An ephemeral event, like a read receipt.
+    Ephemeral,
+    /// A global account data.
+    GlobalAccountData,
+}
+
+impl EventFormat {
+    /// Whether this format has a `sender` field.
+    fn has_sender(self) -> bool {
+        matches!(self, Self::Timeline | Self::SyncTimeline | Self::StrippedState)
+    }
+
+    /// Whether this format has an `event_id` field.
+    fn has_event_id(self) -> bool {
+        matches!(self, Self::Timeline | Self::SyncTimeline)
+    }
+
+    /// Whether this format ha an `room_id` field.
+    fn has_room_id(self) -> bool {
+        matches!(self, Self::Timeline)
+    }
+}
+
 #[derive(Debug)]
-pub struct EventBuilder<C: EventContent> {
+pub struct EventBuilder<C: StaticEventContent<IsPrefix = False>> {
+    /// The format of the event.
+    ///
+    /// It will decide which fields are added to the JSON.
+    format: EventFormat,
     sender: Option<OwnedUserId>,
-    /// Whether the event is an ephemeral one. As such, it doesn't require a
-    /// room id or a sender.
-    is_ephemeral: bool,
     room: Option<OwnedRoomId>,
     event_id: Option<OwnedEventId>,
     /// Whether the event should *not* have an event id. False by default.
@@ -152,10 +207,12 @@ pub struct EventBuilder<C: EventContent> {
     state_key: Option<String>,
 }
 
-impl<E: EventContent> EventBuilder<E>
-where
-    E::EventType: Serialize,
-{
+impl<E: StaticEventContent<IsPrefix = False>> EventBuilder<E> {
+    fn format(mut self, format: EventFormat) -> Self {
+        self.format = format;
+        self
+    }
+
     pub fn room(mut self, room_id: &RoomId) -> Self {
         self.room = Some(room_id.to_owned());
         self
@@ -199,7 +256,7 @@ where
     /// this event.
     pub fn with_bundled_thread_summary(
         mut self,
-        latest_event: Raw<AnyMessageLikeEvent>,
+        latest_event: Raw<AnySyncMessageLikeEvent>,
         count: usize,
         current_user_participated: bool,
     ) -> Self {
@@ -235,50 +292,46 @@ where
         self.state_key = Some(state_key.into());
         self
     }
+}
 
+impl<E> EventBuilder<E>
+where
+    E: StaticEventContent<IsPrefix = False> + Serialize,
+{
     #[inline(always)]
-    fn construct_json(self, requires_room: bool) -> serde_json::Value {
-        // Use the `sender` preferably, or resort to the `redacted_because` sender if
-        // none has been set.
-        let sender = self
-            .sender
-            .or_else(|| Some(self.unsigned.as_ref()?.redacted_because.as_ref()?.sender.clone()));
-
-        if sender.is_none() {
-            assert!(
-                self.is_ephemeral,
-                "the sender must be known when building the JSON for a non read-receipt event"
-            );
-        } else {
-            assert!(
-                !self.is_ephemeral,
-                "event builder set is_ephemeral, but also has a sender field"
-            );
-        }
-
+    fn construct_json(self) -> serde_json::Value {
         let mut json = json!({
-            "type": self.content.event_type(),
+            "type": E::TYPE,
             "content": self.content,
             "origin_server_ts": self.server_ts,
         });
 
         let map = json.as_object_mut().unwrap();
 
-        if let Some(sender) = sender {
+        if self.format.has_sender() {
+            // Use the `sender` preferably, or resort to the `redacted_because` sender if
+            // none has been set.
+            let sender = self
+                .sender
+                .or_else(|| Some(self.unsigned.as_ref()?.redacted_because.as_ref()?.sender.clone())).expect("the sender must be known when building the JSON for a non read-receipt or global event");
             map.insert("sender".to_owned(), json!(sender));
         }
 
-        let event_id = self
-            .event_id
-            .or_else(|| {
-                self.room.as_ref().map(|room_id| EventId::new(room_id.server_name().unwrap()))
-            })
-            .or_else(|| (!self.no_event_id).then(|| EventId::new(server_name!("dummy.org"))));
-        if let Some(event_id) = event_id {
+        if self.format.has_event_id() && !self.no_event_id {
+            let event_id = self.event_id.unwrap_or_else(|| {
+                let server_name = self
+                    .room
+                    .as_ref()
+                    .and_then(|room_id| room_id.server_name())
+                    .unwrap_or(server_name!("dummy.org"));
+
+                EventId::new(server_name)
+            });
+
             map.insert("event_id".to_owned(), json!(event_id));
         }
 
-        if requires_room && !self.is_ephemeral {
+        if self.format.has_room_id() {
             let room_id = self.room.expect("TimelineEvent requires a room id");
             map.insert("room_id".to_owned(), json!(room_id));
         }
@@ -304,19 +357,37 @@ where
     /// The generic argument `T` allows you to automatically cast the [`Raw`]
     /// event into any desired type.
     pub fn into_raw<T>(self) -> Raw<T> {
-        Raw::new(&self.construct_json(true)).unwrap().cast()
+        Raw::new(&self.construct_json()).unwrap().cast_unchecked()
     }
 
     pub fn into_raw_timeline(self) -> Raw<AnyTimelineEvent> {
         self.into_raw()
     }
 
+    pub fn into_any_sync_message_like_event(self) -> AnySyncMessageLikeEvent {
+        self.format(EventFormat::SyncTimeline)
+            .into_raw()
+            .deserialize()
+            .expect("expected message like event")
+    }
+
+    pub fn into_original_sync_room_message_event(self) -> OriginalSyncRoomMessageEvent {
+        self.format(EventFormat::SyncTimeline)
+            .into_raw()
+            .deserialize()
+            .expect("expected original sync room message event")
+    }
+
     pub fn into_raw_sync(self) -> Raw<AnySyncTimelineEvent> {
-        Raw::new(&self.construct_json(false)).unwrap().cast()
+        self.format(EventFormat::SyncTimeline).into_raw()
+    }
+
+    pub fn into_raw_sync_state(self) -> Raw<AnySyncStateEvent> {
+        self.format(EventFormat::SyncTimeline).into_raw()
     }
 
     pub fn into_event(self) -> TimelineEvent {
-        TimelineEvent::new(self.into_raw_sync())
+        TimelineEvent::from_plaintext(self.into_raw_sync())
     }
 }
 
@@ -327,7 +398,7 @@ impl EventBuilder<RoomEncryptedEventContent> {
         let session_id = as_variant!(&self.content.scheme, EncryptedEventScheme::MegolmV1AesSha2)
             .map(|content| content.session_id.clone());
 
-        TimelineEvent::new_utd_event(
+        TimelineEvent::from_utd(
             self.into(),
             UnableToDecryptInfo {
                 session_id,
@@ -345,11 +416,25 @@ impl EventBuilder<RoomMessageEventContent> {
         self
     }
 
-    /// Adds a thread relation to the root event, setting the latest thread
-    /// event id too.
+    /// Adds a thread relation to the root event, setting the reply fallback to
+    /// the latest in-thread event.
     pub fn in_thread(mut self, root: &EventId, latest_thread_event: &EventId) -> Self {
         self.content.relates_to =
             Some(Relation::Thread(Thread::plain(root.to_owned(), latest_thread_event.to_owned())));
+        self
+    }
+
+    /// Adds a thread relation to the root event, that's a non-fallback reply to
+    /// another thread event.
+    pub fn in_thread_reply(mut self, root: &EventId, replied_to: &EventId) -> Self {
+        self.content.relates_to =
+            Some(Relation::Thread(Thread::reply(root.to_owned(), replied_to.to_owned())));
+        self
+    }
+
+    /// Adds the given mentions to the current event.
+    pub fn mentions(mut self, mentions: Mentions) -> Self {
+        self.content.mentions = Some(mentions);
         self
     }
 
@@ -404,7 +489,7 @@ impl EventBuilder<UnstablePollStartEventContent> {
             content.relates_to = Some(RelationWithoutReplacement::Reply {
                 in_reply_to: InReplyTo::new(event_id.to_owned()),
             });
-        };
+        }
         self
     }
 
@@ -415,21 +500,27 @@ impl EventBuilder<UnstablePollStartEventContent> {
 
         if let UnstablePollStartEventContent::New(content) = &mut self.content {
             content.relates_to = Some(RelationWithoutReplacement::Thread(thread));
-        };
+        }
         self
     }
 }
 
 impl EventBuilder<RoomCreateEventContent> {
     /// Define the predecessor fields.
-    pub fn predecessor(mut self, room_id: &RoomId, event_id: &EventId) -> Self {
-        self.content.predecessor = Some(PreviousRoom::new(room_id.to_owned(), event_id.to_owned()));
+    pub fn predecessor(mut self, room_id: &RoomId) -> Self {
+        self.content.predecessor = Some(PreviousRoom::new(room_id.to_owned()));
         self
     }
 
     /// Erase the predecessor if any.
     pub fn no_predecessor(mut self) -> Self {
         self.content.predecessor = None;
+        self
+    }
+
+    /// Sets the `m.room.create` `type` field to `m.space`.
+    pub fn with_space_type(mut self) -> Self {
+        self.content.room_type = Some(RoomType::Space);
         self
     }
 }
@@ -443,48 +534,278 @@ impl EventBuilder<StickerEventContent> {
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for Raw<AnySyncTimelineEvent>
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for Raw<AnySyncTimelineEvent>
 where
-    E::EventType: Serialize,
+    E: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_raw_sync()
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for Raw<AnyTimelineEvent>
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for AnySyncTimelineEvent
 where
-    E::EventType: Serialize,
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnySyncTimelineEvent>::from(val).deserialize().expect("expected sync timeline event")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for Raw<AnyTimelineEvent>
+where
+    E: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_raw_timeline()
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for TimelineEvent
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for AnyTimelineEvent
 where
-    E::EventType: Serialize,
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnyTimelineEvent>::from(val).deserialize().expect("expected timeline event")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>>
+    for Raw<AnyGlobalAccountDataEvent>
+where
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::GlobalAccountData).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for AnyGlobalAccountDataEvent
+where
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnyGlobalAccountDataEvent>::from(val)
+            .deserialize()
+            .expect("expected global account data")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for TimelineEvent
+where
+    E: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_event()
     }
 }
 
-impl<E: StateEventContent> From<EventBuilder<E>> for Raw<AnySyncStateEvent>
-where
-    E::EventType: Serialize,
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<AnySyncStateEvent>
 {
     fn from(val: EventBuilder<E>) -> Self {
-        Raw::new(&val.construct_json(false)).unwrap().cast()
+        val.format(EventFormat::SyncTimeline).into_raw()
     }
 }
 
-impl<E: StateEventContent> From<EventBuilder<E>> for Raw<AnyStateEvent>
-where
-    E::EventType: Serialize,
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for AnySyncStateEvent
 {
     fn from(val: EventBuilder<E>) -> Self {
-        Raw::new(&val.construct_json(true)).unwrap().cast()
+        Raw::<AnySyncStateEvent>::from(val).deserialize().expect("expected sync state")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<SyncStateEvent<E>>
+where
+    E: StaticStateEventContent + RedactContent,
+    E::Redacted: RedactedStateEventContent,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::SyncTimeline).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for SyncStateEvent<E>
+where
+    E: StaticStateEventContent + RedactContent + EventContentFromType,
+    E::Redacted: RedactedStateEventContent<StateKey = <E as StateEventContent>::StateKey>
+        + EventContentFromType,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<SyncStateEvent<E>>::from(val).deserialize().expect("expected sync state")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<AnyStateEvent>
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for AnyStateEvent
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnyStateEvent>::from(val).deserialize().expect("expected state")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<StateEvent<E>>
+where
+    E: StaticStateEventContent + RedactContent,
+    E::Redacted: RedactedStateEventContent,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for StateEvent<E>
+where
+    E: StaticStateEventContent + RedactContent + EventContentFromType,
+    E::Redacted: RedactedStateEventContent<StateKey = <E as StateEventContent>::StateKey>
+        + EventContentFromType,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<StateEvent<E>>::from(val).deserialize().expect("expected state")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<AnyStrippedStateEvent>
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::StrippedState).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for AnyStrippedStateEvent
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnyStrippedStateEvent>::from(val).deserialize().expect("expected stripped state")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<StrippedStateEvent<E::PossiblyRedacted>>
+where
+    E: StaticStateEventContent,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::StrippedState).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for StrippedStateEvent<E::PossiblyRedacted>
+where
+    E: StaticStateEventContent,
+    E::PossiblyRedacted: PossiblyRedactedStateEventContent + EventContentFromType,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<StrippedStateEvent<E::PossiblyRedacted>>::from(val)
+            .deserialize()
+            .expect("expected stripped state")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + EphemeralRoomEventContent> From<EventBuilder<E>>
+    for Raw<AnySyncEphemeralRoomEvent>
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::Ephemeral).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + EphemeralRoomEventContent> From<EventBuilder<E>>
+    for AnySyncEphemeralRoomEvent
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnySyncEphemeralRoomEvent>::from(val).deserialize().expect("expected ephemeral")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for Raw<AnySyncMessageLikeEvent>
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::SyncTimeline).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for AnySyncMessageLikeEvent
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnySyncMessageLikeEvent>::from(val).deserialize().expect("expected sync message-like")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for Raw<SyncMessageLikeEvent<E>>
+where
+    E: RedactContent,
+    E::Redacted: RedactedMessageLikeEventContent,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::SyncTimeline).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for SyncMessageLikeEvent<E>
+where
+    E: RedactContent + EventContentFromType,
+    E::Redacted: RedactedMessageLikeEventContent + EventContentFromType,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<SyncMessageLikeEvent<E>>::from(val).deserialize().expect("expected sync message-like")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for Raw<AnyMessageLikeEvent>
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for AnyMessageLikeEvent
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnyMessageLikeEvent>::from(val).deserialize().expect("expected message-like")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for Raw<MessageLikeEvent<E>>
+where
+    E: RedactContent,
+    E::Redacted: RedactedMessageLikeEventContent,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False> + MessageLikeEventContent> From<EventBuilder<E>>
+    for MessageLikeEvent<E>
+where
+    E: RedactContent + EventContentFromType,
+    E::Redacted: RedactedMessageLikeEventContent + EventContentFromType,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<MessageLikeEvent<E>>::from(val).deserialize().expect("expected message-like")
     }
 }
 
@@ -510,6 +831,11 @@ impl EventFactory {
         self
     }
 
+    pub fn server_ts(self, ts: u64) -> Self {
+        self.next_ts.store(ts, SeqCst);
+        self
+    }
+
     fn next_server_ts(&self) -> MilliSecondsSinceUnixEpoch {
         MilliSecondsSinceUnixEpoch(
             self.next_ts
@@ -520,10 +846,10 @@ impl EventFactory {
     }
 
     /// Create an event from any event content.
-    pub fn event<E: EventContent>(&self, content: E) -> EventBuilder<E> {
+    pub fn event<E: StaticEventContent<IsPrefix = False>>(&self, content: E) -> EventBuilder<E> {
         EventBuilder {
+            format: EventFormat::Timeline,
             sender: self.sender.clone(),
-            is_ephemeral: false,
             room: self.room.clone(),
             server_ts: self.next_server_ts(),
             event_id: None,
@@ -559,8 +885,8 @@ impl EventFactory {
     /// use matrix_sdk_test::event_factory::EventFactory;
     /// use ruma::{
     ///     events::{
-    ///         room::member::{MembershipState, RoomMemberEventContent},
     ///         SyncStateEvent,
+    ///         room::member::{MembershipState, RoomMemberEventContent},
     ///     },
     ///     room_id,
     ///     serde::Raw,
@@ -631,7 +957,7 @@ impl EventFactory {
     ///
     /// use matrix_sdk_test::event_factory::EventFactory;
     /// use ruma::{
-    ///     events::{member_hints::MemberHintsEventContent, SyncStateEvent},
+    ///     events::{SyncStateEvent, member_hints::MemberHintsEventContent},
     ///     owned_user_id, room_id,
     ///     serde::Raw,
     ///     user_id,
@@ -690,7 +1016,7 @@ impl EventFactory {
 
     /// Create a redacted event, with extra information in the unsigned section
     /// about the redaction itself.
-    pub fn redacted<T: RedactedMessageLikeEventContent>(
+    pub fn redacted<T: StaticEventContent<IsPrefix = False> + RedactedMessageLikeEventContent>(
         &self,
         redacter: &UserId,
         content: T,
@@ -711,7 +1037,7 @@ impl EventFactory {
 
     /// Create a redacted state event, with extra information in the unsigned
     /// section about the redaction itself.
-    pub fn redacted_state<T: RedactedStateEventContent>(
+    pub fn redacted_state<T: StaticEventContent<IsPrefix = False> + RedactedStateEventContent>(
         &self,
         redacter: &UserId,
         state_key: impl Into<String>,
@@ -736,7 +1062,7 @@ impl EventFactory {
     /// answers.
     pub fn poll_start(
         &self,
-        content: impl Into<String>,
+        fallback_text: impl Into<String>,
         poll_question: impl Into<String>,
         answers: Vec<impl Into<String>>,
     ) -> EventBuilder<UnstablePollStartEventContent> {
@@ -749,7 +1075,7 @@ impl EventFactory {
         let poll_answers = answers.try_into().unwrap();
         let poll_start_content =
             UnstablePollStartEventContent::New(NewUnstablePollStartEventContent::plain_text(
-                content,
+                fallback_text,
                 UnstablePollStartContentBlock::new(poll_question, poll_answers),
             ));
         self.event(poll_start_content)
@@ -829,10 +1155,8 @@ impl EventFactory {
 
     /// Create a typing notification event.
     pub fn typing(&self, user_ids: Vec<&UserId>) -> EventBuilder<TypingEventContent> {
-        let mut builder = self
-            .event(TypingEventContent::new(user_ids.into_iter().map(ToOwned::to_owned).collect()));
-        builder.is_ephemeral = true;
-        builder
+        self.event(TypingEventContent::new(user_ids.into_iter().map(ToOwned::to_owned).collect()))
+            .format(EventFormat::Ephemeral)
     }
 
     /// Create a read receipt event.
@@ -865,7 +1189,7 @@ impl EventFactory {
         &self,
         map: &mut BTreeMap<OwnedUserId, Int>,
     ) -> EventBuilder<RoomPowerLevelsEventContent> {
-        let mut event = RoomPowerLevelsEventContent::new();
+        let mut event = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
         event.users.append(map);
         self.event(event)
     }
@@ -897,10 +1221,11 @@ impl EventFactory {
     /// ```
     /// use matrix_sdk_test::event_factory::EventFactory;
     /// use ruma::{
-    ///     events::{beacon::BeaconEventContent, MessageLikeEvent},
+    ///     MilliSecondsSinceUnixEpoch,
+    ///     events::{MessageLikeEvent, beacon::BeaconEventContent},
     ///     owned_event_id, room_id,
     ///     serde::Raw,
-    ///     user_id, MilliSecondsSinceUnixEpoch,
+    ///     user_id,
     /// };
     ///
     /// let factory = EventFactory::new().room(room_id!("!test:localhost"));
@@ -938,11 +1263,105 @@ impl EventFactory {
         self.event(StickerEventContent::new(body.into(), info, url))
     }
 
+    /// Create a new `m.call.invite` event.
+    pub fn call_invite(
+        &self,
+        call_id: OwnedVoipId,
+        lifetime: UInt,
+        offer: SessionDescription,
+        version: VoipVersionId,
+    ) -> EventBuilder<CallInviteEventContent> {
+        self.event(CallInviteEventContent::new(call_id, lifetime, offer, version))
+    }
+
+    /// Create a new `m.rtc.notification` event.
+    pub fn rtc_notification(
+        &self,
+        notification_type: NotificationType,
+    ) -> EventBuilder<RtcNotificationEventContent> {
+        self.event(RtcNotificationEventContent::new(
+            MilliSecondsSinceUnixEpoch::now(),
+            Duration::new(30, 0),
+            notification_type,
+        ))
+    }
+
+    // Creates a new `org.matrix.msc4310.rtc.decline` event.
+    pub fn call_decline(
+        &self,
+        notification_event_id: &EventId,
+    ) -> EventBuilder<RtcDeclineEventContent> {
+        self.event(RtcDeclineEventContent::new(notification_event_id))
+    }
+
+    /// Create a new `m.direct` global account data event.
+    pub fn direct(&self) -> EventBuilder<DirectEventContent> {
+        self.global_account_data(DirectEventContent::default())
+    }
+
+    /// Create a new `m.ignored_user_list` global account data event.
+    pub fn ignored_user_list(
+        &self,
+        users: impl IntoIterator<Item = OwnedUserId>,
+    ) -> EventBuilder<IgnoredUserListEventContent> {
+        self.global_account_data(IgnoredUserListEventContent::users(users))
+    }
+
+    /// Create a new `m.push_rules` global account data event.
+    pub fn push_rules(&self, rules: Ruleset) -> EventBuilder<PushRulesEventContent> {
+        self.global_account_data(PushRulesEventContent::new(rules))
+    }
+
+    /// Create a new `m.space.child` state event.
+    pub fn space_child(
+        &self,
+        parent: OwnedRoomId,
+        child: OwnedRoomId,
+    ) -> EventBuilder<SpaceChildEventContent> {
+        let mut event = self.event(SpaceChildEventContent::new(vec![]));
+        event.room = Some(parent);
+        event.state_key = Some(child.to_string());
+        event
+    }
+
+    /// Create a new `m.space.parent` state event.
+    pub fn space_parent(
+        &self,
+        parent: OwnedRoomId,
+        child: OwnedRoomId,
+    ) -> EventBuilder<SpaceParentEventContent> {
+        let mut event = self.event(SpaceParentEventContent::new(vec![]));
+        event.state_key = Some(parent.to_string());
+        event.room = Some(child);
+        event
+    }
+
+    /// Create a new `rs.matrix-sdk.custom.test` custom event
+    pub fn custom_message_like_event(&self) -> EventBuilder<CustomMessageLikeEventContent> {
+        self.event(CustomMessageLikeEventContent)
+    }
+
     /// Set the next server timestamp.
     ///
     /// Timestamps will continue to increase by 1 (millisecond) from that value.
     pub fn set_next_ts(&self, value: u64) {
         self.next_ts.store(value, SeqCst);
+    }
+
+    /// Create a new global account data event of the given `C` content type.
+    pub fn global_account_data<C>(&self, content: C) -> EventBuilder<C>
+    where
+        C: GlobalAccountDataEventContent + StaticEventContent<IsPrefix = False>,
+    {
+        self.event(content).format(EventFormat::GlobalAccountData)
+    }
+}
+
+impl EventBuilder<DirectEventContent> {
+    /// Add a user/room pair to the `m.direct` event.
+    pub fn add_user(mut self, user_id: OwnedDirectUserIdentifier, room_id: &RoomId) -> Self {
+        self.content.0.entry(user_id).or_default().push(room_id.to_owned());
+        self
     }
 }
 
@@ -1044,6 +1463,23 @@ impl EventBuilder<RoomAvatarEventContent> {
     }
 }
 
+impl EventBuilder<RtcNotificationEventContent> {
+    pub fn mentions(mut self, users: impl IntoIterator<Item = OwnedUserId>) -> Self {
+        self.content.mentions = Some(Mentions::with_user_ids(users));
+        self
+    }
+
+    pub fn relates_to_membership_state_event(mut self, event_id: OwnedEventId) -> Self {
+        self.content.relates_to = Some(Reference::new(event_id));
+        self
+    }
+
+    pub fn lifetime(mut self, time_in_seconds: u64) -> Self {
+        self.content.lifetime = Duration::from_secs(time_in_seconds);
+        self
+    }
+}
+
 pub struct ReadReceiptBuilder<'a> {
     factory: &'a EventFactory,
     content: ReceiptEventContent,
@@ -1091,9 +1527,7 @@ impl ReadReceiptBuilder<'_> {
 
     /// Finalize the builder into an event builder.
     pub fn into_event(self) -> EventBuilder<ReceiptEventContent> {
-        let mut builder = self.factory.event(self.into_content());
-        builder.is_ephemeral = true;
-        builder
+        self.factory.event(self.into_content()).format(EventFormat::Ephemeral)
     }
 }
 
@@ -1124,3 +1558,7 @@ impl From<MembershipState> for PreviousMembership {
         Self::new(state)
     }
 }
+
+#[derive(Clone, Default, Debug, Serialize, EventContent)]
+#[ruma_event(type = "rs.matrix-sdk.custom.test", kind = MessageLike)]
+pub struct CustomMessageLikeEventContent;

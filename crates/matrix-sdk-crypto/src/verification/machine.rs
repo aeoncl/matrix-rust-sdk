@@ -255,7 +255,7 @@ impl VerificationMachine {
         for request in requests {
             if let Ok(OutgoingContent::ToDevice(to_device)) = request.clone().try_into() {
                 if let AnyToDeviceEventContent::KeyVerificationCancel(content) = *to_device {
-                    let event = ToDeviceEvent { content, sender: self.own_user_id().to_owned() };
+                    let event = ToDeviceEvent::new(self.own_user_id().to_owned(), content);
 
                     events.push(
                         Raw::new(&event)
@@ -367,7 +367,10 @@ impl VerificationMachine {
                 let Some(device_data) =
                     self.store.get_device(event.sender(), r.from_device()).await?
                 else {
-                    warn!("Could not retrieve the device data for the incoming verification request, ignoring it");
+                    warn!(
+                        "Could not retrieve the device data for the incoming verification request, \
+                         ignoring it"
+                    );
                     return Ok(());
                 };
 
@@ -526,6 +529,18 @@ impl VerificationMachine {
         }
 
         Ok(())
+    }
+
+    /**
+     * Utility function to build the public identity (i.e., an
+     * [`OwnUserIdentityData`]) corresponding to the private identity
+     * stored in the `VerificationStore`.
+     */
+    #[cfg(test)]
+    pub async fn get_own_user_identity_data(
+        &self,
+    ) -> Result<crate::OwnUserIdentityData, crate::SignatureError> {
+        self.store.private_identity.lock().await.to_public_identity().await
     }
 }
 

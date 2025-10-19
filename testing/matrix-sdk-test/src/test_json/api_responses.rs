@@ -1,7 +1,7 @@
 //! Responses to client API calls.
 
 use once_cell::sync::Lazy;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 /// `GET /_matrix/client/v3/devices`
 pub static DEVICES: Lazy<JsonValue> = Lazy::new(|| {
@@ -359,7 +359,13 @@ pub static WELL_KNOWN: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "m.homeserver": {
             "base_url": "HOMESERVER_URL"
-        }
+        },
+        "m.rtc_foci": [
+            {
+                "type": "livekit",
+                "livekit_service_url": "https://livekit.example.com",
+            }
+        ]
     })
 });
 

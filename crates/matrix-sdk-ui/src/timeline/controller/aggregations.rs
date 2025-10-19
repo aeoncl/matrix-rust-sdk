@@ -42,17 +42,18 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use as_variant::as_variant;
 use matrix_sdk::deserialized_responses::EncryptionInfo;
 use ruma::{
+    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
     events::{
+        AnySyncTimelineEvent,
         poll::unstable_start::NewUnstablePollStartEventContentWithoutRelation,
         relation::Replacement, room::message::RoomMessageEventContentWithoutRelation,
-        AnySyncTimelineEvent,
     },
+    room_version_rules::RoomVersionRules,
     serde::Raw,
-    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId,
 };
 use tracing::{info, trace, warn};
 
-use super::{rfind_event_by_item_id, ObservableItemsTransaction};
+use super::{ObservableItemsTransaction, rfind_event_by_item_id};
 use crate::timeline::{
     EventTimelineItem, MsgLikeContent, MsgLikeKind, PollState, ReactionInfo, ReactionStatus,
     TimelineEventItemId, TimelineItem, TimelineItemContent,
@@ -83,6 +84,10 @@ pub(in crate::timeline) struct PendingEdit {
 
     /// The encryption info for this edit.
     pub encryption_info: Option<Arc<EncryptionInfo>>,
+
+    /// If provided, this is the identifier of a remote event item that included
+    /// this bundled edit.
+    pub bundled_item_owner: Option<OwnedEventId>,
 }
 
 /// Which kind of aggregation (related event) is this?
@@ -187,7 +192,7 @@ impl Aggregation {
     fn apply(
         &self,
         event: &mut Cow<'_, EventTimelineItem>,
-        room_version: &RoomVersionId,
+        rules: &RoomVersionRules,
     ) -> ApplyAggregationResult {
         match &self.kind {
             AggregationKind::PollResponse { sender, timestamp, answers } => {
@@ -204,7 +209,7 @@ impl Aggregation {
                 if event.content().is_redacted() {
                     ApplyAggregationResult::LeftItemIntact
                 } else {
-                    let new_item = event.redact(room_version);
+                    let new_item = event.redact(&rules.redaction);
                     *event = Cow::Owned(new_item);
                     ApplyAggregationResult::UpdatedItem
                 }
@@ -373,13 +378,12 @@ impl Aggregations {
 
         // If there was any redaction among the current aggregation, adding a new one
         // should be a noop.
-        if let Some(previous_aggregations) = self.related_events.get(&related_to) {
-            if previous_aggregations
+        if let Some(previous_aggregations) = self.related_events.get(&related_to)
+            && previous_aggregations
                 .iter()
                 .any(|agg| matches!(agg.kind, AggregationKind::Redaction))
-            {
-                return;
-            }
+        {
+            return;
         }
 
         self.inverted_map.insert(aggregation.own_id.clone(), related_to.clone());
@@ -423,7 +427,10 @@ impl Aggregations {
         };
 
         let Some(aggregation) = aggregation else {
-            warn!("incorrect internal state: {aggregation_id:?} was present in the inverted map, not in related-to map.");
+            warn!(
+                "incorrect internal state: {aggregation_id:?} was present in the inverted map, \
+                 not in related-to map."
+            );
             return Ok(false);
         };
 
@@ -479,7 +486,7 @@ impl Aggregations {
         item_id: &TimelineEventItemId,
         event: &mut Cow<'_, EventTimelineItem>,
         items: &mut ObservableItemsTransaction<'_>,
-        room_version: &RoomVersionId,
+        rules: &RoomVersionRules,
     ) -> Result<(), AggregationError> {
         let Some(aggregations) = self.related_events.get(item_id) else {
             return Ok(());
@@ -488,7 +495,7 @@ impl Aggregations {
         let mut has_edits = false;
 
         for a in aggregations {
-            match a.apply(event, room_version) {
+            match a.apply(event, rules) {
                 ApplyAggregationResult::Edit => {
                     has_edits = true;
                 }
@@ -537,7 +544,7 @@ impl Aggregations {
         txn_id: OwnedTransactionId,
         event_id: OwnedEventId,
         items: &mut ObservableItemsTransaction<'_>,
-        room_version: &RoomVersionId,
+        rules: &RoomVersionRules,
     ) -> bool {
         let from = TimelineEventItemId::TransactionId(txn_id);
         let to = TimelineEventItemId::EventId(event_id.clone());
@@ -546,26 +553,26 @@ impl Aggregations {
             return false;
         };
 
-        if let Some(aggregations) = self.related_events.get_mut(&target) {
-            if let Some(found) = aggregations.iter_mut().find(|agg| agg.own_id == from) {
-                found.own_id = to.clone();
+        if let Some(aggregations) = self.related_events.get_mut(&target)
+            && let Some(found) = aggregations.iter_mut().find(|agg| agg.own_id == from)
+        {
+            found.own_id = to.clone();
 
-                match &mut found.kind {
-                    AggregationKind::PollResponse { .. }
-                    | AggregationKind::PollEnd { .. }
-                    | AggregationKind::Edit(..)
-                    | AggregationKind::Redaction => {
-                        // Nothing particular to do.
-                    }
+            match &mut found.kind {
+                AggregationKind::PollResponse { .. }
+                | AggregationKind::PollEnd { .. }
+                | AggregationKind::Edit(..)
+                | AggregationKind::Redaction => {
+                    // Nothing particular to do.
+                }
 
-                    AggregationKind::Reaction { reaction_status, .. } => {
-                        // Mark the reaction as becoming remote, and signal that update to the
-                        // caller.
-                        *reaction_status = ReactionStatus::RemoteToRemote(event_id);
+                AggregationKind::Reaction { reaction_status, .. } => {
+                    // Mark the reaction as becoming remote, and signal that update to the
+                    // caller.
+                    *reaction_status = ReactionStatus::RemoteToRemote(event_id);
 
-                        let found = found.clone();
-                        find_item_and_apply_aggregation(self, items, &target, found, room_version);
-                    }
+                    let found = found.clone();
+                    find_item_and_apply_aggregation(self, items, &target, found, rules);
                 }
             }
         }
@@ -598,7 +605,12 @@ fn resolve_edits(
 
                 TimelineEventItemId::EventId(event_id) => {
                     if let Some(best_edit_pos) = &mut best_edit_pos {
-                        let pos = items.position_by_event_id(event_id);
+                        // Find the position of the timeline owning the edit: either the bundled
+                        // item owner if this was a bundled edit, or the edit event itself.
+                        let pos = items.position_by_event_id(
+                            pending_edit.bundled_item_owner.as_ref().unwrap_or(event_id),
+                        );
+
                         if let Some(pos) = pos {
                             // If the edit is more recent (higher index) than the previous best
                             // edit we knew about, use this one.
@@ -630,16 +642,15 @@ fn resolve_edits(
         }
     }
 
-    if let Some(edit) = best_edit {
-        edit_item(event, edit)
-    } else {
-        false
-    }
+    if let Some(edit) = best_edit { edit_item(event, edit) } else { false }
 }
 
 /// Apply the selected edit to the given EventTimelineItem.
+///
+/// Returns true if the edit was applied, false otherwise (because the edit and
+/// original timeline item types didn't match, for instance).
 fn edit_item(item: &mut Cow<'_, EventTimelineItem>, edit: PendingEdit) -> bool {
-    let PendingEdit { kind: edit_kind, edit_json, encryption_info } = edit;
+    let PendingEdit { kind: edit_kind, edit_json, encryption_info, bundled_item_owner: _ } = edit;
 
     if let Some(event_json) = &edit_json {
         let Some(edit_sender) = event_json.get_field::<OwnedUserId>("sender").ok().flatten() else {
@@ -658,7 +669,7 @@ fn edit_item(item: &mut Cow<'_, EventTimelineItem>, edit: PendingEdit) -> bool {
     }
 
     let TimelineItemContent::MsgLike(content) = item.content() else {
-        info!("Edit of message event applies to {:?}, discarding", item.content().debug_string(),);
+        info!("Edit of message event applies to {:?}, discarding", item.content().debug_string());
         return false;
     };
 
@@ -725,7 +736,7 @@ pub(crate) fn find_item_and_apply_aggregation(
     items: &mut ObservableItemsTransaction<'_>,
     target: &TimelineEventItemId,
     aggregation: Aggregation,
-    room_version: &RoomVersionId,
+    rules: &RoomVersionRules,
 ) -> Option<EventTimelineItem> {
     let Some((idx, event_item)) = rfind_event_by_item_id(items, target) else {
         trace!("couldn't find aggregation's target {target:?}");
@@ -733,7 +744,7 @@ pub(crate) fn find_item_and_apply_aggregation(
     };
 
     let mut cowed = Cow::Borrowed(&*event_item);
-    match aggregation.apply(&mut cowed, room_version) {
+    match aggregation.apply(&mut cowed, rules) {
         ApplyAggregationResult::UpdatedItem => {
             trace!("applied aggregation");
             let new_event_item = cowed.into_owned();
@@ -743,16 +754,14 @@ pub(crate) fn find_item_and_apply_aggregation(
             Some(new_event_item)
         }
         ApplyAggregationResult::Edit => {
-            if let Some(aggregations) = aggregations.related_events.get(target) {
-                if resolve_edits(aggregations, items, &mut cowed) {
-                    let new_event_item = cowed.into_owned();
-                    let new_item = TimelineItem::new(
-                        new_event_item.clone(),
-                        event_item.internal_id.to_owned(),
-                    );
-                    items.replace(idx, new_item);
-                    return Some(new_event_item);
-                }
+            if let Some(aggregations) = aggregations.related_events.get(target)
+                && resolve_edits(aggregations, items, &mut cowed)
+            {
+                let new_event_item = cowed.into_owned();
+                let new_item =
+                    TimelineItem::new(new_event_item.clone(), event_item.internal_id.to_owned());
+                items.replace(idx, new_item);
+                return Some(new_event_item);
             }
             None
         }
@@ -795,6 +804,9 @@ pub(crate) enum AggregationError {
     #[error("a redaction can't be unapplied")]
     CantUndoRedaction,
 
-    #[error("trying to apply an aggregation of one type to an invalid target: expected {expected}, actual {actual}")]
+    #[error(
+        "trying to apply an aggregation of one type to an invalid target: \
+         expected {expected}, actual {actual}"
+    )]
     InvalidType { expected: String, actual: String },
 }

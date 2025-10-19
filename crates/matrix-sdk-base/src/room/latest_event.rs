@@ -15,13 +15,14 @@
 #[cfg(feature = "e2e-encryption")]
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
+use ruma::MilliSecondsSinceUnixEpoch;
 #[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw, OwnedRoomId};
+use ruma::{OwnedRoomId, events::AnySyncTimelineEvent, serde::Raw};
 
 use super::Room;
 #[cfg(feature = "e2e-encryption")]
 use super::RoomInfoNotableUpdateReasons;
-use crate::latest_event::LatestEvent;
+use crate::latest_event::{LatestEvent, LatestEventValue};
 
 impl Room {
     /// The size of the latest_encrypted_events RingBuffer
@@ -31,7 +32,25 @@ impl Room {
     /// Return the last event in this room, if one has been cached during
     /// sliding sync.
     pub fn latest_event(&self) -> Option<LatestEvent> {
-        self.inner.read().latest_event.as_deref().cloned()
+        self.info.read().latest_event.as_deref().cloned()
+    }
+
+    /// Return the [`LatestEventValue`] of this room.
+    ///
+    /// Note that it clones the [`LatestEventValue`]! This can be add pressure
+    /// on the memory if used in a hot path.
+    pub fn new_latest_event(&self) -> LatestEventValue {
+        self.info.read().new_latest_event.clone()
+    }
+
+    /// Return the value of [`LatestEventValue::timestamp`].
+    pub fn new_latest_event_timestamp(&self) -> Option<MilliSecondsSinceUnixEpoch> {
+        self.info.read().new_latest_event.timestamp()
+    }
+
+    /// Return the value of [`LatestEventValue::is_local`].
+    pub fn new_latest_event_is_local(&self) -> bool {
+        self.info.read().new_latest_event.is_local()
     }
 
     /// Return the most recent few encrypted events. When the keys come through
@@ -88,11 +107,12 @@ mod tests_with_e2e_encryption {
     use serde_json::json;
 
     use crate::{
+        BaseClient, Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
+        SessionMeta, StateChanges,
+        client::ThreadingSupport,
         latest_event::LatestEvent,
         response_processors as processors,
         store::{MemoryStore, RoomLoadSettings, StoreConfig},
-        BaseClient, Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
-        SessionMeta, StateChanges,
     };
 
     fn make_room_test_helper(room_type: RoomState) -> (Arc<MemoryStore>, Room) {
@@ -107,8 +127,10 @@ mod tests_with_e2e_encryption {
     #[async_test]
     async fn test_setting_the_latest_event_doesnt_cause_a_room_info_notable_update() {
         // Given a room,
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(
@@ -207,7 +229,7 @@ mod tests_with_e2e_encryption {
 
         use std::collections::BTreeMap;
         let (_store, room) = make_room_test_helper(RoomState::Joined);
-        room.inner.update(|info| info.latest_event = Some(make_latest_event("$A")));
+        room.info.update(|info| info.latest_event = Some(make_latest_event("$A")));
         add_encrypted_event(&room, "$0");
         add_encrypted_event(&room, "$1");
         add_encrypted_event(&room, "$2");
@@ -279,7 +301,7 @@ mod tests_with_e2e_encryption {
     }
 
     fn make_latest_event(event_id: &str) -> Box<LatestEvent> {
-        Box::new(LatestEvent::new(TimelineEvent::new(
+        Box::new(LatestEvent::new(TimelineEvent::from_plaintext(
             Raw::from_json_string(json!({ "event_id": event_id }).to_string()).unwrap(),
         )))
     }

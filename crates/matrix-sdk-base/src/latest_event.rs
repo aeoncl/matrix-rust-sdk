@@ -2,10 +2,13 @@
 //! use as a [crate::Room::latest_event].
 
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
+use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId};
 #[cfg(feature = "e2e-encryption")]
 use ruma::{
+    UserId,
     events::{
-        call::{invite::SyncCallInviteEvent, notify::SyncCallNotifyEvent},
+        AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+        call::invite::SyncCallInviteEvent,
         poll::unstable_start::SyncUnstablePollStartEvent,
         relation::RelationType,
         room::{
@@ -13,15 +16,152 @@ use ruma::{
             message::{MessageType, SyncRoomMessageEvent},
             power_levels::RoomPowerLevels,
         },
+        rtc::notification::SyncRtcNotificationEvent,
         sticker::SyncStickerEvent,
-        AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent,
     },
-    UserId,
 };
-use ruma::{MxcUri, OwnedEventId};
 use serde::{Deserialize, Serialize};
 
-use crate::MinimalRoomMemberEvent;
+use crate::{MinimalRoomMemberEvent, store::SerializableEventContent};
+
+/// A latest event value!
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub enum LatestEventValue {
+    /// No value has been computed yet, or no candidate value was found.
+    #[default]
+    None,
+
+    /// The latest event represents a remote event.
+    Remote(RemoteLatestEventValue),
+
+    /// The latest event represents a local event that is sending.
+    LocalIsSending(LocalLatestEventValue),
+
+    /// The latest event represents a local event that cannot be sent, either
+    /// because a previous local event, or this local event cannot be sent.
+    LocalCannotBeSent(LocalLatestEventValue),
+}
+
+impl LatestEventValue {
+    /// Get the timestamp of the [`LatestEventValue`].
+    ///
+    /// If it's [`None`], it returns `None`. If it's [`Remote`], it returns the
+    /// [`TimelineEvent::timestamp`]. If it's [`LocalIsSending`] or
+    /// [`LocalCannotBeSent`], it returns the
+    /// [`LocalLatestEventValue::timestamp`] value.
+    ///
+    /// [`None`]: LatestEventValue::None
+    /// [`Remote`]: LatestEventValue::Remote
+    /// [`LocalIsSending`]: LatestEventValue::LocalIsSending
+    /// [`LocalCannotBeSent`]: LatestEventValue::LocalCannotBeSent
+    pub fn timestamp(&self) -> Option<MilliSecondsSinceUnixEpoch> {
+        match self {
+            Self::None => None,
+            Self::Remote(remote_latest_event_value) => remote_latest_event_value.timestamp(),
+            Self::LocalIsSending(LocalLatestEventValue { timestamp, .. })
+            | Self::LocalCannotBeSent(LocalLatestEventValue { timestamp, .. }) => Some(*timestamp),
+        }
+    }
+
+    /// Check whether the [`LatestEventValue`] represents a local value or not,
+    /// i.e. it is [`LocalIsSending`] or [`LocalCannotBeSent`].
+    ///
+    /// [`LocalIsSending`]: LatestEventValue::LocalIsSending
+    /// [`LocalCannotBeSent`]: LatestEventValue::LocalCannotBeSent
+    pub fn is_local(&self) -> bool {
+        match self {
+            Self::LocalIsSending(_) | Self::LocalCannotBeSent(_) => true,
+            Self::None | Self::Remote(_) => false,
+        }
+    }
+}
+
+/// Represents the value for [`LatestEventValue::Remote`].
+pub type RemoteLatestEventValue = TimelineEvent;
+
+/// Represents the value for [`LatestEventValue::LocalIsSending`] and
+/// [`LatestEventValue::LocalCannotBeSent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalLatestEventValue {
+    /// The time where the event has been created (by this module).
+    pub timestamp: MilliSecondsSinceUnixEpoch,
+
+    /// The content of the local event.
+    pub content: SerializableEventContent,
+}
+
+#[cfg(test)]
+mod tests_latest_event_value {
+    use ruma::{
+        MilliSecondsSinceUnixEpoch,
+        events::{AnyMessageLikeEventContent, room::message::RoomMessageEventContent},
+        serde::Raw,
+        uint,
+    };
+    use serde_json::json;
+
+    use super::{LatestEventValue, LocalLatestEventValue, RemoteLatestEventValue};
+    use crate::store::SerializableEventContent;
+
+    #[test]
+    fn test_timestamp_with_none() {
+        let value = LatestEventValue::None;
+
+        assert_eq!(value.timestamp(), None);
+    }
+
+    #[test]
+    fn test_timestamp_with_remote() {
+        let value = LatestEventValue::Remote(RemoteLatestEventValue::from_plaintext(
+            Raw::from_json_string(
+                json!({
+                    "content": RoomMessageEventContent::text_plain("raclette"),
+                    "type": "m.room.message",
+                    "event_id": "$ev0",
+                    "room_id": "!r0",
+                    "origin_server_ts": 42,
+                    "sender": "@mnt_io:matrix.org",
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ));
+
+        assert_eq!(value.timestamp(), Some(MilliSecondsSinceUnixEpoch(uint!(42))));
+    }
+
+    #[test]
+    fn test_timestamp_with_local_is_sending() {
+        let value = LatestEventValue::LocalIsSending(LocalLatestEventValue {
+            timestamp: MilliSecondsSinceUnixEpoch(uint!(42)),
+            content: SerializableEventContent::from_raw(
+                Raw::new(&AnyMessageLikeEventContent::RoomMessage(
+                    RoomMessageEventContent::text_plain("raclette"),
+                ))
+                .unwrap(),
+                "m.room.message".to_owned(),
+            ),
+        });
+
+        assert_eq!(value.timestamp(), Some(MilliSecondsSinceUnixEpoch(uint!(42))));
+    }
+
+    #[test]
+    fn test_timestamp_with_local_cannot_be_sent() {
+        let value = LatestEventValue::LocalCannotBeSent(LocalLatestEventValue {
+            timestamp: MilliSecondsSinceUnixEpoch(uint!(42)),
+            content: SerializableEventContent::from_raw(
+                Raw::new(&AnyMessageLikeEventContent::RoomMessage(
+                    RoomMessageEventContent::text_plain("raclette"),
+                ))
+                .unwrap(),
+                "m.room.message".to_owned(),
+            ),
+        });
+
+        assert_eq!(value.timestamp(), Some(MilliSecondsSinceUnixEpoch(uint!(42))));
+    }
+}
 
 /// Represents a decision about whether an event could be stored as the latest
 /// event in a room. Variants starting with Yes indicate that this message could
@@ -41,7 +181,7 @@ pub enum PossibleLatestEvent<'a> {
     YesCallInvite(&'a SyncCallInviteEvent),
 
     /// This message is suitable - it's a call notification
-    YesCallNotify(&'a SyncCallNotifyEvent),
+    YesRtcNotification(&'a SyncRtcNotificationEvent),
 
     /// This state event is suitable - it's a knock membership change
     /// that can be handled by the current user.
@@ -101,8 +241,8 @@ pub fn is_suitable_for_latest_event<'a>(
             PossibleLatestEvent::YesCallInvite(invite)
         }
 
-        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallNotify(notify)) => {
-            PossibleLatestEvent::YesCallNotify(notify)
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RtcNotification(notify)) => {
+            PossibleLatestEvent::YesRtcNotification(notify)
         }
 
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(sticker)) => {
@@ -125,21 +265,21 @@ pub fn is_suitable_for_latest_event<'a>(
         AnySyncTimelineEvent::State(state) => {
             // But we make an exception for knocked state events *if* the current user
             // can either accept or decline them
-            if let AnySyncStateEvent::RoomMember(member) = state {
-                if matches!(member.membership(), MembershipState::Knock) {
-                    let can_accept_or_decline_knocks = match power_levels_info {
-                        Some((own_user_id, room_power_levels)) => {
-                            room_power_levels.user_can_invite(own_user_id)
-                                || room_power_levels.user_can_kick(own_user_id)
-                        }
-                        _ => false,
-                    };
-
-                    // The current user can act on the knock changes, so they should be
-                    // displayed
-                    if can_accept_or_decline_knocks {
-                        return PossibleLatestEvent::YesKnockedStateEvent(member);
+            if let AnySyncStateEvent::RoomMember(member) = state
+                && matches!(member.membership(), MembershipState::Knock)
+            {
+                let can_accept_or_decline_knocks = match power_levels_info {
+                    Some((own_user_id, room_power_levels)) => {
+                        room_power_levels.user_can_invite(own_user_id)
+                            || room_power_levels.user_can_kick(own_user_id)
                     }
+                    _ => false,
+                };
+
+                // The current user can act on the knock changes, so they should be
+                // displayed
+                if can_accept_or_decline_knocks {
+                    return PossibleLatestEvent::YesKnockedStateEvent(member);
                 }
             }
             PossibleLatestEvent::NoUnsupportedEventType
@@ -227,9 +367,10 @@ impl<'de> Deserialize<'de> for LatestEvent {
             Err(err) => variant_errors.push(err),
         }
 
-        Err(serde::de::Error::custom(
-            format!("data did not match any variant of serialized LatestEvent (using serde_json). Observed errors: {variant_errors:?}")
-        ))
+        Err(serde::de::Error::custom(format!(
+            "data did not match any variant of serialized LatestEvent (using serde_json). \
+             Observed errors: {variant_errors:?}"
+        )))
     }
 }
 
@@ -301,77 +442,64 @@ impl LatestEvent {
 mod tests {
     #[cfg(feature = "e2e-encryption")]
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     #[cfg(feature = "e2e-encryption")]
     use assert_matches::assert_matches;
     #[cfg(feature = "e2e-encryption")]
     use assert_matches2::assert_let;
     use matrix_sdk_common::deserialized_responses::TimelineEvent;
-    use ruma::serde::Raw;
+    #[cfg(feature = "e2e-encryption")]
+    use matrix_sdk_test::event_factory::EventFactory;
     #[cfg(feature = "e2e-encryption")]
     use ruma::{
+        MilliSecondsSinceUnixEpoch, UInt, VoipVersionId,
         events::{
-            call::{
-                invite::{CallInviteEventContent, SyncCallInviteEvent},
-                notify::{
-                    ApplicationType, CallNotifyEventContent, NotifyType, SyncCallNotifyEvent,
-                },
-                SessionDescription,
-            },
+            SyncMessageLikeEvent,
+            call::{SessionDescription, invite::CallInviteEventContent},
             poll::{
-                unstable_response::{
-                    SyncUnstablePollResponseEvent, UnstablePollResponseEventContent,
-                },
+                unstable_response::UnstablePollResponseEventContent,
                 unstable_start::{
-                    NewUnstablePollStartEventContent, SyncUnstablePollStartEvent,
-                    UnstablePollAnswer, UnstablePollStartContentBlock,
+                    NewUnstablePollStartEventContent, UnstablePollAnswer,
+                    UnstablePollStartContentBlock,
                 },
             },
             relation::Replacement,
             room::{
+                ImageInfo, MediaSource,
                 encrypted::{
                     EncryptedEventScheme, OlmV1Curve25519AesSha2Content, RoomEncryptedEventContent,
-                    SyncRoomEncryptedEvent,
                 },
                 message::{
                     ImageMessageEventContent, MessageType, RedactedRoomMessageEventContent,
-                    Relation, RoomMessageEventContent, SyncRoomMessageEvent,
+                    Relation, RoomMessageEventContent,
                 },
-                topic::{RoomTopicEventContent, SyncRoomTopicEvent},
-                ImageInfo, MediaSource,
+                topic::RoomTopicEventContent,
             },
             sticker::{StickerEventContent, SyncStickerEvent},
-            AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, EmptyStateKey,
-            Mentions, MessageLikeUnsigned, OriginalSyncMessageLikeEvent, OriginalSyncStateEvent,
-            RedactedSyncMessageLikeEvent, RedactedUnsigned, StateUnsigned, SyncMessageLikeEvent,
-            UnsignedRoomRedactionEvent,
         },
-        owned_event_id, owned_mxc_uri, owned_user_id, MilliSecondsSinceUnixEpoch, UInt,
-        VoipVersionId,
+        owned_event_id, owned_mxc_uri, user_id,
+    };
+    use ruma::{
+        events::rtc::notification::{NotificationType, RtcNotificationEventContent},
+        serde::Raw,
     };
     use serde_json::json;
 
     use super::LatestEvent;
     #[cfg(feature = "e2e-encryption")]
-    use super::{is_suitable_for_latest_event, PossibleLatestEvent};
+    use super::{PossibleLatestEvent, is_suitable_for_latest_event};
 
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_room_messages_are_suitable() {
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-            SyncRoomMessageEvent::Original(OriginalSyncMessageLikeEvent {
-                content: RoomMessageEventContent::new(MessageType::Image(
-                    ImageMessageEventContent::new(
-                        "".to_owned(),
-                        MediaSource::Plain(owned_mxc_uri!("mxc://example.com/1")),
-                    ),
-                )),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(RoomMessageEventContent::new(MessageType::Image(ImageMessageEventContent::new(
+                "".to_owned(),
+                MediaSource::Plain(owned_mxc_uri!("mxc://example.com/1")),
+            ))))
+            .into();
         assert_let!(
             PossibleLatestEvent::YesRoomMessage(SyncMessageLikeEvent::Original(m)) =
                 is_suitable_for_latest_event(&event, None)
@@ -383,19 +511,13 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_polls_are_suitable() {
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::UnstablePollStart(
-            SyncUnstablePollStartEvent::Original(OriginalSyncMessageLikeEvent {
-                content: NewUnstablePollStartEventContent::new(UnstablePollStartContentBlock::new(
-                    "do you like rust?",
-                    vec![UnstablePollAnswer::new("id", "yes")].try_into().unwrap(),
-                ))
-                .into(),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(NewUnstablePollStartEventContent::new(UnstablePollStartContentBlock::new(
+                "do you like rust?",
+                vec![UnstablePollAnswer::new("id", "yes")].try_into().unwrap(),
+            )))
+            .into();
         assert_let!(
             PossibleLatestEvent::YesPoll(SyncMessageLikeEvent::Original(m)) =
                 is_suitable_for_latest_event(&event, None)
@@ -407,20 +529,15 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_call_invites_are_suitable() {
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallInvite(
-            SyncCallInviteEvent::Original(OriginalSyncMessageLikeEvent {
-                content: CallInviteEventContent::new(
-                    "call_id".into(),
-                    UInt::new(123).unwrap(),
-                    SessionDescription::new("".into(), "".into()),
-                    VoipVersionId::V1,
-                ),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(CallInviteEventContent::new(
+                "call_id".into(),
+                UInt::new(123).unwrap(),
+                SessionDescription::new("".into(), "".into()),
+                VoipVersionId::V1,
+            ))
+            .into();
         assert_let!(
             PossibleLatestEvent::YesCallInvite(SyncMessageLikeEvent::Original(_)) =
                 is_suitable_for_latest_event(&event, None)
@@ -430,22 +547,16 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_call_notifications_are_suitable() {
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallNotify(
-            SyncCallNotifyEvent::Original(OriginalSyncMessageLikeEvent {
-                content: CallNotifyEventContent::new(
-                    "call_id".into(),
-                    ApplicationType::Call,
-                    NotifyType::Ring,
-                    Mentions::new(),
-                ),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(RtcNotificationEventContent::new(
+                MilliSecondsSinceUnixEpoch::now(),
+                Duration::new(30, 0),
+                NotificationType::Ring,
+            ))
+            .into();
         assert_let!(
-            PossibleLatestEvent::YesCallNotify(SyncMessageLikeEvent::Original(_)) =
+            PossibleLatestEvent::YesRtcNotification(SyncMessageLikeEvent::Original(_)) =
                 is_suitable_for_latest_event(&event, None)
         );
     }
@@ -453,19 +564,14 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_stickers_are_suitable() {
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(
-            SyncStickerEvent::Original(OriginalSyncMessageLikeEvent {
-                content: StickerEventContent::new(
-                    "sticker!".to_owned(),
-                    ImageInfo::new(),
-                    owned_mxc_uri!("mxc://example.com/1"),
-                ),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(StickerEventContent::new(
+                "sticker!".to_owned(),
+                ImageInfo::new(),
+                owned_mxc_uri!("mxc://example.com/1"),
+            ))
+            .into();
 
         assert_matches!(
             is_suitable_for_latest_event(&event, None),
@@ -476,19 +582,13 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_different_types_of_messagelike_are_unsuitable() {
-        let event =
-            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::UnstablePollResponse(
-                SyncUnstablePollResponseEvent::Original(OriginalSyncMessageLikeEvent {
-                    content: UnstablePollResponseEventContent::new(
-                        vec![String::from("option1")],
-                        owned_event_id!("$1"),
-                    ),
-                    event_id: owned_event_id!("$2"),
-                    sender: owned_user_id!("@a:b.c"),
-                    origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                    unsigned: MessageLikeUnsigned::new(),
-                }),
-            ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(UnstablePollResponseEventContent::new(
+                vec![String::from("option1")],
+                owned_event_id!("$1"),
+            ))
+            .into();
 
         assert_matches!(
             is_suitable_for_latest_event(&event, None),
@@ -499,25 +599,10 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_redacted_messages_are_suitable() {
-        // Ruma does not allow constructing UnsignedRoomRedactionEvent instances.
-        let room_redaction_event: UnsignedRoomRedactionEvent = serde_json::from_value(json!({
-            "content": {},
-            "event_id": "$redaction",
-            "sender": "@x:y.za",
-            "origin_server_ts": 223543,
-            "unsigned": { "reason": "foo" }
-        }))
-        .unwrap();
-
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-            SyncRoomMessageEvent::Redacted(RedactedSyncMessageLikeEvent {
-                content: RedactedRoomMessageEventContent::new(),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: RedactedUnsigned::new(room_redaction_event),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .redacted(user_id!("@x:y.za"), RedactedRoomMessageEventContent::new())
+            .into();
 
         assert_matches!(
             is_suitable_for_latest_event(&event, None),
@@ -528,20 +613,16 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_encrypted_messages_are_unsuitable() {
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-            SyncRoomEncryptedEvent::Original(OriginalSyncMessageLikeEvent {
-                content: RoomEncryptedEventContent::new(
-                    EncryptedEventScheme::OlmV1Curve25519AesSha2(
-                        OlmV1Curve25519AesSha2Content::new(BTreeMap::new(), "".to_owned()),
-                    ),
-                    None,
-                ),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(RoomEncryptedEventContent::new(
+                EncryptedEventScheme::OlmV1Curve25519AesSha2(OlmV1Curve25519AesSha2Content::new(
+                    BTreeMap::new(),
+                    "".to_owned(),
+                )),
+                None,
+            ))
+            .into();
 
         assert_matches!(
             is_suitable_for_latest_event(&event, None),
@@ -552,16 +633,11 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_state_events_are_unsuitable() {
-        let event = AnySyncTimelineEvent::State(AnySyncStateEvent::RoomTopic(
-            SyncRoomTopicEvent::Original(OriginalSyncStateEvent {
-                content: RoomTopicEventContent::new("".to_owned()),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: StateUnsigned::new(),
-                state_key: EmptyStateKey,
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(RoomTopicEventContent::new("".to_owned()))
+            .state_key("")
+            .into();
 
         assert_matches!(
             is_suitable_for_latest_event(&event, None),
@@ -578,15 +654,7 @@ mod tests {
             RoomMessageEventContent::text_plain("Hello, world!").into(),
         )));
 
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-            SyncRoomMessageEvent::Original(OriginalSyncMessageLikeEvent {
-                content: event_content,
-                event_id: owned_event_id!("$2"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new().sender(user_id!("@a:b.c")).event(event_content).into();
 
         assert_matches!(
             is_suitable_for_latest_event(&event, None),
@@ -599,22 +667,17 @@ mod tests {
     fn test_verification_requests_are_unsuitable() {
         use ruma::{device_id, events::room::message::KeyVerificationRequestEventContent, user_id};
 
-        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-            SyncRoomMessageEvent::Original(OriginalSyncMessageLikeEvent {
-                content: RoomMessageEventContent::new(MessageType::VerificationRequest(
-                    KeyVerificationRequestEventContent::new(
-                        "body".to_owned(),
-                        vec![],
-                        device_id!("device_id").to_owned(),
-                        user_id!("@user_id:example.com").to_owned(),
-                    ),
-                )),
-                event_id: owned_event_id!("$1"),
-                sender: owned_user_id!("@a:b.c"),
-                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(123).unwrap()),
-                unsigned: MessageLikeUnsigned::new(),
-            }),
-        ));
+        let event = EventFactory::new()
+            .sender(user_id!("@a:b.c"))
+            .event(RoomMessageEventContent::new(MessageType::VerificationRequest(
+                KeyVerificationRequestEventContent::new(
+                    "body".to_owned(),
+                    vec![],
+                    device_id!("device_id").to_owned(),
+                    user_id!("@user_id:example.com").to_owned(),
+                ),
+            )))
+            .into();
 
         assert_let!(
             PossibleLatestEvent::NoUnsupportedMessageLikeType =
@@ -629,7 +692,7 @@ mod tests {
             latest_event: LatestEvent,
         }
 
-        let event = TimelineEvent::new(
+        let event = TimelineEvent::from_plaintext(
             Raw::from_json_string(json!({ "event_id": "$1" }).to_string()).unwrap(),
         );
 
@@ -656,6 +719,7 @@ mod tests {
                             }
                         },
                         "thread_summary": "None",
+                        "timestamp": null,
                     }
                 }
             })

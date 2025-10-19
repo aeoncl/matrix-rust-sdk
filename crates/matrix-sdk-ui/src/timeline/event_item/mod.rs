@@ -20,20 +20,21 @@ use std::{
 use as_variant::as_variant;
 use indexmap::IndexMap;
 use matrix_sdk::{
+    Client, Error,
     deserialized_responses::{EncryptionInfo, ShieldState},
     send_queue::{SendHandle, SendReactionHandle},
-    Client, Error,
 };
 use matrix_sdk_base::{
-    deserialized_responses::{ShieldStateCode, SENT_IN_CLEAR},
+    deserialized_responses::{SENT_IN_CLEAR, ShieldStateCode},
     latest_event::LatestEvent,
 };
 use once_cell::sync::Lazy;
 use ruma::{
-    events::{receipt::Receipt, room::message::MessageType, AnySyncTimelineEvent},
-    serde::Raw,
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedTransactionId,
-    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedUserId, RoomId, TransactionId, UserId,
+    events::{AnySyncTimelineEvent, receipt::Receipt, room::message::MessageType},
+    room_version_rules::RedactionRules,
+    serde::Raw,
 };
 use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation;
@@ -42,21 +43,21 @@ mod content;
 mod local;
 mod remote;
 
+pub use self::{
+    content::{
+        AnyOtherFullStateEventContent, EmbeddedEvent, EncryptedMessage, InReplyToDetails,
+        MemberProfileChange, MembershipChange, Message, MsgLikeContent, MsgLikeKind,
+        OtherMessageLike, OtherState, PollResult, PollState, RoomMembershipChange,
+        RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineItemContent,
+    },
+    local::{EventSendState, MediaUploadProgress},
+};
 pub(super) use self::{
     content::{
         extract_bundled_edit_event_json, extract_poll_edit_content, extract_room_msg_edit_content,
     },
     local::LocalEventTimelineItem,
     remote::{RemoteEventOrigin, RemoteEventTimelineItem},
-};
-pub use self::{
-    content::{
-        AnyOtherFullStateEventContent, EmbeddedEvent, EncryptedMessage, InReplyToDetails,
-        MemberProfileChange, MembershipChange, Message, MsgLikeContent, MsgLikeKind, OtherState,
-        PollResult, PollState, RoomMembershipChange, RoomPinnedEventsChange, Sticker,
-        ThreadSummary, TimelineItemContent,
-    },
-    local::EventSendState,
 };
 
 /// An item in the timeline that represents at least one event.
@@ -146,7 +147,7 @@ impl EventTimelineItem {
         let raw_sync_event = latest_event.event().raw().clone();
         let encryption_info = latest_event.event().encryption_info().cloned();
 
-        let Ok(event) = raw_sync_event.deserialize_as::<AnySyncTimelineEvent>() else {
+        let Ok(event) = raw_sync_event.deserialize() else {
             warn!("Unable to deserialize latest_event as an AnySyncTimelineEvent!");
             return None;
         };
@@ -534,8 +535,8 @@ impl EventTimelineItem {
     }
 
     /// Create a clone of the current item, with content that's been redacted.
-    pub(super) fn redact(&self, room_version: &RoomVersionId) -> Self {
-        let content = self.content.redact(room_version);
+    pub(super) fn redact(&self, rules: &RedactionRules) -> Self {
+        let content = self.content.redact(rules);
         let kind = match &self.kind {
             EventTimelineItemKind::Local(l) => EventTimelineItemKind::Local(l.clone()),
             EventTimelineItemKind::Remote(r) => EventTimelineItemKind::Remote(r.redact()),
@@ -607,7 +608,8 @@ impl EventTimelineItem {
                 MsgLikeKind::Sticker(_)
                 | MsgLikeKind::Poll(_)
                 | MsgLikeKind::Redacted
-                | MsgLikeKind::UnableToDecrypt(_) => None,
+                | MsgLikeKind::UnableToDecrypt(_)
+                | MsgLikeKind::Other(_) => None,
             },
             TimelineItemContent::MembershipChange(_)
             | TimelineItemContent::ProfileChange(_)
@@ -615,7 +617,7 @@ impl EventTimelineItem {
             | TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. }
             | TimelineItemContent::CallInvite
-            | TimelineItemContent::CallNotify => None,
+            | TimelineItemContent::RtcNotification => None,
         };
 
         if let Some(body) = body {
@@ -773,14 +775,14 @@ impl ReactionsByKeyBySender {
         sender: &UserId,
         annotation: &str,
     ) -> Option<ReactionInfo> {
-        if let Some(by_user) = self.0.get_mut(annotation) {
-            if let Some(info) = by_user.swap_remove(sender) {
-                // If this was the last reaction, remove the annotation entry.
-                if by_user.is_empty() {
-                    self.0.swap_remove(annotation);
-                }
-                return Some(info);
+        if let Some(by_user) = self.0.get_mut(annotation)
+            && let Some(info) = by_user.swap_remove(sender)
+        {
+            // If this was the last reaction, remove the annotation entry.
+            if by_user.is_empty() {
+                self.0.swap_remove(annotation);
             }
+            return Some(info);
         }
         None
     }
@@ -792,23 +794,24 @@ mod tests {
     use assert_matches2::assert_let;
     use matrix_sdk::test_utils::logged_in_client;
     use matrix_sdk_base::{
-        deserialized_responses::TimelineEvent, latest_event::LatestEvent, MinimalStateEvent,
-        OriginalMinimalStateEvent, RequestedRequiredStates,
+        MinimalStateEvent, OriginalMinimalStateEvent, RequestedRequiredStates,
+        deserialized_responses::TimelineEvent, latest_event::LatestEvent,
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory, sync_state_event};
     use ruma::{
+        RoomId, UInt, UserId,
         api::client::sync::sync_events::v5 as http,
         event_id,
         events::{
+            AnySyncStateEvent,
             room::{
                 member::RoomMemberEventContent,
                 message::{MessageFormat, MessageType},
             },
-            AnySyncStateEvent,
         },
         room_id,
         serde::Raw,
-        user_id, RoomId, UInt, UserId,
+        user_id,
     };
 
     use super::{EventTimelineItem, Profile};
@@ -864,8 +867,20 @@ mod tests {
         );
         let client = logged_in_client(None).await;
 
-        // Add power levels state event, otherwise the knock state event can't be used
-        // as the latest event
+        // Add create and power levels state event, otherwise the knock state event
+        // can't be used as the latest event
+        let create_event = sync_state_event!({
+            "type": "m.room.create",
+            "content": { "room_version": "11" },
+            "event_id": "$143278582443PhrSm:example.org",
+            "origin_server_ts": 143273580,
+            "room_id": room_id,
+            "sender": user_id,
+            "state_key": "",
+            "unsigned": {
+              "age": 1235
+            }
+        });
         let power_level_event = sync_state_event!({
             "type": "m.room.power_levels",
             "content": {},
@@ -879,7 +894,7 @@ mod tests {
             }
         });
         let mut room = http::response::Room::new();
-        room.required_state.push(power_level_event);
+        room.required_state.extend([create_event, power_level_event]);
 
         // And the room is stored in the client so it can be extracted when needed
         let response = response_with_room(room_id, room);
@@ -889,7 +904,7 @@ mod tests {
             .unwrap();
 
         // When we construct a timeline event from it
-        let event = TimelineEvent::new(raw_event.cast());
+        let event = TimelineEvent::from_plaintext(raw_event.cast());
         let timeline_item =
             EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
                 .await
@@ -1000,14 +1015,14 @@ mod tests {
         let poll = timeline_item.content().as_poll().unwrap();
         assert!(poll.has_been_edited);
         assert_eq!(
-            poll.start_event_content.poll_start.question.text,
+            poll.poll_start.question.text,
             "It's one banana, Michael, how much could it cost?"
         );
     }
 
     #[async_test]
-    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_storage(
-    ) {
+    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_storage()
+     {
         // Given a sync event that is suitable to be used as a latest_event, and a room
         // with a member event for the sender
 
@@ -1055,8 +1070,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_cache(
-    ) {
+    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_cache()
+     {
         // Given a sync event that is suitable to be used as a latest_event, a room, and
         // a member event for the sender (which isn't part of the room yet).
 
@@ -1074,7 +1089,7 @@ mod tests {
                 .display_name("Alice Margatroid")
                 .reason("")
                 .into_raw_sync()
-                .deserialize_as::<OriginalMinimalStateEvent<RoomMemberEventContent>>()
+                .deserialize_as_unchecked::<OriginalMinimalStateEvent<RoomMemberEventContent>>()
                 .unwrap(),
         );
 

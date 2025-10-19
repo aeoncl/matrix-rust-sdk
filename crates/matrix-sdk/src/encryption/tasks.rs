@@ -14,23 +14,30 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use futures_core::Stream;
+use futures_util::{StreamExt, pin_mut};
+#[cfg(feature = "experimental-encrypted-state-events")]
+use matrix_sdk_base::crypto::types::events::room::encrypted::{
+    EncryptedEvent, RoomEventEncryptionScheme,
+};
+use matrix_sdk_base::{
+    InviteAcceptanceDetails, RoomState, crypto::store::types::RoomKeyBundleInfo,
+};
 use matrix_sdk_common::failures_cache::FailuresCache;
-use ruma::{
-    events::room::encrypted::{EncryptedEventScheme, OriginalSyncRoomEncryptedEvent},
-    serde::Raw,
-    OwnedEventId, OwnedRoomId,
-};
-use tokio::sync::{
-    mpsc::{self, UnboundedReceiver},
-    Mutex,
-};
-use tracing::{debug, trace, warn};
+#[cfg(not(feature = "experimental-encrypted-state-events"))]
+use ruma::events::room::encrypted::{EncryptedEventScheme, OriginalSyncRoomEncryptedEvent};
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::serde::JsonCastable;
+use ruma::{OwnedEventId, OwnedRoomId, serde::Raw};
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
+    Client, Room,
     client::WeakClient,
     encryption::backups::UploadState,
-    executor::{spawn, JoinHandle},
-    Client,
+    executor::{JoinHandle, spawn},
+    room::shared_room_history,
 };
 
 /// A cache of room keys we already downloaded.
@@ -38,23 +45,19 @@ type DownloadCache = FailuresCache<RoomKeyInfo>;
 
 #[derive(Default)]
 pub(crate) struct ClientTasks {
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) upload_room_keys: Option<BackupUploadingTask>,
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) download_room_keys: Option<BackupDownloadTask>,
-    #[cfg(feature = "e2e-encryption")]
     pub(crate) update_recovery_state_after_backup: Option<JoinHandle<()>>,
+    pub(crate) receive_historic_room_key_bundles: Option<BundleReceiverTask>,
     pub(crate) setup_e2ee: Option<JoinHandle<()>>,
 }
 
-#[cfg(feature = "e2e-encryption")]
 pub(crate) struct BackupUploadingTask {
     sender: mpsc::UnboundedSender<()>,
     #[allow(dead_code)]
     join_handle: JoinHandle<()>,
 }
 
-#[cfg(feature = "e2e-encryption")]
 impl Drop for BackupUploadingTask {
     fn drop(&mut self) {
         #[cfg(not(target_family = "wasm"))]
@@ -62,7 +65,6 @@ impl Drop for BackupUploadingTask {
     }
 }
 
-#[cfg(feature = "e2e-encryption")]
 impl BackupUploadingTask {
     pub(crate) fn new(client: WeakClient) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -78,7 +80,7 @@ impl BackupUploadingTask {
         let _ = self.sender.send(());
     }
 
-    pub(crate) async fn listen(client: WeakClient, mut receiver: UnboundedReceiver<()>) {
+    pub(crate) async fn listen(client: WeakClient, mut receiver: mpsc::UnboundedReceiver<()>) {
         while receiver.recv().await.is_some() {
             if let Some(client) = client.get() {
                 let upload_progress = &client.inner.e2ee.backup_state.upload_progress;
@@ -111,7 +113,12 @@ struct RoomKeyDownloadRequest {
     event_id: OwnedEventId,
 
     /// The event we could not decrypt.
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
     event: Raw<OriginalSyncRoomEncryptedEvent>,
+
+    /// The event we could not decrypt.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    event: Raw<EncryptedEvent>,
 
     /// The unique ID of the room key that the event was encrypted with.
     megolm_session_id: String,
@@ -131,7 +138,6 @@ pub(crate) struct BackupDownloadTask {
     join_handle: JoinHandle<()>,
 }
 
-#[cfg(feature = "e2e-encryption")]
 impl Drop for BackupDownloadTask {
     fn drop(&mut self) {
         #[cfg(not(target_family = "wasm"))]
@@ -158,17 +164,42 @@ impl BackupDownloadTask {
     /// Does nothing unless the event is encrypted using `m.megolm.v1.aes-sha2`.
     /// Otherwise, tells the listener task to set off a task to do a backup
     /// download, unless there is one already running.
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
     pub(crate) fn trigger_download_for_utd_event(
         &self,
         room_id: OwnedRoomId,
         event: Raw<OriginalSyncRoomEncryptedEvent>,
     ) {
-        if let Ok(deserialized_event) = event.deserialize() {
-            if let EncryptedEventScheme::MegolmV1AesSha2(c) = deserialized_event.content.scheme {
+        if let Ok(deserialized_event) = event.deserialize()
+            && let EncryptedEventScheme::MegolmV1AesSha2(c) = deserialized_event.content.scheme
+        {
+            let _ = self.sender.send(RoomKeyDownloadRequest {
+                room_id,
+                event_id: deserialized_event.event_id,
+                event,
+                megolm_session_id: c.session_id,
+            });
+        }
+    }
+
+    /// Trigger a backup download for the keys for the given event.
+    ///
+    /// Does nothing unless the event is encrypted using `m.megolm.v1.aes-sha2`.
+    /// Otherwise, tells the listener task to set off a task to do a backup
+    /// download, unless there is one already running.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub(crate) fn trigger_download_for_utd_event<T: JsonCastable<EncryptedEvent>>(
+        &self,
+        room_id: OwnedRoomId,
+        event: Raw<T>,
+    ) {
+        if let Ok(deserialized_event) = event.deserialize_as::<EncryptedEvent>() {
+            if let RoomEventEncryptionScheme::MegolmV1AesSha2(c) = deserialized_event.content.scheme
+            {
                 let _ = self.sender.send(RoomKeyDownloadRequest {
                     room_id,
                     event_id: deserialized_event.event_id,
-                    event,
+                    event: event.cast(),
                     megolm_session_id: c.session_id,
                 });
             }
@@ -183,7 +214,10 @@ impl BackupDownloadTask {
     /// # Arguments
     ///
     /// * `receiver` - The source of incoming [`RoomKeyDownloadRequest`]s.
-    async fn listen(client: WeakClient, mut receiver: UnboundedReceiver<RoomKeyDownloadRequest>) {
+    async fn listen(
+        client: WeakClient,
+        mut receiver: mpsc::UnboundedReceiver<RoomKeyDownloadRequest>,
+    ) {
         let state = Arc::new(Mutex::new(BackupDownloadTaskListenerState::new(client)));
 
         while let Some(room_key_download_request) = receiver.recv().await {
@@ -356,11 +390,20 @@ impl BackupDownloadTaskListenerState {
         // (though if the store is returning errors, probably something else is
         // going to go wrong very soon).
         if machine
-            .is_room_key_available(download_request.event.cast_ref(), &download_request.room_id)
+            .is_room_key_available(
+                #[cfg(not(feature = "experimental-encrypted-state-events"))]
+                download_request.event.cast_ref(),
+                #[cfg(feature = "experimental-encrypted-state-events")]
+                &download_request.event,
+                &download_request.room_id,
+            )
             .await
             .unwrap_or(false)
         {
-            debug!(?download_request, "Not performing backup download because key became available while we were sleeping");
+            debug!(
+                ?download_request,
+                "Not performing backup download because key became available while we were sleeping"
+            );
             return false;
         }
 
@@ -373,7 +416,7 @@ impl BackupDownloadTaskListenerState {
                 "Not performing backup download because this room key has already been downloaded recently"
             );
             return false;
-        };
+        }
 
         // Check if we're backing off from attempts to download this room key
         if self.failures_cache.contains(&room_key_info) {
@@ -389,15 +432,100 @@ impl BackupDownloadTaskListenerState {
     }
 }
 
+pub(crate) struct BundleReceiverTask {
+    _handle: JoinHandle<()>,
+}
+
+impl BundleReceiverTask {
+    pub async fn new(client: &Client) -> Self {
+        let stream = client.encryption().historic_room_key_stream().await.expect("E2EE tasks should only be initialized once we have logged in and have access to an OlmMachine");
+        let weak_client = WeakClient::from_client(client);
+        let handle = spawn(Self::listen_task(weak_client, stream));
+
+        Self { _handle: handle }
+    }
+
+    async fn listen_task(client: WeakClient, stream: impl Stream<Item = RoomKeyBundleInfo>) {
+        pin_mut!(stream);
+
+        // TODO: Listening to this stream is not enough for iOS due to the NSE killing
+        // our OlmMachine and thus also this stream. We need to add an event handler
+        // that will listen for the bundle event. To be able to add an event handler,
+        // we'll have to implement the bundle event in Ruma.
+        while let Some(bundle_info) = stream.next().await {
+            let Some(client) = client.get() else {
+                // The client was dropped while we were waiting on the stream. Let's end the
+                // loop, since this means that the application has shut down.
+                break;
+            };
+
+            let Some(room) = client.get_room(&bundle_info.room_id) else {
+                warn!(room_id = %bundle_info.room_id, "Received a historic room key bundle for an unknown room");
+                continue;
+            };
+
+            Self::handle_bundle(&room, &bundle_info).await;
+        }
+    }
+
+    #[instrument(skip(room), fields(room_id = %room.room_id()))]
+    async fn handle_bundle(room: &Room, bundle_info: &RoomKeyBundleInfo) {
+        if Self::should_accept_bundle(room, bundle_info) {
+            info!("Accepting a late key bundle.");
+
+            if let Err(e) =
+                shared_room_history::maybe_accept_key_bundle(room, &bundle_info.sender).await
+            {
+                warn!("Couldn't accept a late room key bundle {e:?}");
+            }
+        } else {
+            info!("Refusing to accept a historic room key bundle.");
+        }
+    }
+
+    fn should_accept_bundle(room: &Room, bundle_info: &RoomKeyBundleInfo) -> bool {
+        // We accept historic room key bundles up to one day after we have accepted an
+        // invite.
+        const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+        // If we don't have any invite acceptance details, then this client wasn't the
+        // one that accepted the invite.
+        let Some(InviteAcceptanceDetails { invite_accepted_at, inviter }) =
+            room.invite_acceptance_details()
+        else {
+            return false;
+        };
+
+        let state = room.state();
+        let elapsed_since_join = invite_accepted_at.to_system_time().and_then(|t| t.elapsed().ok());
+        let bundle_sender = &bundle_info.sender;
+
+        match (state, elapsed_since_join) {
+            (RoomState::Joined, Some(elapsed_since_join)) => {
+                elapsed_since_join < DAY && bundle_sender == &inviter
+            }
+            (RoomState::Joined, None) => false,
+            (RoomState::Left | RoomState::Invited | RoomState::Knocked | RoomState::Banned, _) => {
+                false
+            }
+        }
+    }
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod test {
-    use matrix_sdk_test::async_test;
-    use ruma::{event_id, room_id};
+    use matrix_sdk_test::{
+        InvitedRoomBuilder, JoinedRoomBuilder, async_test, event_factory::EventFactory,
+    };
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
+    use ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent;
+    use ruma::{event_id, room_id, user_id};
     use serde_json::json;
+    use vodozemac::Curve25519PublicKey;
     use wiremock::MockServer;
 
     use super::*;
-    use crate::test_utils::logged_in_client;
+    use crate::test_utils::{logged_in_client, mocks::MatrixMockServer};
 
     // Test that, if backups are not enabled, we don't incorrectly mark a room key
     // as downloaded.
@@ -429,8 +557,12 @@ mod test {
             }
         });
 
+        #[cfg(not(feature = "experimental-encrypted-state-events"))]
         let event: Raw<OriginalSyncRoomEncryptedEvent> =
             serde_json::from_value(event_content).expect("");
+
+        #[cfg(feature = "experimental-encrypted-state-events")]
+        let event: Raw<EncryptedEvent> = serde_json::from_value(event_content).expect("");
 
         let state = Arc::new(Mutex::new(BackupDownloadTaskListenerState::new(weak_client)));
         let download_request = RoomKeyDownloadRequest {
@@ -454,5 +586,82 @@ mod test {
                 "Backups are not enabled, we should not mark any room keys as downloaded."
             )
         }
+    }
+
+    /// Test that ensures that we only accept a bundle if a certain set of
+    /// conditions is met.
+    #[async_test]
+    async fn test_should_accept_bundle() {
+        let server = MatrixMockServer::new().await;
+
+        let alice_user_id = user_id!("@alice:localhost");
+        let bob_user_id = user_id!("@bob:localhost");
+        let joined_room_id = room_id!("!joined:localhost");
+        let invited_rom_id = room_id!("!invited:localhost");
+
+        let client = server
+            .client_builder()
+            .logged_in_with_token("ABCD".to_owned(), alice_user_id.into(), "DEVICEID".into())
+            .build()
+            .await;
+
+        let event_factory = EventFactory::new().room(invited_rom_id);
+        let bob_member_event = event_factory.member(bob_user_id);
+        let alice_member_event = event_factory.member(bob_user_id).invited(alice_user_id);
+
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_joined_room(JoinedRoomBuilder::new(joined_room_id)).add_invited_room(
+                    InvitedRoomBuilder::new(invited_rom_id)
+                        .add_state_event(bob_member_event)
+                        .add_state_event(alice_member_event),
+                );
+            })
+            .await;
+
+        let room =
+            client.get_room(joined_room_id).expect("We should have access to our joined room now");
+
+        assert!(
+            room.invite_acceptance_details().is_none(),
+            "We shouldn't have any invite acceptance details if we didn't join the room on this Client"
+        );
+
+        let bundle_info = RoomKeyBundleInfo {
+            sender: bob_user_id.to_owned(),
+            sender_key: Curve25519PublicKey::from_bytes([0u8; 32]),
+            room_id: joined_room_id.to_owned(),
+        };
+
+        assert!(
+            !BundleReceiverTask::should_accept_bundle(&room, &bundle_info),
+            "We should not accept a bundle if we did not join the room from this Client"
+        );
+
+        let invited_room =
+            client.get_room(invited_rom_id).expect("We should have access to our invited room now");
+
+        assert!(
+            !BundleReceiverTask::should_accept_bundle(&invited_room, &bundle_info),
+            "We should not accept a bundle if we didn't join the room."
+        );
+
+        server.mock_room_join(invited_rom_id).ok().mock_once().mount().await;
+
+        let room = client
+            .join_room_by_id(invited_rom_id)
+            .await
+            .expect("We should be able to join the invited room");
+
+        let details = room
+            .invite_acceptance_details()
+            .expect("We should have stored the invite acceptance details");
+        assert_eq!(details.inviter, bob_user_id, "We should have recorded that Bob has invited us");
+
+        assert!(
+            BundleReceiverTask::should_accept_bundle(&room, &bundle_info),
+            "We should accept a bundle if we just joined the room and did so from this very Client object"
+        );
     }
 }

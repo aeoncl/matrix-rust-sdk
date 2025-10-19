@@ -15,17 +15,18 @@
 use std::time::Duration;
 
 use http::{
-    header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED},
     HeaderMap, HeaderName, Method, StatusCode,
+    header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED},
 };
+use matrix_sdk_base::sleep;
 use ruma::api::{
-    error::{FromHttpResponseError, HeaderDeserializationError, IntoHttpError, MatrixError},
     EndpointError,
+    error::{FromHttpResponseError, HeaderDeserializationError, IntoHttpError, MatrixError},
 };
 use tracing::{debug, instrument, trace};
 use url::Url;
 
-use crate::{http_client::HttpClient, HttpError, RumaApiError};
+use crate::{HttpError, RumaApiError, http_client::HttpClient};
 
 const TEXT_PLAIN_CONTENT_TYPE: &str = "text/plain";
 #[cfg(test)]
@@ -108,16 +109,22 @@ impl RendezvousChannel {
     /// By outbound we mean that we're going to tell the Matrix server to create
     /// a new rendezvous session. We're going to send an initial empty message
     /// through the channel.
-    #[cfg(test)]
     pub(super) async fn create_outbound(
         client: HttpClient,
         rendezvous_server: &Url,
     ) -> Result<Self, HttpError> {
-        use ruma::api::client::rendezvous::create_rendezvous_session;
+        use ruma::api::{SupportedVersions, client::rendezvous::create_rendezvous_session};
 
         let request = create_rendezvous_session::unstable::Request::default();
         let response = client
-            .send(request, None, rendezvous_server.to_string(), None, &[], Default::default())
+            .send(
+                request,
+                None,
+                rendezvous_server.to_string(),
+                None,
+                &SupportedVersions { versions: Default::default(), features: Default::default() },
+                Default::default(),
+            )
             .await?;
 
         let rendezvous_url = response.url;
@@ -218,7 +225,7 @@ impl RendezvousChannel {
             {
                 return Ok(message.body);
             } else if message.status_code == StatusCode::NOT_MODIFIED {
-                tokio::time::sleep(POLL_TIMEOUT).await;
+                sleep::sleep(POLL_TIMEOUT).await;
                 continue;
             } else {
                 let error = response_to_error(message.status_code, message.body);
@@ -290,8 +297,8 @@ mod test {
     use serde_json::json;
     use similar_asserts::assert_eq;
     use wiremock::{
-        matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
     };
 
     use super::*;

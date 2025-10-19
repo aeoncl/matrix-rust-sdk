@@ -14,24 +14,25 @@
 
 use std::sync::Arc;
 
+use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use matrix_sdk::deserialized_responses::TimelineEvent;
-use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
+use matrix_sdk_test::{ALICE, BOB, async_test, sync_timeline_event};
 use ruma::events::{
+    AnySyncTimelineEvent, TimelineEventType,
     room::{
         member::MembershipState,
         message::{MessageType, RedactedRoomMessageEventContent},
     },
-    AnySyncTimelineEvent, TimelineEventType,
 };
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
-    controller::TimelineSettings, tests::TestTimelineBuilder, AnyOtherFullStateEventContent,
-    MsgLikeContent, MsgLikeKind, TimelineEventTypeFilter, TimelineItem, TimelineItemContent,
-    TimelineItemKind,
+    AnyOtherFullStateEventContent, MsgLikeContent, MsgLikeKind, TimelineEventTypeFilter,
+    TimelineItem, TimelineItemContent, TimelineItemKind, controller::TimelineSettings,
+    tests::TestTimelineBuilder,
 };
 
 #[async_test]
@@ -138,6 +139,31 @@ async fn test_custom_filter() {
 }
 
 #[async_test]
+async fn test_custom_filter_for_custom_msglike_event() {
+    // Filter out all state events.
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings {
+            event_filter: Arc::new(|ev, _| matches!(ev, AnySyncTimelineEvent::MessageLike(_))),
+            ..Default::default()
+        })
+        .build();
+    let mut stream = timeline.subscribe().await;
+
+    let f = &timeline.factory;
+    timeline.handle_live_event(f.custom_message_like_event().sender(&ALICE)).await;
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+
+    assert_matches!(
+        item.as_event().unwrap().content().as_msglike().unwrap().kind.clone(),
+        MsgLikeKind::Other(_)
+    );
+    assert!(date_divider.is_date_divider());
+
+    assert_eq!(timeline.controller.items().await.len(), 2);
+}
+
+#[async_test]
 async fn test_hide_failed_to_parse() {
     let timeline = TestTimelineBuilder::new()
         .settings(TimelineSettings { add_failed_to_parse: false, ..Default::default() })
@@ -146,7 +172,7 @@ async fn test_hide_failed_to_parse() {
     // m.room.message events must have a msgtype and body in content, so this
     // event with an empty content object should fail to deserialize.
     timeline
-        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::from_plaintext(sync_timeline_event!({
             "content": {},
             "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 10,
@@ -158,7 +184,7 @@ async fn test_hide_failed_to_parse() {
     // Similar to above, the m.room.member state event must also not have an
     // empty content object.
     timeline
-        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::from_plaintext(sync_timeline_event!({
             "content": {},
             "event_id": "$d5G0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 2179,

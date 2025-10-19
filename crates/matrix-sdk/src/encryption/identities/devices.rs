@@ -15,16 +15,16 @@
 use std::{collections::BTreeMap, ops::Deref};
 
 use matrix_sdk_base::crypto::{
-    store::CryptoStoreError, Device as BaseDevice, DeviceData, LocalTrust,
-    UserDevices as BaseUserDevices,
+    Device as BaseDevice, DeviceData, LocalTrust, UserDevices as BaseUserDevices,
+    store::CryptoStoreError,
 };
-use ruma::{events::key::verification::VerificationMethod, DeviceId, OwnedDeviceId, OwnedUserId};
+use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, events::key::verification::VerificationMethod};
 
 use super::ManualVerifyError;
 use crate::{
+    Client,
     encryption::verification::{SasVerification, VerificationRequest},
     error::Result,
-    Client,
 };
 
 /// Updates about [`Device`]s which got received over the `/keys/query`
@@ -44,7 +44,7 @@ pub struct DeviceUpdates {
 impl DeviceUpdates {
     pub(crate) fn new(
         client: Client,
-        updates: matrix_sdk_base::crypto::store::DeviceUpdates,
+        updates: matrix_sdk_base::crypto::store::types::DeviceUpdates,
     ) -> Self {
         let map_devices = |(user_id, devices)| {
             // For some reason we need to tell Rust the type of `devices`.

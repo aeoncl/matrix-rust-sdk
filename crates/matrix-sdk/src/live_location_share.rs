@@ -19,14 +19,14 @@
 use async_stream::stream;
 use futures_util::Stream;
 use ruma::{
+    MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId,
     events::{
         beacon::OriginalSyncBeaconEvent, beacon_info::BeaconInfoEventContent,
         location::LocationContent,
     },
-    MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId,
 };
 
-use crate::{event_handler::ObservableEventHandler, Client, Room};
+use crate::{Client, Room, event_handler::ObservableEventHandler};
 
 /// An observable live location.
 #[derive(Debug)]
@@ -41,7 +41,7 @@ impl ObservableLiveLocation {
     }
 
     /// Get a stream of [`LiveLocationShare`].
-    pub fn subscribe(&self) -> impl Stream<Item = LiveLocationShare> {
+    pub fn subscribe(&self) -> impl Stream<Item = LiveLocationShare> + use<> {
         let stream = self.observable_room_events.subscribe();
 
         stream! {

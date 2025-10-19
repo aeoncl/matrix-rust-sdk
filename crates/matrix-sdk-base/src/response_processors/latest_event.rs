@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
-use matrix_sdk_crypto::{DecryptionSettings, RoomEventDecryptionResult};
-use ruma::{events::AnySyncTimelineEvent, serde::Raw, RoomId};
+use matrix_sdk_crypto::RoomEventDecryptionResult;
+use ruma::{RoomId, events::AnySyncTimelineEvent, serde::Raw};
 
-use super::{e2ee::E2EE, verification, Context};
+use super::{Context, e2ee::E2EE, verification};
 use crate::{
-    latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent},
     Result, Room,
+    latest_event::{LatestEvent, PossibleLatestEvent, is_suitable_for_latest_event},
 };
 
 /// Decrypt any [`Room::latest_encrypted_events`] for a particular set of
@@ -80,7 +80,7 @@ async fn find_suitable_and_decrypt(
                     PossibleLatestEvent::YesRoomMessage(_)
                     | PossibleLatestEvent::YesPoll(_)
                     | PossibleLatestEvent::YesCallInvite(_)
-                    | PossibleLatestEvent::YesCallNotify(_)
+                    | PossibleLatestEvent::YesRtcNotification(_)
                     | PossibleLatestEvent::YesSticker(_)
                     | PossibleLatestEvent::YesKnockedStateEvent(_) => {
                         return Some((Box::new(LatestEvent::new(decrypted)), i));
@@ -108,17 +108,19 @@ async fn decrypt_sync_room_event(
     e2ee: &E2EE<'_>,
     room_id: &RoomId,
 ) -> Result<TimelineEvent> {
-    let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: e2ee.decryption_trust_requirement };
-
     let event = match e2ee
         .olm_machine
         .expect("An `OlmMachine` is expected")
-        .try_decrypt_room_event(event.cast_ref(), room_id, &decryption_settings)
+        .try_decrypt_room_event(event.cast_ref_unchecked(), room_id, e2ee.decryption_settings)
         .await?
     {
         RoomEventDecryptionResult::Decrypted(decrypted) => {
-            let event: TimelineEvent = decrypted.into();
+            // We're fine not setting the push actions for the latest event.
+
+            // TODO: we should use `TimelineEvent::to_decrypted`
+            // but this whole code is about to get soon removed by
+            // https://github.com/matrix-org/matrix-rust-sdk/pull/5624.
+            let event = TimelineEvent::from_decrypted(decrypted, None);
 
             if let Ok(sync_timeline_event) = event.raw().deserialize() {
                 verification::process_if_relevant(&sync_timeline_event, e2ee.clone(), room_id)
@@ -129,7 +131,10 @@ async fn decrypt_sync_room_event(
         }
 
         RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
-            TimelineEvent::new_utd_event(event.clone(), utd_info)
+            // TODO: we should use `TimelineEvent::to_utd`
+            // but this whole code is about to get soon removed by
+            // https://github.com/matrix-org/matrix-rust-sdk/pull/5624.
+            TimelineEvent::from_utd(event.clone(), utd_info)
         }
     };
 
@@ -139,11 +144,11 @@ async fn decrypt_sync_room_event(
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
-        async_test, event_factory::EventFactory, JoinedRoomBuilder, SyncResponseBuilder,
+        JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
     };
     use ruma::{event_id, events::room::member::MembershipState, room_id, user_id};
 
-    use super::{decrypt_from_rooms, Context, E2EE};
+    use super::{Context, E2EE, decrypt_from_rooms};
     use crate::{room::RoomInfoNotableUpdateReasons, test_utils::logged_in_base_client};
 
     #[async_test]
@@ -183,7 +188,7 @@ mod tests {
             vec![room.clone()],
             E2EE::new(
                 client.olm_machine().await.as_ref(),
-                client.decryption_trust_requirement,
+                &client.decryption_settings,
                 client.handle_verification_events,
             ),
         )
@@ -194,11 +199,13 @@ mod tests {
         assert!(room.latest_encrypted_events().is_empty());
         assert!(room.latest_event().is_none());
         assert!(context.state_changes.room_infos.is_empty());
-        assert!(!context
-            .room_info_notable_updates
-            .get(room_id)
-            .copied()
-            .unwrap_or_default()
-            .contains(RoomInfoNotableUpdateReasons::LATEST_EVENT));
+        assert!(
+            !context
+                .room_info_notable_updates
+                .get(room_id)
+                .copied()
+                .unwrap_or_default()
+                .contains(RoomInfoNotableUpdateReasons::LATEST_EVENT)
+        );
     }
 }

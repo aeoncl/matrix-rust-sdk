@@ -8,31 +8,30 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use assign::assign;
 use matrix_sdk::{
-    assert_next_eq_with_timeout,
-    crypto::{format_emojis, SasState},
+    Client, assert_next_eq_with_timeout,
+    crypto::{SasState, format_emojis},
     encryption::{
+        BackupDownloadStrategy, EncryptionSettings, LocalTrust,
         backups::BackupState,
         recovery::{Recovery, RecoveryState},
         verification::{
             QrVerificationData, QrVerificationState, Verification, VerificationRequestState,
         },
-        BackupDownloadStrategy, EncryptionSettings, LocalTrust,
     },
     ruma::{
+        OwnedEventId,
         api::client::room::create_room::v3::Request as CreateRoomRequest,
         events::{
-            key::verification::{request::ToDeviceKeyVerificationRequestEvent, VerificationMethod},
+            GlobalAccountDataEventType, OriginalSyncMessageLikeEvent,
+            key::verification::{VerificationMethod, request::ToDeviceKeyVerificationRequestEvent},
             room::message::{
                 MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
                 SyncRoomMessageEvent,
             },
             secret_storage::secret::SecretEventContent,
-            GlobalAccountDataEventType, OriginalSyncMessageLikeEvent,
         },
-        OwnedEventId,
     },
     timeout::timeout,
-    Client,
 };
 use matrix_sdk_ui::{
     notification_client::{NotificationClient, NotificationProcessSetup},
@@ -44,6 +43,8 @@ use tracing::{debug, warn};
 use crate::helpers::{SyncTokenAwareClient, TestClientBuilder};
 
 mod shared_history;
+#[cfg(feature = "experimental-encrypted-state-events")]
+mod state_events;
 
 // This test reproduces a bug seen on clients that use the same `Client`
 // instance for both the usual sliding sync loop and for getting the event for a
@@ -51,8 +52,8 @@ mod shared_history;
 // processed twice, meaning incorrect verification states will be found and the
 // process will fail, especially with user verification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_mutual_sas_verification_with_notification_client_ignores_verification_events(
-) -> Result<()> {
+async fn test_mutual_sas_verification_with_notification_client_ignores_verification_events()
+-> Result<()> {
     let encryption_settings =
         EncryptionSettings { auto_enable_cross_signing: true, ..Default::default() };
     let alice = TestClientBuilder::new("alice")
@@ -1088,7 +1089,7 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
         .expect("The event should have been encrypted and successfully decrypted.");
 
     let event: OriginalSyncMessageLikeEvent<RoomMessageEventContent> =
-        timeline_event.raw().deserialize_as()?;
+        timeline_event.raw().deserialize_as_unchecked()?;
     let message = event.content.msgtype;
 
     assert_let!(MessageType::Text(message) = message);
@@ -1142,7 +1143,7 @@ async fn test_recovery_disabling_deletes_secret_storage_secrets() -> Result<()> 
             .expect("The secret event should still exist");
 
         let event = event
-            .deserialize_as::<SecretEventContent>()
+            .deserialize_as_unchecked::<SecretEventContent>()
             .expect("We should be able to deserialize the content of known secrets");
 
         assert!(
@@ -1166,7 +1167,7 @@ async fn test_recovery_disabling_deletes_secret_storage_secrets() -> Result<()> 
             .expect("The secret event should still exist");
 
         let event = event
-            .deserialize_as::<SecretEventContent>()
+            .deserialize_as_unchecked::<SecretEventContent>()
             .expect("We should be able to deserialize the content since that's what we uploaded");
 
         assert!(

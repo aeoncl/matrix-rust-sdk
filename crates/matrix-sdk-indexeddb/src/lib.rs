@@ -6,13 +6,16 @@ use thiserror::Error;
 
 #[cfg(feature = "e2e-encryption")]
 mod crypto_store;
-mod safe_encode;
-#[cfg(feature = "e2e-encryption")]
-mod serialize_bool_for_indexeddb;
-#[cfg(feature = "e2e-encryption")]
+mod error;
+#[cfg(feature = "event-cache-store")]
+mod event_cache_store;
+#[cfg(feature = "media-store")]
+mod media_store;
 mod serializer;
 #[cfg(feature = "state-store")]
 mod state_store;
+#[cfg(any(feature = "event-cache-store", feature = "media-store"))]
+mod transaction;
 
 #[cfg(feature = "e2e-encryption")]
 pub use crypto_store::{IndexeddbCryptoStore, IndexeddbCryptoStoreError};

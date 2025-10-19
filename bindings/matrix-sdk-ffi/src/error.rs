@@ -1,13 +1,20 @@
-use std::{collections::HashMap, error::Error, fmt, fmt::Display, time::SystemTime};
+use std::{collections::HashMap, error::Error, fmt, fmt::Display};
 
 use matrix_sdk::{
-    authentication::oauth::OAuthError, encryption::CryptoStoreError, event_cache::EventCacheError,
-    reqwest, room::edit::EditError, send_queue::RoomSendQueueError, HttpError, IdParseError,
-    NotificationSettingsError as SdkNotificationSettingsError,
+    authentication::oauth::OAuthError,
+    encryption::{identities::RequestVerificationError, CryptoStoreError},
+    event_cache::EventCacheError,
+    reqwest,
+    room::{calls::CallError, edit::EditError},
+    send_queue::RoomSendQueueError,
+    HttpError, IdParseError, NotificationSettingsError as SdkNotificationSettingsError,
     QueueWedgeError as SdkQueueWedgeError, StoreError,
 };
-use matrix_sdk_ui::{encryption_sync_service, notification_client, sync_service, timeline};
-use ruma::api::client::error::{ErrorBody, ErrorKind as RumaApiErrorKind, RetryAfter};
+use matrix_sdk_ui::{encryption_sync_service, notification_client, spaces, sync_service, timeline};
+use ruma::{
+    api::client::error::{ErrorBody, ErrorKind as RumaApiErrorKind, RetryAfter},
+    MilliSecondsSinceUnixEpoch,
+};
 use tracing::warn;
 use uniffi::UnexpectedUniFFICallbackError;
 
@@ -180,6 +187,12 @@ impl From<EditError> for ClientError {
     }
 }
 
+impl From<CallError> for ClientError {
+    fn from(e: CallError) -> Self {
+        Self::from_err(e)
+    }
+}
+
 impl From<RoomSendQueueError> for ClientError {
     fn from(e: RoomSendQueueError) -> Self {
         Self::from_err(e)
@@ -194,6 +207,18 @@ impl From<NotYetImplemented> for ClientError {
 
 impl From<FocusEventError> for ClientError {
     fn from(e: FocusEventError) -> Self {
+        Self::from_err(e)
+    }
+}
+
+impl From<RequestVerificationError> for ClientError {
+    fn from(e: RequestVerificationError) -> Self {
+        Self::from_err(e)
+    }
+}
+
+impl From<spaces::Error> for ClientError {
+    fn from(e: spaces::Error) -> Self {
         Self::from_err(e)
     }
 }
@@ -749,7 +774,9 @@ impl TryFrom<RumaApiErrorKind> for ErrorKind {
                 let retry_after_ms = match retry_after {
                     Some(RetryAfter::Delay(duration)) => Some(duration.as_millis() as u64),
                     Some(RetryAfter::DateTime(system_time)) => {
-                        let duration = system_time.duration_since(SystemTime::now()).ok();
+                        let duration = MilliSecondsSinceUnixEpoch::now()
+                            .to_system_time()
+                            .and_then(|now| system_time.duration_since(now).ok());
                         duration.map(|duration| duration.as_millis() as u64)
                     }
                     None => None,

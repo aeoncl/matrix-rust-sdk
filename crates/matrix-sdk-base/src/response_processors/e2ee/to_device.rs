@@ -14,12 +14,17 @@
 
 use std::collections::BTreeMap;
 
-use matrix_sdk_crypto::{store::RoomKeyInfo, EncryptionSyncChanges, OlmMachine};
+use matrix_sdk_common::deserialized_responses::{
+    ProcessedToDeviceEvent, ToDeviceUnableToDecryptInfo, ToDeviceUnableToDecryptReason,
+};
+use matrix_sdk_crypto::{
+    DecryptionSettings, EncryptionSyncChanges, OlmMachine, store::types::RoomKeyInfo,
+};
 use ruma::{
-    api::client::sync::sync_events::{v3, v5, DeviceLists},
+    OneTimeKeyAlgorithm, UInt,
+    api::client::sync::sync_events::{DeviceLists, v3, v5},
     events::AnyToDeviceEvent,
     serde::Raw,
-    OneTimeKeyAlgorithm, UInt,
 };
 
 use crate::Result;
@@ -33,6 +38,7 @@ pub async fn from_msc4186(
     to_device: Option<&v5::response::ToDevice>,
     e2ee: &v5::response::E2EE,
     olm_machine: Option<&OlmMachine>,
+    decryption_settings: &DecryptionSettings,
 ) -> Result<Output> {
     process(
         olm_machine,
@@ -41,6 +47,7 @@ pub async fn from_msc4186(
         &e2ee.device_one_time_keys_count,
         e2ee.device_unused_fallback_key_types.as_deref(),
         to_device.as_ref().map(|to_device| to_device.next_batch.clone()),
+        decryption_settings,
     )
     .await
 }
@@ -53,6 +60,7 @@ pub async fn from_msc4186(
 pub async fn from_sync_v2(
     response: &v3::Response,
     olm_machine: Option<&OlmMachine>,
+    decryption_settings: &DecryptionSettings,
 ) -> Result<Output> {
     process(
         olm_machine,
@@ -61,6 +69,7 @@ pub async fn from_sync_v2(
         &response.device_one_time_keys_count,
         response.device_unused_fallback_key_types.as_deref(),
         Some(response.next_batch.clone()),
+        decryption_settings,
     )
     .await
 }
@@ -76,6 +85,7 @@ async fn process(
     one_time_keys_counts: &BTreeMap<OneTimeKeyAlgorithm, UInt>,
     unused_fallback_keys: Option<&[OneTimeKeyAlgorithm]>,
     next_batch_token: Option<String>,
+    decryption_settings: &DecryptionSettings,
 ) -> Result<Output> {
     let encryption_sync_changes = EncryptionSyncChanges {
         to_device_events,
@@ -91,30 +101,42 @@ async fn process(
         // This makes sure that we have the decryption keys for the room
         // events at hand.
         let (events, room_key_updates) =
-            olm_machine.receive_sync_changes(encryption_sync_changes).await?;
+            olm_machine.receive_sync_changes(encryption_sync_changes, decryption_settings).await?;
 
-        let events = events
-            .iter()
-            // TODO: There is loss of information here, after calling `to_raw` it is not
-            // possible to make the difference between a successfully decrypted event and a plain
-            // text event. This information needs to be propagated to top layer at some point if
-            // clients relies on custom encrypted to device events.
-            .map(|p| p.to_raw())
-            .collect();
-
-        Output { decrypted_to_device_events: events, room_key_updates: Some(room_key_updates) }
+        Output { processed_to_device_events: events, room_key_updates: Some(room_key_updates) }
     } else {
-        // If we have no `OlmMachine`, just return the events that were passed in.
+        // If we have no `OlmMachine`, just return the clear events that were passed in.
+        // The encrypted ones are dropped as they are un-usable.
         // This should not happen unless we forget to set things up by calling
         // `Self::activate()`.
         Output {
-            decrypted_to_device_events: encryption_sync_changes.to_device_events,
+            processed_to_device_events: encryption_sync_changes
+                .to_device_events
+                .into_iter()
+                .map(|raw| {
+                    if let Ok(Some(event_type)) = raw.get_field::<String>("type") {
+                        if event_type == "m.room.encrypted" {
+                            ProcessedToDeviceEvent::UnableToDecrypt {
+                                encrypted_event: raw,
+                                utd_info: ToDeviceUnableToDecryptInfo {
+                                    reason: ToDeviceUnableToDecryptReason::NoOlmMachine,
+                                },
+                            }
+                        } else {
+                            ProcessedToDeviceEvent::PlainText(raw)
+                        }
+                    } else {
+                        // Exclude events with no type
+                        ProcessedToDeviceEvent::Invalid(raw)
+                    }
+                })
+                .collect(),
             room_key_updates: None,
         }
     })
 }
 
 pub struct Output {
-    pub decrypted_to_device_events: Vec<Raw<AnyToDeviceEvent>>,
+    pub processed_to_device_events: Vec<ProcessedToDeviceEvent>,
     pub room_key_updates: Option<Vec<RoomKeyInfo>>,
 }

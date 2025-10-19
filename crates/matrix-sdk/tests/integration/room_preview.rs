@@ -6,20 +6,21 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::{RequestedRequiredStates, RoomState};
 use matrix_sdk_test::{
-    async_test, InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, SyncResponseBuilder,
+    InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, SyncResponseBuilder, async_test,
 };
 use ruma::{
-    api::client::sync::sync_events::{v5 as sliding_sync_http, v5::response::Hero},
+    RoomId,
+    api::client::sync::sync_events::v5::{self as sliding_sync_http, response::Hero},
     assign,
     events::room::member::MembershipState,
-    owned_user_id, room_id,
-    space::SpaceRoomJoinRule,
-    RoomId,
+    owned_user_id,
+    room::JoinRuleKind,
+    room_id,
 };
 use serde_json::json;
 use wiremock::{
-    matchers::{header, method, path_regex},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path_regex},
 };
 
 use crate::mock_sync;
@@ -39,7 +40,7 @@ async fn test_room_preview_leave_invited() {
     mock_unknown_summary(
         room_id,
         None,
-        SpaceRoomJoinRule::Knock,
+        JoinRuleKind::Knock,
         Some(MembershipState::Invite),
         &server,
     )
@@ -94,14 +95,8 @@ async fn test_room_preview_leave_knocked() {
     client.sync_once(SyncSettings::default()).await.unwrap();
     server.reset().await;
 
-    mock_unknown_summary(
-        room_id,
-        None,
-        SpaceRoomJoinRule::Knock,
-        Some(MembershipState::Knock),
-        &server,
-    )
-    .await;
+    mock_unknown_summary(room_id, None, JoinRuleKind::Knock, Some(MembershipState::Knock), &server)
+        .await;
     mock_leave(room_id, &server).await;
 
     let room_preview = client.get_room_preview(room_id.into(), Vec::new()).await.unwrap();
@@ -141,7 +136,7 @@ async fn test_room_preview_leave_unknown_room_fails() {
     let (client, server) = logged_in_client_with_server().await;
     let room_id = room_id!("!room:localhost");
 
-    mock_unknown_summary(room_id, None, SpaceRoomJoinRule::Knock, None, &server).await;
+    mock_unknown_summary(room_id, None, JoinRuleKind::Knock, None, &server).await;
 
     let room_preview = client.get_room_preview(room_id.into(), Vec::new()).await.unwrap();
     assert!(room_preview.state.is_none());
@@ -193,7 +188,7 @@ async fn mock_leave(room_id: &RoomId, server: &MockServer) {
 async fn mock_unknown_summary(
     room_id: &RoomId,
     alias: Option<String>,
-    join_rule: SpaceRoomJoinRule,
+    join_rule: JoinRuleKind,
     membership: Option<MembershipState>,
     server: &MockServer,
 ) {

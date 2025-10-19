@@ -16,19 +16,18 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use async_trait::async_trait;
 pub use bytes;
 #[cfg(feature = "e2e-encryption")]
 pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
-    deserialized_responses,
-    store::{self, DynStateStore, MemoryStore, StateStoreExt},
     ComposerDraft, ComposerDraftType, EncryptionState, PredecessorRoom, QueueWedgeError,
     Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
-    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
-    StateStore, StoreError, SuccessorRoom,
+    RoomMember as BaseRoomMember, RoomMemberships, RoomRecencyStamp, RoomState, SessionMeta,
+    StateChanges, StateStore, StoreError, SuccessorRoom, ThreadingSupport, deserialized_responses,
+    store::{self, DynStateStore, MemoryStore, StateStoreExt},
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
@@ -45,8 +44,10 @@ mod error;
 pub mod event_cache;
 pub mod event_handler;
 mod http_client;
+pub mod latest_events;
 pub mod media;
 pub mod notification_settings;
+pub mod paginators;
 pub mod pusher;
 pub mod room;
 pub mod room_directory_search;
@@ -65,8 +66,11 @@ pub mod widget;
 
 pub use account::Account;
 pub use authentication::{AuthApi, AuthSession, SessionTokens};
+#[cfg(feature = "experimental-search")]
+pub mod search_index;
 pub use client::{
-    sanitize_server_name, Client, ClientBuildError, ClientBuilder, LoopCtrl, SessionChange,
+    Client, ClientBuildError, ClientBuilder, LoopCtrl, ServerVendorInfo, SessionChange,
+    sanitize_server_name,
 };
 pub use error::{
     Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError, Result,
@@ -77,7 +81,8 @@ pub use http_client::TransmissionProgress;
 pub use matrix_sdk_sqlite::SqliteCryptoStore;
 #[cfg(feature = "sqlite")]
 pub use matrix_sdk_sqlite::{
-    SqliteEventCacheStore, SqliteStateStore, SqliteStoreConfig, STATE_STORE_DATABASE_NAME,
+    STATE_STORE_DATABASE_NAME, SqliteEventCacheStore, SqliteMediaStore, SqliteStateStore,
+    SqliteStoreConfig,
 };
 pub use media::Media;
 pub use pusher::Pusher;
@@ -96,4 +101,4 @@ pub mod live_location_share;
 pub mod test_utils;
 
 #[cfg(test)]
-matrix_sdk_test::init_tracing_for_tests!();
+matrix_sdk_test_utils::init_tracing_for_tests!();

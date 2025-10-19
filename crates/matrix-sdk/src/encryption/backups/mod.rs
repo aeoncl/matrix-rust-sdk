@@ -24,17 +24,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
+#[cfg(feature = "experimental-encrypted-state-events")]
+use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 use matrix_sdk_base::crypto::{
-    backups::MegolmV1BackupKey,
-    store::BackupDecryptionKey,
-    types::{requests::KeysBackupRequest, RoomKeyBackupInfo},
     OlmMachine, RoomKeyImportResult,
+    backups::MegolmV1BackupKey,
+    store::types::BackupDecryptionKey,
+    types::{RoomKeyBackupInfo, requests::KeysBackupRequest},
 };
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::serde::JsonCastable;
 use ruma::{
+    OwnedRoomId, RoomId, TransactionId,
     api::client::{
         backup::{
-            add_backup_keys, create_backup_version, get_backup_keys, get_backup_keys_for_room,
-            get_backup_keys_for_session, get_latest_backup_info, RoomKeyBackup,
+            RoomKeyBackup, add_backup_keys, create_backup_version, get_backup_keys,
+            get_backup_keys_for_room, get_backup_keys_for_session, get_latest_backup_info,
         },
         error::ErrorKind,
     },
@@ -43,10 +48,9 @@ use ruma::{
         secret::{request::SecretName, send::ToDeviceSecretSendEvent},
     },
     serde::Raw,
-    OwnedRoomId, RoomId, TransactionId,
 };
-use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
-use tracing::{error, info, instrument, trace, warn, Span};
+use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+use tracing::{Span, error, info, instrument, trace, warn};
 
 pub mod futures;
 pub(crate) mod types;
@@ -55,7 +59,7 @@ pub use types::{BackupState, UploadState};
 
 use self::futures::WaitForSteadyState;
 use crate::{
-    crypto::olm::ExportedRoomKey, encryption::BackupDownloadStrategy, Client, Error, Room,
+    Client, Error, Room, crypto::olm::ExportedRoomKey, encryption::BackupDownloadStrategy,
 };
 
 /// The backups manager for the [`Client`].
@@ -360,7 +364,7 @@ impl Backups {
     /// ```
     pub fn state_stream(
         &self,
-    ) -> impl Stream<Item = Result<BackupState, BroadcastStreamRecvError>> {
+    ) -> impl Stream<Item = Result<BackupState, BroadcastStreamRecvError>> + use<> {
         self.client.inner.e2ee.backup_state.global_state.subscribe()
     }
 
@@ -419,7 +423,7 @@ impl Backups {
     pub fn room_keys_for_room_stream(
         &self,
         room_id: &RoomId,
-    ) -> impl Stream<Item = Result<BTreeMap<String, BTreeSet<String>>, BroadcastStreamRecvError>>
+    ) -> impl Stream<Item = Result<BTreeMap<String, BTreeSet<String>>, BroadcastStreamRecvError>> + use<>
     {
         let room_id = room_id.to_owned();
 
@@ -450,21 +454,21 @@ impl Backups {
 
         let backup_keys = olm_machine.store().load_backup_keys().await?;
 
-        if let Some(decryption_key) = backup_keys.decryption_key {
-            if let Some(version) = backup_keys.backup_version {
-                let request =
-                    get_backup_keys_for_room::v3::Request::new(version.clone(), room_id.to_owned());
-                let response = self.client.send(request).await?;
+        if let Some(decryption_key) = backup_keys.decryption_key
+            && let Some(version) = backup_keys.backup_version
+        {
+            let request =
+                get_backup_keys_for_room::v3::Request::new(version.clone(), room_id.to_owned());
+            let response = self.client.send(request).await?;
 
-                // Transform response to standard format (map of room ID -> room key).
-                let response = get_backup_keys::v3::Response::new(BTreeMap::from([(
-                    room_id.to_owned(),
-                    RoomKeyBackup::new(response.sessions),
-                )]));
+            // Transform response to standard format (map of room ID -> room key).
+            let response = get_backup_keys::v3::Response::new(BTreeMap::from([(
+                room_id.to_owned(),
+                RoomKeyBackup::new(response.sessions),
+            )]));
 
-                self.handle_downloaded_room_keys(response, decryption_key, &version, olm_machine)
-                    .await?;
-            }
+            self.handle_downloaded_room_keys(response, decryption_key, &version, olm_machine)
+                .await?;
         }
 
         Ok(())
@@ -616,7 +620,7 @@ impl Backups {
 
     fn room_keys_stream(
         &self,
-    ) -> impl Stream<Item = Result<RoomKeyImportResult, BroadcastStreamRecvError>> {
+    ) -> impl Stream<Item = Result<RoomKeyImportResult, BroadcastStreamRecvError>> + use<> {
         BroadcastStream::new(self.client.inner.e2ee.backup_state.room_keys_broadcaster.subscribe())
     }
 
@@ -630,11 +634,7 @@ impl Backups {
             Ok(r) => Ok(Some(r)),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
-                    if kind == &ErrorKind::NotFound {
-                        Ok(None)
-                    } else {
-                        Err(e.into())
-                    }
+                    if kind == &ErrorKind::NotFound { Ok(None) } else { Err(e.into()) }
                 } else {
                     Err(e.into())
                 }
@@ -649,11 +649,7 @@ impl Backups {
             Ok(_) => Ok(()),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
-                    if kind == &ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(e.into())
-                    }
+                    if kind == &ErrorKind::NotFound { Ok(()) } else { Err(e.into()) }
                 } else {
                     Err(e.into())
                 }
@@ -702,7 +698,10 @@ impl Backups {
                 if let Some(kind) = error.client_api_error_kind() {
                     match kind {
                         ErrorKind::NotFound => {
-                            warn!("No backup found on the server, the backup likely got deleted, disabling backups.");
+                            warn!(
+                                "No backup found on the server, the backup likely got deleted, \
+                                 disabling backups."
+                            );
 
                             self.handle_deleted_backup_version(olm_machine).await?;
                         }
@@ -999,10 +998,25 @@ impl Backups {
 
     /// Send a notification to the task responsible for key backup downloads
     /// that it should attempt to download the keys for the given event.
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
     pub(crate) fn maybe_download_room_key(
         &self,
         room_id: OwnedRoomId,
         event: Raw<OriginalSyncRoomEncryptedEvent>,
+    ) {
+        let tasks = self.client.inner.e2ee.tasks.lock();
+        if let Some(task) = tasks.download_room_keys.as_ref() {
+            task.trigger_download_for_utd_event(room_id, event);
+        }
+    }
+
+    /// Send a notification to the task responsible for key backup downloads
+    /// that it should attempt to download the keys for the given event.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub(crate) fn maybe_download_room_key<T: JsonCastable<EncryptedEvent>>(
+        &self,
+        room_id: OwnedRoomId,
+        event: Raw<T>,
     ) {
         let tasks = self.client.inner.e2ee.tasks.lock();
         if let Some(task) = tasks.download_room_keys.as_ref() {
@@ -1037,8 +1051,8 @@ mod test {
     use matrix_sdk_test::async_test;
     use serde_json::json;
     use wiremock::{
-        matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
     };
 
     use super::*;

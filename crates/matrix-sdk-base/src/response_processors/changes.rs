@@ -13,22 +13,25 @@
 // limitations under the License.
 
 use eyeball::SharedObservable;
+use matrix_sdk_common::timer;
 use ruma::{
-    events::{ignored_user_list::IgnoredUserListEvent, GlobalAccountDataEventType},
+    events::{GlobalAccountDataEventType, ignored_user_list::IgnoredUserListEvent},
     serde::Raw,
 };
 use tracing::{error, instrument, trace};
 
 use super::Context;
 use crate::{
-    store::{BaseStateStore, StateStoreExt as _},
     Result,
+    store::{BaseStateStore, StateStoreExt as _},
 };
 
 /// Save the [`StateChanges`] from the [`Context`] inside the [`BaseStateStore`]
 /// only! The changes aren't applied on the in-memory rooms.
 #[instrument(skip_all)]
 pub async fn save_only(context: Context, state_store: &BaseStateStore) -> Result<()> {
+    let _timer = timer!(tracing::Level::TRACE, "_method");
+
     save_changes(&context, state_store, None).await?;
     broadcast_room_info_notable_updates(&context, state_store);
 
@@ -44,6 +47,8 @@ pub async fn save_and_apply(
     ignore_user_list_changes: &SharedObservable<Vec<String>>,
     sync_token: Option<String>,
 ) -> Result<()> {
+    let _timer = timer!(tracing::Level::TRACE, "_method");
+
     trace!("ready to submit changes to store");
 
     let previous_ignored_user_list =
@@ -80,7 +85,7 @@ fn apply_changes(
     if let Some(event) =
         context.state_changes.account_data.get(&GlobalAccountDataEventType::IgnoredUserList)
     {
-        match event.deserialize_as::<IgnoredUserListEvent>() {
+        match event.deserialize_as_unchecked::<IgnoredUserListEvent>() {
             Ok(event) => {
                 let user_ids: Vec<String> =
                     event.content.ignored_users.keys().map(|id| id.to_string()).collect();

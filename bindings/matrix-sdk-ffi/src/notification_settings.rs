@@ -11,6 +11,7 @@ use matrix_sdk::{
 };
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::{
+    events::push_rules::PushRulesEventContent,
     push::{
         Action as SdkAction, ComparisonOperator as SdkComparisonOperator, PredefinedOverrideRuleId,
         PredefinedUnderrideRuleId, PushCondition as SdkPushCondition, RoomMemberCountIs,
@@ -20,7 +21,7 @@ use ruma::{
 };
 use tokio::sync::RwLock as AsyncRwLock;
 
-use crate::error::NotificationSettingsError;
+use crate::error::{ClientError, NotificationSettingsError};
 
 #[derive(Clone, Default, uniffi::Enum)]
 pub enum ComparisonOperator {
@@ -167,12 +168,13 @@ impl TryFrom<SdkPushCondition> for PushCondition {
     fn try_from(value: SdkPushCondition) -> Result<Self, Self::Error> {
         Ok(match value {
             SdkPushCondition::EventMatch { key, pattern } => Self::EventMatch { key, pattern },
+            #[allow(deprecated)]
             SdkPushCondition::ContainsDisplayName => Self::ContainsDisplayName,
             SdkPushCondition::RoomMemberCount { is } => {
                 Self::RoomMemberCount { prefix: is.prefix.into(), count: is.count.into() }
             }
             SdkPushCondition::SenderNotificationPermission { key } => {
-                Self::SenderNotificationPermission { key }
+                Self::SenderNotificationPermission { key: key.to_string() }
             }
             SdkPushCondition::EventPropertyIs { key, value } => {
                 Self::EventPropertyIs { key, value: value.into() }
@@ -189,6 +191,7 @@ impl From<PushCondition> for SdkPushCondition {
     fn from(value: PushCondition) -> Self {
         match value {
             PushCondition::EventMatch { key, pattern } => Self::EventMatch { key, pattern },
+            #[allow(deprecated)]
             PushCondition::ContainsDisplayName => Self::ContainsDisplayName,
             PushCondition::RoomMemberCount { prefix, count } => Self::RoomMemberCount {
                 is: RoomMemberCountIs {
@@ -197,7 +200,7 @@ impl From<PushCondition> for SdkPushCondition {
                 },
             },
             PushCondition::SenderNotificationPermission { key } => {
-                Self::SenderNotificationPermission { key }
+                Self::SenderNotificationPermission { key: key.into() }
             }
             PushCondition::EventPropertyIs { key, value } => {
                 Self::EventPropertyIs { key, value: value.into() }
@@ -769,5 +772,12 @@ impl NotificationSettings {
             .unmute_room(&parsed_room_id, is_encrypted.into(), is_one_to_one.into())
             .await?;
         Ok(())
+    }
+
+    /// Returns the raw push rules in JSON format.
+    pub async fn get_raw_push_rules(&self) -> Result<Option<String>, ClientError> {
+        let raw_push_rules =
+            self.sdk_client.account().account_data::<PushRulesEventContent>().await?;
+        Ok(raw_push_rules.map(|raw| serde_json::to_string(&raw)).transpose()?)
     }
 }

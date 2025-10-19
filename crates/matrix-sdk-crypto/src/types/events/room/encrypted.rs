@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use ruma::{OwnedDeviceId, RoomId};
+use ruma::{events::AnyToDeviceEventContent, serde::JsonCastable, OwnedDeviceId, RoomId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vodozemac::{megolm::MegolmMessage, olm::OlmMessage, Curve25519PublicKey};
@@ -28,7 +28,7 @@ use crate::types::{
         room_key_request::{self, SupportedKeyInfo},
         EventType, ToDeviceEvent,
     },
-    serialize_curve_key, EventEncryptionAlgorithm,
+    serde_curve_key_option, serialize_curve_key, EventEncryptionAlgorithm,
 };
 
 /// An m.room.encrypted room event.
@@ -65,6 +65,17 @@ impl EncryptedEvent {
     }
 }
 
+impl JsonCastable<EncryptedEvent>
+    for ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent
+{
+}
+
+#[cfg(feature = "experimental-encrypted-state-events")]
+impl JsonCastable<EncryptedEvent>
+    for ruma::events::room::encrypted::unstable_state::OriginalSyncStateRoomEncryptedEvent
+{
+}
+
 /// An m.room.encrypted to-device event.
 pub type EncryptedToDeviceEvent = ToDeviceEvent<ToDeviceEncryptedEventContent>;
 
@@ -94,6 +105,8 @@ pub enum ToDeviceEncryptedEventContent {
 impl EventType for ToDeviceEncryptedEventContent {
     const EVENT_TYPE: &'static str = "m.room.encrypted";
 }
+
+impl JsonCastable<AnyToDeviceEventContent> for ToDeviceEncryptedEventContent {}
 
 impl ToDeviceEncryptedEventContent {
     /// Get the algorithm of the event content.
@@ -221,6 +234,11 @@ impl EventType for RoomEncryptedEventContent {
     const EVENT_TYPE: &'static str = "m.room.encrypted";
 }
 
+impl JsonCastable<ruma::events::AnyMessageLikeEventContent> for RoomEncryptedEventContent {}
+
+#[cfg(feature = "experimental-encrypted-state-events")]
+impl JsonCastable<ruma::events::AnyStateEventContent> for RoomEncryptedEventContent {}
+
 /// An enum for per encryption algorithm event contents.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "Helper")]
@@ -300,11 +318,12 @@ pub struct MegolmV1AesSha2Content {
     pub ciphertext: MegolmMessage,
 
     /// The Curve25519 key of the sender.
-    #[serde(deserialize_with = "deserialize_curve_key", serialize_with = "serialize_curve_key")]
-    pub sender_key: Curve25519PublicKey,
+    #[serde(default, with = "serde_curve_key_option", skip_serializing_if = "Option::is_none")]
+    pub sender_key: Option<Curve25519PublicKey>,
 
     /// The ID of the sending device.
-    pub device_id: OwnedDeviceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<OwnedDeviceId>,
 
     /// The ID of the session used to encrypt the message.
     pub session_id: String,
@@ -514,6 +533,39 @@ pub(crate) mod tests {
         );
         assert!(content.message_id.is_none());
 
+        let serialized = serde_json::to_value(event)?;
+        assert_eq!(json, serialized);
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialization_missing_sender_key_device_id() -> Result<(), serde_json::Error> {
+        let json = json!({
+            "sender": "@alice:example.org",
+            "event_id": "$Nhl3rsgHMjk-DjMJANawr9HHAhLg4GcoTYrSiYYGqEE",
+            "content": {
+                "m.custom": "something custom",
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "session_id": "ZFD6+OmV7fVCsJ7Gap8UnORH8EnmiAkes8FAvQuCw/I",
+                "ciphertext":
+                    "AwgAEiBQs2LgBD2CcB+RLH2bsgp9VadFUJhBXOtCmcJuttBDOeDNjL21d9\
+                     z0AcVSfQFAh9huh4or7sWuNrHcvu9/sMbweTgc0UtdA5xFLheubHouXy4a\
+                     ewze+ShndWAaTbjWJMLsPSQDUMQHBA",
+                "m.relates_to": {
+                    "rel_type": "m.reference",
+                    "event_id": "$WUreEJERkFzO8i2dk6CmTex01cP1dZ4GWKhKCwkWHrQ"
+                },
+            },
+            "type": "m.room.encrypted",
+            "origin_server_ts": 1632491098485u64,
+            "m.custom.top": "something custom in the top",
+        });
+
+        let event: EncryptedEvent = serde_json::from_value(json.clone())?;
+
+        assert_matches!(event.content.scheme, RoomEventEncryptionScheme::MegolmV1AesSha2(_));
+        assert!(event.content.relates_to.is_some());
         let serialized = serde_json::to_value(event)?;
         assert_eq!(json, serialized);
 

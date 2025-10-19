@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
-    store::{LockableCryptoStore, Store},
     CryptoStoreError,
+    store::{LockableCryptoStore, Store},
 };
-use matrix_sdk_common::store_locks::{
-    CrossProcessStoreLock, CrossProcessStoreLockGuard, LockStoreError,
+use matrix_sdk_common::cross_process_lock::{
+    CrossProcessLock, CrossProcessLockError, CrossProcessLockGuard,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -61,13 +61,13 @@ fn compute_session_hash(tokens: &SessionTokens) -> SessionHash {
 #[derive(Clone)]
 pub(super) struct CrossProcessRefreshManager {
     store: Store,
-    store_lock: CrossProcessStoreLock<LockableCryptoStore>,
+    store_lock: CrossProcessLock<LockableCryptoStore>,
     known_session_hash: Arc<Mutex<Option<SessionHash>>>,
 }
 
 impl CrossProcessRefreshManager {
     /// Create a new `CrossProcessRefreshManager`.
-    pub fn new(store: Store, lock: CrossProcessStoreLock<LockableCryptoStore>) -> Self {
+    pub fn new(store: Store, lock: CrossProcessLock<LockableCryptoStore>) -> Self {
         Self { store, store_lock: lock, known_session_hash: Arc::new(Mutex::new(None)) }
     }
 
@@ -100,12 +100,7 @@ impl CrossProcessRefreshManager {
             (Some(db), Some(known)) => db != known,
         };
 
-        trace!(
-            "Hash mismatch? {:?} (prev. known={:?}, db={:?})",
-            hash_mismatch,
-            *prev_hash,
-            db_hash
-        );
+        trace!(hash_mismatch, ?prev_hash, ?db_hash);
 
         let guard = CrossProcessRefreshLockGuard {
             hash_guard: prev_hash,
@@ -139,7 +134,7 @@ pub(super) struct CrossProcessRefreshLockGuard {
     hash_guard: OwnedMutexGuard<Option<SessionHash>>,
 
     /// Cross-process lock being hold.
-    _store_guard: CrossProcessStoreLockGuard,
+    _store_guard: CrossProcessLockGuard,
 
     /// Reference to the underlying store, for storing the hash of the latest
     /// known session (as a custom value).
@@ -198,14 +193,14 @@ impl CrossProcessRefreshLockGuard {
         let new_hash = compute_session_hash(trusted_tokens);
         trace!("Trusted OAuth 2.0 tokens have hash {new_hash:?}; db had {:?}", self.db_hash);
 
-        if let Some(db_hash) = &self.db_hash {
-            if new_hash != *db_hash {
-                // That should never happen, unless we got into an impossible situation!
-                // In this case, we assume the value returned by the callback is always
-                // correct, so override that in the database too.
-                tracing::error!("error: DB and trusted disagree. Overriding in DB.");
-                self.save_in_database(&new_hash).await?;
-            }
+        if let Some(db_hash) = &self.db_hash
+            && new_hash != *db_hash
+        {
+            // That should never happen, unless we got into an impossible situation!
+            // In this case, we assume the value returned by the callback is always
+            // correct, so override that in the database too.
+            tracing::error!("error: DB and trusted disagree. Overriding in DB.");
+            self.save_in_database(&new_hash).await?;
         }
 
         self.save_in_memory(new_hash);
@@ -223,7 +218,7 @@ pub enum CrossProcessRefreshLockError {
 
     /// The locking itself failed.
     #[error(transparent)]
-    LockError(#[from] LockStoreError),
+    LockError(#[from] CrossProcessLockError),
 
     /// The previous hash isn't valid.
     #[error("the previous stored hash isn't a valid integer")]
@@ -234,7 +229,10 @@ pub enum CrossProcessRefreshLockError {
     MissingLock,
 
     /// Cross-process lock was set, but without session callbacks.
-    #[error("reload session callback must be set with Client::set_session_callbacks() for the cross-process lock to work")]
+    #[error(
+        "reload session callback must be set with Client::set_session_callbacks() \
+         for the cross-process lock to work"
+    )]
     MissingReloadSession,
 
     /// The store has been created twice.
@@ -249,21 +247,21 @@ mod tests {
 
     use anyhow::Context as _;
     use futures_util::future::join_all;
-    use matrix_sdk_base::{store::RoomLoadSettings, SessionMeta};
+    use matrix_sdk_base::{SessionMeta, store::RoomLoadSettings};
     use matrix_sdk_test::async_test;
     use ruma::{owned_device_id, owned_user_id};
 
     use super::compute_session_hash;
     use crate::{
+        Error,
         authentication::oauth::cross_process::SessionHash,
         test_utils::{
             client::{
-                mock_prev_session_tokens_with_refresh, mock_session_tokens_with_refresh,
-                oauth::mock_session, MockClientBuilder,
+                MockClientBuilder, mock_prev_session_tokens_with_refresh,
+                mock_session_tokens_with_refresh, oauth::mock_session,
             },
             mocks::MatrixMockServer,
         },
-        Error,
     };
 
     #[async_test]
@@ -271,8 +269,8 @@ mod tests {
         // Create a client that will use sqlite databases.
 
         let tmp_dir = tempfile::tempdir()?;
-        let client = MockClientBuilder::new("https://example.org".to_owned())
-            .sqlite_store(&tmp_dir)
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
             .unlogged()
             .build()
             .await;
@@ -321,8 +319,12 @@ mod tests {
         server.mock_who_am_i().ok().expect(1).named("whoami").mount().await;
 
         let tmp_dir = tempfile::tempdir()?;
-        let client =
-            server.client_builder().sqlite_store(&tmp_dir).registered_with_oauth().build().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
+            .registered_with_oauth()
+            .build()
+            .await;
         let oauth = client.oauth();
 
         // Enable cross-process lock.
@@ -371,7 +373,12 @@ mod tests {
         oauth_server.mock_token().ok().expect(1).named("token").mount().await;
 
         let tmp_dir = tempfile::tempdir()?;
-        let client = server.client_builder().sqlite_store(&tmp_dir).unlogged().build().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
+            .unlogged()
+            .build()
+            .await;
         let oauth = client.oauth();
 
         let next_tokens = mock_session_tokens_with_refresh();
@@ -420,7 +427,12 @@ mod tests {
 
         // Create the first client.
         let tmp_dir = tempfile::tempdir()?;
-        let client = server.client_builder().sqlite_store(&tmp_dir).unlogged().build().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
+            .unlogged()
+            .build()
+            .await;
 
         let oauth = client.oauth();
         oauth.enable_cross_process_refresh_lock("client1".to_owned()).await?;
@@ -431,15 +443,24 @@ mod tests {
 
         // Create a second client, without restoring it, to test that a token update
         // before restoration doesn't cause new issues.
-        let unrestored_client =
-            server.client_builder().sqlite_store(&tmp_dir).unlogged().build().await;
+        let unrestored_client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
+            .unlogged()
+            .build()
+            .await;
         let unrestored_oauth = unrestored_client.oauth();
         unrestored_oauth.enable_cross_process_refresh_lock("unrestored_client".to_owned()).await?;
 
         {
             // Create a third client that will run a refresh while the others two are doing
             // nothing.
-            let client3 = server.client_builder().sqlite_store(&tmp_dir).unlogged().build().await;
+            let client3 = server
+                .client_builder()
+                .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
+                .unlogged()
+                .build()
+                .await;
 
             let oauth3 = client3.oauth();
             oauth3.enable_cross_process_refresh_lock("client3".to_owned()).await?;
@@ -547,7 +568,12 @@ mod tests {
         oauth_server.mock_revocation().ok().expect(1).named("revocation").mount().await;
 
         let tmp_dir = tempfile::tempdir()?;
-        let client = server.client_builder().sqlite_store(&tmp_dir).unlogged().build().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.sqlite_store(&tmp_dir, None))
+            .unlogged()
+            .build()
+            .await;
         let oauth = client.oauth().insecure_rewrite_https_to_http();
 
         // Enable cross-process lock.

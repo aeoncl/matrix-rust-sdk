@@ -16,29 +16,31 @@ use std::{future::Future, sync::Arc};
 
 use eyeball::Subscriber;
 use indexmap::IndexMap;
-#[cfg(test)]
-use matrix_sdk::crypto::{DecryptionSettings, RoomEventDecryptionResult, TrustRequirement};
 use matrix_sdk::{
+    AsyncTraitDeps, Result, Room, SendOutsideWasm,
     crypto::types::events::CryptoContextInfo,
     deserialized_responses::{EncryptionInfo, TimelineEvent},
-    event_cache::paginator::PaginableRoom,
-    room::{PushContext, Relations, RelationsOptions},
-    AsyncTraitDeps, Result, Room, SendOutsideWasm,
+    paginators::{PaginableRoom, thread::PaginableThread},
+    room::PushContext,
 };
-use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo};
+use matrix_sdk_base::{RoomInfo, latest_event::LatestEvent};
 use ruma::{
+    EventId, OwnedEventId, OwnedTransactionId, OwnedUserId, UserId,
     events::{
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
         fully_read::FullyReadEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        room::encrypted::OriginalSyncRoomEncryptedEvent,
     },
+    room_version_rules::RoomVersionRules,
     serde::Raw,
-    EventId, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId, UserId,
 };
 use tracing::error;
 
 use super::{EventTimelineItem, Profile, RedactError, TimelineBuilder};
-use crate::timeline::{self, pinned_events_loader::PinnedEventsRoom, Timeline};
+use crate::timeline::{
+    self, Timeline, latest_event::LatestEventValue, pinned_events_loader::PinnedEventsRoom,
+};
 
 pub trait RoomExt {
     /// Get a [`Timeline`] for this room.
@@ -49,7 +51,7 @@ pub trait RoomExt {
     ///
     /// This is the same as using `room.timeline_builder().build()`.
     fn timeline(&self)
-        -> impl Future<Output = Result<Timeline, timeline::Error>> + SendOutsideWasm;
+    -> impl Future<Output = Result<Timeline, timeline::Error>> + SendOutsideWasm;
 
     /// Get a [`TimelineBuilder`] for this room.
     ///
@@ -66,6 +68,9 @@ pub trait RoomExt {
     fn latest_event_item(
         &self,
     ) -> impl Future<Output = Option<EventTimelineItem>> + SendOutsideWasm;
+
+    /// Return a [`LatestEventValue`] corresponding to this room's latest event.
+    fn new_latest_event(&self) -> impl Future<Output = LatestEventValue>;
 }
 
 impl RoomExt for Room {
@@ -78,22 +83,31 @@ impl RoomExt for Room {
     }
 
     async fn latest_event_item(&self) -> Option<EventTimelineItem> {
-        if let Some(latest_event) = (**self).latest_event() {
+        if let Some(latest_event) = self.latest_event() {
             EventTimelineItem::from_latest_event(self.client(), self.room_id(), latest_event).await
         } else {
             None
         }
     }
+
+    async fn new_latest_event(&self) -> LatestEventValue {
+        LatestEventValue::from_base_latest_event_value(
+            (**self).new_latest_event(),
+            self,
+            &self.client(),
+        )
+        .await
+    }
 }
 
 pub(super) trait RoomDataProvider:
-    Clone + PaginableRoom + PinnedEventsRoom + 'static
+    Clone + Decryptor + PaginableRoom + PaginableThread + PinnedEventsRoom + 'static
 {
     fn own_user_id(&self) -> &UserId;
-    fn room_version(&self) -> RoomVersionId;
+    fn room_version_rules(&self) -> RoomVersionRules;
 
     fn crypto_context_info(&self)
-        -> impl Future<Output = CryptoContextInfo> + SendOutsideWasm + '_;
+    -> impl Future<Output = CryptoContextInfo> + SendOutsideWasm + '_;
 
     fn profile_from_user_id<'a>(
         &'a self,
@@ -113,6 +127,7 @@ pub(super) trait RoomDataProvider:
     fn load_event_receipts<'a>(
         &'a self,
         event_id: &'a EventId,
+        receipt_thread: ReceiptThread,
     ) -> impl Future<Output = IndexMap<OwnedUserId, Receipt>> + SendOutsideWasm + 'a;
 
     /// Load the current fully-read event id, from storage.
@@ -144,8 +159,6 @@ pub(super) trait RoomDataProvider:
         sender: &UserId,
     ) -> impl Future<Output = Option<Arc<EncryptionInfo>>> + SendOutsideWasm;
 
-    async fn relations(&self, event_id: OwnedEventId, opts: RelationsOptions) -> Result<Relations>;
-
     /// Loads an event from the cache or network.
     fn load_event<'a>(
         &'a self,
@@ -158,8 +171,8 @@ impl RoomDataProvider for Room {
         (**self).own_user_id()
     }
 
-    fn room_version(&self) -> RoomVersionId {
-        (**self).clone_info().room_version_or_default()
+    fn room_version_rules(&self) -> RoomVersionRules {
+        (**self).clone_info().room_version_rules_or_default()
     }
 
     async fn crypto_context_info(&self) -> CryptoContextInfo {
@@ -217,31 +230,15 @@ impl RoomDataProvider for Room {
     async fn load_event_receipts<'a>(
         &'a self,
         event_id: &'a EventId,
+        receipt_thread: ReceiptThread,
     ) -> IndexMap<OwnedUserId, Receipt> {
-        let mut unthreaded_receipts = match self
-            .load_event_receipts(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
-            .await
-        {
+        match self.load_event_receipts(ReceiptType::Read, receipt_thread.clone(), event_id).await {
             Ok(receipts) => receipts.into_iter().collect(),
             Err(e) => {
-                error!(?event_id, "Failed to get unthreaded read receipts for event: {e}");
+                error!(?event_id, ?receipt_thread, "Failed to get read receipts for event: {e}");
                 IndexMap::new()
             }
-        };
-
-        let main_thread_receipts = match self
-            .load_event_receipts(ReceiptType::Read, ReceiptThread::Main, event_id)
-            .await
-        {
-            Ok(receipts) => receipts,
-            Err(e) => {
-                error!(?event_id, "Failed to get main thread read receipts for event: {e}");
-                Vec::new()
-            }
-        };
-
-        unthreaded_receipts.extend(main_thread_receipts);
-        unthreaded_receipts
+        }
     }
 
     async fn push_context(&self) -> Option<PushContext> {
@@ -297,10 +294,6 @@ impl RoomDataProvider for Room {
         self.get_encryption_info(session_id, sender).await
     }
 
-    async fn relations(&self, event_id: OwnedEventId, opts: RelationsOptions) -> Result<Relations> {
-        self.relations(event_id, opts).await
-    }
-
     async fn load_event<'a>(&'a self, event_id: &'a EventId) -> Result<TimelineEvent> {
         self.load_or_fetch_event(event_id, None).await
     }
@@ -308,7 +301,7 @@ impl RoomDataProvider for Room {
 
 // Internal helper to make most of retry_event_decryption independent of a room
 // object, which is annoying to create for testing and not really needed
-pub(super) trait Decryptor: AsyncTraitDeps + Clone + 'static {
+pub(crate) trait Decryptor: AsyncTraitDeps + Clone + 'static {
     fn decrypt_event_impl(
         &self,
         raw: &Raw<AnySyncTimelineEvent>,
@@ -322,34 +315,10 @@ impl Decryptor for Room {
         raw: &Raw<AnySyncTimelineEvent>,
         push_ctx: Option<&PushContext>,
     ) -> Result<TimelineEvent> {
-        self.decrypt_event(raw.cast_ref(), push_ctx).await
-    }
-}
-
-#[cfg(test)]
-impl Decryptor for (matrix_sdk_base::crypto::OlmMachine, ruma::OwnedRoomId) {
-    async fn decrypt_event_impl(
-        &self,
-        raw: &Raw<AnySyncTimelineEvent>,
-        push_ctx: Option<&PushContext>,
-    ) -> Result<TimelineEvent> {
-        let (olm_machine, room_id) = self;
-        let decryption_settings =
-            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
-
-        let mut timeline_event = match olm_machine
-            .try_decrypt_room_event(raw.cast_ref(), room_id, &decryption_settings)
-            .await?
-        {
-            RoomEventDecryptionResult::Decrypted(decrypted) => decrypted.into(),
-            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
-                TimelineEvent::new_utd_event(raw.clone(), utd_info)
-            }
-        };
-
-        // Fill the push actions here, to mimic what `Room::decrypt_event` does.
-        timeline_event.push_actions = push_ctx.map(|ctx| ctx.for_event(timeline_event.raw()));
-
-        Ok(timeline_event)
+        // Note: We specify the cast type in case the
+        // `experimental-encrypted-state-events` feature is enabled, which provides
+        // multiple cast implementations.
+        self.decrypt_event(raw.cast_ref_unchecked::<OriginalSyncRoomEncryptedEvent>(), push_ctx)
+            .await
     }
 }

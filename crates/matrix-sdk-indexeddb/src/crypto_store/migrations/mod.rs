@@ -14,23 +14,32 @@
 
 use std::ops::Deref;
 
-use indexed_db_futures::{prelude::*, web_sys::DomException};
+use indexed_db_futures::{
+    database::Database,
+    error::{Error, OpenDbError},
+    index::Index,
+    internals::SystemRepr,
+    object_store::ObjectStore,
+    prelude::*,
+    transaction::Transaction,
+};
 use tracing::info;
-use wasm_bindgen::JsValue;
 
-use crate::{crypto_store::Result, serializer::IndexeddbSerializer, IndexeddbCryptoStoreError};
+use crate::{crypto_store::Result, serializer::SafeEncodeSerializer, IndexeddbCryptoStoreError};
 
 mod old_keys;
 mod v0_to_v5;
 mod v10_to_v11;
 mod v11_to_v12;
+mod v12_to_v13;
+mod v13_to_v14;
 mod v5_to_v7;
 mod v7;
 mod v7_to_v8;
 mod v8_to_v10;
 
 struct MigrationDb {
-    db: IdbDatabase,
+    db: Database,
     next_version: u32,
 }
 
@@ -40,12 +49,12 @@ impl MigrationDb {
     /// closing the DB when this object is dropped.
     async fn new(name: &str, next_version: u32) -> Result<Self> {
         info!("IndexeddbCryptoStore migrate data before v{next_version} starting");
-        Ok(Self { db: IdbDatabase::open(name)?.await?, next_version })
+        Ok(Self { db: Database::open(name).await?, next_version })
     }
 }
 
 impl Deref for MigrationDb {
-    type Target = IdbDatabase;
+    type Target = Database;
 
     fn deref(&self) -> &Self::Target {
         &self.db
@@ -56,7 +65,7 @@ impl Drop for MigrationDb {
     fn drop(&mut self) {
         let version = self.next_version;
         info!("IndexeddbCryptoStore migrate data before v{version} finished");
-        self.db.close();
+        self.db.as_sys().close();
     }
 }
 
@@ -98,8 +107,8 @@ const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 99;
 /// of the schema if necessary.
 pub async fn open_and_upgrade_db(
     name: &str,
-    serializer: &IndexeddbSerializer,
-) -> Result<IdbDatabase, IndexeddbCryptoStoreError> {
+    serializer: &SafeEncodeSerializer,
+) -> Result<Database, IndexeddbCryptoStoreError> {
     // Move the DB version up from where it is to the latest version.
     //
     // Schema changes need to be separate from data migrations, so we often
@@ -158,6 +167,15 @@ pub async fn open_and_upgrade_db(
         v11_to_v12::schema_add(name).await?;
     }
 
+    if old_version < 13 {
+        v12_to_v13::schema_add(name).await?;
+    }
+
+    if old_version < 14 {
+        v13_to_v14::data_migrate(name, serializer).await?;
+        v13_to_v14::schema_bump(name).await?;
+    }
+
     // If you add more migrations here, you'll need to update
     // `tests::EXPECTED_SCHEMA_VERSION`.
 
@@ -166,11 +184,11 @@ pub async fn open_and_upgrade_db(
     // `MAX_SUPPORTED_SCHEMA_VERSION` itself to the next multiple of 10).
 
     // Open and return the DB (we know it's at the latest version)
-    Ok(IdbDatabase::open(name)?.await?)
+    Ok(Database::open(name).await?)
 }
 
 async fn db_version(name: &str) -> Result<u32, IndexeddbCryptoStoreError> {
-    let db = IdbDatabase::open(name)?.await?;
+    let db = Database::open(name).await?;
     let old_version = db.version() as u32;
     db.close();
     Ok(old_version)
@@ -186,50 +204,45 @@ type OldVersion = u32;
 /// * `version` - version we are upgrading to.
 /// * `f` - closure which will be called if the database is below the version
 ///   given. It will be called with three arguments `(db, txn, oldver)`, where:
-///   * `db` - the [`IdbDatabase`]
-///   * `txn` - the database transaction: a [`IdbTransaction`]
+///   * `db` - the [`Database`]
+///   * `txn` - the database transaction: a [`Transaction`]
 ///   * `oldver` - the version number before the upgrade.
-async fn do_schema_upgrade<F>(name: &str, version: u32, f: F) -> Result<(), DomException>
+async fn do_schema_upgrade<F>(name: &str, version: u32, f: F) -> Result<(), OpenDbError>
 where
-    F: Fn(&IdbDatabase, IdbTransaction<'_>, OldVersion) -> Result<(), JsValue> + 'static,
+    F: Fn(&Transaction<'_>, OldVersion) -> Result<(), Error> + 'static,
 {
     info!("IndexeddbCryptoStore upgrade schema -> v{version} starting");
-    let mut db_req: OpenDbRequest = IdbDatabase::open_u32(name, version)?;
+    let db = Database::open(name)
+        .with_version(version)
+        .with_on_upgrade_needed(move |evt, tx| {
+            // Even if the web-sys bindings expose the version as a f64, the IndexedDB API
+            // works with an unsigned integer.
+            // See <https://github.com/rustwasm/wasm-bindgen/issues/1149>
+            let old_version = evt.old_version() as u32;
 
-    db_req.set_on_upgrade_needed(Some(move |evt: &IdbVersionChangeEvent| {
-        // Even if the web-sys bindings expose the version as a f64, the IndexedDB API
-        // works with an unsigned integer.
-        // See <https://github.com/rustwasm/wasm-bindgen/issues/1149>
-        let old_version = evt.old_version() as u32;
-
-        // Run the upgrade code we were supplied
-        f(evt.db(), evt.transaction(), old_version)
-    }));
-
-    let db = db_req.await?;
+            // Run the upgrade code we were supplied
+            f(tx, old_version)
+        })
+        .await?;
     db.close();
     info!("IndexeddbCryptoStore upgrade schema -> v{version} complete");
     Ok(())
 }
 
 fn add_nonunique_index<'a>(
-    object_store: &'a IdbObjectStore<'a>,
+    object_store: &'a ObjectStore<'a>,
     name: &str,
     key_path: &str,
-) -> Result<IdbIndex<'a>, DomException> {
-    let params = IdbIndexParameters::new();
-    params.set_unique(false);
-    object_store.create_index_with_params(name, &IdbKeyPath::str(key_path), &params)
+) -> Result<Index<'a>, Error> {
+    object_store.create_index(name, key_path.into()).with_unique(false).build()
 }
 
 fn add_unique_index<'a>(
-    object_store: &'a IdbObjectStore<'a>,
+    object_store: &'a ObjectStore<'a>,
     name: &str,
     key_path: &str,
-) -> Result<IdbIndex<'a>, DomException> {
-    let params = IdbIndexParameters::new();
-    params.set_unique(true);
-    object_store.create_index_with_params(name, &IdbKeyPath::str(key_path), &params)
+) -> Result<Index<'a>, Error> {
+    object_store.create_index(name, key_path.into()).with_unique(true).build()
 }
 
 #[cfg(all(test, target_family = "wasm"))]
@@ -238,7 +251,9 @@ mod tests {
 
     use assert_matches::assert_matches;
     use gloo_utils::format::JsValueSerdeExt;
-    use indexed_db_futures::prelude::*;
+    use indexed_db_futures::{
+        database::VersionChangeEvent, prelude::*, transaction::TransactionMode,
+    };
     use matrix_sdk_common::js_tracing::make_tracing_subscriber;
     use matrix_sdk_crypto::{
         olm::{InboundGroupSession, SenderData, SessionKey},
@@ -251,6 +266,7 @@ mod tests {
     use ruma::{room_id, OwnedRoomId, RoomId};
     use serde::Serialize;
     use tracing_subscriber::util::SubscriberInitExt;
+    use wasm_bindgen::JsValue;
     use web_sys::console;
 
     use super::{v0_to_v5, v7::InboundGroupSessionIndexedDbObject2};
@@ -262,7 +278,7 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     /// The schema version we expect after we open the store.
-    const EXPECTED_SCHEMA_VERSION: u32 = 12;
+    const EXPECTED_SCHEMA_VERSION: u32 = 14;
 
     /// Adjust this to test do a more comprehensive perf test
     const NUM_RECORDS_FOR_PERF: usize = 2_000;
@@ -271,7 +287,7 @@ mod tests {
     #[async_test]
     async fn test_count_lots_of_sessions_v8() {
         let cipher = Arc::new(StoreCipher::new().unwrap());
-        let serializer = IndexeddbSerializer::new(Some(cipher.clone()));
+        let serializer = SafeEncodeSerializer::new(Some(cipher.clone()));
         // Session keys are slow to create, so make one upfront and use it for every
         // session
         let session_key = create_session_key();
@@ -293,14 +309,21 @@ mod tests {
         // Check how long it takes to insert these records
         measure_performance("Inserting", "v8", NUM_RECORDS_FOR_PERF, || async {
             for (key, session_js) in objects.iter() {
-                store.add_key_val(key, session_js).unwrap().await.unwrap();
+                store
+                    .add(session_js)
+                    .with_key(key)
+                    .without_key_type()
+                    .build()
+                    .unwrap()
+                    .await
+                    .unwrap();
             }
         })
         .await;
 
         // Check how long it takes to count these records
         measure_performance("Counting", "v8", NUM_RECORDS_FOR_PERF, || async {
-            store.count().unwrap().await.unwrap();
+            store.count().await.unwrap();
         })
         .await;
     }
@@ -308,7 +331,7 @@ mod tests {
     /// Make lots of sessions and see how long it takes to count them in v10
     #[async_test]
     async fn test_count_lots_of_sessions_v10() {
-        let serializer = IndexeddbSerializer::new(Some(Arc::new(StoreCipher::new().unwrap())));
+        let serializer = SafeEncodeSerializer::new(Some(Arc::new(StoreCipher::new().unwrap())));
 
         // Session keys are slow to create, so make one upfront and use it for every
         // session
@@ -329,40 +352,51 @@ mod tests {
         // Check how long it takes to insert these records
         measure_performance("Inserting", "v10", NUM_RECORDS_FOR_PERF, || async {
             for (key, session_js) in objects.iter() {
-                store.add_key_val(key, session_js).unwrap().await.unwrap();
+                store
+                    .add(session_js)
+                    .with_key(key)
+                    .without_key_type()
+                    .build()
+                    .unwrap()
+                    .await
+                    .unwrap();
             }
         })
         .await;
 
         // Check how long it takes to count these records
         measure_performance("Counting", "v10", NUM_RECORDS_FOR_PERF, || async {
-            store.count().unwrap().await.unwrap();
+            store.count().await.unwrap();
         })
         .await;
     }
 
-    async fn create_db(db_prefix: &str) -> IdbDatabase {
+    async fn create_db(db_prefix: &str) -> Database {
         let db_name = format!("{db_prefix}::matrix-sdk-crypto");
         let store_name = format!("{db_prefix}_store");
-        let mut db_req: OpenDbRequest = IdbDatabase::open_u32(&db_name, 1).unwrap();
-        db_req.set_on_upgrade_needed(Some(
-            move |evt: &IdbVersionChangeEvent| -> Result<(), JsValue> {
-                evt.db().create_object_store(&store_name)?;
-                Ok(())
-            },
-        ));
-        db_req.await.unwrap()
+        Database::open(&db_name)
+            .with_version(1u32)
+            .with_on_upgrade_needed(
+                move |_: VersionChangeEvent, tx: &Transaction<'_>| -> Result<(), Error> {
+                    tx.db().create_object_store(&store_name).build()?;
+                    Ok(())
+                },
+            )
+            .build()
+            .unwrap()
+            .await
+            .unwrap()
     }
 
-    async fn create_transaction<'a>(db: &'a IdbDatabase, db_prefix: &str) -> IdbTransaction<'a> {
+    async fn create_transaction<'a>(db: &'a Database, db_prefix: &str) -> Transaction<'a> {
         let store_name = format!("{db_prefix}_store");
-        db.transaction_on_one_with_mode(&store_name, IdbTransactionMode::Readwrite).unwrap()
+        db.transaction(&store_name).with_mode(TransactionMode::Readwrite).build().unwrap()
     }
 
     async fn create_store<'a>(
-        transaction: &'a IdbTransaction<'a>,
+        transaction: &'a Transaction<'a>,
         db_prefix: &str,
-    ) -> IdbObjectStore<'a> {
+    ) -> ObjectStore<'a> {
         let store_name = format!("{db_prefix}_store");
         transaction.object_store(&store_name).unwrap()
     }
@@ -384,7 +418,7 @@ mod tests {
         i: usize,
         session_key: &SessionKey,
         cipher: &Arc<StoreCipher>,
-        serializer: &IndexeddbSerializer,
+        serializer: &SafeEncodeSerializer,
     ) -> (JsValue, JsValue) {
         let session = create_inbound_group_session(i, session_key);
         let pickled_session = session.pickle().await;
@@ -405,7 +439,7 @@ mod tests {
     async fn create_inbound_group_sessions3_record(
         i: usize,
         session_key: &SessionKey,
-        serializer: &IndexeddbSerializer,
+        serializer: &SafeEncodeSerializer,
     ) -> (JsValue, JsValue) {
         let session = create_inbound_group_session(i, session_key);
         let pickled_session = session.pickle().await;
@@ -509,7 +543,7 @@ mod tests {
         let db_name = format!("{db_prefix:0}::matrix-sdk-crypto");
 
         // delete the db in case it was used in a previous run
-        let _ = IdbDatabase::delete_by_name(&db_name);
+        let _ = Database::delete_by_name(&db_name);
 
         // Given a DB with data in it as it was at v5
         let room_id = room_id!("!test:localhost");
@@ -557,21 +591,21 @@ mod tests {
         store: &IndexeddbCryptoStore,
         fetched_backed_up_session: &InboundGroupSession,
     ) {
-        let db = IdbDatabase::open(&db_name).unwrap().await.unwrap();
+        let db = Database::open(&db_name).build().unwrap().await.unwrap();
         assert!(db.version() >= 10.0);
-        let transaction = db.transaction_on_one("inbound_group_sessions3").unwrap();
+        let transaction = db.transaction("inbound_group_sessions3").build().unwrap();
         let raw_store = transaction.object_store("inbound_group_sessions3").unwrap();
         let key = store.serializer.encode_key(
             keys::INBOUND_GROUP_SESSIONS_V3,
             (fetched_backed_up_session.room_id(), fetched_backed_up_session.session_id()),
         );
         let idb_object: InboundGroupSessionIndexedDbObject =
-            serde_wasm_bindgen::from_value(raw_store.get(&key).unwrap().await.unwrap().unwrap())
-                .unwrap();
+            serde_wasm_bindgen::from_value(raw_store.get(&key).await.unwrap().unwrap()).unwrap();
 
         assert_eq!(idb_object.backed_up_to, -1);
         assert!(raw_store.index_names().find(|idx| idx == "backed_up_to").is_some());
 
+        transaction.commit().await.unwrap();
         db.close();
     }
 
@@ -580,16 +614,15 @@ mod tests {
         store: &IndexeddbCryptoStore,
         session: &InboundGroupSession,
     ) {
-        let db = IdbDatabase::open(&db_name).unwrap().await.unwrap();
+        let db = Database::open(&db_name).build().unwrap().await.unwrap();
         assert!(db.version() >= 12.0);
-        let transaction = db.transaction_on_one("inbound_group_sessions3").unwrap();
+        let transaction = db.transaction("inbound_group_sessions3").build().unwrap();
         let raw_store = transaction.object_store("inbound_group_sessions3").unwrap();
         let key = store
             .serializer
             .encode_key(keys::INBOUND_GROUP_SESSIONS_V3, (session.room_id(), session.session_id()));
         let idb_object: InboundGroupSessionIndexedDbObject =
-            serde_wasm_bindgen::from_value(raw_store.get(&key).unwrap().await.unwrap().unwrap())
-                .unwrap();
+            serde_wasm_bindgen::from_value(raw_store.get(&key).await.unwrap().unwrap()).unwrap();
 
         assert_eq!(
             idb_object.session_id,
@@ -612,6 +645,7 @@ mod tests {
             .find(|idx| idx == "inbound_group_session_sender_key_sender_data_type_idx")
             .is_some());
 
+        transaction.commit().await.unwrap();
         db.close();
     }
 
@@ -671,13 +705,12 @@ mod tests {
         // entry.
         let db = create_v5_db(&db_name).await.unwrap();
 
-        let serializer = IndexeddbSerializer::new(store_cipher.clone());
+        let serializer = SafeEncodeSerializer::new(store_cipher.clone());
 
         let txn = db
-            .transaction_on_one_with_mode(
-                old_keys::INBOUND_GROUP_SESSIONS_V1,
-                IdbTransactionMode::Readwrite,
-            )
+            .transaction(old_keys::INBOUND_GROUP_SESSIONS_V1)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
             .unwrap();
         let sessions = txn.object_store(old_keys::INBOUND_GROUP_SESSIONS_V1).unwrap();
         for session in session_entries {
@@ -690,9 +723,9 @@ mod tests {
             // Serialize the session with the old style of serialization, since that's what
             // we used at the time.
             let serialized_session = serialize_value_as_legacy(&store_cipher, &pickle);
-            sessions.put_key_val(&key, &serialized_session).unwrap();
+            sessions.put(&serialized_session).with_key(key).build().unwrap();
         }
-        txn.await.into_result().unwrap();
+        txn.commit().await.unwrap();
 
         // now close our DB, reopen it properly, and check that we can still read our
         // data.
@@ -725,21 +758,23 @@ mod tests {
         let db_name = format!("{db_prefix:0}::matrix-sdk-crypto");
 
         // delete the db in case it was used in a previous run
-        let _ = IdbDatabase::delete_by_name(&db_name);
+        let _ = Database::delete_by_name(&db_name).unwrap().await.unwrap();
 
         // Given a DB with data in it as it was at v5
         let db = create_v5_db(&db_name).await.unwrap();
 
         let txn = db
-            .transaction_on_one_with_mode(keys::BACKUP_KEYS, IdbTransactionMode::Readwrite)
+            .transaction(keys::BACKUP_KEYS)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
             .unwrap();
         let store = txn.object_store(keys::BACKUP_KEYS).unwrap();
         store
-            .put_key_val(
-                &JsValue::from_str(old_keys::BACKUP_KEY_V1),
-                &serialize_value_as_legacy(&store_cipher, &"1".to_owned()),
-            )
+            .put(&serialize_value_as_legacy(&store_cipher, &"1".to_owned()))
+            .with_key(JsValue::from_str(old_keys::BACKUP_KEY_V1))
+            .build()
             .unwrap();
+        txn.commit().await.unwrap();
         db.close();
 
         // When I open a store based on that DB, triggering an upgrade
@@ -751,9 +786,9 @@ mod tests {
         assert_eq!(backup_data.backup_version, Some("1".to_owned()));
     }
 
-    async fn create_v5_db(name: &str) -> std::result::Result<IdbDatabase, DomException> {
+    async fn create_v5_db(name: &str) -> std::result::Result<Database, OpenDbError> {
         v0_to_v5::schema_add(name).await?;
-        IdbDatabase::open_u32(name, 5)?.await
+        Database::open(name).with_version(5u32).build()?.await
     }
 
     /// Opening a db that has been upgraded to MAX_SUPPORTED_SCHEMA_VERSION
@@ -800,23 +835,27 @@ mod tests {
         let db_name = format!("{db_prefix}::matrix-sdk-crypto");
 
         // delete the db in case it was used in a previous run
-        let _ = IdbDatabase::delete_by_name(&db_name);
+        let _ = Database::delete_by_name(&db_name);
 
         // Open, and close, the store at the regular version.
         IndexeddbCryptoStore::open_with_store_cipher(&db_prefix, None).await.unwrap();
 
         // Now upgrade to the given version, keeping a record of the previous version so
         // that we can double-check it.
-        let mut db_req: OpenDbRequest = IdbDatabase::open_u32(&db_name, version).unwrap();
-
         let old_version: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
         let old_version2 = old_version.clone();
-        db_req.set_on_upgrade_needed(Some(move |evt: &IdbVersionChangeEvent| {
-            old_version2.set(Some(evt.old_version() as u32));
-            Ok(())
-        }));
 
-        let db = db_req.await.unwrap();
+        let db = Database::open(&db_name)
+            .with_version(version)
+            .with_on_upgrade_needed(move |evt: VersionChangeEvent, _: &Transaction<'_>| {
+                old_version2.set(Some(evt.old_version() as u32));
+                Ok(())
+            })
+            .build()
+            .unwrap()
+            .await
+            .unwrap();
+
         assert_eq!(
             old_version.get(),
             Some(EXPECTED_SCHEMA_VERSION),

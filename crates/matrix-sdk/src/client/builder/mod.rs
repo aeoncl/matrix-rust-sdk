@@ -15,21 +15,27 @@
 
 mod homeserver_config;
 
+#[cfg(feature = "experimental-search")]
+use std::collections::HashMap;
 #[cfg(feature = "sqlite")]
 use std::path::Path;
-use std::{fmt, sync::Arc};
+#[cfg(any(feature = "experimental-search", feature = "sqlite"))]
+use std::path::PathBuf;
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use homeserver_config::*;
-use matrix_sdk_base::{store::StoreConfig, BaseClient};
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::DecryptionSettings;
+use matrix_sdk_base::{BaseClient, ThreadingSupport, store::StoreConfig};
 #[cfg(feature = "sqlite")]
 use matrix_sdk_sqlite::SqliteStoreConfig;
 use ruma::{
-    api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
+    api::{MatrixVersion, SupportedVersions, error::FromHttpResponseError},
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex, OnceCell};
-use tracing::{debug, field::debug, instrument, Span};
+use tokio::sync::{Mutex, OnceCell, broadcast};
+use tracing::{Span, debug, field::debug, instrument};
 
 use super::{Client, ClientInner};
 #[cfg(feature = "e2e-encryption")]
@@ -38,15 +44,22 @@ use crate::crypto::{CollectStrategy, TrustRequirement};
 use crate::encryption::EncryptionSettings;
 #[cfg(not(target_family = "wasm"))]
 use crate::http_client::HttpSettings;
+#[cfg(feature = "experimental-search")]
+use crate::search_index::SearchIndex;
+#[cfg(feature = "experimental-search")]
+use crate::search_index::SearchIndexStoreKind;
 use crate::{
-    authentication::{oauth::OAuthCtx, AuthCtx},
-    client::ClientServerCapabilities,
+    HttpError, IdParseError,
+    authentication::{AuthCtx, oauth::OAuthCtx},
+    client::{
+        CachedValue::{Cached, NotSet},
+        ClientServerInfo,
+    },
     config::RequestConfig,
     error::RumaApiError,
     http_client::HttpClient,
     send_queue::SendQueueData,
     sliding_sync::VersionBuilder as SlidingSyncVersionBuilder,
-    HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -96,7 +109,7 @@ pub struct ClientBuilder {
     store_config: BuilderStoreConfig,
     request_config: RequestConfig,
     respect_login_well_known: bool,
-    server_versions: Option<Box<[MatrixVersion]>>,
+    server_versions: Option<BTreeSet<MatrixVersion>>,
     handle_refresh_tokens: bool,
     base_client: Option<BaseClient>,
     #[cfg(feature = "e2e-encryption")]
@@ -104,10 +117,13 @@ pub struct ClientBuilder {
     #[cfg(feature = "e2e-encryption")]
     room_key_recipient_strategy: CollectStrategy,
     #[cfg(feature = "e2e-encryption")]
-    decryption_trust_requirement: TrustRequirement,
+    decryption_settings: DecryptionSettings,
     #[cfg(feature = "e2e-encryption")]
     enable_share_history_on_invite: bool,
     cross_process_store_locks_holder_name: String,
+    threading_support: ThreadingSupport,
+    #[cfg(feature = "experimental-search")]
+    search_index_store_kind: SearchIndexStoreKind,
 }
 
 impl ClientBuilder {
@@ -131,11 +147,16 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             room_key_recipient_strategy: Default::default(),
             #[cfg(feature = "e2e-encryption")]
-            decryption_trust_requirement: TrustRequirement::Untrusted,
+            decryption_settings: DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
             #[cfg(feature = "e2e-encryption")]
             enable_share_history_on_invite: false,
             cross_process_store_locks_holder_name:
                 Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
+            threading_support: ThreadingSupport::Disabled,
+            #[cfg(feature = "experimental-search")]
+            search_index_store_kind: SearchIndexStoreKind::InMemory,
         }
     }
 
@@ -278,7 +299,7 @@ impl ClientBuilder {
     /// ```
     /// # use matrix_sdk_base::store::MemoryStore;
     /// # let custom_state_store = MemoryStore::new();
-    /// use matrix_sdk::{config::StoreConfig, Client};
+    /// use matrix_sdk::{Client, config::StoreConfig};
     ///
     /// let store_config =
     ///     StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
@@ -440,11 +461,8 @@ impl ClientBuilder {
 
     /// Set the trust requirement to be used when decrypting events.
     #[cfg(feature = "e2e-encryption")]
-    pub fn with_decryption_trust_requirement(
-        mut self,
-        trust_requirement: TrustRequirement,
-    ) -> Self {
-        self.decryption_trust_requirement = trust_requirement;
+    pub fn with_decryption_settings(mut self, decryption_settings: DecryptionSettings) -> Self {
+        self.decryption_settings = decryption_settings;
         self
     }
 
@@ -464,7 +482,7 @@ impl ClientBuilder {
     /// Set the cross-process store locks holder name.
     ///
     /// The SDK provides cross-process store locks (see
-    /// [`matrix_sdk_common::store_locks::CrossProcessStoreLock`]). The
+    /// [`matrix_sdk_common::cross_process_lock::CrossProcessLock`]). The
     /// `holder_name` will be the value used for all cross-process store locks
     /// used by the `Client` being built.
     ///
@@ -472,6 +490,21 @@ impl ClientBuilder {
     /// method must be called with different `hold_name` values.
     pub fn cross_process_store_locks_holder_name(mut self, holder_name: String) -> Self {
         self.cross_process_store_locks_holder_name = holder_name;
+        self
+    }
+
+    /// Whether the threads feature is enabled throuoghout the SDK.
+    /// This will affect how timelines are setup, how read receipts are sent
+    /// and how room unreads are computed.
+    pub fn with_threading_support(mut self, threading_support: ThreadingSupport) -> Self {
+        self.threading_support = threading_support;
+        self
+    }
+
+    /// The base directory in which each room's index directory will be stored.
+    #[cfg(feature = "experimental-search")]
+    pub fn search_index_store(mut self, kind: SearchIndexStoreKind) -> Self {
+        self.search_index_store_kind = kind;
         self
     }
 
@@ -511,12 +544,13 @@ impl ClientBuilder {
             let mut client = BaseClient::new(
                 build_store_config(self.store_config, &self.cross_process_store_locks_holder_name)
                     .await?,
+                self.threading_support,
             );
 
             #[cfg(feature = "e2e-encryption")]
             {
                 client.room_key_recipient_strategy = self.room_key_recipient_strategy;
-                client.decryption_trust_requirement = self.decryption_trust_requirement;
+                client.decryption_settings = self.decryption_settings;
             }
 
             client
@@ -525,7 +559,7 @@ impl ClientBuilder {
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
         #[allow(unused_variables)]
-        let HomeserverDiscoveryResult { server, homeserver, supported_versions } =
+        let HomeserverDiscoveryResult { server, homeserver, supported_versions, well_known } =
             homeserver_cfg.discover(&http_client).await?;
 
         let sliding_sync_version = {
@@ -537,7 +571,9 @@ impl ClientBuilder {
                 None => None,
             };
 
-            let version = self.sliding_sync_version_builder.build(supported_versions.as_ref())?;
+            let version = self.sliding_sync_version_builder.build(
+                supported_versions.map(|response| response.as_supported_versions()).as_ref(),
+            )?;
 
             tracing::info!(?version, "selected sliding sync version");
 
@@ -560,12 +596,24 @@ impl ClientBuilder {
         // Enable the send queue by default.
         let send_queue = Arc::new(SendQueueData::new(true));
 
-        let server_capabilities = ClientServerCapabilities {
-            server_versions: self.server_versions,
-            unstable_features: None,
+        let server_info = ClientServerInfo {
+            supported_versions: match self.server_versions {
+                Some(versions) => {
+                    Cached(SupportedVersions { versions, features: Default::default() })
+                }
+                None => NotSet,
+            },
+            well_known: Cached(well_known.map(Into::into)),
         };
 
         let event_cache = OnceCell::new();
+        let latest_events = OnceCell::new();
+        let thread_subscriptions_catchup = OnceCell::new();
+
+        #[cfg(feature = "experimental-search")]
+        let search_index =
+            SearchIndex::new(Arc::new(Mutex::new(HashMap::new())), self.search_index_store_kind);
+
         let inner = ClientInner::new(
             auth_ctx,
             server,
@@ -573,15 +621,19 @@ impl ClientBuilder {
             sliding_sync_version,
             http_client,
             base_client,
-            server_capabilities,
+            server_info,
             self.respect_login_well_known,
             event_cache,
             send_queue,
+            latest_events,
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
             #[cfg(feature = "e2e-encryption")]
             self.enable_share_history_on_invite,
             self.cross_process_store_locks_holder_name,
+            #[cfg(feature = "experimental-search")]
+            search_index,
+            thread_subscriptions_catchup,
         )
         .await;
 
@@ -616,11 +668,20 @@ async fn build_store_config(
                 .event_cache_store({
                     let mut config = config.clone();
 
-                    if let Some(cache_path) = cache_path {
+                    if let Some(ref cache_path) = cache_path {
                         config = config.path(cache_path);
                     }
 
                     matrix_sdk_sqlite::SqliteEventCacheStore::open_with_config(config).await?
+                })
+                .media_store({
+                    let mut config = config.clone();
+
+                    if let Some(ref cache_path) = cache_path {
+                        config = config.path(cache_path);
+                    }
+
+                    matrix_sdk_sqlite::SqliteMediaStore::open_with_config(config).await?
                 });
 
             #[cfg(feature = "e2e-encryption")]
@@ -672,7 +733,10 @@ async fn build_indexeddb_store_config(
     };
 
     let store_config = {
-        tracing::warn!("The IndexedDB backend does not implement an event cache store, falling back to the in-memory event cache store…");
+        tracing::warn!(
+            "The IndexedDB backend does not implement an event cache store, \
+             falling back to the in-memory event cache store…"
+        );
         store_config.event_cache_store(matrix_sdk_base::event_cache::store::MemoryStore::new())
     };
 
@@ -727,7 +791,7 @@ enum BuilderStoreConfig {
     #[cfg(feature = "sqlite")]
     Sqlite {
         config: SqliteStoreConfig,
-        cache_path: Option<std::path::PathBuf>,
+        cache_path: Option<PathBuf>,
     },
     #[cfg(feature = "indexeddb")]
     IndexedDb {
@@ -802,10 +866,10 @@ pub enum ClientBuildError {
 pub(crate) mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_test::{async_test, test_json};
-    use serde_json::{json_internal, Value as JsonValue};
+    use serde_json::{Value as JsonValue, json_internal};
     use wiremock::{
-        matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
     };
 
     use super::*;
@@ -968,11 +1032,13 @@ pub(crate) mod tests {
         let homeserver = make_mock_homeserver().await;
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::CrossSigned);
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::CrossSigned,
+            });
 
         let client = builder.build().await.unwrap();
         assert_matches!(
-            client.base_client().decryption_trust_requirement,
+            client.base_client().decryption_settings.sender_device_trust_requirement,
             TrustRequirement::CrossSigned
         );
     }
@@ -984,11 +1050,13 @@ pub(crate) mod tests {
 
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::Untrusted);
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            });
 
         let client = builder.build().await.unwrap();
         assert_matches!(
-            client.base_client().decryption_trust_requirement,
+            client.base_client().decryption_settings.sender_device_trust_requirement,
             TrustRequirement::Untrusted
         );
     }

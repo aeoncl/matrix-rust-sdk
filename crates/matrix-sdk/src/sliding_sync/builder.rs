@@ -5,17 +5,16 @@ use std::{
     time::Duration,
 };
 
+use cfg_if::cfg_if;
 use matrix_sdk_common::timer;
-use ruma::{api::client::sync::sync_events::v5 as http, OwnedRoomId};
-use tokio::sync::{broadcast::channel, Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use ruma::{OwnedRoomId, api::client::sync::sync_events::v5 as http};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, broadcast::channel};
 
 use super::{
-    cache::{format_storage_key_prefix, restore_sliding_sync_state},
-    sticky_parameters::SlidingSyncStickyManager,
     Error, SlidingSync, SlidingSyncInner, SlidingSyncListBuilder, SlidingSyncPositionMarkers,
-    Version,
+    Version, cache::format_storage_key_prefix, sticky_parameters::SlidingSyncStickyManager,
 };
-use crate::{sliding_sync::SlidingSyncStickyParameters, Client, Result};
+use crate::{Client, Result, sliding_sync::SlidingSyncStickyParameters};
 
 /// Configuration for a Sliding Sync instance.
 ///
@@ -184,6 +183,23 @@ impl SlidingSyncBuilder {
         self
     }
 
+    /// Set the Threads subscriptions extension configuration.
+    pub fn with_thread_subscriptions_extension(
+        mut self,
+        thread_subscriptions: http::request::ThreadSubscriptions,
+    ) -> Self {
+        self.extensions.get_or_insert_with(Default::default).thread_subscriptions =
+            thread_subscriptions;
+        self
+    }
+
+    /// Unset the Threads subscriptions extension configuration.
+    pub fn without_thread_subscriptions_extension(mut self) -> Self {
+        self.extensions.get_or_insert_with(Default::default).thread_subscriptions =
+            Default::default();
+        self
+    }
+
     /// Sets a custom timeout duration for the sliding sync polling endpoint.
     ///
     /// This is the maximum time to wait before the sliding sync server returns
@@ -223,9 +239,7 @@ impl SlidingSyncBuilder {
     }
 
     /// Build the Sliding Sync.
-    ///
-    /// If `self.storage_key` is `Some(_)`, load the cached data from cold
-    /// storage.
+    #[allow(clippy::unused_async)] // Async is only used if the e2e-encryption feature is enabled.
     pub async fn build(self) -> Result<SlidingSync> {
         let client = self.client;
 
@@ -245,26 +259,21 @@ impl SlidingSyncBuilder {
             lists.insert(list.name().to_owned(), list);
         }
 
-        // Reload existing state from the cache.
-        let restored_fields = restore_sliding_sync_state(&client, &self.storage_key).await?;
-
-        let pos = if let Some(_fields) = restored_fields {
-            #[cfg(feature = "e2e-encryption")]
-            if self.share_pos {
-                _fields.pos
-            } else {
-                None
+        let (share_pos, pos) = {
+            cfg_if! {
+                if #[cfg(feature = "e2e-encryption")] {
+                    if self.share_pos {
+                        // If the sliding sync instance is configured to share its current sync
+                        // position, we will restore it from the cache.
+                        (true, super::cache::restore_sliding_sync_state(&client, &self.storage_key).await?.and_then(|fields| fields.pos))
+                    } else {
+                        (false, None)
+                    }
+                } else {
+                    (false, None)
+                }
             }
-            #[cfg(not(feature = "e2e-encryption"))]
-            None
-        } else {
-            None
         };
-
-        #[cfg(feature = "e2e-encryption")]
-        let share_pos = self.share_pos;
-        #[cfg(not(feature = "e2e-encryption"))]
-        let share_pos = false;
 
         let lists = AsyncRwLock::new(lists);
 

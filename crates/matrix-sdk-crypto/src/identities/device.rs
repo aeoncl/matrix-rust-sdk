@@ -40,11 +40,12 @@ use crate::OlmMachine;
 use crate::{
     error::{MismatchedIdentityKeysError, OlmError, OlmResult, SignatureError},
     identities::{OwnUserIdentityData, UserIdentityData},
-    olm::{
-        InboundGroupSession, OutboundGroupSession, Session, ShareInfo, SignedJsonObject, VerifyJson,
-    },
+    olm::{InboundGroupSession, OutboundGroupSession, Session, ShareInfo, VerifyJson},
+    session_manager::{withheld_code_for_device_for_share_strategy, CollectStrategy},
     store::{
-        caches::SequenceNumber, Changes, CryptoStoreWrapper, DeviceChanges, Result as StoreResult,
+        caches::SequenceNumber,
+        types::{Changes, DeviceChanges},
+        CryptoStoreWrapper, Result as StoreResult,
     },
     types::{
         events::{
@@ -460,6 +461,8 @@ impl Device {
     /// * `event_type` - The type of the event to be sent.
     /// * `content` - The content of the event to be sent. This should be a type
     ///   that implements the `Serialize` trait.
+    /// * `share_strategy` - The share strategy to use to determine whether we
+    ///   should encrypt to the device.
     ///
     /// # Returns
     ///
@@ -470,7 +473,19 @@ impl Device {
         &self,
         event_type: &str,
         content: &Value,
+        share_strategy: CollectStrategy,
     ) -> OlmResult<Raw<ToDeviceEncryptedEventContent>> {
+        if let Some(withheld_code) = withheld_code_for_device_for_share_strategy(
+            &self.inner,
+            share_strategy,
+            &self.own_identity,
+            &self.device_owner_identity,
+        )
+        .await?
+        {
+            return Err(OlmError::Withheld(withheld_code));
+        }
+
         let (used_session, raw_encrypted) = self.encrypt(event_type, content).await?;
 
         // Persist the used session
@@ -855,7 +870,7 @@ impl DeviceData {
         &mut self,
         device_keys: &DeviceKeys,
     ) -> Result<bool, SignatureError> {
-        self.verify_device_keys(device_keys)?;
+        device_keys.check_self_signature()?;
 
         if self.user_id() != device_keys.user_id || self.device_id() != device_keys.device_id {
             Err(SignatureError::UserIdMismatch)
@@ -907,26 +922,11 @@ impl DeviceData {
         key.verify_canonicalized_json(user_id, key_id, signatures, canonical_json)
     }
 
-    fn has_signed(&self, signed_object: &impl SignedJsonObject) -> Result<(), SignatureError> {
-        let key = self.ed25519_key().ok_or(SignatureError::MissingSigningKey)?;
-        let user_id = self.user_id();
-        let key_id = &DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, self.device_id());
-
-        key.verify_json(user_id, key_id, signed_object)
-    }
-
-    pub(crate) fn verify_device_keys(
-        &self,
-        device_keys: &DeviceKeys,
-    ) -> Result<(), SignatureError> {
-        self.has_signed(device_keys)
-    }
-
     pub(crate) fn verify_one_time_key(
         &self,
         one_time_key: &SignedKey,
     ) -> Result<(), SignatureError> {
-        self.has_signed(one_time_key)
+        self.device_keys.has_signed(one_time_key)
     }
 
     /// Mark the device as deleted.
@@ -980,17 +980,15 @@ impl TryFrom<&DeviceKeys> for DeviceData {
     type Error = SignatureError;
 
     fn try_from(device_keys: &DeviceKeys) -> Result<Self, Self::Error> {
-        let device = Self {
+        device_keys.check_self_signature()?;
+        Ok(Self {
             device_keys: device_keys.clone().into(),
             deleted: Arc::new(AtomicBool::new(false)),
             trust_state: Arc::new(RwLock::new(LocalTrust::Unset)),
             withheld_code_sent: Arc::new(AtomicBool::new(false)),
             first_time_seen_ts: MilliSecondsSinceUnixEpoch::now(),
             olm_wedging_index: Default::default(),
-        };
-
-        device.verify_device_keys(device_keys)?;
-        Ok(device)
+        })
     }
 }
 

@@ -4,32 +4,29 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::{
-    room::reply::{EnforceThread, Reply},
-    test_utils::mocks::MatrixMockServer,
-};
+use matrix_sdk::test_utils::mocks::MatrixMockServer;
 use matrix_sdk_base::timeout::timeout;
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE, BOB, CAROL,
+    ALICE, BOB, CAROL, JoinedRoomBuilder, async_test, event_factory::EventFactory,
 };
 use matrix_sdk_ui::timeline::{
     Error as TimelineError, EventSendState, MsgLikeContent, MsgLikeKind, RoomExt, TimelineDetails,
-    TimelineItemContent,
+    TimelineEventItemId, TimelineFocus, TimelineItemContent,
 };
 use ruma::{
-    event_id,
+    MilliSecondsSinceUnixEpoch, UInt, event_id,
     events::{
+        Mentions,
         reaction::RedactedReactionEventContent,
         relation::InReplyTo,
         room::{
+            ImageInfo,
             encrypted::{
                 EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
             },
-            message::{Relation, ReplyWithinThread, RoomMessageEventContentWithoutRelation},
-            ImageInfo,
+            message::{Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
         },
         sticker::{StickerEventContent, StickerMediaSource},
-        Mentions,
     },
     owned_event_id, owned_mxc_uri, room_id,
 };
@@ -37,8 +34,8 @@ use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
 use tokio::task::yield_now;
 use wiremock::{
-    matchers::{header, method, path_regex},
     Mock, Request, ResponseTemplate,
+    matchers::{header, method, path_regex},
 };
 
 #[async_test]
@@ -72,12 +69,15 @@ async fn test_in_reply_to_details() {
 
     // Add an event and a reply to that event to the timeline
     let eid1 = event_id!("$event1");
+    let timestamp = MilliSecondsSinceUnixEpoch(UInt::new(1984).unwrap());
     let f = EventFactory::new();
     server
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id)
-                .add_timeline_event(f.text_msg("hello").sender(*ALICE).event_id(eid1))
+                .add_timeline_event(
+                    f.text_msg("hello").sender(*ALICE).event_id(eid1).server_ts(timestamp),
+                )
                 .add_timeline_event(f.text_msg("hello to you too").reply_to(eid1).sender(*BOB)),
         )
         .await;
@@ -102,7 +102,9 @@ async fn test_in_reply_to_details() {
         );
         let in_reply_to = in_reply_to.clone().unwrap();
         assert_eq!(in_reply_to.event_id, eid1);
-        assert_matches!(in_reply_to.event, TimelineDetails::Ready(_));
+        assert_let!(TimelineDetails::Ready(embedded) = in_reply_to.event);
+        assert_eq!(embedded.timestamp, timestamp);
+        assert_eq!(embedded.identifier, TimelineEventItemId::EventId(eid1.to_owned()));
 
         // Good old date divider.
         assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[2]);
@@ -701,10 +703,7 @@ async fn test_send_reply() {
     timeline
         .send_reply(
             RoomMessageEventContentWithoutRelation::text_plain("Replying to Bob"),
-            Reply {
-                event_id: event_id_from_bob.into(),
-                enforce_thread: EnforceThread::MaybeThreaded,
-            },
+            event_id_from_bob.into(),
         )
         .await
         .unwrap();
@@ -714,7 +713,7 @@ async fn test_send_reply() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike_reply_message = reply_item.content().as_msglike().unwrap();
     let reply_message = reply_item.content().as_message().unwrap();
     assert_eq!(reply_message.body(), "Replying to Bob");
@@ -803,10 +802,7 @@ async fn test_send_reply_to_self() {
     timeline
         .send_reply(
             RoomMessageEventContentWithoutRelation::text_plain("Replying to self"),
-            Reply {
-                event_id: event_id_from_self.into(),
-                enforce_thread: EnforceThread::MaybeThreaded,
-            },
+            event_id_from_self.into(),
         )
         .await
         .unwrap();
@@ -816,7 +812,7 @@ async fn test_send_reply_to_self() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike_reply_message = reply_item.content().as_msglike().unwrap();
     let reply_message = msglike_reply_message.as_message().unwrap();
     assert_eq!(reply_message.body(), "Replying to self");
@@ -871,7 +867,7 @@ async fn test_send_reply_to_threaded() {
     timeline
         .send_reply(
             RoomMessageEventContentWithoutRelation::text_plain("Hello, Bob!"),
-            Reply { event_id: event_id_1.into(), enforce_thread: EnforceThread::MaybeThreaded },
+            event_id_1.into(),
         )
         .await
         .unwrap();
@@ -881,7 +877,7 @@ async fn test_send_reply_to_threaded() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike = reply_item.content().as_msglike().unwrap();
     let reply_message = msglike.as_message().unwrap();
 
@@ -973,10 +969,7 @@ async fn test_send_reply_with_event_id() {
     timeline
         .send_reply(
             RoomMessageEventContentWithoutRelation::text_plain("Replying to Bob"),
-            Reply {
-                event_id: event_id_from_bob.into(),
-                enforce_thread: EnforceThread::MaybeThreaded,
-            },
+            event_id_from_bob.into(),
         )
         .await
         .unwrap();
@@ -986,7 +979,7 @@ async fn test_send_reply_with_event_id() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike_reply_message = reply_item.content().as_msglike().unwrap();
     let reply_message = msglike_reply_message.as_message().unwrap();
     assert_eq!(reply_message.body(), "Replying to Bob");
@@ -1058,14 +1051,16 @@ async fn test_send_reply_enforce_thread() {
         .mount()
         .await;
 
-    timeline
-        .send_reply(
-            RoomMessageEventContentWithoutRelation::text_plain("Replying to Bob"),
-            Reply {
-                event_id: event_id_from_bob.into(),
-                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
-            },
-        )
+    // Starting a thread.
+    let thread_timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Thread { root_event_id: event_id_from_bob.to_owned() })
+        .build()
+        .await
+        .unwrap();
+
+    thread_timeline
+        .send(RoomMessageEventContent::text_plain("Replying to Bob").into())
         .await
         .unwrap();
 
@@ -1074,7 +1069,7 @@ async fn test_send_reply_enforce_thread() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike_reply_message = reply_item.content().as_msglike().unwrap();
     let reply_message = msglike_reply_message.as_message().unwrap();
     assert_eq!(reply_message.body(), "Replying to Bob");
@@ -1157,13 +1152,18 @@ async fn test_send_reply_enforce_thread_is_reply() {
         .mount()
         .await;
 
-    timeline
+    // Starting a thread, and making an explicit reply inside the thread.
+    let thread_timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Thread { root_event_id: event_id_from_bob.to_owned() })
+        .build()
+        .await
+        .unwrap();
+
+    thread_timeline
         .send_reply(
             RoomMessageEventContentWithoutRelation::text_plain("Replying to Bob"),
-            Reply {
-                event_id: event_id_from_bob.into(),
-                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::Yes),
-            },
+            event_id_from_bob.into(),
         )
         .await
         .unwrap();
@@ -1173,7 +1173,7 @@ async fn test_send_reply_enforce_thread_is_reply() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike_reply_message = reply_item.content().as_msglike().unwrap();
     let reply_message = msglike_reply_message.as_message().unwrap();
     assert_eq!(reply_message.body(), "Replying to Bob");
@@ -1255,10 +1255,7 @@ async fn test_send_reply_with_event_id_that_is_redacted() {
     timeline
         .send_reply(
             RoomMessageEventContentWithoutRelation::text_plain("Replying to Bob"),
-            Reply {
-                event_id: redacted_event_id_from_bob.into(),
-                enforce_thread: EnforceThread::MaybeThreaded,
-            },
+            redacted_event_id_from_bob.into(),
         )
         .await
         .unwrap();
@@ -1268,7 +1265,7 @@ async fn test_send_reply_with_event_id_that_is_redacted() {
 
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
 
-    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(reply_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
     let msglike_reply_message = reply_item.content().as_msglike().unwrap();
     let reply_message = msglike_reply_message.as_message().unwrap();
     assert_eq!(reply_message.body(), "Replying to Bob");

@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs, missing_debug_implementations)]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
 
@@ -98,7 +98,8 @@ pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
 use serde::{Deserialize, Serialize};
 pub use session_manager::CollectStrategy;
 pub use store::{
-    CrossSigningKeyExport, CryptoStoreError, SecretImportError, SecretInfo, TrackedUser,
+    types::{CrossSigningKeyExport, TrackedUser},
+    CryptoStoreError, SecretImportError, SecretInfo,
 };
 pub use verification::{
     format_emojis, AcceptSettings, AcceptedProtocols, CancelInfo, Emoji, EmojiShortAuthString, Sas,
@@ -113,7 +114,7 @@ pub use vodozemac;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
-matrix_sdk_test::init_tracing_for_tests!();
+matrix_sdk_test_utils::init_tracing_for_tests!();
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
@@ -589,7 +590,9 @@ pub enum RoomEventDecryptionResult {
 ///
 /// ```no_run
 /// # use anyhow::Result;
-/// # use matrix_sdk_crypto::{EncryptionSyncChanges, OlmMachine};
+/// # use matrix_sdk_crypto::{
+///     DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement
+/// };
 /// # use ruma::api::client::sync::sync_events::v3::Response;
 /// # #[tokio::main]
 /// # async fn main() -> Result<()> {
@@ -616,11 +619,15 @@ pub enum RoomEventDecryptionResult {
 ///         next_batch_token: Some(response.next_batch),
 ///     };
 ///
+///     let decryption_settings = DecryptionSettings {
+///         sender_device_trust_requirement: TrustRequirement::Untrusted
+///     };
+///
 ///     // Push the sync changes into the OlmMachine, make sure that this is
 ///     // happening before the `next_batch` token of the sync is persisted.
 ///     let to_device_events = client
 ///         .olm_machine
-///         .receive_sync_changes(sync_changes)
+///         .receive_sync_changes(sync_changes, &decryption_settings)
 ///         .await?;
 ///
 ///     // Send the outgoing requests out that the sync changes produced.
@@ -767,8 +774,10 @@ pub enum RoomEventDecryptionResult {
 /// ```no_run
 /// # use anyhow::Result;
 /// # use std::ops::Deref;
-/// # use matrix_sdk_crypto::{EncryptionSyncChanges, OlmMachine};
-/// # use ruma::api::client::sync::sync_events::v3::{Response, JoinedRoom};
+/// # use matrix_sdk_crypto::{
+/// #     DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement
+/// # };
+/// # use ruma::api::client::sync::sync_events::v3::{Response, State, JoinedRoom};
 /// # use ruma::{OwnedUserId, serde::Raw, events::AnySyncStateEvent};
 /// # #[tokio::main]
 /// # async fn main() -> Result<()> {
@@ -804,11 +813,15 @@ pub enum RoomEventDecryptionResult {
 ///         next_batch_token: Some(response.next_batch),
 ///     };
 ///
+///     let decryption_settings = DecryptionSettings {
+///         sender_device_trust_requirement: TrustRequirement::Untrusted
+///     };
+///
 ///     // Push the sync changes into the OlmMachine, make sure that this is
 ///     // happening before the `next_batch` token of the sync is persisted.
 ///     let to_device_events = client
 ///         .olm_machine
-///         .receive_sync_changes(sync_changes)
+///         .receive_sync_changes(sync_changes, &decryption_settings)
 ///         .await?;
 ///
 ///     // Send the outgoing requests out that the sync changes produced.
@@ -820,10 +833,12 @@ pub enum RoomEventDecryptionResult {
 ///     for (_, room) in &response.rooms.join {
 ///         // For simplicity reasons we're only looking at the state field of a joined room, but
 ///         // the events in the timeline are important as well.
-///         for event in &room.state.events {
-///             if is_member_event_of_a_joined_user(event) && is_room_encrypted(room) {
-///                 let user_id = get_user_id(event);
-///                 users.push(user_id);
+///         if let State::Before(state) = &room.state {
+///            for event in &state.events {
+///                 if is_member_event_of_a_joined_user(event) && is_room_encrypted(room) {
+///                     let user_id = get_user_id(event);
+///                     users.push(user_id);
+///                 }
 ///             }
 ///         }
 ///     }
@@ -1054,7 +1069,7 @@ pub enum RoomEventDecryptionResult {
 ///         let content = Raw::new(&json!({
 ///             "body": message,
 ///             "msgtype": "m.text",
-///         }))?.cast();
+///         }))?.cast_unchecked();
 ///
 ///         let users = get_joined_members(room_id).await;
 ///

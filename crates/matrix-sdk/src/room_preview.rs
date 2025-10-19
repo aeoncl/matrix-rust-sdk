@@ -21,17 +21,15 @@
 use futures_util::future::join_all;
 use matrix_sdk_base::{RoomHero, RoomInfo, RoomState};
 use ruma::{
-    api::client::{membership::joined_members, state::get_state_events},
-    directory::PublicRoomJoinRule,
-    events::room::{history_visibility::HistoryVisibility, join_rules::JoinRule},
-    room::RoomType,
-    space::SpaceRoomJoinRule,
     OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName, RoomId, RoomOrAliasId, ServerName,
+    api::client::{membership::joined_members, state::get_state_events},
+    events::room::history_visibility::HistoryVisibility,
+    room::{JoinRuleSummary, RoomType},
 };
 use tokio::try_join;
 use tracing::{instrument, warn};
 
-use crate::{room_directory_search::RoomDirectorySearch, Client, Error, Room};
+use crate::{Client, Error, Room, room_directory_search::RoomDirectorySearch};
 
 /// The preview of a room, be it invited/joined/left, or not.
 #[derive(Debug, Clone)]
@@ -64,7 +62,7 @@ pub struct RoomPreview {
     pub room_type: Option<RoomType>,
 
     /// What's the join rule for this room?
-    pub join_rule: SpaceRoomJoinRule,
+    pub join_rule: Option<JoinRuleSummary>,
 
     /// Is the room world-readable (i.e. is its history_visibility set to
     /// world_readable)?
@@ -102,19 +100,7 @@ impl RoomPreview {
             topic: room_info.topic().map(ToOwned::to_owned),
             avatar_url: room_info.avatar_url().map(ToOwned::to_owned),
             room_type: room_info.room_type().cloned(),
-            join_rule: match room_info.join_rule() {
-                JoinRule::Invite => SpaceRoomJoinRule::Invite,
-                JoinRule::Knock => SpaceRoomJoinRule::Knock,
-                JoinRule::Private => SpaceRoomJoinRule::Private,
-                JoinRule::Restricted(_) => SpaceRoomJoinRule::Restricted,
-                JoinRule::KnockRestricted(_) => SpaceRoomJoinRule::KnockRestricted,
-                JoinRule::Public => SpaceRoomJoinRule::Public,
-                _ => {
-                    // The JoinRule enum is non-exhaustive. Let's do a white lie and pretend it's
-                    // private (a cautious choice).
-                    SpaceRoomJoinRule::Private
-                }
-            },
+            join_rule: room_info.join_rule().cloned().map(Into::into),
             is_world_readable: room_info
                 .history_visibility()
                 .map(|vis| *vis == HistoryVisibility::WorldReadable),
@@ -253,7 +239,7 @@ impl RoomPreview {
         let own_server_name = client.session_meta().map(|s| s.user_id.server_name());
         let via = ensure_server_names_is_not_empty(own_server_name, via, room_or_alias_id);
 
-        let request = ruma::api::client::room::get_summary::msc3266::Request::new(
+        let request = ruma::api::client::room::get_summary::v1::Request::new(
             room_or_alias_id.to_owned(),
             via,
         );
@@ -278,17 +264,19 @@ impl RoomPreview {
             None
         };
 
+        let summary = response.summary;
+
         Ok(RoomPreview {
             room_id,
-            canonical_alias: response.canonical_alias,
-            name: response.name,
-            topic: response.topic,
-            avatar_url: response.avatar_url,
-            num_joined_members: response.num_joined_members.into(),
+            canonical_alias: summary.canonical_alias,
+            name: summary.name,
+            topic: summary.topic,
+            avatar_url: summary.avatar_url,
+            num_joined_members: summary.num_joined_members.into(),
             num_active_members,
-            room_type: response.room_type,
-            join_rule: response.join_rule,
-            is_world_readable: Some(response.world_readable),
+            room_type: summary.room_type,
+            join_rule: Some(summary.join_rule),
+            is_world_readable: Some(summary.world_readable),
             state,
             is_direct,
             heroes: cached_room.map(|r| r.heroes()),
@@ -375,14 +363,7 @@ async fn search_for_room_preview_in_room_directory(
             num_active_members: None,
             // Assume it's a room
             room_type: None,
-            join_rule: match room_description.join_rule {
-                PublicRoomJoinRule::Public => SpaceRoomJoinRule::Public,
-                PublicRoomJoinRule::Knock => SpaceRoomJoinRule::Knock,
-                PublicRoomJoinRule::_Custom(rule) => SpaceRoomJoinRule::_Custom(rule),
-                _ => {
-                    panic!("Unexpected PublicRoomJoinRule {:?}", room_description.join_rule)
-                }
-            },
+            join_rule: Some(room_description.join_rule.into()),
             is_world_readable: Some(room_description.is_world_readable),
             state: None,
             is_direct: None,
@@ -402,10 +383,11 @@ fn ensure_server_names_is_not_empty(
 ) -> Vec<OwnedServerName> {
     let mut server_names = server_names;
 
-    if let Some((own_server, alias_server)) = own_server_name.zip(room_or_alias_id.server_name()) {
-        if server_names.is_empty() && own_server != alias_server {
-            server_names.push(alias_server.to_owned());
-        }
+    if let Some((own_server, alias_server)) = own_server_name.zip(room_or_alias_id.server_name())
+        && server_names.is_empty()
+        && own_server != alias_server
+    {
+        server_names.push(alias_server.to_owned());
     }
 
     server_names
@@ -413,7 +395,7 @@ fn ensure_server_names_is_not_empty(
 
 #[cfg(test)]
 mod tests {
-    use ruma::{owned_server_name, room_alias_id, room_id, server_name, RoomOrAliasId, ServerName};
+    use ruma::{RoomOrAliasId, ServerName, owned_server_name, room_alias_id, room_id, server_name};
 
     use crate::room_preview::ensure_server_names_is_not_empty;
 

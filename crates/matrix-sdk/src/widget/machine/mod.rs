@@ -17,12 +17,12 @@
 use std::time::Duration;
 
 use driver_req::{ReadStateRequest, UpdateDelayedEventRequest};
-use from_widget::{SendToDeviceEventResponse, UpdateDelayedEventResponse};
+use from_widget::UpdateDelayedEventResponse;
 use indexmap::IndexMap;
 use ruma::{
+    OwnedRoomId,
     events::{AnyStateEvent, AnyTimelineEvent},
     serde::{JsonObject, Raw},
-    OwnedRoomId,
 };
 use serde::Serialize;
 use serde_json::value::RawValue as RawJsonValue;
@@ -49,11 +49,11 @@ use self::{
 #[cfg(doc)]
 use super::WidgetDriver;
 use super::{
+    Capabilities, StateEventFilter, StateKeySelector,
     capabilities::{SEND_DELAYED_EVENT, UPDATE_DELAYED_EVENT},
     filter::FilterInput,
-    Capabilities, StateEventFilter, StateKeySelector,
 };
-use crate::{widget::Filter, Error, Result};
+use crate::{Error, Result, widget::Filter};
 
 mod driver_req;
 mod from_widget;
@@ -66,7 +66,7 @@ mod to_widget;
 
 pub(crate) use self::{
     driver_req::{MatrixDriverRequestData, SendEventRequest, SendToDeviceRequest},
-    from_widget::SendEventResponse,
+    from_widget::{SendEventResponse, SendToDeviceEventResponse},
     incoming::{IncomingMessage, MatrixDriverResponse},
 };
 
@@ -280,7 +280,7 @@ impl WidgetMachine {
                 return vec![Self::send_from_widget_err_response(
                     raw_request,
                     FromWidgetErrorResponse::from_error(Error::SerdeJson(e)),
-                )]
+                )];
             }
         };
 
@@ -348,7 +348,8 @@ impl WidgetMachine {
                 let CapabilitiesState::Negotiated(capabilities) = &self.capabilities else {
                     return vec![Self::send_from_widget_error_string_response(
                         raw_request,
-                        "Received send update delayed event request before capabilities were negotiated"
+                        "Received send update delayed event request \
+                         before capabilities were negotiated",
                     )];
                 };
 
@@ -531,9 +532,7 @@ impl WidgetMachine {
         request.add_response_handler(|result, _| {
             vec![Self::send_from_widget_response(
                 raw_request,
-                result
-                    .map(|_| SendToDeviceEventResponse {})
-                    .map_err(FromWidgetErrorResponse::from_error),
+                result.map_err(FromWidgetErrorResponse::from_error),
             )]
         });
         Some(action)
@@ -622,8 +621,8 @@ impl WidgetMachine {
             response_data: impl Serialize,
         ) -> Action {
             let f = || {
-                let mut object =
-                    raw_request.deserialize_as::<IndexMap<String, Box<RawJsonValue>>>()?;
+                let mut object = raw_request
+                    .deserialize_as_unchecked::<IndexMap<String, Box<RawJsonValue>>>()?;
                 let response_data = serde_json::value::to_raw_value(&response_data)?;
                 object.insert("response".to_owned(), response_data);
                 serde_json::to_string(&object)
@@ -715,7 +714,10 @@ impl WidgetMachine {
         // mutably)
         match self.pending_state_updates.take() {
             None => {
-                error!("Initial state updates must only be set to `None` once all requests are complete; dropping state response");
+                error!(
+                    "Initial state updates must only be set to `None` once all requests \
+                     are complete; dropping state response"
+                );
                 None
             }
 

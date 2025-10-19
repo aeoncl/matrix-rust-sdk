@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher as _};
+pub use fuzzy_matcher::{FuzzyMatcher as _, skim::SkimMatcherV2};
 
-use super::{normalize_string, Filter};
+use super::{Filter, normalize_string};
 
 struct FuzzyMatcher {
     matcher: SkimMatcherV2,
@@ -44,13 +44,13 @@ impl FuzzyMatcher {
 ///
 /// Rooms are fetched from the `Client`. The pattern and the room names are
 /// normalized with `normalize_string`.
-pub fn new_filter(pattern: &str) -> impl Filter {
+pub fn new_filter(pattern: &str) -> impl Filter + use<> {
     let searcher = FuzzyMatcher::new().with_pattern(pattern);
 
     move |room| -> bool {
-        let Some(room_name) = room.cached_display_name() else { return false };
+        let Some(room_name) = &room.cached_display_name else { return false };
 
-        searcher.matches(&room_name.to_string())
+        searcher.matches(room_name)
     }
 }
 

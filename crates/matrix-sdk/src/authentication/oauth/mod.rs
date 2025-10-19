@@ -178,22 +178,20 @@ use error::{
 use matrix_sdk_base::crypto::types::qr_login::QrCodeData;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::once_cell::sync::OnceCell;
-use matrix_sdk_base::{store::RoomLoadSettings, SessionMeta};
+use matrix_sdk_base::{SessionMeta, store::RoomLoadSettings};
 use oauth2::{
-    basic::BasicClient as OAuthClient, AccessToken, PkceCodeVerifier, RedirectUrl, RefreshToken,
-    RevocationUrl, Scope, StandardErrorResponse, StandardRevocableToken, TokenResponse, TokenUrl,
+    AccessToken, PkceCodeVerifier, RedirectUrl, RefreshToken, RevocationUrl, Scope,
+    StandardErrorResponse, StandardRevocableToken, TokenResponse, TokenUrl,
+    basic::BasicClient as OAuthClient,
 };
 pub use oauth2::{ClientId, CsrfToken};
 use ruma::{
-    api::client::discovery::{
-        get_authentication_issuer,
-        get_authorization_server_metadata::{
-            self,
-            msc2965::{AccountManagementAction, AuthorizationServerMetadata},
-        },
+    DeviceId, OwnedDeviceId,
+    api::client::discovery::get_authorization_server_metadata::{
+        self,
+        v1::{AccountManagementAction, AuthorizationServerMetadata},
     },
     serde::Raw,
-    DeviceId, OwnedDeviceId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -207,7 +205,6 @@ mod auth_code_builder;
 mod cross_process;
 pub mod error;
 mod http_client;
-mod oidc_discovery;
 #[cfg(feature = "e2e-encryption")]
 pub mod qrcode;
 pub mod registration;
@@ -217,7 +214,7 @@ mod tests;
 #[cfg(feature = "e2e-encryption")]
 use self::cross_process::{CrossProcessRefreshLockGuard, CrossProcessRefreshManager};
 #[cfg(feature = "e2e-encryption")]
-use self::qrcode::LoginWithQrCode;
+use self::qrcode::{LoginWithGeneratedQrCode, LoginWithQrCode};
 pub use self::{
     account_management_url::{AccountManagementActionFull, AccountManagementUrlBuilder},
     auth_code_builder::{OAuthAuthCodeUrlBuilder, OAuthAuthorizationData},
@@ -225,11 +222,10 @@ pub use self::{
 };
 use self::{
     http_client::OAuthHttpClient,
-    oidc_discovery::discover,
-    registration::{register_client, ClientMetadata, ClientRegistrationResponse},
+    registration::{ClientMetadata, ClientRegistrationResponse, register_client},
 };
 use super::{AuthData, SessionTokens};
-use crate::{client::SessionChange, executor::spawn, Client, HttpError, RefreshTokenError, Result};
+use crate::{Client, HttpError, RefreshTokenError, Result, client::SessionChange, executor::spawn};
 
 pub(crate) struct OAuthCtx {
     /// Lock and state when multiple processes may refresh an OAuth 2.0 session.
@@ -370,97 +366,18 @@ impl OAuth {
 
     /// Log in using a QR code.
     ///
-    /// This method allows you to log in with a QR code, the existing device
-    /// needs to display the QR code which this device can scan and call
-    /// this method to log in.
-    ///
-    /// A successful login using this method will automatically mark the device
-    /// as verified and transfer all end-to-end encryption related secrets, like
-    /// the private cross-signing keys and the backup key from the existing
-    /// device to the new device.
-    ///
     /// # Arguments
-    ///
-    /// * `data` - The data scanned from a QR code.
     ///
     /// * `registration_data` - The data to restore or register the client with
     ///   the server. If this is not provided, an error will occur unless
     ///   [`OAuth::register_client()`] or [`OAuth::restore_registered_client()`]
     ///   was called previously.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use anyhow::bail;
-    /// use futures_util::StreamExt;
-    /// use matrix_sdk::{
-    ///     authentication::oauth::{
-    ///         registration::ClientMetadata,
-    ///         qrcode::{LoginProgress, QrCodeData, QrCodeModeData},
-    ///     },
-    ///     ruma::serde::Raw,
-    ///     Client,
-    /// };
-    /// # fn client_metadata() -> Raw<ClientMetadata> { unimplemented!() }
-    /// # _ = async {
-    /// # let bytes = unimplemented!();
-    /// // You'll need to use a different library to scan and extract the raw bytes from the QR
-    /// // code.
-    /// let qr_code_data = QrCodeData::from_bytes(bytes)?;
-    ///
-    /// // Fetch the homeserver out of the parsed QR code data.
-    /// let QrCodeModeData::Reciprocate{ server_name } = qr_code_data.mode_data else {
-    ///     bail!("The QR code is invalid, we did not receive a homeserver in the QR code.");
-    /// };
-    ///
-    /// // Build the client as usual.
-    /// let client = Client::builder()
-    ///     .server_name_or_homeserver_url(server_name)
-    ///     .handle_refresh_tokens()
-    ///     .build()
-    ///     .await?;
-    ///
-    /// let oauth = client.oauth();
-    /// let client_metadata: Raw<ClientMetadata> = client_metadata();
-    /// let registration_data = client_metadata.into();
-    ///
-    /// // Subscribing to the progress is necessary since we need to input the check
-    /// // code on the existing device.
-    /// let login = oauth.login_with_qr_code(&qr_code_data, Some(&registration_data));
-    /// let mut progress = login.subscribe_to_progress();
-    ///
-    /// // Create a task which will show us the progress and tell us the check
-    /// // code to input in the existing device.
-    /// let task = tokio::spawn(async move {
-    ///     while let Some(state) = progress.next().await {
-    ///         match state {
-    ///             LoginProgress::Starting => (),
-    ///             LoginProgress::EstablishingSecureChannel { check_code } => {
-    ///                 let code = check_code.to_digit();
-    ///                 println!("Please enter the following code into the other device {code:02}");
-    ///             },
-    ///             LoginProgress::WaitingForToken { user_code } => {
-    ///                 println!("Please use your other device to confirm the log in {user_code}")
-    ///             },
-    ///             LoginProgress::Done => break,
-    ///         }
-    ///     }
-    /// });
-    ///
-    /// // Now run the future to complete the login.
-    /// login.await?;
-    /// task.abort();
-    ///
-    /// println!("Successfully logged in: {:?} {:?}", client.user_id(), client.device_id());
-    /// # anyhow::Ok(()) };
-    /// ```
     #[cfg(feature = "e2e-encryption")]
     pub fn login_with_qr_code<'a>(
         &'a self,
-        data: &'a QrCodeData,
         registration_data: Option<&'a ClientRegistrationData>,
-    ) -> LoginWithQrCode<'a> {
-        LoginWithQrCode::new(&self.client, data, registration_data)
+    ) -> LoginWithQrCodeBuilder<'a> {
+        LoginWithQrCodeBuilder { client: &self.client, registration_data }
     }
 
     /// Restore or register the OAuth 2.0 client for the server with the given
@@ -477,7 +394,7 @@ impl OAuth {
         if self.client_id().is_some() {
             tracing::info!("OAuth 2.0 is already configured.");
             return Ok(());
-        };
+        }
 
         let Some(data) = data else {
             return Err(OAuthError::NotRegistered);
@@ -569,33 +486,6 @@ impl OAuth {
         Ok(metadata.account_management_uri.map(AccountManagementUrlBuilder::new))
     }
 
-    /// Discover the authentication issuer and retrieve the
-    /// [`AuthorizationServerMetadata`] using the GET `/auth_issuer` endpoint
-    /// previously defined in [MSC2965].
-    ///
-    /// **Note**: This endpoint is deprecated.
-    ///
-    /// MSC2956: https://github.com/matrix-org/matrix-spec-proposals/pull/2965
-    async fn fallback_discover(
-        &self,
-    ) -> Result<Raw<AuthorizationServerMetadata>, OAuthDiscoveryError> {
-        #[allow(deprecated)]
-        let issuer =
-            match self.client.send(get_authentication_issuer::msc2965::Request::new()).await {
-                Ok(response) => response.issuer,
-                Err(error)
-                    if error
-                        .as_client_api_error()
-                        .is_some_and(|err| err.status_code == http::StatusCode::NOT_FOUND) =>
-                {
-                    return Err(OAuthDiscoveryError::NotSupported);
-                }
-                Err(error) => return Err(error.into()),
-            };
-
-        discover(self.http_client(), &issuer).await
-    }
-
     /// Fetch the OAuth 2.0 authorization server metadata of the homeserver.
     ///
     /// Returns an error if a problem occurred when fetching or validating the
@@ -609,23 +499,19 @@ impl OAuth {
                 .is_some_and(|err| err.status_code == http::StatusCode::NOT_FOUND)
         };
 
-        let raw_metadata = match self
-            .client
-            .send(get_authorization_server_metadata::msc2965::Request::new())
-            .await
-        {
-            Ok(response) => response.metadata,
-            // If the endpoint returns a 404, i.e. the server doesn't support the endpoint, attempt
-            // to use the equivalent, but deprecated, endpoint.
-            Err(error) if is_endpoint_unsupported(&error) => {
-                // TODO: remove this fallback behavior when the metadata endpoint has wider
-                // support.
-                self.fallback_discover().await?
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let response =
+            self.client.send(get_authorization_server_metadata::v1::Request::new()).await.map_err(
+                |error| {
+                    // If the endpoint returns a 404, i.e. the server doesn't support the endpoint.
+                    if is_endpoint_unsupported(&error) {
+                        OAuthDiscoveryError::NotSupported
+                    } else {
+                        error.into()
+                    }
+                },
+            )?;
 
-        let metadata = raw_metadata.deserialize()?;
+        let metadata = response.metadata.deserialize()?;
 
         if self.ctx().insecure_discover {
             metadata.insecure_validate_urls()?;
@@ -853,7 +739,7 @@ impl OAuth {
         }
 
         #[cfg(feature = "e2e-encryption")]
-        self.client.encryption().spawn_initialization_task(None);
+        self.client.encryption().spawn_initialization_task(None).await;
 
         Ok(())
     }
@@ -890,7 +776,10 @@ impl OAuth {
     }
 
     /// The scopes to request for logging in and the corresponding device ID.
-    fn login_scopes(device_id: Option<OwnedDeviceId>) -> ([Scope; 2], OwnedDeviceId) {
+    fn login_scopes(
+        device_id: Option<OwnedDeviceId>,
+        additional_scopes: Option<Vec<Scope>>,
+    ) -> (Vec<Scope>, OwnedDeviceId) {
         /// Scope to grand full access to the client-server API.
         const SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS: &str =
             "urn:matrix:org.matrix.msc2967.client:api:*";
@@ -900,13 +789,16 @@ impl OAuth {
         // Generate the device ID if it is not provided.
         let device_id = device_id.unwrap_or_else(DeviceId::new);
 
-        (
-            [
-                Scope::new(SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS.to_owned()),
-                Scope::new(format!("{SCOPE_MATRIX_DEVICE_ID_PREFIX}{device_id}")),
-            ],
-            device_id,
-        )
+        let mut scopes = vec![
+            Scope::new(SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS.to_owned()),
+            Scope::new(format!("{SCOPE_MATRIX_DEVICE_ID_PREFIX}{device_id}")),
+        ];
+
+        if let Some(extra_scopes) = additional_scopes {
+            scopes.extend(extra_scopes);
+        }
+
+        (scopes, device_id)
     }
 
     /// Log in via OAuth 2.0 with the Authorization Code flow.
@@ -939,6 +831,12 @@ impl OAuth {
     ///   [`OAuth::register_client()`] or [`OAuth::restore_registered_client()`]
     ///   was called previously.
     ///
+    /// * `additional_scopes` - Additional scopes to request from the
+    ///   authorization server, e.g. "urn:matrix:client:com.example.msc9999.foo".
+    ///   The scopes for API access and the device ID according to the
+    ///   [specification](https://spec.matrix.org/v1.15/client-server-api/#allocated-scope-tokens)
+    ///   are always requested.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -957,7 +855,7 @@ impl OAuth {
     /// let client_metadata: Raw<ClientMetadata> = client_metadata();
     /// let registration_data = client_metadata.into();
     ///
-    /// let auth_data = oauth.login(redirect_uri, None, Some(registration_data))
+    /// let auth_data = oauth.login(redirect_uri, None, Some(registration_data), None)
     ///                      .build()
     ///                      .await?;
     ///
@@ -978,8 +876,9 @@ impl OAuth {
         redirect_uri: Url,
         device_id: Option<OwnedDeviceId>,
         registration_data: Option<ClientRegistrationData>,
+        additional_scopes: Option<Vec<Scope>>,
     ) -> OAuthAuthCodeUrlBuilder {
-        let (scopes, device_id) = Self::login_scopes(device_id);
+        let (scopes, device_id) = Self::login_scopes(device_id, additional_scopes);
 
         OAuthAuthCodeUrlBuilder::new(
             self.clone(),
@@ -1054,7 +953,7 @@ impl OAuth {
             self.enable_cross_process_lock().await.map_err(OAuthError::from)?;
 
             #[cfg(feature = "e2e-encryption")]
-            self.client.encryption().spawn_initialization_task(None);
+            self.client.encryption().spawn_initialization_task(None).await;
         }
 
         Ok(())
@@ -1067,22 +966,20 @@ impl OAuth {
         // Enable the cross-process lock for refreshes, if needs be.
         self.deferred_enable_cross_process_refresh_lock().await;
 
-        if let Some(cross_process_manager) = self.ctx().cross_process_token_refresh_manager.get() {
-            if let Some(tokens) = self.client.session_tokens() {
-                let mut cross_process_guard = cross_process_manager.spin_lock().await?;
+        if let Some(cross_process_manager) = self.ctx().cross_process_token_refresh_manager.get()
+            && let Some(tokens) = self.client.session_tokens()
+        {
+            let mut cross_process_guard = cross_process_manager.spin_lock().await?;
 
-                if cross_process_guard.hash_mismatch {
-                    // At this point, we're finishing a login while another process had written
-                    // something in the database. It's likely the information in the database is
-                    // just outdated and wasn't properly updated, but display a warning, just in
-                    // case this happens frequently.
-                    warn!(
-                        "unexpected cross-process hash mismatch when finishing login (see comment)"
-                    );
-                }
-
-                cross_process_guard.save_in_memory_and_db(&tokens).await?;
+            if cross_process_guard.hash_mismatch {
+                // At this point, we're finishing a login while another process had written
+                // something in the database. It's likely the information in the database is
+                // just outdated and wasn't properly updated, but display a warning, just in
+                // case this happens frequently.
+                warn!("unexpected cross-process hash mismatch when finishing login (see comment)");
             }
+
+            cross_process_guard.save_in_memory_and_db(&tokens).await?;
         }
 
         Ok(())
@@ -1161,7 +1058,7 @@ impl OAuth {
         device_id: Option<OwnedDeviceId>,
     ) -> Result<oauth2::StandardDeviceAuthorizationResponse, qrcode::DeviceAuthorizationOAuthError>
     {
-        let (scopes, _) = Self::login_scopes(device_id);
+        let (scopes, _) = Self::login_scopes(device_id, None);
 
         let client_id = self.client_id().ok_or(OAuthError::NotRegistered)?.clone();
 
@@ -1424,6 +1321,187 @@ impl OAuth {
         }
 
         Ok(())
+    }
+}
+
+/// Builder for QR login futures.
+#[cfg(feature = "e2e-encryption")]
+#[derive(Debug)]
+pub struct LoginWithQrCodeBuilder<'a> {
+    /// The underlying Matrix API client.
+    client: &'a Client,
+
+    /// The data to restore or register the client with the server.
+    registration_data: Option<&'a ClientRegistrationData>,
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl<'a> LoginWithQrCodeBuilder<'a> {
+    /// This method allows you to log in with a scanned QR code.
+    ///
+    /// The existing device needs to display the QR code which this device can
+    /// scan and call this method to log in.
+    ///
+    /// A successful login using this method will automatically mark the device
+    /// as verified and transfer all end-to-end encryption related secrets, like
+    /// the private cross-signing keys and the backup key from the existing
+    /// device to the new device.
+    ///
+    /// For the reverse flow where this device generates the QR code for the
+    /// existing device to scan, use [`LoginWithQrCodeBuilder::generate`].
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The data scanned from a QR code.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use anyhow::bail;
+    /// use futures_util::StreamExt;
+    /// use matrix_sdk::{
+    ///     authentication::oauth::{
+    ///         registration::ClientMetadata,
+    ///         qrcode::{LoginProgress, QrCodeData, QrCodeModeData, QrProgress},
+    ///     },
+    ///     ruma::serde::Raw,
+    ///     Client,
+    /// };
+    /// # fn client_metadata() -> Raw<ClientMetadata> { unimplemented!() }
+    /// # _ = async {
+    /// # let bytes = unimplemented!();
+    /// // You'll need to use a different library to scan and extract the raw bytes from the QR
+    /// // code.
+    /// let qr_code_data = QrCodeData::from_bytes(bytes)?;
+    ///
+    /// // Fetch the homeserver out of the parsed QR code data.
+    /// let QrCodeModeData::Reciprocate{ server_name } = qr_code_data.mode_data else {
+    ///     bail!("The QR code is invalid, we did not receive a homeserver in the QR code.");
+    /// };
+    ///
+    /// // Build the client as usual.
+    /// let client = Client::builder()
+    ///     .server_name_or_homeserver_url(server_name)
+    ///     .handle_refresh_tokens()
+    ///     .build()
+    ///     .await?;
+    ///
+    /// let oauth = client.oauth();
+    /// let client_metadata: Raw<ClientMetadata> = client_metadata();
+    /// let registration_data = client_metadata.into();
+    ///
+    /// // Subscribing to the progress is necessary since we need to input the check
+    /// // code on the existing device.
+    /// let login = oauth.login_with_qr_code(Some(&registration_data)).scan(&qr_code_data);
+    /// let mut progress = login.subscribe_to_progress();
+    ///
+    /// // Create a task which will show us the progress and tell us the check
+    /// // code to input in the existing device.
+    /// let task = tokio::spawn(async move {
+    ///     while let Some(state) = progress.next().await {
+    ///         match state {
+    ///             LoginProgress::Starting | LoginProgress::SyncingSecrets => (),
+    ///             LoginProgress::EstablishingSecureChannel(QrProgress { check_code }) => {
+    ///                 let code = check_code.to_digit();
+    ///                 println!("Please enter the following code into the other device {code:02}");
+    ///             },
+    ///             LoginProgress::WaitingForToken { user_code } => {
+    ///                 println!("Please use your other device to confirm the log in {user_code}")
+    ///             },
+    ///             LoginProgress::Done => break,
+    ///         }
+    ///     }
+    /// });
+    ///
+    /// // Now run the future to complete the login.
+    /// login.await?;
+    /// task.abort();
+    ///
+    /// println!("Successfully logged in: {:?} {:?}", client.user_id(), client.device_id());
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub fn scan(self, data: &'a QrCodeData) -> LoginWithQrCode<'a> {
+        LoginWithQrCode::new(self.client, data, self.registration_data)
+    }
+
+    /// This method allows you to log in by generating a QR code.
+    ///
+    /// This device needs to call this method to generate and display the
+    /// QR code which the existing device can scan and grant the log in.
+    ///
+    /// A successful login using this method will automatically mark the device
+    /// as verified and transfer all end-to-end encryption related secrets, like
+    /// the private cross-signing keys and the backup key from the existing
+    /// device to the new device.
+    ///
+    /// For the reverse flow where the existing device generates the QR code
+    /// for this device to scan, use [`LoginWithQrCodeBuilder::scan`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use anyhow::bail;
+    /// use futures_util::StreamExt;
+    /// use matrix_sdk::{
+    ///     authentication::oauth::{
+    ///         registration::ClientMetadata,
+    ///         qrcode::{GeneratedQrProgress, LoginProgress, QrCodeData, QrCodeModeData},
+    ///     },
+    ///     ruma::serde::Raw,
+    ///     Client,
+    /// };
+    /// use std::io::stdin;
+    /// # fn client_metadata() -> Raw<ClientMetadata> { unimplemented!() }
+    /// # _ = async {
+    /// // Build the client as usual.
+    /// let client = Client::builder()
+    ///     .server_name_or_homeserver_url("matrix.org")
+    ///     .handle_refresh_tokens()
+    ///     .build()
+    ///     .await?;
+    ///
+    /// let oauth = client.oauth();
+    /// let client_metadata: Raw<ClientMetadata> = client_metadata();
+    /// let registration_data = client_metadata.into();
+    ///
+    /// // Subscribing to the progress is necessary since we need to display the
+    /// // QR code and prompt for the check code.
+    /// let login = oauth.login_with_qr_code(Some(&registration_data)).generate();
+    /// let mut progress = login.subscribe_to_progress();
+    ///
+    /// // Create a task which will show us the progress and allows us to display
+    /// // the QR code and prompt for the check code.
+    /// let task = tokio::spawn(async move {
+    ///     while let Some(state) = progress.next().await {
+    ///         match state {
+    ///             LoginProgress::Starting | LoginProgress::SyncingSecrets => (),
+    ///             LoginProgress::EstablishingSecureChannel(GeneratedQrProgress::QrReady(qr)) => {
+    ///                 println!("Please use your other device to scan the QR code {:?}", qr)
+    ///             }
+    ///             LoginProgress::EstablishingSecureChannel(GeneratedQrProgress::QrScanned(cctx)) => {
+    ///                 println!("Please enter the code displayed on your other device");
+    ///                 let mut s = String::new();
+    ///                 stdin().read_line(&mut s).unwrap();
+    ///                 let check_code = s.trim().parse::<u8>().unwrap();
+    ///                 cctx.send(check_code).await.unwrap()
+    ///             }
+    ///             LoginProgress::WaitingForToken { user_code } => {
+    ///                 println!("Please use your other device to confirm the log in {user_code}")
+    ///             },
+    ///             LoginProgress::Done => break,
+    ///         }
+    ///     }
+    /// });
+    ///
+    /// // Now run the future to complete the login.
+    /// login.await?;
+    /// task.abort();
+    ///
+    /// println!("Successfully logged in: {:?} {:?}", client.user_id(), client.device_id());
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub fn generate(self) -> LoginWithGeneratedQrCode<'a> {
+        LoginWithGeneratedQrCode::new(self.client, self.registration_data)
     }
 }
 

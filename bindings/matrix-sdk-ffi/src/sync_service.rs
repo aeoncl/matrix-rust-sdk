@@ -16,7 +16,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use futures_util::pin_mut;
 use matrix_sdk::Client;
-use matrix_sdk_common::{runtime::get_runtime_handle, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     sync_service::{
         State as MatrixSyncServiceState, SyncService as MatrixSyncService,
@@ -26,7 +26,8 @@ use matrix_sdk_ui::{
 };
 
 use crate::{
-    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService, TaskHandle,
+    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService,
+    runtime::get_runtime_handle, TaskHandle,
 };
 
 #[derive(uniffi::Enum)]
@@ -44,7 +45,7 @@ impl From<MatrixSyncServiceState> for SyncServiceState {
             MatrixSyncServiceState::Idle => Self::Idle,
             MatrixSyncServiceState::Running => Self::Running,
             MatrixSyncServiceState::Terminated => Self::Terminated,
-            MatrixSyncServiceState::Error => Self::Error,
+            MatrixSyncServiceState::Error(_error) => Self::Error,
             MatrixSyncServiceState::Offline => Self::Offline,
         }
     }
@@ -89,6 +90,15 @@ impl SyncService {
             }
         })))
     }
+
+    /// Force expiring both sliding sync sessions.
+    ///
+    /// This ensures that the sync service is stopped before expiring both
+    /// sessions. It should be used sparingly, as it will cause a restart of
+    /// the sessions on the server as well.
+    pub async fn expire_sessions(&self) {
+        self.inner.expire_sessions().await;
+    }
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -115,6 +125,12 @@ impl SyncServiceBuilder {
     pub fn with_offline_mode(self: Arc<Self>) -> Arc<Self> {
         let this = unwrap_or_clone_arc(self);
         let builder = this.builder.with_offline_mode();
+        Arc::new(Self { builder, ..this })
+    }
+
+    pub fn with_share_pos(self: Arc<Self>, enable: bool) -> Arc<Self> {
+        let this = unwrap_or_clone_arc(self);
+        let builder = this.builder.with_share_pos(enable);
         Arc::new(Self { builder, ..this })
     }
 

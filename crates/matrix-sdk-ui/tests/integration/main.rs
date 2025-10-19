@@ -14,12 +14,12 @@
 
 use itertools::Itertools as _;
 use matrix_sdk::deserialized_responses::TimelineEvent;
-use ruma::{events::AnyStateEvent, serde::Raw, EventId, RoomId};
+use ruma::{EventId, RoomId, events::AnyStateEvent, serde::Raw};
 use serde::Serialize;
 use serde_json::json;
 use wiremock::{
-    matchers::{header, method, path, path_regex, query_param, query_param_is_missing},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path, path_regex, query_param, query_param_is_missing},
 };
 
 mod encryption_sync_service;
@@ -29,7 +29,7 @@ mod sliding_sync;
 mod sync_service;
 mod timeline;
 
-matrix_sdk_test::init_tracing_for_tests!();
+matrix_sdk_test_utils::init_tracing_for_tests!();
 
 /// Mount a Mock on the given server to handle the `GET /sync` endpoint with
 /// an optional `since` param that returns a 200 status code with the given

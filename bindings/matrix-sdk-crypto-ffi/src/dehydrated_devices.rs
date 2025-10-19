@@ -1,15 +1,16 @@
 use std::{mem::ManuallyDrop, sync::Arc};
 
+use matrix_sdk_common::executor::Handle;
 use matrix_sdk_crypto::{
     dehydrated_devices::{
         DehydratedDevice as InnerDehydratedDevice, DehydratedDevices as InnerDehydratedDevices,
         RehydratedDevice as InnerRehydratedDevice,
     },
-    store::DehydratedDeviceKey as InnerDehydratedDeviceKey,
+    store::types::DehydratedDeviceKey as InnerDehydratedDeviceKey,
+    DecryptionSettings,
 };
 use ruma::{api::client::dehydrated_device, events::AnyToDeviceEvent, serde::Raw, OwnedDeviceId};
 use serde_json::json;
-use tokio::runtime::Handle;
 
 use crate::{CryptoStoreError, DehydratedDeviceKey};
 
@@ -154,9 +155,13 @@ impl Drop for RehydratedDevice {
 
 #[matrix_sdk_ffi_macros::export]
 impl RehydratedDevice {
-    pub fn receive_events(&self, events: String) -> Result<(), crate::CryptoStoreError> {
+    pub fn receive_events(
+        &self,
+        events: String,
+        decryption_settings: &DecryptionSettings,
+    ) -> Result<(), crate::CryptoStoreError> {
         let events: Vec<Raw<AnyToDeviceEvent>> = serde_json::from_str(&events)?;
-        self.runtime.block_on(self.inner.receive_events(events))?;
+        self.runtime.block_on(self.inner.receive_events(events, decryption_settings))?;
 
         Ok(())
     }

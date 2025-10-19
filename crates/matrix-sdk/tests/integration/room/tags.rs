@@ -1,17 +1,21 @@
 use std::{collections::BTreeMap, ops::Not, time::Duration};
 
-use matrix_sdk::{config::SyncSettings, Client, Room};
+use matrix_sdk::{
+    Client, Room,
+    config::{SyncSettings, SyncToken},
+};
 use matrix_sdk_test::{
-    async_test, test_json, JoinedRoomBuilder, RoomAccountDataTestEvent, SyncResponseBuilder,
+    JoinedRoomBuilder, RoomAccountDataTestEvent, SyncResponseBuilder, async_test, test_json,
 };
 use ruma::{
+    RoomId,
     events::tag::{TagInfo, TagName, Tags},
-    room_id, RoomId,
+    room_id,
 };
 use serde_json::json;
 use wiremock::{
-    matchers::{header, method, path_regex},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path_regex},
 };
 
 use crate::{logged_in_client_with_server, mock_sync};
@@ -61,7 +65,8 @@ async fn mock_sync_with_tags(
 }
 
 async fn sync_once(client: &Client, server: &MockServer) {
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(3000)).token(SyncToken::NoToken);
     client.sync_once(sync_settings).await.unwrap();
     server.reset().await;
 }

@@ -13,17 +13,18 @@
 // limitations under the License.
 
 use ruma::{
-    api::client::{account::request_openid_token, delayed_events, to_device::send_event_to_device},
+    api::client::{account::request_openid_token, delayed_events},
     events::{AnyStateEvent, AnyTimelineEvent, AnyToDeviceEvent},
     serde::Raw,
 };
-use serde::{de, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de};
 use serde_json::value::RawValue as RawJsonValue;
 use uuid::Uuid;
 
 #[cfg(doc)]
 use super::MatrixDriverRequestData;
 use super::{
+    SendToDeviceEventResponse,
     from_widget::{FromWidgetRequest, SendEventResponse},
     to_widget::ToWidgetResponse,
 };
@@ -82,7 +83,7 @@ pub(crate) enum MatrixDriverResponse {
     /// A response to a [`MatrixDriverRequestData::SendEvent`] command.
     EventSent(SendEventResponse),
     /// A response to a `Action::SendToDevice` command.
-    ToDeviceSent(send_event_to_device::v3::Response),
+    ToDeviceSent(SendToDeviceEventResponse),
     /// Client updated a delayed event.
     /// A response to a [`MatrixDriverRequestData::UpdateDelayedEvent`] command.
     DelayedEventUpdated(delayed_events::update_delayed_event::unstable::Response),

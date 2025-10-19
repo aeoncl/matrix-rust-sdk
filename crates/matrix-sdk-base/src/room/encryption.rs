@@ -19,13 +19,13 @@ use super::Room;
 impl Room {
     /// Get the encryption state of this room.
     pub fn encryption_state(&self) -> EncryptionState {
-        self.inner.read().encryption_state()
+        self.info.read().encryption_state()
     }
 
     /// Get the `m.room.encryption` content that enabled end to end encryption
     /// in the room.
     pub fn encryption_settings(&self) -> Option<RoomEncryptionEventContent> {
-        self.inner.read().base_info.encryption.clone()
+        self.info.read().base_info.encryption.clone()
     }
 }
 
@@ -35,6 +35,11 @@ impl Room {
 pub enum EncryptionState {
     /// The room is encrypted.
     Encrypted,
+
+    /// The room is encrypted, additionally requiring state events to be
+    /// encrypted.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    StateEncrypted,
 
     /// The room is not encrypted.
     NotEncrypted,
@@ -46,8 +51,23 @@ pub enum EncryptionState {
 
 impl EncryptionState {
     /// Check whether `EncryptionState` is [`Encrypted`][Self::Encrypted].
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
     pub fn is_encrypted(&self) -> bool {
         matches!(self, Self::Encrypted)
+    }
+
+    /// Check whether `EncryptionState` is [`Encrypted`][Self::Encrypted] or
+    /// [`StateEncrypted`][Self::StateEncrypted].
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Encrypted | Self::StateEncrypted)
+    }
+
+    /// Check whether `EncryptionState` is
+    /// [`StateEncrypted`][Self::StateEncrypted].
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub fn is_state_encrypted(&self) -> bool {
+        matches!(self, Self::StateEncrypted)
     }
 
     /// Check whether `EncryptionState` is [`Unknown`][Self::Unknown].
@@ -60,25 +80,22 @@ impl EncryptionState {
 mod tests {
     use std::{
         ops::{Not, Sub},
-        str::FromStr,
         sync::Arc,
         time::Duration,
     };
 
     use assert_matches::assert_matches;
-    use matrix_sdk_test::ALICE;
+    use matrix_sdk_test::{ALICE, event_factory::EventFactory};
     use ruma::{
-        events::{
-            room::encryption::{OriginalSyncRoomEncryptionEvent, RoomEncryptionEventContent},
-            AnySyncStateEvent, EmptyStateKey, StateUnsigned, SyncStateEvent,
-        },
+        EventEncryptionAlgorithm, MilliSecondsSinceUnixEpoch, event_id,
+        events::{AnySyncStateEvent, room::encryption::RoomEncryptionEventContent},
         room_id,
         time::SystemTime,
-        user_id, EventEncryptionAlgorithm, MilliSecondsSinceUnixEpoch, OwnedEventId,
+        user_id,
     };
 
     use super::{EncryptionState, Room};
-    use crate::{store::MemoryStore, RoomState};
+    use crate::{RoomState, store::MemoryStore};
 
     fn make_room_test_helper(room_type: RoomState) -> (Arc<MemoryStore>, Room) {
         let store = Arc::new(MemoryStore::new());
@@ -97,7 +114,7 @@ mod tests {
     }
 
     fn receive_state_events(room: &Room, events: Vec<&AnySyncStateEvent>) {
-        room.inner.update_if(|info| {
+        room.info.update_if(|info| {
             let mut res = false;
             for ev in events {
                 res |= info.handle_state_event(ev);
@@ -114,18 +131,15 @@ mod tests {
 
         let encryption_content =
             RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-        let encryption_event = AnySyncStateEvent::RoomEncryption(SyncStateEvent::Original(
-            OriginalSyncRoomEncryptionEvent {
-                content: encryption_content,
-                event_id: OwnedEventId::from_str("$1234_1").unwrap(),
-                sender: ALICE.to_owned(),
-                // we can simply use now here since this will be dropped when using a
-                // MinimalStateEvent in the roomInfo
-                origin_server_ts: timestamp(0),
-                state_key: EmptyStateKey,
-                unsigned: StateUnsigned::new(),
-            },
-        ));
+        let encryption_event = EventFactory::new()
+            .sender(*ALICE)
+            .event(encryption_content)
+            .state_key("")
+            .event_id(event_id!("$1234_1"))
+            // we can simply use now here since this will be dropped when using a MinimalStateEvent
+            // in the roomInfo
+            .server_ts(timestamp(0))
+            .into();
         receive_state_events(&room, vec![&encryption_event]);
 
         assert_matches!(room.encryption_state(), EncryptionState::Encrypted);
@@ -136,7 +150,7 @@ mod tests {
         let (_store, room) = make_room_test_helper(RoomState::Joined);
 
         assert_matches!(room.encryption_state(), EncryptionState::Unknown);
-        room.inner.update_if(|info| {
+        room.info.update_if(|info| {
             info.mark_encryption_state_synced();
 
             false
@@ -154,5 +168,16 @@ mod tests {
         assert!(EncryptionState::Unknown.is_encrypted().not());
         assert!(EncryptionState::Encrypted.is_encrypted());
         assert!(EncryptionState::NotEncrypted.is_encrypted().not());
+
+        #[cfg(feature = "experimental-encrypted-state-events")]
+        {
+            assert!(EncryptionState::StateEncrypted.is_unknown().not());
+            assert!(EncryptionState::StateEncrypted.is_encrypted());
+
+            assert!(EncryptionState::Unknown.is_state_encrypted().not());
+            assert!(EncryptionState::Encrypted.is_state_encrypted().not());
+            assert!(EncryptionState::StateEncrypted.is_state_encrypted());
+            assert!(EncryptionState::NotEncrypted.is_state_encrypted().not());
+        }
     }
 }

@@ -3,14 +3,14 @@
 use imbl::HashSet;
 use indexmap::IndexSet;
 use ruma::{
+    RoomId,
     push::{
         AnyPushRuleRef, PatternedPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
         PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
     },
-    RoomId,
 };
 
-use super::{command::Command, rule_commands::RuleCommands, RoomNotificationMode};
+use super::{RoomNotificationMode, command::Command, rule_commands::RuleCommands};
 use crate::{
     error::NotificationSettingsError,
     notification_settings::{IsEncrypted, IsOneToOne},
@@ -142,11 +142,11 @@ impl Rules {
             match rule {
                 AnyPushRuleRef::Override(r) | AnyPushRuleRef::Underride(r) => {
                     for condition in &r.conditions {
-                        if let PushCondition::EventMatch { key, pattern } = condition {
-                            if key == "room_id" {
-                                room_ids.insert(pattern.clone());
-                                break;
-                            }
+                        if let PushCondition::EventMatch { key, pattern } = condition
+                            && key == "room_id"
+                        {
+                            room_ids.insert(pattern.clone());
+                            break;
                         }
                     }
                 }
@@ -173,19 +173,19 @@ impl Rules {
         #[allow(deprecated)]
         if let Some(rule) =
             self.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::ContainsDisplayName)
+            && rule.enabled()
+            && rule.triggers_notification()
         {
-            if rule.enabled() && rule.triggers_notification() {
-                return true;
-            }
+            return true;
         }
 
         #[allow(deprecated)]
         if let Some(rule) =
             self.ruleset.get(RuleKind::Content, PredefinedContentRuleId::ContainsUserName)
+            && rule.enabled()
+            && rule.triggers_notification()
         {
-            if rule.enabled() && rule.triggers_notification() {
-                return true;
-            }
+            return true;
         }
 
         false
@@ -316,22 +316,24 @@ pub(crate) mod tests {
     use imbl::HashSet;
     use matrix_sdk_test::{
         async_test,
-        notification_settings::{build_ruleset, get_server_default_ruleset},
+        notification_settings::{
+            build_ruleset, get_server_default_ruleset, server_default_ruleset_with_legacy_mentions,
+        },
     };
     use ruma::{
+        OwnedRoomId, RoomId,
         push::{
             Action, NewConditionalPushRule, NewPushRule, PredefinedContentRuleId,
             PredefinedOverrideRuleId, PredefinedUnderrideRuleId, PushCondition, RuleKind,
         },
-        OwnedRoomId, RoomId,
     };
 
     use super::RuleCommands;
     use crate::{
         error::NotificationSettingsError,
         notification_settings::{
-            rules::{self, Rules},
             IsEncrypted, IsOneToOne, RoomNotificationMode,
+            rules::{self, Rules},
         },
     };
 
@@ -488,7 +490,7 @@ pub(crate) mod tests {
     async fn test_is_user_mention_enabled() {
         // If `IsUserMention` is enable, then is_user_mention_enabled() should return
         // `true` even if the deprecated rules are disabled
-        let mut ruleset = get_server_default_ruleset();
+        let mut ruleset = server_default_ruleset_with_legacy_mentions();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, true)
             .unwrap();
@@ -505,13 +507,15 @@ pub(crate) mod tests {
         assert!(rules.is_user_mention_enabled());
         // is_enabled() should also return `true` for
         // PredefinedOverrideRuleId::IsUserMention
-        assert!(rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention.as_str())
-            .unwrap());
+        assert!(
+            rules
+                .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention.as_str())
+                .unwrap()
+        );
 
         // If `IsUserMention` is disabled, then is_user_mention_enabled() should return
         // `false` even if the deprecated rules are enabled
-        let mut ruleset = get_server_default_ruleset();
+        let mut ruleset = server_default_ruleset_with_legacy_mentions();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, false)
             .unwrap();
@@ -536,16 +540,18 @@ pub(crate) mod tests {
         assert!(!rules.is_user_mention_enabled());
         // is_enabled() should also return `false` for
         // PredefinedOverrideRuleId::IsUserMention
-        assert!(!rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention.as_str())
-            .unwrap());
+        assert!(
+            !rules
+                .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention.as_str())
+                .unwrap()
+        );
     }
 
     #[async_test]
     async fn test_is_room_mention_enabled() {
         // If `IsRoomMention` is present and enabled then is_room_mention_enabled()
         // should return `true` even if the deprecated rule is disabled
-        let mut ruleset = get_server_default_ruleset();
+        let mut ruleset = server_default_ruleset_with_legacy_mentions();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention, true)
             .unwrap();
@@ -558,13 +564,15 @@ pub(crate) mod tests {
         assert!(rules.is_room_mention_enabled());
         // is_enabled() should also return `true` for
         // PredefinedOverrideRuleId::IsRoomMention
-        assert!(rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention.as_str())
-            .unwrap());
+        assert!(
+            rules
+                .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention.as_str())
+                .unwrap()
+        );
 
         // If `IsRoomMention` is present and disabled then is_room_mention_enabled()
         // should return `false` even if the deprecated rule is enabled
-        let mut ruleset = get_server_default_ruleset();
+        let mut ruleset = server_default_ruleset_with_legacy_mentions();
         ruleset
             .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention, false)
             .unwrap();
@@ -575,9 +583,11 @@ pub(crate) mod tests {
         assert!(!rules.is_room_mention_enabled());
         // is_enabled() should also return `false` for
         // PredefinedOverrideRuleId::IsRoomMention
-        assert!(!rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention.as_str())
-            .unwrap());
+        assert!(
+            !rules
+                .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention.as_str())
+                .unwrap()
+        );
     }
 
     #[async_test]
@@ -644,9 +654,11 @@ pub(crate) mod tests {
         rules.apply(rules_commands);
 
         // The rule must have been disabled in the updated rules
-        assert!(!rules
-            .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction.as_str())
-            .unwrap());
+        assert!(
+            !rules
+                .is_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction.as_str())
+                .unwrap()
+        );
     }
 
     #[async_test]

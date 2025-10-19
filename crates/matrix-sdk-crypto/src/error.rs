@@ -76,6 +76,18 @@ pub enum OlmError {
     /// Encryption failed due to an error collecting the recipient devices.
     #[error("encryption failed due to an error collecting the recipient devices: {0}")]
     SessionRecipientCollectionError(SessionRecipientCollectionError),
+
+    /// Encrypted content is withheld from this device
+    #[error("encryption content is withheld from this: {0}")]
+    Withheld(WithheldCode),
+
+    /// Refused to decrypt because the sender was not verified or did not meet
+    /// the required VerificationLevel.
+    #[error(
+        "refusing to decrypt the event because the sender device was not \
+        verified and 'exclude insecure devices' is enabled."
+    )]
+    UnverifiedSenderDevice,
 }
 
 /// Error representing a failure during a group encryption operation.
@@ -121,6 +133,12 @@ pub enum MegolmError {
     /// The nested value is the sender's current verification level.
     #[error("decryption failed because trust requirement not satisfied: {0}")]
     SenderIdentityNotTrusted(VerificationLevel),
+
+    /// The outer state key could not be verified against the inner encrypted
+    /// state key and type.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    #[error("decryption failed because the state key failed to validate")]
+    StateKeyVerificationFailed,
 }
 
 /// Decryption failed because of a mismatch between the identity keys of the

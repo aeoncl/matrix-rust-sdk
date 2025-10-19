@@ -12,11 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use matrix_sdk_base::crypto::store::RoomKeyCounts;
-use ruma::{
-    events::{EventContent, GlobalAccountDataEventType},
-    exports::ruma_macros::EventContent,
-};
+use matrix_sdk_base::crypto::store::types::RoomKeyCounts;
+use ruma::events::macros::EventContent;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -24,7 +21,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 #[cfg(doc)]
 use crate::encryption::{
     backups::Backups,
-    recovery::{futures::Enable, Recovery},
+    recovery::{Recovery, futures::Enable},
 };
 
 /// Result type alias for the [`Recovery`] subsystem.
@@ -114,13 +111,4 @@ pub(super) struct SecretStorageDisabledContent {}
 #[ruma_event(type = "m.org.matrix.custom.backup_disabled", kind = GlobalAccountData)]
 pub(super) struct BackupDisabledContent {
     pub disabled: bool,
-}
-
-impl BackupDisabledContent {
-    /// Get the event type of the [`BackupDisabledContent`] global account data
-    /// event.
-    pub(super) fn event_type() -> GlobalAccountDataEventType {
-        // This is dumb, there's got to be a better way to get to the event type?
-        Self { disabled: false }.event_type()
-    }
 }

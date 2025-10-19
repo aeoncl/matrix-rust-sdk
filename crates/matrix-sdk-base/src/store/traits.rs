@@ -24,32 +24,38 @@ use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
 use matrix_sdk_common::AsyncTraitDeps;
 use ruma::{
-    api::MatrixVersion,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+    api::{
+        SupportedVersions,
+        client::discovery::discover_homeserver::{
+            self, HomeserverInfo, IdentityServerInfo, RtcFocusInfo, TileServerInfo,
+        },
+    },
     events::{
-        presence::PresenceEvent,
-        receipt::{Receipt, ReceiptThread, ReceiptType},
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, EmptyStateKey, GlobalAccountDataEvent,
         GlobalAccountDataEventContent, GlobalAccountDataEventType, RedactContent,
         RedactedStateEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
         RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
+        presence::PresenceEvent,
+        receipt::{Receipt, ReceiptThread, ReceiptType},
     },
     serde::Raw,
     time::SystemTime,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{
-    send_queue::SentRequestKey, ChildTransactionId, DependentQueuedRequest,
-    DependentQueuedRequestKind, QueueWedgeError, QueuedRequest, QueuedRequestKind,
-    RoomLoadSettings, StateChanges, StoreError,
+    ChildTransactionId, DependentQueuedRequest, DependentQueuedRequestKind, QueueWedgeError,
+    QueuedRequest, QueuedRequestKind, RoomLoadSettings, StateChanges, StoreError,
+    send_queue::SentRequestKey,
 };
 use crate::{
+    MinimalRoomMemberEvent, RoomInfo, RoomMemberships,
     deserialized_responses::{
         DisplayName, RawAnySyncOrStrippedState, RawMemberEvent, RawSyncOrStrippedState,
     },
-    MinimalRoomMemberEvent, RoomInfo, RoomMemberships,
+    store::StoredThreadSubscription,
 };
 
 /// An abstract state store trait that can be used to implement different stores
@@ -473,6 +479,40 @@ pub trait StateStore: AsyncTraitDeps {
         &self,
         room: &RoomId,
     ) -> Result<Vec<DependentQueuedRequest>, Self::Error>;
+
+    /// Insert or update a thread subscription for a given room and thread.
+    ///
+    /// If the new thread subscription hasn't set a bumpstamp, and there was a
+    /// previous subscription in the database with a bumpstamp, the existing
+    /// bumpstamp is kept.
+    ///
+    /// If the new thread subscription has a bumpstamp that's lower than or
+    /// equal to a previously one, the existing subscription is kept, i.e.
+    /// this method must have no effect.
+    async fn upsert_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+        subscription: StoredThreadSubscription,
+    ) -> Result<(), Self::Error>;
+
+    /// Remove a previous thread subscription for a given room and thread.
+    ///
+    /// Note: removing an unknown thread subscription is a no-op.
+    async fn remove_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<(), Self::Error>;
+
+    /// Loads the current thread subscription for a given room and thread.
+    ///
+    /// Returns `None` if there was no entry for the given room/thread pair.
+    async fn load_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<Option<StoredThreadSubscription>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -767,6 +807,31 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
             .await
             .map_err(Into::into)
     }
+
+    async fn upsert_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+        subscription: StoredThreadSubscription,
+    ) -> Result<(), Self::Error> {
+        self.0.upsert_thread_subscription(room, thread_id, subscription).await.map_err(Into::into)
+    }
+
+    async fn load_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<Option<StoredThreadSubscription>, Self::Error> {
+        self.0.load_thread_subscription(room, thread_id).await.map_err(Into::into)
+    }
+
+    async fn remove_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<(), Self::Error> {
+        self.0.remove_thread_subscription(room, thread_id).await.map_err(Into::into)
+    }
 }
 
 /// Convenience functionality for state stores.
@@ -783,7 +848,9 @@ pub trait StateStoreExt: StateStore {
         room_id: &RoomId,
     ) -> Result<Option<RawSyncOrStrippedState<C>>, Self::Error>
     where
-        C: StaticEventContent + StaticStateEventContent<StateKey = EmptyStateKey> + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent<StateKey = EmptyStateKey>
+            + RedactContent,
         C::Redacted: RedactedStateEventContent,
     {
         Ok(self.get_state_event(room_id, C::TYPE.into(), "").await?.map(|raw| raw.cast()))
@@ -800,7 +867,9 @@ pub trait StateStoreExt: StateStore {
         state_key: &K,
     ) -> Result<Option<RawSyncOrStrippedState<C>>, Self::Error>
     where
-        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
         C::StateKey: Borrow<K>,
         C::Redacted: RedactedStateEventContent,
         K: AsRef<str> + ?Sized + Sync,
@@ -821,7 +890,9 @@ pub trait StateStoreExt: StateStore {
         room_id: &RoomId,
     ) -> Result<Vec<RawSyncOrStrippedState<C>>, Self::Error>
     where
-        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
         C::Redacted: RedactedStateEventContent,
     {
         // FIXME: Could be more efficient, if we had streaming store accessor functions
@@ -847,7 +918,9 @@ pub trait StateStoreExt: StateStore {
         state_keys: I,
     ) -> Result<Vec<RawSyncOrStrippedState<C>>, Self::Error>
     where
-        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
         C::StateKey: Borrow<K>,
         C::Redacted: RedactedStateEventContent,
         K: AsRef<str> + Sized + Sync + 'a,
@@ -871,9 +944,9 @@ pub trait StateStoreExt: StateStore {
         &self,
     ) -> Result<Option<Raw<GlobalAccountDataEvent<C>>>, Self::Error>
     where
-        C: StaticEventContent + GlobalAccountDataEventContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False> + GlobalAccountDataEventContent,
     {
-        Ok(self.get_account_data_event(C::TYPE.into()).await?.map(Raw::cast))
+        Ok(self.get_account_data_event(C::TYPE.into()).await?.map(Raw::cast_unchecked))
     }
 
     /// Get an event of a statically-known type from the room account data
@@ -888,9 +961,12 @@ pub trait StateStoreExt: StateStore {
         room_id: &RoomId,
     ) -> Result<Option<Raw<RoomAccountDataEvent<C>>>, Self::Error>
     where
-        C: StaticEventContent + RoomAccountDataEventContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False> + RoomAccountDataEventContent,
     {
-        Ok(self.get_room_account_data_event(room_id, C::TYPE.into()).await?.map(Raw::cast))
+        Ok(self
+            .get_room_account_data_event(room_id, C::TYPE.into())
+            .await?
+            .map(Raw::cast_unchecked))
     }
 
     /// Get the `MemberEvent` for the given state key in the given room id.
@@ -950,48 +1026,84 @@ where
     }
 }
 
-/// Server capabilities returned by the /client/versions endpoint.
+/// Useful server info such as data returned by the /client/versions and
+/// .well-known/client/matrix endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ServerCapabilities {
+pub struct ServerInfo {
     /// Versions supported by the remote server.
-    ///
-    /// This contains [`MatrixVersion`]s converted to strings.
     pub versions: Vec<String>,
 
     /// List of unstable features and their enablement status.
     pub unstable_features: BTreeMap<String, bool>,
+
+    /// Information about the server found in the client well-known file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub well_known: Option<WellKnownResponse>,
 
     /// Last time we fetched this data from the server, in milliseconds since
     /// epoch.
     last_fetch_ts: f64,
 }
 
-impl ServerCapabilities {
+impl ServerInfo {
     /// The number of milliseconds after which the data is considered stale.
     pub const STALE_THRESHOLD: f64 = (1000 * 60 * 60 * 24 * 7) as _; // seven days
 
-    /// Encode server capabilities into this serializable struct.
-    pub fn new(versions: &[MatrixVersion], unstable_features: BTreeMap<String, bool>) -> Self {
-        Self {
-            versions: versions.iter().map(|item| item.to_string()).collect(),
-            unstable_features,
-            last_fetch_ts: now_timestamp_ms(),
-        }
+    /// Encode server info into this serializable struct.
+    pub fn new(
+        versions: Vec<String>,
+        unstable_features: BTreeMap<String, bool>,
+        well_known: Option<WellKnownResponse>,
+    ) -> Self {
+        Self { versions, unstable_features, well_known, last_fetch_ts: now_timestamp_ms() }
     }
 
-    /// Decode server capabilities from this serializable struct.
+    /// Decode server info from this serializable struct.
     ///
     /// May return `None` if the data is considered stale, after
     /// [`Self::STALE_THRESHOLD`] milliseconds since the last time we stored
     /// it.
-    pub fn maybe_decode(&self) -> Option<(Vec<MatrixVersion>, BTreeMap<String, bool>)> {
+    pub fn maybe_decode(&self) -> Option<Self> {
         if now_timestamp_ms() - self.last_fetch_ts >= Self::STALE_THRESHOLD {
             None
         } else {
-            Some((
-                self.versions.iter().filter_map(|item| item.parse().ok()).collect(),
-                self.unstable_features.clone(),
-            ))
+            Some(self.clone())
+        }
+    }
+
+    /// Extracts known Matrix versions and features from the un-typed lists of
+    /// strings.
+    ///
+    /// Note: Matrix versions that Ruma cannot parse, or does not know about,
+    /// are discarded.
+    pub fn supported_versions(&self) -> SupportedVersions {
+        SupportedVersions::from_parts(&self.versions, &self.unstable_features)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A serialisable representation of discover_homeserver::Response.
+pub struct WellKnownResponse {
+    /// Information about the homeserver to connect to.
+    pub homeserver: HomeserverInfo,
+
+    /// Information about the identity server to connect to.
+    pub identity_server: Option<IdentityServerInfo>,
+
+    /// Information about the tile server to use to display location data.
+    pub tile_server: Option<TileServerInfo>,
+
+    /// A list of the available MatrixRTC foci, ordered by priority.
+    pub rtc_foci: Vec<RtcFocusInfo>,
+}
+
+impl From<discover_homeserver::Response> for WellKnownResponse {
+    fn from(response: discover_homeserver::Response) -> Self {
+        Self {
+            homeserver: response.homeserver,
+            identity_server: response.identity_server,
+            tile_server: response.tile_server,
+            rtc_foci: response.rtc_foci,
         }
     }
 }
@@ -1011,8 +1123,8 @@ pub enum StateStoreDataValue {
     /// The sync token.
     SyncToken(String),
 
-    /// The server capabilities.
-    ServerCapabilities(ServerCapabilities),
+    /// The server info (versions, well-known etc).
+    ServerInfo(ServerInfo),
 
     /// A filter with the given ID.
     Filter(String),
@@ -1027,6 +1139,10 @@ pub enum StateStoreDataValue {
     /// `matrix_sdk_ui::unable_to_decrypt_hook::UtdHookManager`.
     UtdHookManagerData(GrowableBloom),
 
+    /// A unit value telling us that the client uploaded duplicate one-time
+    /// keys.
+    OneTimeKeyAlreadyUploaded,
+
     /// A composer draft for the room.
     /// To learn more, see [`ComposerDraft`].
     ///
@@ -1035,6 +1151,38 @@ pub enum StateStoreDataValue {
 
     /// A list of knock request ids marked as seen in a room.
     SeenKnockRequests(BTreeMap<OwnedEventId, OwnedUserId>),
+
+    /// A list of tokens to continue thread subscriptions catchup.
+    ///
+    /// See documentation of [`ThreadSubscriptionCatchupToken`] for more
+    /// details.
+    ThreadSubscriptionsCatchupTokens(Vec<ThreadSubscriptionCatchupToken>),
+}
+
+/// Tokens to use when catching up on thread subscriptions.
+///
+/// These tokens are created when the client receives some thread subscriptions
+/// from sync, but the sync indicates that there are more thread subscriptions
+/// available on the server. In this case, it's expected that the client will
+/// call the [MSC4308] companion endpoint to catch up (back-paginate) on
+/// previous thread subscriptions.
+///
+/// [MSC4308]: https://github.com/matrix-org/matrix-spec-proposals/pull/4308
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadSubscriptionCatchupToken {
+    /// The token to use as the lower bound when fetching new threads
+    /// subscriptions.
+    ///
+    /// In sliding sync, this is the `prev_batch` value of a sliding sync
+    /// response.
+    pub from: String,
+
+    /// The token to use as the upper bound when fetching new threads
+    /// subscriptions.
+    ///
+    /// In sliding sync, it must be set to the `pos` value of the sliding sync
+    /// *request*, which response received a `prev_batch` token.
+    pub to: Option<String>,
 }
 
 /// Current draft of the composer for the room.
@@ -1097,14 +1245,22 @@ impl StateStoreDataValue {
         as_variant!(self, Self::ComposerDraft)
     }
 
-    /// Get this value if it is the server capabilities metadata.
-    pub fn into_server_capabilities(self) -> Option<ServerCapabilities> {
-        as_variant!(self, Self::ServerCapabilities)
+    /// Get this value if it is the server info metadata.
+    pub fn into_server_info(self) -> Option<ServerInfo> {
+        as_variant!(self, Self::ServerInfo)
     }
 
     /// Get this value if it is the data for the ignored join requests.
     pub fn into_seen_knock_requests(self) -> Option<BTreeMap<OwnedEventId, OwnedUserId>> {
         as_variant!(self, Self::SeenKnockRequests)
+    }
+
+    /// Get this value if it is the data for the thread subscriptions catchup
+    /// tokens.
+    pub fn into_thread_subscriptions_catchup_tokens(
+        self,
+    ) -> Option<Vec<ThreadSubscriptionCatchupToken>> {
+        as_variant!(self, Self::ThreadSubscriptionsCatchupTokens)
     }
 }
 
@@ -1114,8 +1270,8 @@ pub enum StateStoreDataKey<'a> {
     /// The sync token.
     SyncToken,
 
-    /// The server capabilities,
-    ServerCapabilities,
+    /// The server info,
+    ServerInfo,
 
     /// A filter with the given name.
     Filter(&'a str),
@@ -1130,24 +1286,34 @@ pub enum StateStoreDataKey<'a> {
     /// `matrix_sdk_ui::unable_to_decrypt_hook::UtdHookManager`.
     UtdHookManagerData,
 
+    /// Data remembering if the client already reported that it has uploaded
+    /// duplicate one-time keys.
+    OneTimeKeyAlreadyUploaded,
+
     /// A composer draft for the room.
     /// To learn more, see [`ComposerDraft`].
     ///
     /// [`ComposerDraft`]: Self::ComposerDraft
-    ComposerDraft(&'a RoomId),
+    ComposerDraft(&'a RoomId, Option<&'a EventId>),
 
     /// A list of knock request ids marked as seen in a room.
     SeenKnockRequests(&'a RoomId),
+
+    /// A list of thread subscriptions catchup tokens.
+    ThreadSubscriptionsCatchupTokens,
 }
 
 impl StateStoreDataKey<'_> {
     /// Key to use for the [`SyncToken`][Self::SyncToken] variant.
     pub const SYNC_TOKEN: &'static str = "sync_token";
-    /// Key to use for the [`ServerCapabilities`][Self::ServerCapabilities]
+
+    /// Key to use for the [`ServerInfo`][Self::ServerInfo]
     /// variant.
-    pub const SERVER_CAPABILITIES: &'static str = "server_capabilities";
+    pub const SERVER_INFO: &'static str = "server_capabilities"; // Note: this is the old name, kept for backwards compatibility.
+    //
     /// Key prefix to use for the [`Filter`][Self::Filter] variant.
     pub const FILTER: &'static str = "filter";
+
     /// Key prefix to use for the [`UserAvatarUrl`][Self::UserAvatarUrl]
     /// variant.
     pub const USER_AVATAR_URL: &'static str = "user_avatar_url";
@@ -1160,6 +1326,10 @@ impl StateStoreDataKey<'_> {
     /// variant.
     pub const UTD_HOOK_MANAGER_DATA: &'static str = "utd_hook_manager_data";
 
+    /// Key to use for the flag remembering that we already reported that we
+    /// uploaded duplicate one-time keys.
+    pub const ONE_TIME_KEY_ALREADY_UPLOADED: &'static str = "one_time_key_already_uploaded";
+
     /// Key prefix to use for the [`ComposerDraft`][Self::ComposerDraft]
     /// variant.
     pub const COMPOSER_DRAFT: &'static str = "composer_draft";
@@ -1167,25 +1337,62 @@ impl StateStoreDataKey<'_> {
     /// Key prefix to use for the
     /// [`SeenKnockRequests`][Self::SeenKnockRequests] variant.
     pub const SEEN_KNOCK_REQUESTS: &'static str = "seen_knock_requests";
+
+    /// Key prefix to use for the
+    /// [`ThreadSubscriptionsCatchupTokens`][Self::ThreadSubscriptionsCatchupTokens] variant.
+    pub const THREAD_SUBSCRIPTIONS_CATCHUP_TOKENS: &'static str =
+        "thread_subscriptions_catchup_tokens";
+}
+
+/// Compare two thread subscription changes bump stamps, given a fixed room and
+/// thread root event id pair.
+///
+/// May update the newer one to keep the previous one if needed, under some
+/// conditions.
+///
+/// Returns true if the new subscription should be stored, or false if the new
+/// subscription should be ignored.
+pub fn compare_thread_subscription_bump_stamps(
+    previous: Option<u64>,
+    new: &mut Option<u64>,
+) -> bool {
+    match (previous, &new) {
+        // If the previous subscription had a bump stamp, and the new one doesn't, keep the
+        // previous one; it should be updated soon via sync anyways.
+        (Some(prev_bump), None) => {
+            *new = Some(prev_bump);
+        }
+
+        // If the previous bump stamp is newer than the new one, don't store the value at all.
+        (Some(prev_bump), Some(new_bump)) if *new_bump <= prev_bump => {
+            return false;
+        }
+
+        // In all other cases, keep the new bumpstamp.
+        _ => {}
+    }
+
+    true
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{now_timestamp_ms, ServerCapabilities};
+    use super::{ServerInfo, now_timestamp_ms};
 
     #[test]
-    fn test_stale_server_capabilities() {
-        let mut caps = ServerCapabilities {
+    fn test_stale_server_info() {
+        let mut server_info = ServerInfo {
             versions: Default::default(),
             unstable_features: Default::default(),
-            last_fetch_ts: now_timestamp_ms() - ServerCapabilities::STALE_THRESHOLD - 1.0,
+            well_known: Default::default(),
+            last_fetch_ts: now_timestamp_ms() - ServerInfo::STALE_THRESHOLD - 1.0,
         };
 
         // Definitely stale.
-        assert!(caps.maybe_decode().is_none());
+        assert!(server_info.maybe_decode().is_none());
 
         // Definitely not stale.
-        caps.last_fetch_ts = now_timestamp_ms() - 1.0;
-        assert!(caps.maybe_decode().is_some());
+        server_info.last_fetch_ts = now_timestamp_ms() - 1.0;
+        assert!(server_info.maybe_decode().is_some());
     }
 }

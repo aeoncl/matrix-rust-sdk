@@ -2,18 +2,19 @@ use std::{collections::BTreeMap, default::Default};
 
 use insta::{assert_json_snapshot, with_settings};
 use ruma::{
+    CanonicalJsonValue, CrossSigningKeyId, CrossSigningOrDeviceSignatures,
+    CrossSigningOrDeviceSigningKeyId, DeviceId, OwnedBase64PublicKey,
+    OwnedBase64PublicKeyOrDeviceId, OwnedDeviceId, OwnedUserId, SigningKeyAlgorithm, UserId,
     api::client::keys::get_keys::v3::Response as KeyQueryResponse,
     device_id,
     encryption::{CrossSigningKey, DeviceKeys, KeyUsage},
     serde::Raw,
-    user_id, CanonicalJsonValue, CrossSigningKeyId, CrossSigningOrDeviceSignatures,
-    CrossSigningOrDeviceSigningKeyId, DeviceId, OwnedBase64PublicKey,
-    OwnedBase64PublicKeyOrDeviceId, OwnedDeviceId, OwnedUserId, SigningKeyAlgorithm, UserId,
+    user_id,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature};
 
-use super::keys_query::{keys_query, master_keys, KeysQueryUser};
+use super::keys_query::{KeysQueryUser, keys_query, master_keys};
 use crate::{
     ruma_response_from_json, ruma_response_to_json,
     test_json::keys_query::{device_keys_payload, self_signing_keys},
@@ -149,8 +150,9 @@ impl KeyQueryResponseTemplate {
     /// calculated.
     ///
     /// The device can optionally be signed by the self-signing key by calling
-    /// [`KeyResponseTemplateDeviceOptions::verified(true)`] on the `options`
-    /// object.
+    /// [`KeyQueryResponseTemplateDeviceOptions::new().
+    /// verified(true)`](KeyQueryResponseTemplateDeviceOptions::verified) on the
+    /// `options` object.
     pub fn with_device(
         mut self,
         device_id: &DeviceId,
@@ -603,6 +605,14 @@ impl KeyDistributionTestData {
 
     pub fn good_id() -> &'static UserId {
         user_id!("@good:localhost")
+    }
+
+    pub fn good_device_1_id() -> &'static DeviceId {
+        device_id!("JAXGBVZYLA")
+    }
+
+    pub fn good_device_2_id() -> &'static DeviceId {
+        device_id!("ZGLCFWEPCY")
     }
 }
 

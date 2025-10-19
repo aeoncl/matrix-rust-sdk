@@ -53,7 +53,7 @@ use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
     olm::{PrivateCrossSigningIdentity, StaticAccountData},
-    store::{Changes, CryptoStoreWrapper},
+    store::{types::Changes, CryptoStoreWrapper},
     types::{requests::OutgoingVerificationRequest, Signatures},
     CryptoStoreError, DeviceData, LocalTrust, OwnUserIdentityData, UserIdentityData,
 };
@@ -596,7 +596,7 @@ impl IdentitiesBeingVerified {
             changes.key_requests = secret_requests;
         }
 
-        // TODO store the signature upload request as well.
+        // TODO: store the signature upload request as well.
         self.store.save_changes(changes).await?;
 
         Ok(merged_request
@@ -747,7 +747,10 @@ pub(crate) mod tests {
     use super::{event_enums::OutgoingContent, VerificationStore};
     use crate::{
         olm::PrivateCrossSigningIdentity,
-        store::{Changes, CryptoStore, CryptoStoreWrapper, IdentityChanges, MemoryStore},
+        store::{
+            types::{Changes, IdentityChanges},
+            CryptoStore, CryptoStoreWrapper, MemoryStore,
+        },
         types::{
             events::ToDeviceEvents,
             requests::{AnyOutgoingRequest, OutgoingRequest, OutgoingVerificationRequest},
@@ -778,30 +781,30 @@ pub(crate) mod tests {
         sender: &UserId,
         content: OutgoingContent,
     ) -> ToDeviceEvents {
-        let content = if let OutgoingContent::ToDevice(c) = content { c } else { unreachable!() };
+        let OutgoingContent::ToDevice(content) = content else { unreachable!() };
         let sender = sender.to_owned();
 
         match *content {
             AnyToDeviceEventContent::KeyVerificationRequest(c) => {
-                ToDeviceEvents::KeyVerificationRequest(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationRequest(ToDeviceEvent::new(sender, c))
             }
             AnyToDeviceEventContent::KeyVerificationReady(c) => {
-                ToDeviceEvents::KeyVerificationReady(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationReady(ToDeviceEvent::new(sender, c))
             }
             AnyToDeviceEventContent::KeyVerificationKey(c) => {
-                ToDeviceEvents::KeyVerificationKey(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationKey(ToDeviceEvent::new(sender, c))
             }
             AnyToDeviceEventContent::KeyVerificationStart(c) => {
-                ToDeviceEvents::KeyVerificationStart(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationStart(ToDeviceEvent::new(sender, c))
             }
             AnyToDeviceEventContent::KeyVerificationAccept(c) => {
-                ToDeviceEvents::KeyVerificationAccept(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationAccept(ToDeviceEvent::new(sender, c))
             }
             AnyToDeviceEventContent::KeyVerificationMac(c) => {
-                ToDeviceEvents::KeyVerificationMac(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationMac(ToDeviceEvent::new(sender, c))
             }
             AnyToDeviceEventContent::KeyVerificationDone(c) => {
-                ToDeviceEvents::KeyVerificationDone(ToDeviceEvent { sender, content: c })
+                ToDeviceEvents::KeyVerificationDone(ToDeviceEvent::new(sender, c))
             }
 
             _ => unreachable!(),
@@ -827,13 +830,12 @@ pub(crate) mod tests {
     pub(crate) async fn setup_stores() -> (Account, VerificationStore, Account, VerificationStore) {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let alice_store = MemoryStore::new();
-        let (alice_private_identity, _, _) =
-            PrivateCrossSigningIdentity::with_account(&alice).await;
+        let alice_private_identity = PrivateCrossSigningIdentity::for_account(&alice);
         let alice_private_identity = Mutex::new(alice_private_identity);
 
         let bob = Account::with_device_id(bob_id(), bob_device_id());
         let bob_store = MemoryStore::new();
-        let (bob_private_identity, _, _) = PrivateCrossSigningIdentity::with_account(&bob).await;
+        let bob_private_identity = PrivateCrossSigningIdentity::for_account(&bob);
         let bob_private_identity = Mutex::new(bob_private_identity);
 
         let alice_public_identity =

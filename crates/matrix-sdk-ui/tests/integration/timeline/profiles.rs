@@ -15,18 +15,21 @@
 use std::{sync::Arc, time::Duration};
 
 use assert_matches::assert_matches;
-use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
+use matrix_sdk::{
+    config::{SyncSettings, SyncToken},
+    test_utils::logged_in_client_with_server,
+};
 use matrix_sdk_common::executor::spawn;
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
-    SyncResponseBuilder, ALICE, BOB, CAROL, DEFAULT_TEST_ROOM_ID,
+    ALICE, BOB, CAROL, DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, SyncResponseBuilder, async_test,
+    event_factory::EventFactory, mocks::mock_encryption_state,
 };
 use matrix_sdk_ui::timeline::{RoomExt, TimelineDetails};
 use ruma::events::room::member::MembershipState;
 use serde_json::json;
 use wiremock::{
-    matchers::{method, path_regex},
     Mock, ResponseTemplate,
+    matchers::{method, path_regex},
 };
 
 use crate::mock_sync;
@@ -34,7 +37,8 @@ use crate::mock_sync;
 #[async_test]
 async fn test_update_sender_profiles() {
     let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(3000)).token(SyncToken::NoToken);
 
     let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();

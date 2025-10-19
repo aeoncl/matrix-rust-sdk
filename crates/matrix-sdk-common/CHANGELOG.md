@@ -6,6 +6,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.14.0] - 2025-09-04
+
+### Features
+
+- Tracing subscribers created via [`matrix_sdk_common::js_tracing::MakeJsLogWriter`] or [`make_tracing_subscriber`] will now drop log events at the `TRACE` level. Previously `TRACE` logs were treated the same as `DEBUG` logs. ([#5590](https://github.com/matrix-org/matrix-rust-sdk/pull/5590)).
+
+- [**breaking**] Use `Raw<AnyTimelineEvent>` in place of `Raw<AnyMessageLikeEvent>`
+  in `DecryptedRoomEvent::event`.
+  ([#5512](https://github.com/matrix-org/matrix-rust-sdk/pull/5512/files)).
+  Affects the following functions:
+  - `OlmMachine::decrypt_room_event` - existing matches on the result's event field
+     should be updated to `AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::...)`
+
+## [0.13.0] - 2025-07-10
+
+### Features
+
+- Expose the `ROOM_VERSION_RULES_FALLBACK` that should be used when the rules of
+  a room are unknown.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- Expose the `ROOM_VERSION_FALLBACK` that should be used when the version of a
+  room is unknown.
+  ([#5306](https://github.com/matrix-org/matrix-rust-sdk/pull/5306))
+
+### Refactor
+
+- [**breaking**] `extract_bundled_thread_summary()` returns a
+  `Raw<AnySyncMessageLikeEvent>` for the latest event instead of a
+  `Raw<AnyMessageLikeEvent>`.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+
+## [0.12.0] - 2025-06-10
+
+No notable changes in this release.
+
 ## [0.11.0] - 2025-04-11
 
 ### Features
@@ -49,5 +84,3 @@ All notable changes to this project will be documented in this file.
 ### Refactor
 
 - Move `linked_chunk` from `matrix-sdk` to `matrix-sdk-common`.
-
-

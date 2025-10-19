@@ -14,14 +14,11 @@
 
 use std::iter;
 
-use matrix_sdk_base::{
-    crypto::store::StoredRoomKeyBundleData,
-    media::{MediaFormat, MediaRequestParameters},
-};
-use ruma::{events::room::MediaSource, OwnedUserId, UserId};
+use matrix_sdk_base::media::{MediaFormat, MediaRequestParameters};
+use ruma::{OwnedUserId, UserId, events::room::MediaSource};
 use tracing::{info, instrument, warn};
 
-use crate::{crypto::types::events::room_key_bundle::RoomKeyBundleContent, Error, Result, Room};
+use crate::{Error, Result, Room, crypto::types::events::room_key_bundle::RoomKeyBundleContent};
 
 /// Share any shareable E2EE history in the given room with the given recipient,
 /// as per [MSC4268].
@@ -112,7 +109,7 @@ pub(super) async fn share_room_history(room: &Room, user_id: OwnedUserId) -> Res
 ///
 /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
 #[instrument(skip(room), fields(room_id = ?room.room_id(), bundle_sender))]
-pub(super) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Result<()> {
+pub(crate) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Result<()> {
     // TODO: retry this if it gets interrupted or it fails.
     // TODO: do this in the background.
 
@@ -124,21 +121,32 @@ pub(super) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Re
         return Ok(());
     };
 
-    let Some(StoredRoomKeyBundleData { sender_user, sender_data, bundle_data }) =
+    let Some(bundle_info) =
         olm_machine.store().get_received_room_key_bundle_data(room.room_id(), inviter).await?
     else {
         // No bundle received (yet).
-        // TODO: deal with the bundle arriving later (https://github.com/matrix-org/matrix-rust-sdk/issues/4926)
         return Ok(());
     };
 
-    tracing::Span::current().record("bundle_sender", sender_user.as_str());
+    tracing::Span::current().record("bundle_sender", bundle_info.sender_user.as_str());
+
+    // Ensure that we get a fresh list of devices for the inviter, in case we need
+    // to recalculate the `SenderData`.
+    // XXX: is this necessary, given (with exclude-insecure-devices), we should have
+    // checked that the inviter device was cross-signed when we received the
+    // to-device message?
+    let (req_id, request) =
+        olm_machine.query_keys_for_users(iter::once(bundle_info.sender_user.as_ref()));
+
+    if !request.device_keys.is_empty() {
+        room.client.keys_query(&req_id, request.device_keys).await?;
+    }
 
     let bundle_content = client
         .media()
         .get_media_content(
             &MediaRequestParameters {
-                source: MediaSource::Encrypted(Box::new(bundle_data.file)),
+                source: MediaSource::Encrypted(Box::new(bundle_info.bundle_data.file.clone())),
                 format: MediaFormat::File,
             },
             false,
@@ -150,9 +158,7 @@ pub(super) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Re
             olm_machine
                 .store()
                 .receive_room_key_bundle(
-                    room.room_id(),
-                    &sender_user,
-                    &sender_data,
+                    &bundle_info,
                     bundle,
                     // TODO: Use the progress listener and expose an argument for it.
                     |_, _| {},
@@ -160,7 +166,7 @@ pub(super) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Re
                 .await?;
         }
         Err(err) => {
-            warn!("Failed to deserialize room key bundle: {}", err);
+            warn!("Failed to deserialize room key bundle: {err}");
         }
     }
 

@@ -23,17 +23,17 @@ use language_tags::LanguageTag;
 use matrix_sdk_base::deserialized_responses::PrivOwnedStr;
 use oauth2::{AsyncHttpClient, ClientId, HttpClientError, RequestTokenError};
 use ruma::{
-    api::client::discovery::get_authorization_server_metadata::msc2965::{GrantType, ResponseType},
-    serde::{PartialEqAsRefStr, Raw, StringEnum},
     SecondsSinceUnixEpoch,
+    api::client::discovery::get_authorization_server_metadata::v1::{GrantType, ResponseType},
+    serde::{Raw, StringEnum},
 };
-use serde::{ser::SerializeMap, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeMap};
 use url::Url;
 
 use super::{
+    OAuthHttpClient,
     error::OAuthClientRegistrationError,
     http_client::{check_http_response_json_content_type, check_http_response_status_code},
-    OAuthHttpClient,
 };
 
 /// Register a client with an OAuth 2.0 authorization server.
@@ -179,7 +179,7 @@ pub enum OAuthGrantType {
 }
 
 /// The possible types of an application.
-#[derive(Clone, StringEnum, PartialEqAsRefStr, Eq)]
+#[derive(Clone, StringEnum)]
 #[ruma_enum(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum ApplicationType {

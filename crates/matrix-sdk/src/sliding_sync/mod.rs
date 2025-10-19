@@ -21,10 +21,9 @@ mod client;
 mod error;
 mod list;
 mod sticky_parameters;
-mod utils;
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap},
+    collections::{BTreeMap, btree_map::Entry},
     fmt::Debug,
     future::Future,
     sync::{Arc, RwLock as StdRwLock},
@@ -35,27 +34,27 @@ use async_stream::stream;
 pub use client::{Version, VersionBuilder};
 use futures_core::stream::Stream;
 use matrix_sdk_base::RequestedRequiredStates;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_common::executor::JoinHandleExt as _;
 use matrix_sdk_common::{executor::spawn, timer};
 use ruma::{
+    OwnedRoomId, RoomId,
     api::client::{error::ErrorKind, sync::sync_events::v5 as http},
-    assign, OwnedRoomId, RoomId,
+    assign,
 };
-use serde::{Deserialize, Serialize};
 use tokio::{
     select,
-    sync::{broadcast::Sender, Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock, broadcast::Sender},
 };
-use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
-#[cfg(feature = "e2e-encryption")]
-use self::utils::JoinHandleExt as _;
 pub use self::{builder::*, client::VersionBuilderError, error::*, list::*};
 use self::{
     cache::restore_sliding_sync_state,
     client::SlidingSyncResponseProcessor,
     sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager, StickyData},
 };
-use crate::{config::RequestConfig, Client, Result};
+use crate::{Client, Result, config::RequestConfig};
 
 /// The Sliding Sync instance.
 ///
@@ -80,7 +79,7 @@ pub(super) struct SlidingSyncInner {
     poll_timeout: Duration,
 
     /// Extra duration for the sliding sync request to timeout. This is added to
-    /// the [`Self::proxy_timeout`].
+    /// the [`Self::poll_timeout`].
     network_timeout: Duration,
 
     /// The storage key to keep this cache at and load it from.
@@ -122,6 +121,12 @@ pub(super) struct SlidingSyncInner {
 impl SlidingSync {
     pub(super) fn new(inner: SlidingSyncInner) -> Self {
         Self { inner: Arc::new(inner) }
+    }
+
+    /// Whether the current sliding sync instance has set a sync position
+    /// marker.
+    pub async fn has_pos(&self) -> bool {
+        self.inner.position.lock().await.pos.is_some()
     }
 
     async fn cache_to_storage(&self, position: &SlidingSyncPositionMarkers) -> Result<()> {
@@ -235,7 +240,7 @@ impl SlidingSync {
     #[instrument(skip_all)]
     async fn handle_response(
         &self,
-        sliding_sync_response: http::Response,
+        mut sliding_sync_response: http::Response,
         position: &mut SlidingSyncPositionMarkers,
         requested_required_states: RequestedRequiredStates,
     ) -> Result<UpdateSummary, crate::Error> {
@@ -253,13 +258,35 @@ impl SlidingSync {
         // happens here.
 
         let sync_response = {
+            let _timer = timer!("response processor");
+
             let response_processor = {
-                // Take the lock to avoid concurrent sliding syncs overwriting each other's room
-                // infos.
-                let _sync_lock = self.inner.client.base_client().sync_lock().lock().await;
+                // Take the lock to synchronise accesses to the state store, to avoid concurrent
+                // sliding syncs overwriting each other's room infos.
+                let _state_store_lock = {
+                    let _timer = timer!("acquiring the `state_store_lock`");
+
+                    self.inner.client.base_client().state_store_lock().lock().await
+                };
 
                 let mut response_processor =
                     SlidingSyncResponseProcessor::new(self.inner.client.clone());
+
+                // Process thread subscriptions if they're available.
+                //
+                // It's important to do this *before* handling the room responses, so that
+                // notifications can be properly generated based on the thread subscriptions,
+                // for the events in threads we've subscribed to.
+                if self.is_thread_subscriptions_enabled() {
+                    response_processor
+                        .handle_thread_subscriptions(
+                            position.pos.as_deref(),
+                            std::mem::take(
+                                &mut sliding_sync_response.extensions.thread_subscriptions,
+                            ),
+                        )
+                        .await?;
+                }
 
                 #[cfg(feature = "e2e-encryption")]
                 if self.is_e2ee_enabled() {
@@ -281,7 +308,8 @@ impl SlidingSync {
             response_processor.process_and_take_response().await?
         };
 
-        debug!(?sync_response, "Sliding Sync response has been handled by the client");
+        debug!("Sliding Sync response has been handled by the client");
+        trace!(?sync_response);
 
         // Commit sticky parameters, if needed.
         if let Some(ref txn_id) = sliding_sync_response.txn_id {
@@ -353,11 +381,14 @@ impl SlidingSync {
         // Everything went well, we can update the position markers.
         //
         // Save the new position markers.
+        debug!(previous_pos = position.pos, new_pos = pos, "Updating `pos`");
+
         position.pos = pos;
 
         Ok(update_summary)
     }
 
+    #[instrument(skip_all)]
     async fn generate_sync_request(
         &self,
         txn_id: &mut LazyTransactionId,
@@ -386,7 +417,15 @@ impl SlidingSync {
         // has been fully handled successfully, in this case the `pos` is updated, or
         // the response handling has failed, in this case the `pos` hasn't been updated
         // and the same `pos` will be used for this new request.
-        let mut position_guard = self.inner.position.clone().lock_owned().await;
+        let mut position_guard = {
+            debug!("Waiting to acquire the `position` lock");
+
+            let _timer = timer!("acquiring the `position` lock");
+
+            self.inner.position.clone().lock_owned().await
+        };
+
+        debug!(pos = ?position_guard.pos, "Got a position");
 
         let to_device_enabled =
             self.inner.sticky.read().unwrap().data().extensions.to_device.enabled == Some(true);
@@ -600,6 +639,13 @@ impl SlidingSync {
         self.inner.sticky.read().unwrap().data().extensions.e2ee.enabled == Some(true)
     }
 
+    /// Is the thread subscriptions extension enabled for this sliding sync
+    /// instance?
+    fn is_thread_subscriptions_enabled(&self) -> bool {
+        self.inner.sticky.read().unwrap().data().extensions.thread_subscriptions.enabled
+            == Some(true)
+    }
+
     #[cfg(not(feature = "e2e-encryption"))]
     fn is_e2ee_enabled(&self) -> bool {
         false
@@ -613,15 +659,19 @@ impl SlidingSync {
             || !self.inner.lists.read().await.is_empty()
     }
 
+    /// Send a single sliding sync request, and returns the response summary.
+    ///
+    /// Public for testing purposes only.
+    #[doc(hidden)]
     #[instrument(skip_all, fields(pos, conn_id = self.inner.id))]
-    async fn sync_once(&self) -> Result<UpdateSummary> {
+    pub async fn sync_once(&self) -> Result<UpdateSummary> {
         let (request, request_config, position_guard) =
             self.generate_sync_request(&mut LazyTransactionId::new()).await?;
 
-        // Send the request, kaboom.
+        // Send the request.
         let summaries = self.send_sync_request(request, request_config, position_guard).await?;
 
-        // Notify a new sync was received
+        // Notify a new sync was received.
         self.inner.client.inner.sync_beat.notify(usize::MAX);
 
         Ok(summaries)
@@ -720,13 +770,28 @@ impl SlidingSync {
         info!("Session expired; resetting `pos` and sticky parameters");
 
         {
+            let lists = self.inner.lists.read().await;
+            for list in lists.values() {
+                // Invalidate in-memory data that would be persisted on disk.
+                list.set_maximum_number_of_rooms(None);
+
+                // Invalidate the sticky data for this list.
+                list.invalidate_sticky_data();
+            }
+        }
+
+        // Remove the cached sliding sync state as well.
+        {
             let mut position = self.inner.position.lock().await;
+
+            // Invalidate in memory.
             position.pos = None;
 
+            // Propagate to disk.
+            // Note: this propagates both the sliding sync state and the cached lists'
+            // state to disk.
             if let Err(err) = self.cache_to_storage(&position).await {
-                error!(
-                    "couldn't invalidate sliding sync frozen state when expiring session: {err}"
-                );
+                warn!("Failed to invalidate cached sliding sync state: {err}");
             }
         }
 
@@ -737,8 +802,6 @@ impl SlidingSync {
             // when the session will restart.
             sticky.data_mut().room_subscriptions.clear();
         }
-
-        self.inner.lists.read().await.values().for_each(|list| list.invalidate_sticky_data());
     }
 }
 
@@ -791,14 +854,6 @@ impl SlidingSync {
 pub(super) struct SlidingSyncPositionMarkers {
     /// An ephemeral position in the current stream, as received from the
     /// previous `/sync` response, or `None` for the first request.
-    ///
-    /// Should not be persisted.
-    pos: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct FrozenSlidingSyncPos {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pos: Option<String>,
 }
 
@@ -896,34 +951,34 @@ mod tests {
 
     use assert_matches::assert_matches;
     use event_listener::Listener;
-    use futures_util::{future::join_all, pin_mut, StreamExt};
+    use futures_util::{StreamExt, future::join_all, pin_mut};
     use matrix_sdk_base::{RequestedRequiredStates, RoomMemberships};
     use matrix_sdk_common::executor::spawn;
-    use matrix_sdk_test::{async_test, event_factory::EventFactory, ALICE};
+    use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
     use ruma::{
+        OwnedRoomId, TransactionId,
         api::client::error::ErrorKind,
         assign,
         events::{direct::DirectEvent, room::member::MembershipState},
         owned_room_id, room_id,
         serde::Raw,
-        uint, OwnedRoomId, TransactionId,
+        uint,
     };
     use serde::Deserialize;
     use serde_json::json;
     use wiremock::{
-        http::Method, matchers::method, Match, Mock, MockServer, Request, ResponseTemplate,
+        Match, Mock, MockServer, Request, ResponseTemplate, http::Method, matchers::method,
     };
 
     use super::{
-        http,
-        sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
         SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
-        SlidingSyncStickyParameters,
+        SlidingSyncStickyParameters, http,
+        sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
     };
     use crate::{
+        Client, Result,
         sliding_sync::cache::restore_sliding_sync_state,
         test_utils::{logged_in_client, mocks::MatrixMockServer},
-        Client, Result,
     };
 
     #[derive(Copy, Clone)]
@@ -955,8 +1010,10 @@ mod tests {
 
     #[async_test]
     async fn test_subscribe_to_rooms() -> Result<()> {
-        let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
-            .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
+        let (server, sliding_sync) = new_sliding_sync(vec![
+            SlidingSyncList::builder("foo")
+                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+        ])
         .await?;
 
         let stream = sliding_sync.sync();
@@ -1075,8 +1132,10 @@ mod tests {
 
     #[async_test]
     async fn test_room_subscriptions_are_reset_when_session_expires() -> Result<()> {
-        let (_server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
-            .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
+        let (_server, sliding_sync) = new_sliding_sync(vec![
+            SlidingSyncList::builder("foo")
+                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+        ])
         .await?;
 
         let room_id_0 = room_id!("!r0:bar.org");
@@ -1134,8 +1193,10 @@ mod tests {
 
     #[async_test]
     async fn test_add_list() -> Result<()> {
-        let (_server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
-            .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
+        let (_server, sliding_sync) = new_sliding_sync(vec![
+            SlidingSyncList::builder("foo")
+                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+        ])
         .await?;
 
         let _stream = sliding_sync.sync();
@@ -1448,7 +1509,7 @@ mod tests {
 
         #[cfg(feature = "e2e-encryption")]
         {
-            use matrix_sdk_base::crypto::store::Changes;
+            use matrix_sdk_base::crypto::store::types::Changes;
             if let Some(olm_machine) = &*client.olm_machine().await {
                 olm_machine
                     .store()
@@ -1963,8 +2024,10 @@ mod tests {
 
     #[async_test]
     async fn test_stop_sync_loop() -> Result<()> {
-        let (_server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
-            .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
+        let (_server, sliding_sync) = new_sliding_sync(vec![
+            SlidingSyncList::builder("foo")
+                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+        ])
         .await?;
 
         // Start the sync loop.
@@ -2594,7 +2657,7 @@ mod tests {
     #[async_test]
     async fn test_timeout_one_list() -> Result<()> {
         let (_server, sliding_sync) = new_sliding_sync(vec![
-            SlidingSyncList::builder("foo").sync_mode(SlidingSyncMode::new_growing(10))
+            SlidingSyncList::builder("foo").sync_mode(SlidingSyncMode::new_growing(10)),
         ])
         .await?;
 
@@ -2780,7 +2843,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_sync_lock_is_released_before_calling_handlers() -> Result<()> {
+    async fn test_state_store_lock_is_released_before_calling_handlers() -> Result<()> {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
         let room_id = room_id!("!mu5hr00m:example.org");

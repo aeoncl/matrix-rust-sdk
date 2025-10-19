@@ -18,25 +18,31 @@ use std::{fmt::Debug, sync::Arc};
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::room_directory_search::RoomDirectorySearch as SdkRoomDirectorySearch;
-use matrix_sdk_common::{runtime::get_runtime_handle, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::ServerName;
 use tokio::sync::RwLock;
 
-use crate::{error::ClientError, task_handle::TaskHandle};
+use crate::{error::ClientError, runtime::get_runtime_handle, task_handle::TaskHandle};
 
 #[derive(uniffi::Enum)]
 pub enum PublicRoomJoinRule {
     Public,
     Knock,
+    Restricted,
+    KnockRestricted,
+    Invite,
 }
 
-impl TryFrom<ruma::directory::PublicRoomJoinRule> for PublicRoomJoinRule {
+impl TryFrom<ruma::room::JoinRuleKind> for PublicRoomJoinRule {
     type Error = String;
 
-    fn try_from(value: ruma::directory::PublicRoomJoinRule) -> Result<Self, Self::Error> {
+    fn try_from(value: ruma::room::JoinRuleKind) -> Result<Self, Self::Error> {
         match value {
-            ruma::directory::PublicRoomJoinRule::Public => Ok(Self::Public),
-            ruma::directory::PublicRoomJoinRule::Knock => Ok(Self::Knock),
+            ruma::room::JoinRuleKind::Public => Ok(Self::Public),
+            ruma::room::JoinRuleKind::Knock => Ok(Self::Knock),
+            ruma::room::JoinRuleKind::Restricted => Ok(Self::Restricted),
+            ruma::room::JoinRuleKind::KnockRestricted => Ok(Self::KnockRestricted),
+            ruma::room::JoinRuleKind::Invite => Ok(Self::Invite),
             rule => Err(format!("unsupported join rule: {rule:?}")),
         }
     }
@@ -147,11 +153,6 @@ impl RoomDirectorySearch {
             }
         })))
     }
-}
-
-#[derive(uniffi::Record)]
-pub struct RoomDirectorySearchEntriesResult {
-    pub entries_stream: Arc<TaskHandle>,
 }
 
 #[derive(uniffi::Enum)]

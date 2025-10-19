@@ -16,9 +16,12 @@
 //! to access some fields.
 
 use ruma::{
-    events::{relation::BundledThread, AnySyncTimelineEvent},
+    MilliSecondsSinceUnixEpoch, OwnedEventId,
+    events::{
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+        relation::BundledThread,
+    },
     serde::Raw,
-    OwnedEventId, UInt,
 };
 use serde::Deserialize;
 
@@ -28,6 +31,8 @@ use crate::deserialized_responses::{ThreadSummary, ThreadSummaryStatus};
 enum RelationsType {
     #[serde(rename = "m.thread")]
     Thread,
+    #[serde(rename = "m.replace")]
+    Edit,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +50,23 @@ struct SimplifiedContent {
     relates_to: Option<RelatesTo>,
 }
 
+/// Try to extract the thread root from an event's content, if provided.
+///
+/// The thread root is the field located at `m.relates_to`.`event_id`,
+/// if the field at `m.relates_to`.`rel_type` is `m.thread`.
+///
+/// Returns `None` if we couldn't find a thread root, or if there was an issue
+/// during deserialization.
+pub fn extract_thread_root_from_content(
+    content: Raw<AnyMessageLikeEventContent>,
+) -> Option<OwnedEventId> {
+    let relates_to = content.deserialize_as_unchecked::<SimplifiedContent>().ok()?.relates_to?;
+    match relates_to.rel_type {
+        RelationsType::Thread => relates_to.event_id,
+        RelationsType::Edit => None,
+    }
+}
+
 /// Try to extract the thread root from a timeline event, if provided.
 ///
 /// The thread root is the field located at `content`.`m.relates_to`.`event_id`,
@@ -53,9 +75,23 @@ struct SimplifiedContent {
 /// Returns `None` if we couldn't find a thread root, or if there was an issue
 /// during deserialization.
 pub fn extract_thread_root(event: &Raw<AnySyncTimelineEvent>) -> Option<OwnedEventId> {
+    extract_thread_root_from_content(event.get_field("content").ok().flatten()?)
+}
+
+/// Try to extract the target of an edit event, from a raw timeline event, if
+/// provided.
+///
+/// The target event is the field located at
+/// `content`.`m.relates_to`.`event_id`, if the field at
+/// `content`.`m.relates_to`.`rel_type` is `m.replace`.
+///
+/// Returns `None` if we couldn't find it, or if there was an issue
+/// during deserialization.
+pub fn extract_edit_target(event: &Raw<AnySyncTimelineEvent>) -> Option<OwnedEventId> {
     let relates_to = event.get_field::<SimplifiedContent>("content").ok().flatten()?.relates_to?;
     match relates_to.rel_type {
-        RelationsType::Thread => relates_to.event_id,
+        RelationsType::Edit => relates_to.event_id,
+        RelationsType::Thread => None,
     }
 }
 
@@ -74,35 +110,58 @@ struct Unsigned {
 }
 
 /// Try to extract a bundled thread summary of a timeline event, if available.
-pub fn extract_bundled_thread_summary(event: &Raw<AnySyncTimelineEvent>) -> ThreadSummaryStatus {
+pub fn extract_bundled_thread_summary(
+    event: &Raw<AnySyncTimelineEvent>,
+) -> (ThreadSummaryStatus, Option<Raw<AnySyncMessageLikeEvent>>) {
     match event.get_field::<Unsigned>("unsigned") {
         Ok(Some(Unsigned { relations: Some(Relations { thread: Some(bundled_thread) }) })) => {
             // Take the count from the bundled thread summary, if available. If it can't be
-            // converted to a `u64`, we use `UInt::MAX` as a fallback, as this is unlikely
+            // converted to a `u32`, we use `u32::MAX` as a fallback, as this is unlikely
             // to happen to have that many events in real-world threads.
-            let count = bundled_thread.count.try_into().unwrap_or(UInt::MAX.try_into().unwrap());
+            let count = bundled_thread.count.try_into().unwrap_or(u32::MAX);
 
             let latest_reply =
                 bundled_thread.latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
 
-            ThreadSummaryStatus::Some(ThreadSummary { num_replies: count, latest_reply })
+            (
+                ThreadSummaryStatus::Some(ThreadSummary { num_replies: count, latest_reply }),
+                Some(bundled_thread.latest_event),
+            )
         }
-        Ok(_) => ThreadSummaryStatus::None,
-        Err(_) => ThreadSummaryStatus::Unknown,
+        Ok(_) => (ThreadSummaryStatus::None, None),
+        Err(_) => (ThreadSummaryStatus::Unknown, None),
     }
+}
+
+/// Try to extract the `origin_server_ts`, if available.
+///
+/// If the value is larger than `max_value`, it becomes `max_value`. This is
+/// necessary to prevent against user-forged value pretending an event is coming
+/// from the future.
+pub fn extract_timestamp(
+    event: &Raw<AnySyncTimelineEvent>,
+    max_value: MilliSecondsSinceUnixEpoch,
+) -> Option<MilliSecondsSinceUnixEpoch> {
+    let mut origin_server_ts = event.get_field("origin_server_ts").ok().flatten()?;
+
+    if origin_server_ts > max_value {
+        origin_server_ts = max_value;
+    }
+
+    Some(origin_server_ts)
 }
 
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use ruma::{event_id, serde::Raw};
+    use ruma::{UInt, event_id};
     use serde_json::json;
 
-    use super::extract_thread_root;
-    use crate::{
-        deserialized_responses::{ThreadSummary, ThreadSummaryStatus},
-        serde_helpers::extract_bundled_thread_summary,
+    use super::{
+        MilliSecondsSinceUnixEpoch, Raw, extract_bundled_thread_summary, extract_thread_root,
+        extract_timestamp,
     };
+    use crate::deserialized_responses::{ThreadSummary, ThreadSummaryStatus};
 
     #[test]
     fn test_extract_thread_root() {
@@ -125,7 +184,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_eq!(observed_thread_root.as_deref(), Some(thread_root));
@@ -139,7 +198,7 @@ mod tests {
             "origin_server_ts": 42,
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_matches!(observed_thread_root, None);
@@ -155,7 +214,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_matches!(observed_thread_root, None);
@@ -175,7 +234,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_matches!(observed_thread_root, None);
@@ -211,11 +270,11 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         assert_matches!(
             extract_bundled_thread_summary(&event),
-            ThreadSummaryStatus::Some(ThreadSummary { .. })
+            (ThreadSummaryStatus::Some(ThreadSummary { .. }), Some(..))
         );
 
         // When there's a bundled thread summary, we can assert it with certainty.
@@ -226,9 +285,9 @@ mod tests {
             "origin_server_ts": 42,
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
-        assert_matches!(extract_bundled_thread_summary(&event), ThreadSummaryStatus::None);
+        assert_matches!(extract_bundled_thread_summary(&event), (ThreadSummaryStatus::None, None));
 
         // When there's a bundled replace, we can assert there's no thread summary.
         let event = Raw::new(&json!({
@@ -255,9 +314,9 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
-        assert_matches!(extract_bundled_thread_summary(&event), ThreadSummaryStatus::None);
+        assert_matches!(extract_bundled_thread_summary(&event), (ThreadSummaryStatus::None, None));
 
         // When the bundled thread summary is malformed, we return
         // `ThreadSummaryStatus::Unknown`.
@@ -275,8 +334,86 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
-        assert_matches!(extract_bundled_thread_summary(&event), ThreadSummaryStatus::Unknown);
+        assert_matches!(
+            extract_bundled_thread_summary(&event),
+            (ThreadSummaryStatus::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn test_extract_timestamp() {
+        let event = Raw::new(&json!({
+            "event_id": "$ev0",
+            "type": "m.room.message",
+            "sender": "@mnt_io:matrix.org",
+            "origin_server_ts": 42,
+            "content": {
+                "body": "Le gras, c'est la vie",
+            }
+        }))
+        .unwrap()
+        .cast_unchecked();
+
+        let timestamp = extract_timestamp(&event, MilliSecondsSinceUnixEpoch(UInt::from(100u32)));
+
+        assert_eq!(timestamp, Some(MilliSecondsSinceUnixEpoch(UInt::from(42u32))));
+    }
+
+    #[test]
+    fn test_extract_timestamp_no_origin_server_ts() {
+        let event = Raw::new(&json!({
+            "event_id": "$ev0",
+            "type": "m.room.message",
+            "sender": "@mnt_io:matrix.org",
+            "content": {
+                "body": "Le gras, c'est la vie",
+            }
+        }))
+        .unwrap()
+        .cast_unchecked();
+
+        let timestamp = extract_timestamp(&event, MilliSecondsSinceUnixEpoch(UInt::from(100u32)));
+
+        assert!(timestamp.is_none());
+    }
+
+    #[test]
+    fn test_extract_timestamp_invalid_origin_server_ts() {
+        let event = Raw::new(&json!({
+            "event_id": "$ev0",
+            "type": "m.room.message",
+            "sender": "@mnt_io:matrix.org",
+            "origin_server_ts": "saucisse",
+            "content": {
+                "body": "Le gras, c'est la vie",
+            }
+        }))
+        .unwrap()
+        .cast_unchecked();
+
+        let timestamp = extract_timestamp(&event, MilliSecondsSinceUnixEpoch(UInt::from(100u32)));
+
+        assert!(timestamp.is_none());
+    }
+
+    #[test]
+    fn test_extract_timestamp_malicious_origin_server_ts() {
+        let event = Raw::new(&json!({
+            "event_id": "$ev0",
+            "type": "m.room.message",
+            "sender": "@mnt_io:matrix.org",
+            "origin_server_ts": 101,
+            "content": {
+                "body": "Le gras, c'est la vie",
+            }
+        }))
+        .unwrap()
+        .cast_unchecked();
+
+        let timestamp = extract_timestamp(&event, MilliSecondsSinceUnixEpoch(UInt::from(100u32)));
+
+        assert_eq!(timestamp, Some(MilliSecondsSinceUnixEpoch(UInt::from(100u32))));
     }
 }

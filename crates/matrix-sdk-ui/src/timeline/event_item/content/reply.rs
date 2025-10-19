@@ -15,17 +15,18 @@
 use std::sync::Arc;
 
 use imbl::Vector;
-use matrix_sdk::deserialized_responses::{TimelineEvent, UnsignedEventLocation};
-use ruma::{OwnedEventId, OwnedUserId};
+use matrix_sdk::deserialized_responses::TimelineEvent;
+use ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId};
 use tracing::{debug, instrument, warn};
 
 use super::TimelineItemContent;
 use crate::timeline::{
+    Error as TimelineError, MsgLikeContent, MsgLikeKind, PollState, TimelineEventItemId,
+    TimelineItem,
     controller::TimelineMetadata,
-    event_handler::TimelineAction,
+    event_handler::{HandleAggregationKind, TimelineAction},
     event_item::{EventTimelineItem, Profile, TimelineDetails},
     traits::RoomDataProvider,
-    Error as TimelineError, TimelineItem,
 };
 
 /// Details about an event being replied to.
@@ -68,6 +69,13 @@ pub struct EmbeddedEvent {
     pub sender: OwnedUserId,
     /// The profile of the sender of the related embedded event.
     pub sender_profile: TimelineDetails<Profile>,
+    /// The timestamp of the event.
+    pub timestamp: MilliSecondsSinceUnixEpoch,
+    /// The unique identifier of this event.
+    ///
+    /// This is the transaction ID for a local echo that has not been sent and
+    /// the event ID for a local echo that has been sent or a remote event.
+    pub identifier: TimelineEventItemId,
 }
 
 impl EmbeddedEvent {
@@ -77,6 +85,8 @@ impl EmbeddedEvent {
             content: timeline_item.content.clone(),
             sender: timeline_item.sender.clone(),
             sender_profile: timeline_item.sender_profile.clone(),
+            timestamp: timeline_item.timestamp,
+            identifier: timeline_item.identifier(),
         }
     }
 
@@ -84,14 +94,8 @@ impl EmbeddedEvent {
     pub(in crate::timeline) async fn try_from_timeline_event<P: RoomDataProvider>(
         timeline_event: TimelineEvent,
         room_data_provider: &P,
-        timeline_items: &Vector<Arc<TimelineItem>>,
-        meta: &mut TimelineMetadata,
+        meta: &TimelineMetadata,
     ) -> Result<Option<Self>, TimelineError> {
-        let bundled_edit_encryption_info =
-            timeline_event.kind.unsigned_encryption_map().and_then(|map| {
-                map.get(&UnsignedEventLocation::RelationsReplace)?.encryption_info().cloned()
-            });
-
         let (raw_event, unable_to_decrypt_info) = match timeline_event.kind {
             matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
                 utd_info,
@@ -110,31 +114,91 @@ impl EmbeddedEvent {
 
         debug!(event_type = %event.event_type(), "got deserialized event");
 
-        // We don't need to fill the thread information of an embedded reply.
+        // We don't need to fill relation information or process metadata for an
+        // embedded reply.
+        let in_reply_to = None;
+        let thread_root = None;
         let thread_summary = None;
 
         let sender = event.sender().to_owned();
+        let timestamp = event.origin_server_ts();
+        let identifier = TimelineEventItemId::EventId(event.event_id().to_owned());
         let action = TimelineAction::from_event(
             event,
             &raw_event,
             room_data_provider,
+            unable_to_decrypt_info.map(|utd_info| (utd_info, meta.unable_to_decrypt_hook.as_ref())),
+            in_reply_to,
+            thread_root,
             thread_summary,
-            unable_to_decrypt_info,
-            bundled_edit_encryption_info,
-            timeline_items,
-            meta,
         )
         .await;
 
-        let Some(TimelineAction::AddItem { content }) = action else {
-            // The event can't be represented as a standalone timeline item.
-            return Ok(None);
-        };
+        match action {
+            Some(TimelineAction::AddItem { content }) => {
+                let sender_profile = TimelineDetails::from_initial_value(
+                    room_data_provider.profile_from_user_id(&sender).await,
+                );
+                Ok(Some(Self { content, sender, sender_profile, timestamp, identifier }))
+            }
 
-        let sender_profile = TimelineDetails::from_initial_value(
-            room_data_provider.profile_from_user_id(&sender).await,
-        );
+            Some(TimelineAction::HandleAggregation { kind, .. }) => {
+                // As an exception, edits are allowed to be embedded events.
 
-        Ok(Some(Self { content, sender, sender_profile }))
+                // For an embedded event, we don't need to fill a few fields; it's in an
+                // embedded view context, so there's no strong need to show all detailed
+                // information about it.
+                let reactions = Default::default();
+                let thread_root = None;
+                let in_reply_to = None;
+                let thread_summary = None;
+
+                let content = match kind {
+                    HandleAggregationKind::Edit { replacement } => {
+                        let msg = replacement.new_content;
+                        Some(TimelineItemContent::message(
+                            msg.msgtype,
+                            msg.mentions,
+                            reactions,
+                            thread_root,
+                            in_reply_to,
+                            thread_summary,
+                        ))
+                    }
+
+                    HandleAggregationKind::PollEdit { replacement } => {
+                        let msg = replacement.new_content;
+                        let poll_state = PollState::new(msg.poll_start, msg.text);
+                        Some(TimelineItemContent::MsgLike(MsgLikeContent {
+                            kind: MsgLikeKind::Poll(poll_state),
+                            reactions: Default::default(),
+                            thread_root,
+                            in_reply_to,
+                            thread_summary,
+                        }))
+                    }
+
+                    _ => {
+                        // The event can't be represented as a standalone timeline item.
+                        warn!("embedded event is an aggregation: {}", kind.debug_string());
+                        None
+                    }
+                };
+
+                if let Some(content) = content {
+                    let sender_profile = TimelineDetails::from_initial_value(
+                        room_data_provider.profile_from_user_id(&sender).await,
+                    );
+                    Ok(Some(Self { content, sender, sender_profile, timestamp, identifier }))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            None => {
+                warn!("embedded event lead to no action (neither an aggregation nor a new item)");
+                Ok(None)
+            }
+        }
     }
 }

@@ -18,17 +18,14 @@ use std::{
 };
 
 use ruma::{
-    events::{
-        room::member::{MembershipState, SyncRoomMemberEvent},
-        StateEventType,
-    },
     OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+    events::room::member::{MembershipState, SyncRoomMemberEvent},
 };
 use tracing::{instrument, trace};
 
 use super::{DynStateStore, Result, StateChanges};
 use crate::{
-    deserialized_responses::{AmbiguityChange, DisplayName, RawMemberEvent},
+    deserialized_responses::{AmbiguityChange, DisplayName, SyncOrStrippedState},
     store::StateStoreExt,
 };
 
@@ -45,11 +42,7 @@ impl DisplayNameUsers {
     fn remove(&mut self, user_id: &UserId) -> Option<OwnedUserId> {
         self.users.remove(user_id);
 
-        if self.user_count() == 1 {
-            self.users.iter().next().cloned()
-        } else {
-            None
-        }
+        if self.user_count() == 1 { self.users.iter().next().cloned() } else { None }
     }
 
     /// Add the given [`UserId`] from the map, marking that the [`UserId`]
@@ -188,17 +181,13 @@ impl AmbiguityCache {
     ) -> Result<Option<String>> {
         let user_id = new_event.state_key();
 
-        let old_event = if let Some(m) = changes
-            .state
-            .get(room_id)
-            .and_then(|events| events.get(&StateEventType::RoomMember)?.get(user_id.as_str()))
-        {
-            Some(RawMemberEvent::Sync(m.clone().cast()))
+        let old_event = if let Some(member) = changes.member(room_id, user_id) {
+            Some(SyncOrStrippedState::Stripped(member))
         } else {
-            self.store.get_member_event(room_id, user_id).await?
+            self.store.get_member_event(room_id, user_id).await?.and_then(|r| r.deserialize().ok())
         };
 
-        let Some(Ok(old_event)) = old_event.map(|r| r.deserialize()) else { return Ok(None) };
+        let Some(old_event) = old_event else { return Ok(None) };
 
         if is_member_active(old_event.membership()) {
             let display_name = if let Some(d) = changes
@@ -313,7 +302,7 @@ impl AmbiguityCache {
 #[cfg(test)]
 mod test {
     use matrix_sdk_test::async_test;
-    use ruma::{room_id, server_name, user_id, EventId};
+    use ruma::{EventId, room_id, server_name, user_id};
     use serde_json::json;
 
     use super::*;

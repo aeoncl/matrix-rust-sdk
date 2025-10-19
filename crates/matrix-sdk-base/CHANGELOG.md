@@ -6,6 +6,114 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Refactor
+
+- `Client::sync_lock` has been renamed `Client::state_store_lock`.
+  ([#5707](https://github.com/matrix-org/matrix-rust-sdk/pull/5707))
+
+## [0.14.1] - 2025-09-10
+
+### Security Fixes
+
+- Fix a panic in the `RoomMember::normalized_power_level` method.
+  ([#5635](https://github.com/matrix-org/matrix-rust-sdk/pull/5635)) (Low, [CVE-2025-59047](https://www.cve.org/CVERecord?id=CVE-2025-59047), [GHSA-qhj8-q5r6-8q6j](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-qhj8-q5r6-8q6j)).
+
+## [0.14.0] - 2025-09-04
+
+### Features
+- Add `SyncResponse::RoomUpdates::is_empty` to check if there were any room updates.
+  ([#5593](https://github.com/matrix-org/matrix-rust-sdk/pull/5593))
+- Add `EncryptionState::StateEncrypted` to represent rooms supporting encrypted
+  state events. Feature-gated behind `experimental-encrypted-state-events`.
+  ([#5523](https://github.com/matrix-org/matrix-rust-sdk/pull/5523))
+- [**breaking**] The `state` field of `JoinedRoomUpdate` and `LeftRoomUpdate`
+  now uses the `State` enum, depending on whether the state changes were
+  received in the `state` field or the `state_after` field.
+  ([#5488](https://github.com/matrix-org/matrix-rust-sdk/pull/5488))
+- [**breaking**] `RoomCreateWithCreatorEventContent` has a new field
+  `additional_creators` that allows to specify additional room creators beside
+  the user sending the `m.room.create` event, introduced with room version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- [**breaking**] The `RoomInfo` method now remembers the inviter at the time
+  when the `BaseClient::room_joined()` method was called. The caller is
+  responsible to remember the inviter before a server request to join the room
+  is made. The  `RoomInfo::invite_accepted_at` method was removed, the
+  `RoomInfo::invite_details` method returns both the timestamp and the
+  inviter.
+  ([#5390](https://github.com/matrix-org/matrix-rust-sdk/pull/5390))
+
+### Refactor
+- [**breaking**] The `Stripped` variants of `RawAnySyncOrStrippedTimelineEvent`,
+  `RawAnySyncOrStrippedState` and `AnySyncOrStrippedState` use `StrippedState`
+  instead of `AnyStrippedStateEvent`.
+  ([#5473](https://github.com/matrix-org/matrix-rust-sdk/pull/5473))
+- [**breaking**] The `stripped_state` field of `StateChanges` uses
+  `StrippedState` instead of `AnyStrippedStateEvent`.
+  ([#5473](https://github.com/matrix-org/matrix-rust-sdk/pull/5473))
+- [**breaking**] `RelationalLinkedChunk::items` now takes a `RoomId` instead of an
+  `&OwnedLinkedChunkId` parameter.
+  ([#5445](https://github.com/matrix-org/matrix-rust-sdk/pull/5445))
+- [**breaking**] Add an `IsPrefix = False` bound to the
+  `get_state_event_static()`, `get_state_event_static_for_key()` and
+  `get_state_events_static()`, `get_account_data_event_static()` and
+  `get_room_account_data_event_static` methods of `StateStoreExt`. These methods
+  only worked for events where the full event type is statically-known, and this
+  is now enforced at compile-time. The matching non-`static` methods of
+  `StateStore` can be used instead for event types with a variable suffix.
+  ([#5444](https://github.com/matrix-org/matrix-rust-sdk/pull/5444))
+- [**breaking**] `SyncOrStrippedState<RoomPowerLevelsEventContent>::power_levels()`
+  takes `AuthorizationRules` and a list of creators, because creators can have
+  infinite power levels, as introduced in room version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- [**breaking**] `RoomMember::power_level()` and
+  `RoomMember::normalized_power_level()` now use `UserPowerLevel` to represent
+  power levels instead of `i64` to differentiate the infinite power level of
+  creators, as introduced in room version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- [**breaking**] The `creator()` methods of `Room` and `RoomInfo` have been
+  renamed to `creators()` and can now return a list of user IDs, to reflect that
+  a room can have several creators, as introduced in room version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- [**breaking**] `RoomInfo::room_version_or_default()` was replaced with
+  `room_version_rules_or_default()`. The room version should only be used for
+  display purposes. The rules contain flags for all the differences in behavior
+  between all known room versions.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- [**breaking**] `MinimalStateEvent::redact()` takes `RedactionRules` instead of
+  a `RoomVersionId`.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- [**breaking**] The `event_id` field of `PredecessorRoom` was removed, due to
+  its removal in the Matrix specification with MSC4291.
+  ([#5419](https://github.com/matrix-org/matrix-rust-sdk/pull/5419))
+
+## [0.13.0] - 2025-07-10
+
+### Features
+- The `RoomInfo` now remembers when an invite was explicitly accepted when the
+  `BaseClient::room_joined()` method was called. A new getter for this
+  timestamp exists, the `RoomInfo::invite_accepted_at()` method returns this
+  timestamp.
+  ([#5333](https://github.com/matrix-org/matrix-rust-sdk/pull/5333))
+- [**breaking**] The `BaseClient::new()` method now takes an additional `ThreadingSupport`
+  parameter controlling whether the client is supposed to do extra processing for threads. Right
+  now, it controls whether to exclude in-thread events from the room unread counts, but it may be
+  expanded in the future to support more threading-related features.
+  ([#5325](https://github.com/matrix-org/matrix-rust-sdk/pull/5325))
+
+### Refactor
+
+- The cached `ServerCapabilities` has been renamed to `ServerInfo` and
+  additionally contains the well-known response alongside the existing server versions.
+  Despite the old name, it does not contain the server capabilities.
+  ([#5167](https://github.com/matrix-org/matrix-rust-sdk/pull/5167))
+- `Room::join_rule` and `Room::is_public` now return an `Option` to reflect that the join rule
+  state event might be missing, in which case they will return `None`.
+  ([#5278](https://github.com/matrix-org/matrix-rust-sdk/pull/5278))
+
+## [0.12.0] - 2025-06-10
+
+No notable changes in this release.
+
 ## [0.11.0] - 2025-04-11
 
 ### Features
@@ -22,8 +130,8 @@ All notable changes to this project will be documented in this file.
   - `EventCacheStoreMedia` has a new method `last_media_cleanup_time_inner`
   - There are new `'static` bounds in `MediaService` for the media cache stores
 - `event_cache::store::MemoryStore` implements `Clone`.
-- `BaseClient` now has a `handle_verification_events` field which is `true` by 
-  default and can be negated so the `NotificationClient` won't handle received 
+- `BaseClient` now has a `handle_verification_events` field which is `true` by
+  default and can be negated so the `NotificationClient` won't handle received
   verification events too, causing errors in the `VerificationMachine`.
 - [**breaking**] `Room::is_encryption_state_synced` has been removed
   ([#4777](https://github.com/matrix-org/matrix-rust-sdk/pull/4777))

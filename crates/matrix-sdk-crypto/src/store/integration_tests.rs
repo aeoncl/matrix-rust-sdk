@@ -51,8 +51,11 @@ macro_rules! cryptostore_integration_tests {
                     PrivateCrossSigningIdentity, SenderData, SenderDataType, Session
                 },
                 store::{
-                    BackupDecryptionKey, Changes, CryptoStore, DehydratedDeviceKey, DeviceChanges, GossipRequest,
-                    IdentityChanges, PendingChanges, RoomSettings, StoredRoomKeyBundleData,
+                    types::{
+                        BackupDecryptionKey, Changes, DehydratedDeviceKey, DeviceChanges,
+                        IdentityChanges, PendingChanges, StoredRoomKeyBundleData, RoomSettings,
+                    },
+                    CryptoStore, GossipRequest,
                 },
                 testing::{get_device, get_other_identity, get_own_identity},
                 types::{
@@ -565,6 +568,62 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
+            async fn test_get_inbound_group_sessions_by_room_id_empty() {
+                let dir = "get_inbound_group_session_by_room_id_empty";
+                let (_, store) = get_loaded_store(dir).await;
+                assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 0);
+
+                let room_id = &room_id!("!testing:localhost");
+                assert_eq!(store.get_inbound_group_sessions_by_room_id(room_id).await.unwrap().len(), 0);
+            }
+
+            #[async_test]
+            async fn test_get_inbound_group_sessions_by_room_id() {
+                let dir = "get_inbound_group_session_by_room_id";
+                let (account, store) = get_loaded_store(dir).await;
+                assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 0);
+
+                let room_id = &room_id!("!testing:localhost");
+                let (_, session_1) = account.create_group_session_pair_with_defaults(room_id).await;
+                let (_, session_2) = account.create_group_session_pair_with_defaults(room_id).await;
+
+                let second_room_id = &room_id!("!other_room_testing:localhost");
+                let (_, session_3) = account.create_group_session_pair_with_defaults(second_room_id).await;
+
+                let mut sessions = vec![
+                    session_1,
+                    session_2,
+                    session_3
+                ];
+
+                let changes = Changes {
+                    inbound_group_sessions: sessions.clone(),
+                    ..Default::default()
+                };
+                store.save_changes(changes).await.expect("Can't save group session");
+
+                drop(store);
+
+                // The last session is in a different room, so should not be returned by
+                // get_inbound_group_sessions_by_room_id. Remove it from the list.
+                sessions.pop();
+
+                let store = get_store(dir, None, false).await;
+                // Make sure all the sessions are in the store
+                assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 3);
+
+                store.load_account().await.unwrap();
+
+                let loaded_sessions = store
+                    .get_inbound_group_sessions_by_room_id(room_id)
+                    .await
+                    .unwrap();
+
+                assert_eq!(loaded_sessions.len(), 2);
+                assert_session_lists_eq(sessions, loaded_sessions, "room by id sessions");
+            }
+
+            #[async_test]
             async fn test_fetch_inbound_group_sessions_for_device() {
                 // Given a store exists, containing inbound group sessions from different devices
                 let (account, store) =
@@ -946,7 +1005,7 @@ macro_rules! cryptostore_integration_tests {
                 let id = TransactionId::new();
                 let info: SecretInfo = MegolmV1AesSha2Content {
                     room_id: room_id!("!test:localhost").to_owned(),
-                    sender_key,
+                    sender_key: Some(sender_key),
                     session_id: "test_session_id".to_owned(),
                 }
                 .into();
@@ -1007,7 +1066,7 @@ macro_rules! cryptostore_integration_tests {
                 let id = TransactionId::new();
                 let info: SecretInfo = MegolmV1AesSha2Content {
                     room_id: room_id!("!test:localhost").to_owned(),
-                    sender_key: account.identity_keys().curve25519,
+                    sender_key: Some(account.identity_keys().curve25519),
                     session_id: "test_session_id".to_owned(),
                 }
                 .into();
@@ -1160,6 +1219,8 @@ macro_rules! cryptostore_integration_tests {
                 let room_1 = room_id!("!test_1:localhost");
                 let settings_1 = RoomSettings {
                     algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2,
+                    #[cfg(feature = "experimental-encrypted-state-events")]
+                    encrypt_state_events: false,
                     only_allow_trusted_devices: true,
                     session_rotation_period: Some(Duration::from_secs(10)),
                     session_rotation_period_messages: Some(123),
@@ -1278,8 +1339,6 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            // Not yet implemented in the indexedDB store so we're disabling it on WASM.
-            #[cfg_attr(target_family = "wasm", ignore)]
             async fn test_received_room_key_bundle() {
                 let store = get_store("received_room_key_bundle", None, true).await;
                 let test_room = room_id!("!room:example.org");
@@ -1303,6 +1362,7 @@ macro_rules! cryptostore_integration_tests {
 
                     StoredRoomKeyBundleData {
                         sender_user: sender_user.to_owned(),
+                        sender_key: Curve25519PublicKey::from_bytes([0u8; 32]),
                         sender_data: SenderData::unknown(),
                         bundle_data: RoomKeyBundleContent {
                             room_id: room_id!("!room:example.org").to_owned(),

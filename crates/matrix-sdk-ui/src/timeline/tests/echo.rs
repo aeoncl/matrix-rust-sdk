@@ -18,11 +18,11 @@ use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{assert_next_matches_with_timeout, send_queue::RoomSendQueueUpdate};
 use matrix_sdk_base::store::QueueWedgeError;
-use matrix_sdk_test::{async_test, ALICE, BOB};
+use matrix_sdk_test::{ALICE, BOB, async_test};
 use ruma::{
-    event_id,
-    events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
-    user_id, MilliSecondsSinceUnixEpoch,
+    MilliSecondsSinceUnixEpoch, event_id,
+    events::{AnyMessageLikeEventContent, room::message::RoomMessageEventContent},
+    user_id,
 };
 use stream_assert::{assert_next_matches, assert_pending};
 
@@ -50,7 +50,10 @@ async fn test_remote_echo_full_trip() {
         let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
         let event_item = item.as_event().unwrap();
         assert!(event_item.is_local_echo());
-        assert_matches!(event_item.send_state(), Some(EventSendState::NotSentYet));
+        assert_matches!(
+            event_item.send_state(),
+            Some(EventSendState::NotSentYet { progress: None })
+        );
         assert!(!event_item.can_be_replied_to());
         item.unique_id().to_owned()
     };
@@ -250,8 +253,7 @@ async fn test_no_read_marker_with_local_echo() {
                 .sender(user_id!("@a:b.c"))
                 .event_id(event_id)
                 .server_ts(MilliSecondsSinceUnixEpoch::now())
-                .into_event()]
-            .into_iter(),
+                .into_event()],
             RemoteEventOrigin::Sync,
         )
         .await;
@@ -308,7 +310,7 @@ async fn test_no_reuse_of_counters() {
     let local_id = assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value: item } => {
         let event_item = item.as_event().unwrap();
         assert!(event_item.is_local_echo());
-        assert_matches!(event_item.send_state(), Some(EventSendState::NotSentYet));
+        assert_matches!(event_item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
         assert!(!event_item.can_be_replied_to());
         item.unique_id().to_owned()
     });

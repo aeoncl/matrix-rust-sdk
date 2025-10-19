@@ -5,12 +5,15 @@ use matrix_sdk::{
     encryption,
     encryption::{backups, recovery},
 };
-use matrix_sdk_common::{runtime::get_runtime_handle, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use thiserror::Error;
 use tracing::{error, info};
 use zeroize::Zeroize;
 
-use crate::{client::Client, error::ClientError, ruma::AuthData, task_handle::TaskHandle};
+use crate::{
+    client::Client, error::ClientError, ruma::AuthData, runtime::get_runtime_handle,
+    task_handle::TaskHandle,
+};
 
 #[derive(uniffi::Object)]
 pub struct Encryption {
@@ -76,9 +79,14 @@ pub enum RecoveryError {
     #[error(transparent)]
     Client { source: crate::ClientError },
 
-    /// Error in the secret storage subsystem.
+    /// Error in the secret storage subsystem, except for when importing a
+    /// secret.
     #[error("Error in the secret-storage subsystem: {error_message}")]
     SecretStorage { error_message: String },
+
+    /// Error when importing a secret from secret storage.
+    #[error("Error importing a secret: {error_message}")]
+    Import { error_message: String },
 }
 
 impl From<matrix_sdk::encryption::recovery::RecoveryError> for RecoveryError {
@@ -86,6 +94,9 @@ impl From<matrix_sdk::encryption::recovery::RecoveryError> for RecoveryError {
         match value {
             recovery::RecoveryError::BackupExistsOnServer => Self::BackupExistsOnServer,
             recovery::RecoveryError::Sdk(e) => Self::Client { source: ClientError::from(e) },
+            recovery::RecoveryError::SecretStorage(
+                matrix_sdk::encryption::secret_storage::SecretStorageError::ImportError { .. },
+            ) => Self::Import { error_message: value.to_string() },
             recovery::RecoveryError::SecretStorage(e) => {
                 Self::SecretStorage { error_message: e.to_string() }
             }
@@ -284,6 +295,15 @@ impl Encryption {
         Ok(self.inner.recovery().is_last_device().await?)
     }
 
+    /// Does the user have other devices that the current device can verify
+    /// against?
+    ///
+    /// The device must be signed by the user's cross-signing key, must have an
+    /// identity, and must not be a dehydrated device.
+    pub async fn has_devices_to_verify_against(&self) -> Result<bool, ClientError> {
+        Ok(self.inner.has_devices_to_verify_against().await?)
+    }
+
     pub async fn wait_for_backup_upload_steady_state(
         &self,
         progress_listener: Option<Box<dyn BackupSteadyStateListener>>,
@@ -437,9 +457,9 @@ impl Encryption {
                 info!("No identity found in the store.");
             }
             Err(error) => {
-                error!("Failed fetching identity from the store: {}", error);
+                error!("Failed fetching identity from the store: {error}");
             }
-        };
+        }
 
         info!("Requesting identity from the server.");
 

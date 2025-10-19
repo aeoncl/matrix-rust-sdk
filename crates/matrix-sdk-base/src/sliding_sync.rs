@@ -14,21 +14,24 @@
 
 //! Extend `BaseClient` with capabilities to handle MSC4186.
 
-use matrix_sdk_common::deserialized_responses::TimelineEvent;
-use ruma::{api::client::sync::sync_events::v5 as http, OwnedRoomId};
 #[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnyToDeviceEvent, serde::Raw};
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
+use matrix_sdk_common::{deserialized_responses::TimelineEvent, timer};
+use ruma::{
+    OwnedRoomId, api::client::sync::sync_events::v5 as http, events::receipt::SyncReceiptEvent,
+    serde::Raw,
+};
 use tracing::{instrument, trace};
 
 use super::BaseClient;
 use crate::{
+    RequestedRequiredStates,
     error::Result,
     read_receipts::compute_unread_counts,
     response_processors as processors,
     room::RoomInfoNotableUpdateReasons,
     store::ambiguity_map::AmbiguityCache,
     sync::{RoomUpdates, SyncResponse},
-    RequestedRequiredStates,
 };
 
 impl BaseClient {
@@ -44,7 +47,7 @@ impl BaseClient {
         &self,
         to_device: Option<&http::response::ToDevice>,
         e2ee: &http::response::E2EE,
-    ) -> Result<Option<Vec<Raw<AnyToDeviceEvent>>>> {
+    ) -> Result<Option<Vec<ProcessedToDeviceEvent>>> {
         if to_device.is_none() && e2ee.is_empty() {
             return Ok(None);
         }
@@ -62,9 +65,14 @@ impl BaseClient {
 
         let mut context = processors::Context::default();
 
-        let processors::e2ee::to_device::Output { decrypted_to_device_events, room_key_updates } =
-            processors::e2ee::to_device::from_msc4186(to_device, e2ee, olm_machine.as_ref())
-                .await?;
+        let processors::e2ee::to_device::Output { processed_to_device_events, room_key_updates } =
+            processors::e2ee::to_device::from_msc4186(
+                to_device,
+                e2ee,
+                olm_machine.as_ref(),
+                &self.decryption_settings,
+            )
+            .await?;
 
         processors::latest_event::decrypt_from_rooms(
             &mut context,
@@ -75,7 +83,7 @@ impl BaseClient {
                 .collect(),
             processors::e2ee::E2EE::new(
                 olm_machine.as_ref(),
-                self.decryption_trust_requirement,
+                &self.decryption_settings,
                 self.handle_verification_events,
             ),
         )
@@ -89,7 +97,7 @@ impl BaseClient {
         )
         .await?;
 
-        Ok(Some(decrypted_to_device_events))
+        Ok(Some(processed_to_device_events))
     }
 
     /// Process a response from a sliding sync call.
@@ -117,7 +125,9 @@ impl BaseClient {
             // we received a room reshuffling event only, there won't be anything for us to
             // process. stop early
             return Ok(SyncResponse::default());
-        };
+        }
+
+        let _timer = timer!(tracing::Level::TRACE, "_method");
 
         let mut context = processors::Context::default();
 
@@ -152,7 +162,7 @@ impl BaseClient {
                 #[cfg(feature = "e2e-encryption")]
                 processors::e2ee::E2EE::new(
                     self.olm_machine().await.as_ref(),
-                    self.decryption_trust_requirement,
+                    &self.decryption_settings,
                     self.handle_verification_events,
                 ),
                 processors::notification::Notification::new(
@@ -188,9 +198,6 @@ impl BaseClient {
             }
         }
 
-        // Check if tombstoned rooms are not creating an invalid state, like a loop.
-        processors::state_events::check_tombstone(&mut context, &room_updates, &self.state_store)?;
-
         // Handle read receipts and typing notifications independently of the rooms:
         // these both live in a different subsection of the server's response,
         // so they may exist without any update for the associated room.
@@ -205,8 +212,7 @@ impl BaseClient {
             &extensions.account_data,
             &mut room_updates,
             &self.state_store,
-        )
-        .await;
+        );
 
         global_account_data_processor.apply(&mut context, &state_store).await;
 
@@ -251,27 +257,27 @@ impl BaseClient {
         &self,
         room_id: &OwnedRoomId,
         response: &http::Response,
-        sync_response: &mut SyncResponse,
+        new_sync_events: Vec<TimelineEvent>,
         room_previous_events: Vec<TimelineEvent>,
-    ) -> Result<()> {
+    ) -> Result<Option<Raw<SyncReceiptEvent>>> {
         let mut context = processors::Context::default();
 
         let mut save_context = false;
 
-        // Get or create the `JoinedRoomUpdate`, so that we can push the receipt
-        // ephemeral event, and compute the unread counts.
-        let joined_room_update = sync_response.rooms.joined.entry(room_id.to_owned()).or_default();
-
         // Handle the receipt ephemeral event.
-        if let Some(receipt_ephemeral_event) = response.extensions.receipts.rooms.get(room_id) {
+        let receipt_ephemeral_event = if let Some(receipt_ephemeral_event) =
+            response.extensions.receipts.rooms.get(room_id)
+        {
             processors::room::msc4186::extensions::dispatch_receipt_ephemeral_event_for_room(
                 &mut context,
                 room_id,
                 receipt_ephemeral_event,
-                joined_room_update,
             );
             save_context = true;
-        }
+            Some(receipt_ephemeral_event.clone())
+        } else {
+            None
+        };
 
         let user_id = &self.session_meta().expect("logged in user").user_id;
 
@@ -285,8 +291,9 @@ impl BaseClient {
                 room_id,
                 context.state_changes.receipts.get(room_id),
                 room_previous_events,
-                &joined_room_update.timeline.events,
+                &new_sync_events,
                 &mut room_info.read_receipts,
+                self.threading_support,
             );
 
             if prev_read_receipts != room_info.read_receipts {
@@ -306,7 +313,7 @@ impl BaseClient {
             processors::changes::save_only(context, &self.state_store).await?;
         }
 
-        Ok(())
+        Ok(receipt_ephemeral_event)
     }
 }
 
@@ -325,9 +332,12 @@ mod tests {
     };
     use matrix_sdk_test::async_test;
     use ruma::{
+        JsOption, MxcUri, OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, UserId,
         api::client::sync::sync_events::UnreadNotificationsCount,
         assign, event_id,
         events::{
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent, GlobalAccountDataEventContent,
+            StateEventContent, StateEventType,
             direct::{DirectEventContent, DirectUserIdentifier, OwnedDirectUserIdentifier},
             room::{
                 avatar::RoomAvatarEventContent,
@@ -338,12 +348,10 @@ mod tests {
                 name::RoomNameEventContent,
                 pinned_events::RoomPinnedEventsEventContent,
             },
-            AnySyncMessageLikeEvent, AnySyncTimelineEvent, GlobalAccountDataEventContent,
-            StateEventContent, StateEventType,
         },
         mxc_uri, owned_event_id, owned_mxc_uri, owned_user_id, room_alias_id, room_id,
         serde::Raw,
-        uint, user_id, JsOption, MxcUri, OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, UserId,
+        uint, user_id,
     };
     use serde_json::json;
 
@@ -351,14 +359,15 @@ mod tests {
     #[cfg(feature = "e2e-encryption")]
     use super::processors::room::msc4186::cache_latest_events;
     use crate::{
+        BaseClient, EncryptionState, RequestedRequiredStates, RoomInfoNotableUpdate, RoomState,
+        SessionMeta,
+        client::ThreadingSupport,
         room::{RoomHero, RoomInfoNotableUpdateReasons},
         store::{RoomLoadSettings, StoreConfig},
         test_utils::logged_in_base_client,
-        BaseClient, EncryptionState, RequestedRequiredStates, RoomInfoNotableUpdate, RoomState,
-        SessionMeta,
     };
     #[cfg(feature = "e2e-encryption")]
-    use crate::{store::MemoryStore, Room};
+    use crate::{Room, store::MemoryStore};
 
     #[async_test]
     async fn test_notification_count_set() {
@@ -581,8 +590,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_receiving_a_knocked_room_membership_event_with_wrong_state_key_creates_an_invited_room(
-    ) {
+    async fn test_receiving_a_knocked_room_membership_event_with_wrong_state_key_creates_an_invited_room()
+     {
         // Given a logged-in client,
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -605,8 +614,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_receiving_an_unknown_room_membership_event_in_invite_state_creates_an_invited_room(
-    ) {
+    async fn test_receiving_an_unknown_room_membership_event_in_invite_state_creates_an_invited_room()
+     {
         // Given a logged-in client,
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -624,7 +633,7 @@ mod tests {
             "state_key": user_id,
         }))
         .expect("Failed to make raw event")
-        .cast();
+        .cast_unchecked();
         room.invite_state = Some(vec![event]);
 
         let response = response_with_room(room_id, room);
@@ -811,7 +820,9 @@ mod tests {
         create_dm(&client, room_id, user_a_id, user_b_id, MembershipState::Join).await;
 
         // (Sanity: B is a direct target, and is in Join state)
-        assert!(direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id)));
+        assert!(
+            direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id))
+        );
         assert_eq!(membership(&client, room_id, user_b_id).await, MembershipState::Join);
 
         // When B leaves
@@ -820,13 +831,15 @@ mod tests {
         // Then B is still a direct target, and is in Leave state (B is a direct target
         // because we want to return to our old DM in the UI even if the other
         // user left, so we can reinvite them. See https://github.com/matrix-org/matrix-rust-sdk/issues/2017)
-        assert!(direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id)));
+        assert!(
+            direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id))
+        );
         assert_eq!(membership(&client, room_id, user_b_id).await, MembershipState::Leave);
     }
 
     #[async_test]
-    async fn test_other_person_refusing_invite_to_a_dm_is_reflected_in_their_membership_and_direct_targets(
-    ) {
+    async fn test_other_person_refusing_invite_to_a_dm_is_reflected_in_their_membership_and_direct_targets()
+     {
         let room_id = room_id!("!r:e.uk");
         let user_a_id = user_id!("@a:e.uk");
         let user_b_id = user_id!("@b:e.uk");
@@ -836,7 +849,9 @@ mod tests {
         create_dm(&client, room_id, user_a_id, user_b_id, MembershipState::Invite).await;
 
         // (Sanity: B is a direct target, and is in Invite state)
-        assert!(direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id)));
+        assert!(
+            direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id))
+        );
         assert_eq!(membership(&client, room_id, user_b_id).await, MembershipState::Invite);
 
         // When B declines the invitation (i.e. leaves)
@@ -845,7 +860,9 @@ mod tests {
         // Then B is still a direct target, and is in Leave state (B is a direct target
         // because we want to return to our old DM in the UI even if the other
         // user left, so we can reinvite them. See https://github.com/matrix-org/matrix-rust-sdk/issues/2017)
-        assert!(direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id)));
+        assert!(
+            direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id))
+        );
         assert_eq!(membership(&client, room_id, user_b_id).await, MembershipState::Leave);
     }
 
@@ -863,7 +880,9 @@ mod tests {
         assert_eq!(membership(&client, room_id, user_a_id).await, MembershipState::Join);
 
         // (Sanity: B is a direct target, and is in Join state)
-        assert!(direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id)));
+        assert!(
+            direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id))
+        );
         assert_eq!(membership(&client, room_id, user_b_id).await, MembershipState::Join);
 
         let room = client.get_room(room_id).unwrap();
@@ -887,7 +906,9 @@ mod tests {
         assert_eq!(membership(&client, room_id, user_a_id).await, MembershipState::Join);
 
         // (Sanity: B is a direct target, and is in Join state)
-        assert!(direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id)));
+        assert!(
+            direct_targets(&client, room_id).contains(<&DirectUserIdentifier>::from(user_b_id))
+        );
         assert_eq!(membership(&client, room_id, user_b_id).await, MembershipState::Invite);
 
         let room = client.get_room(room_id).unwrap();
@@ -1063,8 +1084,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_canonical_alias_is_found_in_invitation_room_when_processing_sliding_sync_response(
-    ) {
+    async fn test_canonical_alias_is_found_in_invitation_room_when_processing_sliding_sync_response()
+     {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1160,7 +1181,7 @@ mod tests {
                 let store = StoreConfig::new("cross-process-foo".to_owned());
                 state_store = store.state_store.clone();
 
-                let client = BaseClient::new(store);
+                let client = BaseClient::new(store, ThreadingSupport::Disabled);
                 client
                     .activate(
                         session_meta.clone(),
@@ -1191,7 +1212,7 @@ mod tests {
             let client = {
                 let mut store = StoreConfig::new("cross-process-foo".to_owned());
                 store.state_store = state_store;
-                let client = BaseClient::new(store);
+                let client = BaseClient::new(store, ThreadingSupport::Disabled);
                 client
                     .activate(
                         session_meta,
@@ -1303,6 +1324,17 @@ mod tests {
         let client = logged_in_base_client(Some(own_user_id)).await;
         let room_id = room_id!("!r:e.uk");
 
+        // The room create event.
+        let create = json!({
+            "sender":"@ignacio:example.com",
+            "state_key":"",
+            "type":"m.room.create",
+            "event_id": "$idc",
+            "origin_server_ts": 12344415,
+            "content":{ "room_version": "11" },
+            "room_id": room_id,
+        });
+
         // Give the current user invite or kick permissions in this room
         let power_levels = json!({
             "sender":"@alice:example.com",
@@ -1328,7 +1360,10 @@ mod tests {
         // When the sliding sync response contains a timeline
         let events = &[knock_event];
         let mut room = room_with_timeline(events);
-        room.required_state.push(Raw::new(&power_levels).unwrap().cast());
+        room.required_state.extend([
+            Raw::new(&create).unwrap().cast_unchecked(),
+            Raw::new(&power_levels).unwrap().cast_unchecked(),
+        ]);
         let response = response_with_room(room_id, room);
         client
             .process_sliding_sync(&response, &RequestedRequiredStates::default())
@@ -1376,7 +1411,7 @@ mod tests {
         // When the sliding sync response contains a timeline
         let events = &[knock_event];
         let mut room = room_with_timeline(events);
-        room.required_state.push(Raw::new(&power_levels).unwrap().cast());
+        room.required_state.push(Raw::new(&power_levels).unwrap().cast_unchecked());
         let response = response_with_room(room_id, room);
         client
             .process_sliding_sync(&response, &RequestedRequiredStates::default())
@@ -1418,6 +1453,7 @@ mod tests {
         assert!(client_room.latest_event().is_none());
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
     async fn test_cached_latest_event_can_be_redacted() {
         // Given a logged-in client
@@ -1489,7 +1525,7 @@ mod tests {
     #[async_test]
     async fn test_when_only_one_event_we_cache_it() {
         let event1 = make_event("m.room.message", "$1");
-        let events = &[event1.clone()];
+        let events = std::slice::from_ref(&event1);
         let chosen = choose_event_to_cache(events).await;
         assert_eq!(ev_id(chosen), rawev_id(event1));
     }
@@ -1758,7 +1794,7 @@ mod tests {
 
         // Then the room in the client has the recency stamp
         let client_room = client.get_room(room_id).expect("No room found");
-        assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 42);
+        assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 42.into());
     }
 
     #[async_test]
@@ -1780,7 +1816,7 @@ mod tests {
 
             // Then the room in the client has the recency stamp
             let client_room = client.get_room(room_id).expect("No room found");
-            assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 42);
+            assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 42.into());
         }
 
         {
@@ -1796,7 +1832,7 @@ mod tests {
 
             // Then the room in the client has the previous recency stamp
             let client_room = client.get_room(room_id).expect("No room found");
-            assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 42);
+            assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 42.into());
         }
 
         {
@@ -1813,7 +1849,7 @@ mod tests {
 
             // Then the room in the client has the recency stamp
             let client_room = client.get_room(room_id).expect("No room found");
-            assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 153);
+            assert_eq!(client_room.recency_stamp().expect("No recency stamp"), 153.into());
         }
     }
 
@@ -1906,18 +1942,20 @@ mod tests {
 
         // Send sliding sync response containing a membership event with 'join' value.
         let room_id = room_id!("!r:e.uk");
-        let events = vec![Raw::from_json_string(
-            json!({
-                "type": "m.room.member",
-                "event_id": "$3",
-                "content": { "membership": "join" },
-                "sender": "@u:h.uk",
-                "origin_server_ts": 12344445,
-                "state_key": "@u:e.uk",
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "m.room.member",
+                    "event_id": "$3",
+                    "content": { "membership": "join" },
+                    "sender": "@u:h.uk",
+                    "origin_server_ts": 12344445,
+                    "state_key": "@u:e.uk",
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         let room = assign!(http::response::Room::new(), {
             required_state: events,
         });
@@ -1937,18 +1975,20 @@ mod tests {
         );
         assert!(room_info_notable_update_stream.is_empty());
 
-        let events = vec![Raw::from_json_string(
-            json!({
-                "type": "m.room.member",
-                "event_id": "$3",
-                "content": { "membership": "leave" },
-                "sender": "@u:h.uk",
-                "origin_server_ts": 12344445,
-                "state_key": "@u:e.uk",
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "m.room.member",
+                    "event_id": "$3",
+                    "content": { "membership": "leave" },
+                    "sender": "@u:h.uk",
+                    "origin_server_ts": 12344445,
+                    "state_key": "@u:e.uk",
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         let room = assign!(http::response::Room::new(), {
             required_state: events,
         });
@@ -2004,17 +2044,19 @@ mod tests {
         // When I receive a sliding sync response containing one update about an unread
         // marker,
         let room_id = room_id!("!r:e.uk");
-        let room_account_data_events = vec![Raw::from_json_string(
-            json!({
-                "type": "m.marked_unread",
-                "event_id": "$1",
-                "content": { "unread": true },
-                "sender": client.session_meta().unwrap().user_id,
-                "origin_server_ts": 12344445,
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let room_account_data_events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "m.marked_unread",
+                    "event_id": "$1",
+                    "content": { "unread": true },
+                    "sender": client.session_meta().unwrap().user_id,
+                    "origin_server_ts": 12344445,
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         let mut response = response_with_room(room_id, http::response::Room::new());
         response.extensions.account_data.rooms.insert(room_id.to_owned(), room_account_data_events);
 
@@ -2048,17 +2090,19 @@ mod tests {
         assert!(room_info_notable_update_stream.is_empty());
 
         // …Unless its value changes!
-        let room_account_data_events = vec![Raw::from_json_string(
-            json!({
-                "type": "m.marked_unread",
-                "event_id": "$1",
-                "content": { "unread": false },
-                "sender": client.session_meta().unwrap().user_id,
-                "origin_server_ts": 12344445,
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let room_account_data_events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "m.marked_unread",
+                    "event_id": "$1",
+                    "content": { "unread": false },
+                    "sender": client.session_meta().unwrap().user_id,
+                    "origin_server_ts": 12344445,
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         response.extensions.account_data.rooms.insert(room_id.to_owned(), room_account_data_events);
         client
             .process_sliding_sync(&response, &RequestedRequiredStates::default())
@@ -2110,17 +2154,19 @@ mod tests {
         // When I receive a sliding sync response containing one update about an
         // unstable unread marker,
         let room_id = room_id!("!r:e.uk");
-        let unstable_room_account_data_events = vec![Raw::from_json_string(
-            json!({
-                "type": "com.famedly.marked_unread",
-                "event_id": "$1",
-                "content": { "unread": true },
-                "sender": client.session_meta().unwrap().user_id,
-                "origin_server_ts": 12344445,
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let unstable_room_account_data_events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "com.famedly.marked_unread",
+                    "event_id": "$1",
+                    "content": { "unread": true },
+                    "sender": client.session_meta().unwrap().user_id,
+                    "origin_server_ts": 12344445,
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         let mut response = response_with_room(room_id, http::response::Room::new());
         response
             .extensions
@@ -2144,17 +2190,19 @@ mod tests {
         assert!(room_info_notable_update_stream.is_empty());
 
         // When I receive a sliding sync response with a stable unread marker update,
-        let stable_room_account_data_events = vec![Raw::from_json_string(
-            json!({
-                "type": "m.marked_unread",
-                "event_id": "$1",
-                "content": { "unread": false },
-                "sender": client.session_meta().unwrap().user_id,
-                "origin_server_ts": 12344445,
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let stable_room_account_data_events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "m.marked_unread",
+                    "event_id": "$1",
+                    "content": { "unread": false },
+                    "sender": client.session_meta().unwrap().user_id,
+                    "origin_server_ts": 12344445,
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         response
             .extensions
             .account_data
@@ -2199,17 +2247,19 @@ mod tests {
 
         // Finally, when I receive a sliding sync response with a stable unread marker
         // update again,
-        let stable_room_account_data_events = vec![Raw::from_json_string(
-            json!({
-                "type": "m.marked_unread",
-                "event_id": "$3",
-                "content": { "unread": true },
-                "sender": client.session_meta().unwrap().user_id,
-                "origin_server_ts": 12344445,
-            })
-            .to_string(),
-        )
-        .unwrap()];
+        let stable_room_account_data_events = vec![
+            Raw::from_json_string(
+                json!({
+                    "type": "m.marked_unread",
+                    "event_id": "$3",
+                    "content": { "unread": true },
+                    "sender": client.session_meta().unwrap().user_id,
+                    "origin_server_ts": 12344445,
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        ];
         response
             .extensions
             .account_data
@@ -2514,12 +2564,12 @@ mod tests {
 
     #[cfg(feature = "e2e-encryption")]
     fn make_event(event_type: &str, id: &str) -> TimelineEvent {
-        TimelineEvent::new(make_raw_event(event_type, id))
+        TimelineEvent::from_plaintext(make_raw_event(event_type, id))
     }
 
     #[cfg(feature = "e2e-encryption")]
     fn make_encrypted_event(id: &str) -> TimelineEvent {
-        TimelineEvent::new_utd_event(
+        TimelineEvent::from_utd(
             Raw::from_json_string(
                 json!({
                     "type": "m.room.encrypted",
@@ -2709,7 +2759,7 @@ mod tests {
             "state_key": invitee,
         }))
         .expect("Failed to make raw event")
-        .cast();
+        .cast_unchecked();
 
         room.invite_state = Some(vec![evt]);
 
@@ -2737,7 +2787,7 @@ mod tests {
             "state_key": knocker,
         }))
         .expect("Failed to make raw event")
-        .cast();
+        .cast_unchecked();
 
         room.invite_state = Some(vec![evt]);
     }
@@ -2772,7 +2822,7 @@ mod tests {
             "content": content,
         }))
         .expect("Failed to create account data event")
-        .cast()
+        .cast_unchecked()
     }
 
     fn make_state_event<C: StateEventContent, E>(
@@ -2797,6 +2847,6 @@ mod tests {
             "unsigned": unsigned,
         }))
         .expect("Failed to create state event")
-        .cast()
+        .cast_unchecked()
     }
 }

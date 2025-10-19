@@ -1,33 +1,25 @@
 use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
+#[cfg(not(target_family = "wasm"))]
+use matrix_sdk::reqwest::Certificate;
 use matrix_sdk::{
-    authentication::oauth::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
-    crypto::{
-        types::qr_login::{LoginQrCodeDecodeError, QrCodeModeData},
-        CollectStrategy, TrustRequirement,
-    },
+    crypto::{CollectStrategy, DecryptionSettings, TrustRequirement},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     event_cache::EventCacheError,
-    reqwest::Certificate,
     ruma::{ServerName, UserId},
     sliding_sync::{
         Error as MatrixSlidingSyncError, VersionBuilder as MatrixSlidingSyncVersionBuilder,
         VersionBuilderError,
     },
     Client as MatrixClient, ClientBuildError as MatrixClientBuildError, HttpError, IdParseError,
-    RumaApiError, SqliteStoreConfig,
+    RumaApiError, SqliteStoreConfig, ThreadingSupport,
 };
-use matrix_sdk_common::{runtime::get_runtime_handle, SendOutsideWasm, SyncOutsideWasm};
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
-use tracing::{debug, error};
+use tracing::debug;
 use zeroize::Zeroizing;
 
 use super::client::Client;
-use crate::{
-    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
-    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
-};
+use crate::{client::ClientSessionDelegate, error::ClientError, helpers::unwrap_or_clone_arc};
 
 /// A list of bytes containing a certificate in DER or PEM form.
 pub type CertificateBytes = Vec<u8>;
@@ -37,164 +29,6 @@ enum HomeserverConfig {
     Url(String),
     ServerName(String),
     ServerNameOrUrl(String),
-}
-
-/// Data for the QR code login mechanism.
-///
-/// The [`QrCodeData`] can be serialized and encoded as a QR code or it can be
-/// decoded from a QR code.
-#[derive(Debug, uniffi::Object)]
-pub struct QrCodeData {
-    inner: qrcode::QrCodeData,
-}
-
-#[matrix_sdk_ffi_macros::export]
-impl QrCodeData {
-    /// Attempt to decode a slice of bytes into a [`QrCodeData`] object.
-    ///
-    /// The slice of bytes would generally be returned by a QR code decoder.
-    #[uniffi::constructor]
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, QrCodeDecodeError> {
-        Ok(Self { inner: qrcode::QrCodeData::from_bytes(&bytes)? }.into())
-    }
-
-    /// The server name contained within the scanned QR code data.
-    ///
-    /// Note: This value is only present when scanning a QR code the belongs to
-    /// a logged in client. The mode where the new client shows the QR code
-    /// will return `None`.
-    pub fn server_name(&self) -> Option<String> {
-        match &self.inner.mode_data {
-            QrCodeModeData::Reciprocate { server_name } => Some(server_name.to_owned()),
-            QrCodeModeData::Login => None,
-        }
-    }
-}
-
-/// Error type for the decoding of the [`QrCodeData`].
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-#[uniffi(flat_error)]
-pub enum QrCodeDecodeError {
-    #[error("Error decoding QR code: {error:?}")]
-    Crypto {
-        #[from]
-        error: LoginQrCodeDecodeError,
-    },
-}
-
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum HumanQrLoginError {
-    #[error("Linking with this device is not supported.")]
-    LinkingNotSupported,
-    #[error("The sign in was cancelled.")]
-    Cancelled,
-    #[error("The sign in was not completed in the required time.")]
-    Expired,
-    #[error("A secure connection could not have been established between the two devices.")]
-    ConnectionInsecure,
-    #[error("The sign in was declined.")]
-    Declined,
-    #[error("An unknown error has happened.")]
-    Unknown,
-    #[error("The homeserver doesn't provide sliding sync in its configuration.")]
-    SlidingSyncNotAvailable,
-    #[error("Unable to use OIDC as the supplied client metadata is invalid.")]
-    OidcMetadataInvalid,
-    #[error("The other device is not signed in and as such can't sign in other devices.")]
-    OtherDeviceNotSignedIn,
-}
-
-impl From<qrcode::QRCodeLoginError> for HumanQrLoginError {
-    fn from(value: qrcode::QRCodeLoginError) -> Self {
-        use qrcode::{QRCodeLoginError, SecureChannelError};
-
-        match value {
-            QRCodeLoginError::LoginFailure { reason, .. } => match reason {
-                LoginFailureReason::UnsupportedProtocol => HumanQrLoginError::LinkingNotSupported,
-                LoginFailureReason::AuthorizationExpired => HumanQrLoginError::Expired,
-                LoginFailureReason::UserCancelled => HumanQrLoginError::Cancelled,
-                _ => HumanQrLoginError::Unknown,
-            },
-
-            QRCodeLoginError::OAuth(e) => {
-                if let Some(e) = e.as_request_token_error() {
-                    match e {
-                        DeviceCodeErrorResponseType::AccessDenied => HumanQrLoginError::Declined,
-                        DeviceCodeErrorResponseType::ExpiredToken => HumanQrLoginError::Expired,
-                        _ => HumanQrLoginError::Unknown,
-                    }
-                } else {
-                    HumanQrLoginError::Unknown
-                }
-            }
-
-            QRCodeLoginError::SecureChannel(e) => match e {
-                SecureChannelError::Utf8(_)
-                | SecureChannelError::MessageDecode(_)
-                | SecureChannelError::Json(_)
-                | SecureChannelError::RendezvousChannel(_) => HumanQrLoginError::Unknown,
-                SecureChannelError::SecureChannelMessage { .. }
-                | SecureChannelError::Ecies(_)
-                | SecureChannelError::InvalidCheckCode => HumanQrLoginError::ConnectionInsecure,
-                SecureChannelError::InvalidIntent => HumanQrLoginError::OtherDeviceNotSignedIn,
-            },
-
-            QRCodeLoginError::UnexpectedMessage { .. }
-            | QRCodeLoginError::CrossProcessRefreshLock(_)
-            | QRCodeLoginError::DeviceKeyUpload(_)
-            | QRCodeLoginError::SessionTokens(_)
-            | QRCodeLoginError::UserIdDiscovery(_)
-            | QRCodeLoginError::SecretImport(_) => HumanQrLoginError::Unknown,
-        }
-    }
-}
-
-/// Enum describing the progress of the QR-code login.
-#[derive(Debug, Default, Clone, uniffi::Enum)]
-pub enum QrLoginProgress {
-    /// The login process is starting.
-    #[default]
-    Starting,
-    /// We established a secure channel with the other device.
-    EstablishingSecureChannel {
-        /// The check code that the device should display so the other device
-        /// can confirm that the channel is secure as well.
-        check_code: u8,
-        /// The string representation of the check code, will be guaranteed to
-        /// be 2 characters long, preserving the leading zero if the
-        /// first digit is a zero.
-        check_code_string: String,
-    },
-    /// We are waiting for the login and for the OAuth 2.0 authorization server
-    /// to give us an access token.
-    WaitingForToken { user_code: String },
-    /// The login has successfully finished.
-    Done,
-}
-
-#[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait QrLoginProgressListener: SyncOutsideWasm + SendOutsideWasm {
-    fn on_update(&self, state: QrLoginProgress);
-}
-
-impl From<qrcode::LoginProgress> for QrLoginProgress {
-    fn from(value: qrcode::LoginProgress) -> Self {
-        use qrcode::LoginProgress;
-
-        match value {
-            LoginProgress::Starting => Self::Starting,
-            LoginProgress::EstablishingSecureChannel { check_code } => {
-                let check_code = check_code.to_digit();
-
-                Self::EstablishingSecureChannel {
-                    check_code,
-                    check_code_string: format!("{check_code:02}"),
-                }
-            }
-            LoginProgress::WaitingForToken { user_code } => Self::WaitingForToken { user_code },
-            LoginProgress::Done => Self::Done,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -274,22 +108,35 @@ pub struct ClientBuilder {
     system_is_memory_constrained: bool,
     username: Option<String>,
     homeserver_cfg: Option<HomeserverConfig>,
-    user_agent: Option<String>,
     sliding_sync_version_builder: SlidingSyncVersionBuilder,
-    proxy: Option<String>,
-    disable_ssl_verification: bool,
     disable_automatic_token_refresh: bool,
     cross_process_store_locks_holder_name: Option<String>,
     enable_oidc_refresh_lock: bool,
     session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
-    additional_root_certificates: Vec<Vec<u8>>,
-    disable_built_in_root_certificates: bool,
     encryption_settings: EncryptionSettings,
     room_key_recipient_strategy: CollectStrategy,
-    decryption_trust_requirement: TrustRequirement,
+    decryption_settings: DecryptionSettings,
     enable_share_history_on_invite: bool,
     request_config: Option<RequestConfig>,
+
+    #[cfg(not(target_family = "wasm"))]
+    user_agent: Option<String>,
+    #[cfg(not(target_family = "wasm"))]
+    proxy: Option<String>,
+    #[cfg(not(target_family = "wasm"))]
+    disable_ssl_verification: bool,
+    #[cfg(not(target_family = "wasm"))]
+    disable_built_in_root_certificates: bool,
+    #[cfg(not(target_family = "wasm"))]
+    additional_root_certificates: Vec<Vec<u8>>,
+
+    threading_support: ThreadingSupport,
 }
+
+/// The timeout applies to each read operation, and resets after a successful
+/// read. This is more appropriate for detecting stalled connections when the
+/// size isn’t known beforehand.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[matrix_sdk_ffi_macros::export]
 impl ClientBuilder {
@@ -321,9 +168,12 @@ impl ClientBuilder {
                 auto_enable_backups: false,
             },
             room_key_recipient_strategy: Default::default(),
-            decryption_trust_requirement: TrustRequirement::Untrusted,
+            decryption_settings: DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
             enable_share_history_on_invite: false,
             request_config: Default::default(),
+            threading_support: ThreadingSupport::Disabled,
         })
     }
 
@@ -455,12 +305,6 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub fn user_agent(self: Arc<Self>, user_agent: String) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.user_agent = Some(user_agent);
-        Arc::new(builder)
-    }
-
     pub fn sliding_sync_version_builder(
         self: Arc<Self>,
         version_builder: SlidingSyncVersionBuilder,
@@ -470,40 +314,9 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub fn proxy(self: Arc<Self>, url: String) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.proxy = Some(url);
-        Arc::new(builder)
-    }
-
-    pub fn disable_ssl_verification(self: Arc<Self>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.disable_ssl_verification = true;
-        Arc::new(builder)
-    }
-
     pub fn disable_automatic_token_refresh(self: Arc<Self>) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.disable_automatic_token_refresh = true;
-        Arc::new(builder)
-    }
-
-    pub fn add_root_certificates(
-        self: Arc<Self>,
-        certificates: Vec<CertificateBytes>,
-    ) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.additional_root_certificates = certificates;
-
-        Arc::new(builder)
-    }
-
-    /// Don't trust any system root certificates, only trust the certificates
-    /// provided through
-    /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
-    pub fn disable_built_in_root_certificates(self: Arc<Self>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.disable_built_in_root_certificates = true;
         Arc::new(builder)
     }
 
@@ -545,12 +358,12 @@ impl ClientBuilder {
     }
 
     /// Set the trust requirement to be used when decrypting events.
-    pub fn room_decryption_trust_requirement(
+    pub fn decryption_settings(
         self: Arc<Self>,
-        trust_requirement: TrustRequirement,
+        decryption_settings: DecryptionSettings,
     ) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
-        builder.decryption_trust_requirement = trust_requirement;
+        builder.decryption_settings = decryption_settings;
         Arc::new(builder)
     }
 
@@ -571,6 +384,23 @@ impl ClientBuilder {
     pub fn request_config(self: Arc<Self>, config: RequestConfig) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.request_config = Some(config);
+        Arc::new(builder)
+    }
+
+    /// Whether the client should support threads client-side or not, and enable
+    /// experimental support for MSC4306 (threads subscriptions) or not.
+    pub fn threads_enabled(
+        self: Arc<Self>,
+        enabled: bool,
+        thread_subscriptions: bool,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        let support = if enabled {
+            ThreadingSupport::Enabled { with_subscriptions: thread_subscriptions }
+        } else {
+            ThreadingSupport::Disabled
+        };
+        builder.threading_support = support;
         Arc::new(builder)
     }
 
@@ -650,52 +480,55 @@ impl ClientBuilder {
             }
         };
 
-        let mut certificates = Vec::new();
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let mut certificates = Vec::new();
 
-        for certificate in builder.additional_root_certificates {
-            // We don't really know what type of certificate we may get here, so let's try
-            // first one type, then the other.
-            match Certificate::from_der(&certificate) {
-                Ok(cert) => {
-                    certificates.push(cert);
-                }
-                Err(der_error) => {
-                    let cert = Certificate::from_pem(&certificate).map_err(|pem_error| {
-                        ClientBuildError::Generic {
-                            message: format!("Failed to add a root certificate as DER ({der_error:?}) or PEM ({pem_error:?})"),
-                        }
-                    })?;
-                    certificates.push(cert);
+            for certificate in builder.additional_root_certificates {
+                // We don't really know what type of certificate we may get here, so let's try
+                // first one type, then the other.
+                match Certificate::from_der(&certificate) {
+                    Ok(cert) => {
+                        certificates.push(cert);
+                    }
+                    Err(der_error) => {
+                        let cert = Certificate::from_pem(&certificate).map_err(|pem_error| {
+                            ClientBuildError::Generic {
+                                message: format!("Failed to add a root certificate as DER ({der_error:?}) or PEM ({pem_error:?})"),
+                            }
+                        })?;
+                        certificates.push(cert);
+                    }
                 }
             }
-        }
 
-        inner_builder = inner_builder.add_root_certificates(certificates);
+            inner_builder = inner_builder.add_root_certificates(certificates);
 
-        if builder.disable_built_in_root_certificates {
-            inner_builder = inner_builder.disable_built_in_root_certificates();
-        }
+            if builder.disable_built_in_root_certificates {
+                inner_builder = inner_builder.disable_built_in_root_certificates();
+            }
 
-        if let Some(proxy) = builder.proxy {
-            inner_builder = inner_builder.proxy(proxy);
-        }
+            if let Some(proxy) = builder.proxy {
+                inner_builder = inner_builder.proxy(proxy);
+            }
 
-        if builder.disable_ssl_verification {
-            inner_builder = inner_builder.disable_ssl_verification();
+            if builder.disable_ssl_verification {
+                inner_builder = inner_builder.disable_ssl_verification();
+            }
+
+            if let Some(user_agent) = builder.user_agent {
+                inner_builder = inner_builder.user_agent(user_agent);
+            }
         }
 
         if !builder.disable_automatic_token_refresh {
             inner_builder = inner_builder.handle_refresh_tokens();
         }
 
-        if let Some(user_agent) = builder.user_agent {
-            inner_builder = inner_builder.user_agent(user_agent);
-        }
-
         inner_builder = inner_builder
             .with_encryption_settings(builder.encryption_settings)
             .with_room_key_recipient_strategy(builder.room_key_recipient_strategy)
-            .with_decryption_trust_requirement(builder.decryption_trust_requirement)
+            .with_decryption_settings(builder.decryption_settings)
             .with_enable_share_history_on_invite(builder.enable_share_history_on_invite);
 
         match builder.sliding_sync_version_builder {
@@ -722,6 +555,7 @@ impl ClientBuilder {
             if let Some(timeout) = config.timeout {
                 updated_config = updated_config.timeout(Duration::from_millis(timeout));
             }
+            updated_config = updated_config.read_timeout(DEFAULT_READ_TIMEOUT);
             if let Some(max_concurrent_requests) = config.max_concurrent_requests {
                 if max_concurrent_requests > 0 {
                     updated_config = updated_config.max_concurrent_requests(NonZeroUsize::new(
@@ -736,7 +570,24 @@ impl ClientBuilder {
             inner_builder = inner_builder.request_config(updated_config);
         }
 
+        inner_builder = inner_builder.with_threading_support(builder.threading_support);
+
         let sdk_client = inner_builder.build().await?;
+
+        // Disable retries for this request to prevent it from being retried
+        // indefinitely
+        let config = sdk_client.request_config().disable_retry();
+
+        // Log server version information at info level.
+        if let Ok(server_info) = sdk_client.server_vendor_info(Some(config)).await {
+            tracing::info!(
+                server_name = %server_info.server_name,
+                version = %server_info.version,
+                "Connected to Matrix server"
+            );
+        } else {
+            tracing::warn!("Could not retrieve server version information");
+        }
 
         Ok(Arc::new(
             Client::new(
@@ -748,59 +599,46 @@ impl ClientBuilder {
             .await?,
         ))
     }
+}
 
-    /// Finish the building of the client and attempt to log in using the
-    /// provided [`QrCodeData`].
-    ///
-    /// This method will build the client and immediately attempt to log the
-    /// client in using the provided [`QrCodeData`] using the login
-    /// mechanism described in [MSC4108]. As such this methods requires OAuth
-    /// 2.0 support as well as sliding sync support.
-    ///
-    /// The usage of the progress_listener is required to transfer the
-    /// [`CheckCode`] to the existing client.
-    ///
-    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
-    pub async fn build_with_qr_code(
+#[cfg(not(target_family = "wasm"))]
+#[matrix_sdk_ffi_macros::export]
+impl ClientBuilder {
+    pub fn proxy(self: Arc<Self>, url: String) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.proxy = Some(url);
+        Arc::new(builder)
+    }
+
+    pub fn disable_ssl_verification(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_ssl_verification = true;
+        Arc::new(builder)
+    }
+
+    pub fn add_root_certificates(
         self: Arc<Self>,
-        qr_code_data: &QrCodeData,
-        oidc_configuration: &OidcConfiguration,
-        progress_listener: Box<dyn QrLoginProgressListener>,
-    ) -> Result<Arc<Client>, HumanQrLoginError> {
-        let QrCodeModeData::Reciprocate { server_name } = &qr_code_data.inner.mode_data else {
-            return Err(HumanQrLoginError::OtherDeviceNotSignedIn);
-        };
+        certificates: Vec<CertificateBytes>,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.additional_root_certificates = certificates;
 
-        let builder = self.server_name_or_homeserver_url(server_name.to_owned());
+        Arc::new(builder)
+    }
 
-        let client = builder.build().await.map_err(|e| match e {
-            ClientBuildError::SlidingSync(_) => HumanQrLoginError::SlidingSyncNotAvailable,
-            _ => {
-                error!("Couldn't build the client {e:?}");
-                HumanQrLoginError::Unknown
-            }
-        })?;
+    /// Don't trust any system root certificates, only trust the certificates
+    /// provided through
+    /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
+    pub fn disable_built_in_root_certificates(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_built_in_root_certificates = true;
+        Arc::new(builder)
+    }
 
-        let registration_data = oidc_configuration
-            .registration_data()
-            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
-
-        let oauth = client.inner.oauth();
-        let login = oauth.login_with_qr_code(&qr_code_data.inner, Some(&registration_data));
-
-        let mut progress = login.subscribe_to_progress();
-
-        // We create this task, which will get cancelled once it's dropped, just in case
-        // the progress stream doesn't end.
-        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
-            while let Some(state) = progress.next().await {
-                progress_listener.on_update(state.into());
-            }
-        }));
-
-        login.await?;
-
-        Ok(client)
+    pub fn user_agent(self: Arc<Self>, user_agent: String) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.user_agent = Some(user_agent);
+        Arc::new(builder)
     }
 }
 

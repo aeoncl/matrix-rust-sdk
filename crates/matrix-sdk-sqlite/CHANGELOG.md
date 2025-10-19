@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+- Implement a new constructor that allows to open `SqliteCryptoStore` with a cryptographic key
+  ([#5472](https://github.com/matrix-org/matrix-rust-sdk/pull/5472))
+
+### Refactor
+- [breaking] Change the logic for opening a store so as to use a `Secret` enum in the function `open_with_pool` instead of a `passphrase`
+  ([#5472](https://github.com/matrix-org/matrix-rust-sdk/pull/5472))
+
+## [0.14.0] - 2025-09-04
+
+No notable changes in this release.
+
+## [0.13.0] - 2025-07-10
+
+### Security Fixes
+
+- Fix SQL injection vulnerability in `find_event_relations()`.
+  ([d0c0100](https://github.com/matrix-org/matrix-rust-sdk/commit/d0c01006e4808db5eb96ad5c496416f284d8bd3c), Moderate, [CVE-2025-53549](https://www.cve.org/CVERecord?id=CVE-2025-53549), [GHSA-275g-g844-73jh](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-275g-g844-73jh))
+
+## [0.12.0] - 2025-06-10
+
 ### Bug Fixes
 
 - Fix a `UNIQUE` constraint violation in the event cache store

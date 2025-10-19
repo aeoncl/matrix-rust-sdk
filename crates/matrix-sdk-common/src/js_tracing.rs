@@ -23,11 +23,11 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use tracing::{field::Field, level_filters::LevelFilter, Event, Level, Metadata};
+use tracing::{Event, Level, Metadata, field::Field, level_filters::LevelFilter};
 use tracing_subscriber::{
     fmt::{
-        format::{DefaultFields, Writer},
         FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter, Subscriber,
+        format::{DefaultFields, Writer},
     },
     registry::LookupSpan,
 };
@@ -186,20 +186,22 @@ impl io::Write for JsLogWriter {
 
 fn write_message_to_logger(level: Level, message: &JsValue, logger: &JsLogger) {
     match level {
-        Level::TRACE | Level::DEBUG => logger.debug(message),
+        Level::TRACE => (),
+        Level::DEBUG => logger.debug(message),
         Level::INFO => logger.info(message),
         Level::WARN => logger.warn(message),
         Level::ERROR => logger.error(message),
-    };
+    }
 }
 
 fn write_message_to_console(level: Level, message: &JsValue) {
     match level {
-        Level::TRACE | Level::DEBUG => web_sys::console::debug_1(message),
+        Level::TRACE => (),
+        Level::DEBUG => web_sys::console::debug_1(message),
         Level::INFO => web_sys::console::info_1(message),
         Level::WARN => web_sys::console::warn_1(message),
         Level::ERROR => web_sys::console::error_1(message),
-    };
+    }
 }
 
 /// An implementation of [`FormatEvent`] which formats events in a sensible way
@@ -342,10 +344,11 @@ pub fn make_tracing_subscriber(logger: Option<JsLogger>) -> JsLoggingSubscriber 
     };
 
     tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
-        .with_writer(make_writer)
+        // JsLogWriter drops Level::TRACE events, so there's no point formatting them.
+        .with_max_level(Level::DEBUG)
         .with_ansi(false)
         .event_format(JsEventFormatter::new())
+        .with_writer(make_writer)
         .finish()
 }
 

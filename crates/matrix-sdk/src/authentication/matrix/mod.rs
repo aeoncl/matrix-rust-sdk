@@ -20,9 +20,10 @@ use std::fmt;
 #[cfg(feature = "sso-login")]
 use std::future::Future;
 
-use matrix_sdk_base::{store::RoomLoadSettings, SessionMeta};
+use matrix_sdk_base::{SessionMeta, store::RoomLoadSettings};
 use ruma::{
     api::{
+        OutgoingRequest, SendAccessToken,
         client::{
             account::register,
             session::{
@@ -30,7 +31,6 @@ use ruma::{
             },
             uiaa::UserIdentifier,
         },
-        OutgoingRequest, SendAccessToken,
     },
     serde::JsonObject,
 };
@@ -40,10 +40,10 @@ use tracing::{debug, error, info, instrument};
 use url::Url;
 
 use crate::{
+    Client, Error, RefreshTokenError, Result,
     authentication::AuthData,
     client::SessionChange,
     error::{HttpError, HttpResult},
-    Client, Error, RefreshTokenError, Result,
 };
 
 mod login_builder;
@@ -105,20 +105,20 @@ impl MatrixAuth {
         idp_id: Option<&str>,
     ) -> Result<String> {
         let homeserver = self.client.homeserver();
-        let server_versions = self.client.server_versions().await?;
+        let supported_versions = self.client.supported_versions().await?;
 
         let request = if let Some(id) = idp_id {
             sso_login_with_provider::v3::Request::new(id.to_owned(), redirect_url.to_owned())
                 .try_into_http_request::<Vec<u8>>(
                     homeserver.as_str(),
                     SendAccessToken::None,
-                    &server_versions,
+                    &supported_versions,
                 )
         } else {
             sso_login::v3::Request::new(redirect_url.to_owned()).try_into_http_request::<Vec<u8>>(
                 homeserver.as_str(),
                 SendAccessToken::None,
-                &server_versions,
+                &supported_versions,
             )
         };
 
@@ -536,10 +536,9 @@ impl MatrixAuth {
 
                 if let Some(save_session_callback) =
                     self.client.inner.auth_ctx.save_session_callback.get()
+                    && let Err(err) = save_session_callback(self.client.clone())
                 {
-                    if let Err(err) = save_session_callback(self.client.clone()) {
-                        error!("when saving session after refresh: {err}");
-                    }
+                    error!("when saving session after refresh: {err}");
                 }
 
                 _ = self
@@ -572,10 +571,10 @@ impl MatrixAuth {
     ///
     /// ```no_run
     /// use matrix_sdk::{
+    ///     Client,
     ///     ruma::api::client::{
     ///         account::register::v3::Request as RegistrationRequest, uiaa,
     ///     },
-    ///     Client,
     /// };
     /// # use url::Url;
     /// # let homeserver = Url::parse("http://example.com").unwrap();
@@ -662,9 +661,9 @@ impl MatrixAuth {
     ///
     /// ```no_run
     /// use matrix_sdk::{
+    ///     Client, SessionMeta, SessionTokens,
     ///     authentication::matrix::MatrixSession,
     ///     ruma::{device_id, user_id},
-    ///     Client, SessionMeta, SessionTokens,
     /// };
     /// # use url::Url;
     /// # async {
@@ -691,7 +690,7 @@ impl MatrixAuth {
     /// [`LoginBuilder::send()`] method returns:
     ///
     /// ```no_run
-    /// use matrix_sdk::{store::RoomLoadSettings, Client};
+    /// use matrix_sdk::{Client, store::RoomLoadSettings};
     /// use url::Url;
     /// # async {
     ///
@@ -802,7 +801,7 @@ impl MatrixAuth {
                 _ => None,
             };
 
-            self.client.encryption().spawn_initialization_task(auth_data);
+            self.client.encryption().spawn_initialization_task(auth_data).await;
         }
 
         Ok(())
@@ -815,7 +814,7 @@ impl MatrixAuth {
 ///
 /// ```
 /// use matrix_sdk::{
-///     authentication::matrix::MatrixSession, SessionMeta, SessionTokens,
+///     SessionMeta, SessionTokens, authentication::matrix::MatrixSession,
 /// };
 /// use ruma::{device_id, user_id};
 ///

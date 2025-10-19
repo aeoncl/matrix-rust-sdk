@@ -1,7 +1,7 @@
 [package]
 authors = ["Damir Jelić <poljar@termina.org.uk>"]
 description = "A high level Matrix client-server library."
-edition = "2021"
+edition = "2024"
 homepage = "https://github.com/matrix-org/matrix-rust-sdk"
 keywords = ["matrix", "chat", "messaging", "ruma", "nio"]
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ name = "matrix-sdk"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version.workspace = true
-version = "0.11.0"
+version = "0.14.0"
 
 [package.metadata.docs.rs]
 features = ["docsrs"]
@@ -46,6 +46,15 @@ indexeddb = ["matrix-sdk-indexeddb/state-store"]
 qrcode = ["e2e-encryption", "matrix-sdk-base/qrcode"]
 automatic-room-key-forwarding = ["e2e-encryption", "matrix-sdk-base/automatic-room-key-forwarding"]
 experimental-send-custom-to-device = ["e2e-encryption", "matrix-sdk-base/experimental-send-custom-to-device"]
+
+# Enable experimental support for encrypting state events; see
+# https://github.com/matrix-org/matrix-rust-sdk/issues/5397.
+experimental-encrypted-state-events = [
+    "e2e-encryption",
+    "matrix-sdk-base/experimental-encrypted-state-events",
+    "matrix-sdk-sqlite/experimental-encrypted-state-events"
+]
+
 markdown = ["ruma/markdown"]
 native-tls = ["reqwest/native-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
@@ -55,12 +64,16 @@ sso-login = ["local-server"]
 
 uniffi = ["dep:uniffi", "matrix-sdk-base/uniffi", "dep:matrix-sdk-ffi-macros"]
 
-experimental-widgets = ["dep:uuid"]
+experimental-widgets = ["dep:uuid", "experimental-send-custom-to-device"]
 
 docsrs = ["e2e-encryption", "sqlite", "indexeddb", "sso-login", "qrcode"]
 
 # Add support for inline media galleries via msgtypes
 unstable-msc4274 = ["ruma/unstable-msc4274", "matrix-sdk-base/unstable-msc4274"]
+
+experimental-search = ["matrix-sdk-search"]
+
+experimental-element-recent-emojis = ["matrix-sdk-base/experimental-element-recent-emojis"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
@@ -68,14 +81,14 @@ anymap2 = "0.13.0"
 aquamarine.workspace = true
 as_variant.workspace = true
 assert_matches2 = { workspace = true, optional = true }
-async-channel = "2.3.1"
+async-channel = "2.5.0"
 async-stream.workspace = true
 async-trait.workspace = true
-axum = { version = "0.8.1", optional = true }
-bytes = "1.9.0"
+axum = { version = "0.8.4", optional = true }
+bytes = "1.10.1"
 bytesize = "2.0.1"
-cfg-if = "1.0.0"
-event-listener = "5.4.0"
+cfg-if = "1.0.3"
+event-listener = "5.4.1"
 eyeball.workspace = true
 eyeball-im.workspace = true
 eyre = { version = "0.6.12", optional = true }
@@ -84,25 +97,28 @@ futures-util.workspace = true
 http.workspace = true
 imbl = { workspace = true, features = ["serde"] }
 indexmap.workspace = true
+itertools.workspace = true
 js_int = "0.2.2"
 language-tags = { version = "0.3.2" }
 matrix-sdk-base.workspace = true
 matrix-sdk-common.workspace = true
 matrix-sdk-ffi-macros = { workspace = true, optional = true }
 matrix-sdk-indexeddb = { workspace = true, optional = true }
+matrix-sdk-search = { workspace = true, optional = true }
 matrix-sdk-sqlite = { workspace = true, optional = true }
 matrix-sdk-test = { workspace = true, optional = true }
 mime.workspace = true
-mime2ext = "0.1.53"
-oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "timing-resistant-secret-traits"] }
+mime2ext = "0.1.54"
+oauth2.workspace = true
 once_cell.workspace = true
-percent-encoding = "2.3.1"
+percent-encoding = "2.3.2"
 pin-project-lite.workspace = true
 rand = { workspace = true, optional = true }
 ruma = { workspace = true, features = [
     "rand",
+    "federation-api-c",
     "unstable-msc2448",
-    "unstable-msc2965",
+    "unstable-msc4191",
     "unstable-msc3930",
     "unstable-msc3245-v1-compat",
     "unstable-msc4230",
@@ -117,7 +133,7 @@ sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
-tokio-util = "0.7.13"
+tokio-util = "0.7.16"
 tower = { version = "0.5.2", features = ["util"], optional = true }
 tracing = { workspace = true, features = ["attributes"] }
 uniffi = { workspace = true, optional = true }
@@ -128,7 +144,7 @@ vodozemac.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-backon = "1.5.0"
+backon = "1.5.2"
 # only activate reqwest's stream feature on non-wasm, the wasm part seems to not
 # support *sending* streams, which makes it useless for us.
 reqwest = { workspace = true, features = ["stream", "gzip", "http2"] }
@@ -150,6 +166,7 @@ futures-executor.workspace = true
 insta.workspace = true
 matrix-sdk-base = { workspace = true, features = ["testing"] }
 matrix-sdk-test.workspace = true
+matrix-sdk-test-utils.workspace = true
 serde_urlencoded = "0.7.1"
 similar-asserts.workspace = true
 stream_assert.workspace = true
